@@ -1,0 +1,103 @@
+package replication
+
+import (
+	"bytes"
+	"testing"
+
+	"github.com/nomadsql/replicateddb/codec"
+	"github.com/nomadsql/replicateddb/ids"
+)
+
+func TestFrameRoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteFrame(&buf, MsgPing, 0, []byte{1, 2, 3}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Type != MsgPing || !bytes.Equal(f.Payload, []byte{1, 2, 3}) {
+		t.Fatalf("mismatch: %+v", f)
+	}
+}
+
+func TestFrameRejects(t *testing.T) {
+	// Bad magic.
+	if _, err := ReadFrame(bytes.NewReader(make([]byte, 12))); err == nil {
+		t.Fatal("expected bad magic error")
+	}
+	// Oversize length prefix (no 4GB allocation: must fail fast).
+	hdr := []byte{0x52, 0x44, 0, 1, 0, 3, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF}
+	if _, err := ReadFrame(bytes.NewReader(hdr)); err == nil {
+		t.Fatal("expected oversize error")
+	}
+	// Truncated payload.
+	var buf bytes.Buffer
+	if err := WriteFrame(&buf, MsgPing, 0, []byte{1, 2, 3, 4}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFrame(bytes.NewReader(buf.Bytes()[:len(buf.Bytes())-2])); err == nil {
+		t.Fatal("expected truncation error")
+	}
+}
+
+func TestHelloRoundTrip(t *testing.T) {
+	h := &Hello{
+		ProtocolVersion: 1, MinProtocolVersion: 1,
+		NodeID: ids.NewNodeID(), DBID: ids.NewDBID(),
+		SchemaEpoch: 9, Capabilities: CapZstd,
+		Have: []codec.OriginWatermark{{Origin: ids.NewNodeID(), Sequence: 12}},
+	}
+	h.SchemaHash[31] = 7
+	got, err := DecodeHello(EncodeHello(nil, h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NodeID != h.NodeID || got.SchemaEpoch != 9 || len(got.Have) != 1 ||
+		got.Have[0].Sequence != 12 || got.SchemaHash != h.SchemaHash {
+		t.Fatalf("mismatch: %+v", got)
+	}
+}
+
+func TestBatchesRoundTrip(t *testing.T) {
+	batches := []*codec.MutationBatch{
+		{
+			ProtocolVersion: 1, TxID: ids.NewTxID(), OriginNode: ids.NewNodeID(),
+			Sequence: 1, HLC: 100, SchemaEpoch: 1,
+			Mutations: []codec.Mutation{{TableID: 1, RowID: ids.NewRowID(), ColumnID: 2, Value: codec.Text("v")}},
+		},
+	}
+	got, err := DecodeBatches(EncodeBatches(nil, batches), codec.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Sequence != 1 {
+		t.Fatalf("mismatch: %+v", got)
+	}
+}
+
+func TestNeedAndErrorRoundTrip(t *testing.T) {
+	n := Need{Origin: ids.NewNodeID(), FromSeq: 77}
+	got, err := DecodeNeed(EncodeNeed(nil, n))
+	if err != nil || got != n {
+		t.Fatalf("need mismatch: %+v %v", got, err)
+	}
+	code, msg, err := DecodeError(EncodeError(nil, ErrSnapshotRequired, "gone"))
+	if err != nil || code != ErrSnapshotRequired || msg != "gone" {
+		t.Fatalf("error mismatch: %d %q %v", code, msg, err)
+	}
+}
+
+func TestSnapshotChunkRoundTrip(t *testing.T) {
+	c := &SnapshotChunk{Last: true, Cells: []codec.SnapshotCell{
+		{TableID: 1, RowID: ids.NewRowID(), ColumnID: 2, Value: codec.Int(3)},
+	}}
+	got, err := DecodeSnapshotChunk(EncodeSnapshotChunk(nil, c), codec.DefaultLimits(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Last || len(got.Cells) != 1 {
+		t.Fatalf("mismatch: %+v", got)
+	}
+}

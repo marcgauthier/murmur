@@ -1,0 +1,17 @@
+# Binaries and test artifacts
+*.test
+*.out
+*.exe
+*.o
+*.a
+*.so
+
+# Coverage and profiling
+*.prof
+*.pprof
+coverage.txt
+
+# OS and IDE files
+.DS_Store
+.vscode/
+.idea/
