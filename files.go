@@ -364,8 +364,10 @@ func (fs *fileStore) commit(mutations []codec.Mutation) error {
 	if err != nil {
 		return err
 	}
-	if err := db.store.SetMaterializedGeneration(gen); err != nil {
-		return err
+	if len(db.remoteRows) == 0 {
+		if err := db.store.SetMaterializedGeneration(gen); err != nil {
+			return err
+		}
 	}
 	if repl := db.replManager(); repl != nil {
 		repl.NotifyLocal()

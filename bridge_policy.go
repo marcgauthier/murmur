@@ -239,6 +239,9 @@ func (db *DB) commitBridgePolicy(ctx context.Context, mutations ...codec.Mutatio
 	defer db.writeMu.Unlock()
 	db.applyMu.Lock()
 	defer db.applyMu.Unlock()
+	if err := db.flushRemoteLocked(); err != nil {
+		return err
+	}
 	identity := db.schemaIdentity()
 	batch := &codec.MutationBatch{ProtocolVersion: replication.ProtocolVersion, TxID: ids.NewTxID(), OriginNode: db.cfg.NodeID, HLC: db.store.ClockNow(), SchemaEpoch: identity.Epoch, SchemaHash: identity.Hash, Mutations: mutations}
 	result, err := db.store.CommitLocal(ctx, batch)

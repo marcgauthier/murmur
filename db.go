@@ -64,8 +64,11 @@ type DB struct {
 	lastStatus   Status
 	lastStatusOK bool
 
-	writeMu sync.Mutex // serialized local write coordinator
-	applyMu sync.Mutex // serializes all durable commits + materialization
+	writeMu         sync.Mutex                    // serialized local write coordinator
+	applyMu         sync.Mutex                    // serializes all durable commits + materialization
+	remoteRows      map[sqlengine.RowKey]struct{} // durable remote rows awaiting SQLite
+	remoteTxnCount  int                           // received transactions since the last SQLite flush
+	remoteFlushWake chan struct{}                 // count/row threshold wakes the bulk flush worker
 
 	sched *writerScheduler // fair writer admission (see scheduler.go)
 
@@ -91,7 +94,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrUnsupportedSchema, err)
 	}
-	db := &DB{cfg: cfg, log: cfg.Logger, reg: reg, dbState: StateOpening, openedAt: time.Now(), sched: newWriterScheduler(cfg.Scheduling)}
+	db := &DB{cfg: cfg, log: cfg.Logger, reg: reg, dbState: StateOpening, openedAt: time.Now(), sched: newWriterScheduler(cfg.Scheduling), remoteFlushWake: make(chan struct{}, 1)}
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
 	if err := db.recoverRotationLeftovers(); err != nil {
@@ -323,6 +326,8 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	}
 
 	db.setState(StateReady)
+	db.wg.Add(1)
+	go db.remoteMaterializationLoop()
 	if db.repl != nil {
 		db.startReplication(db.repl)
 	}
@@ -634,6 +639,14 @@ func (db *DB) BeginTxWithID(ctx context.Context, txID ids.TxID, _ *TxOptions) (*
 		ticket.Release()
 		return nil, err
 	}
+	db.applyMu.Lock()
+	flushErr := db.flushRemoteLocked()
+	db.applyMu.Unlock()
+	if flushErr != nil {
+		db.writeMu.Unlock()
+		ticket.Release()
+		return nil, flushErr
+	}
 	stx, err := db.engine.Begin(context.Background())
 	if err != nil {
 		db.writeMu.Unlock()
@@ -756,6 +769,12 @@ func (db *DB) commitTx(tx *Tx) error {
 		return err
 	}
 	if len(mutations) == 0 {
+		db.applyMu.Lock()
+		err := db.flushRemoteLocked()
+		db.applyMu.Unlock()
+		if err != nil {
+			return err
+		}
 		noteCommit(0)
 		return nil // no net change; nothing to replicate
 	}
@@ -788,6 +807,10 @@ func (db *DB) commitTx(tx *Tx) error {
 		}
 		return err
 	}
+	materializedByFlush := len(db.remoteRows) > 0
+	if err := db.flushRemoteLocked(); err != nil {
+		return err
+	}
 	gen, err := db.store.StateGeneration()
 	if err != nil {
 		return err
@@ -817,8 +840,10 @@ func (db *DB) commitTx(tx *Tx) error {
 			}
 		}
 	}
-	if err := db.store.SetMaterializedGeneration(gen); err != nil {
-		return err
+	if !materializedByFlush {
+		if err := db.store.SetMaterializedGeneration(gen); err != nil {
+			return err
+		}
 	}
 	if err := db.fireCrash(func(h *crashHooks) func() error { return h.afterDurable }); err != nil {
 		// Ambiguous commit: durable and materialized, acknowledgement lost.
@@ -870,6 +895,8 @@ func (db *DB) rebuildLocked() error {
 		db.log.Error("rebuild failed; node failed closed", "err", err.Error())
 		return err
 	}
+	db.remoteRows = nil
+	db.remoteTxnCount = 0
 	if db.subMgr != nil {
 		db.subMgr.notifyChange(true)
 	}
@@ -879,7 +906,8 @@ func (db *DB) rebuildLocked() error {
 
 // --- replication applier ---
 
-// ApplyRemote durably merges a received batch and materializes winners.
+// ApplyRemote durably merges a received batch and queues its winning rows for
+// bulk SQLite materialization.
 // It satisfies replication.Applier. Acknowledgements are sent by the
 // replication manager only after this returns nil.
 func (db *DB) ApplyRemote(ctx context.Context, batch *codec.MutationBatch) error {
@@ -923,41 +951,12 @@ func (db *DB) ApplyRemote(ctx context.Context, batch *codec.MutationBatch) error
 		failed = false
 		return nil
 	}
-	if len(res.Winners) > 0 {
-		winners := res.Winners
-		if batchTouchesBridgePolicy(db, batch.Mutations) {
-			resolved, rerr := resolveBridgeWinners(db, res.Winners)
-			if rerr != nil {
-				db.log.Warn("remote apply failed; rebuilding materializer", "err", rerr.Error())
-				if rerr := db.rebuildLocked(); rerr != nil {
-					db.log.Error("rebuild failed", "err", rerr.Error())
-				}
-				failed = false
-				return nil
-			}
-			winners = resolved
-		}
-		if err := db.engine.ApplyWinners(db.shadowReader(), winners); err != nil {
-			// Durable state is correct; the materializer is stale. Rebuild inline
-			// (we hold applyMu) and ack anyway: the batch is durable.
-			db.log.Warn("remote apply failed; rebuilding materializer", "err", err.Error())
-			if rerr := db.rebuildLocked(); rerr != nil {
-				db.log.Error("rebuild failed", "err", rerr.Error())
-			}
-			failed = false
-			return nil
-		}
-		db.metrics.remoteApplyWinners.Add(uint64(len(res.Winners)))
-	}
-	if err := db.store.SetMaterializedGeneration(res.Generation); err != nil {
+	if err := db.queueRemoteLocked(res.Winners, res.Generation, 1); err != nil {
 		if state.IsStorageFailure(err) {
 			db.log.Error("remote apply failed; storage failed closed", "err", err.Error())
 			db.setState(StateFailed)
 		}
 		return err
-	}
-	if db.subMgr != nil {
-		db.subMgr.notifyChange(false)
 	}
 	if db.files != nil {
 		// New file metadata may need object bytes: wake the fetch scan.
@@ -974,8 +973,8 @@ func (db *DB) ApplyRemote(ctx context.Context, batch *codec.MutationBatch) error
 
 // ApplyRemoteGroup commits an ordered group of remote transactions with one
 // writer admission and one Pebble sync. Transaction IDs, receipts, and origin
-// sequence positions remain independent; materialization and acknowledgement
-// become visible only after the complete group is durable.
+// sequence positions remain independent. Query visibility follows the next
+// bulk SQLite flush; acknowledgement follows the durable Pebble commit.
 func (db *DB) ApplyRemoteGroup(ctx context.Context, batches []*codec.MutationBatch) error {
 	if len(batches) == 0 {
 		return nil
@@ -1026,46 +1025,12 @@ func (db *DB) ApplyRemoteGroup(ctx context.Context, batches []*codec.MutationBat
 		failed = false
 		return nil
 	}
-	if len(res.Winners) > 0 {
-		winners := res.Winners
-		needsResolve := false
-		for _, b := range batches {
-			if batchTouchesBridgePolicy(db, b.Mutations) {
-				needsResolve = true
-				break
-			}
-		}
-		if needsResolve {
-			resolved, rerr := resolveBridgeWinners(db, res.Winners)
-			if rerr != nil {
-				db.log.Warn("remote group apply failed; rebuilding materializer", "err", rerr.Error())
-				if rerr := db.rebuildLocked(); rerr != nil {
-					db.log.Error("rebuild failed", "err", rerr.Error())
-				}
-				failed = false
-				return nil
-			}
-			winners = resolved
-		}
-		if err := db.engine.ApplyWinners(db.shadowReader(), winners); err != nil {
-			db.log.Warn("remote group apply failed; rebuilding materializer", "err", err.Error())
-			if rerr := db.rebuildLocked(); rerr != nil {
-				db.log.Error("rebuild failed", "err", rerr.Error())
-			}
-			failed = false
-			return nil
-		}
-		db.metrics.remoteApplyWinners.Add(uint64(len(res.Winners)))
-	}
-	if err := db.store.SetMaterializedGeneration(res.Generation); err != nil {
+	if err := db.queueRemoteLocked(res.Winners, res.Generation, len(batches)); err != nil {
 		if state.IsStorageFailure(err) {
 			db.log.Error("remote group apply failed; storage failed closed", "err", err.Error())
 			db.setState(StateFailed)
 		}
 		return err
-	}
-	if db.subMgr != nil {
-		db.subMgr.notifyChange(false)
 	}
 	failed = false
 	return nil
@@ -1083,6 +1048,8 @@ func (db *DB) ApplySnapshotChunk(ctx context.Context, manifest *codec.SnapshotMa
 		return false, fmt.Errorf("replicateddb: writer admission: %w", err)
 	}
 	defer ticket.Release()
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
 	db.applyMu.Lock()
 	defer db.applyMu.Unlock()
 	res, complete, err := db.store.ImportSnapshotChunk(ctx, manifest, index, cells, last, uint64(db.cfg.Replication.MaxSnapshotBytes))
@@ -1800,6 +1767,13 @@ func (db *DB) Close() error {
 	}
 	db.wg.Wait()
 	var first error
+	if db.engine != nil {
+		db.applyMu.Lock()
+		if err := db.flushRemoteLocked(); err != nil {
+			first = fmt.Errorf("replicateddb: final remote materialization: %w", err)
+		}
+		db.applyMu.Unlock()
+	}
 	if db.cfg.Durability.SyncInterval > 0 && db.store != nil {
 		if err := db.store.Sync(); err != nil {
 			first = fmt.Errorf("replicateddb: final durability sync: %w", err)

@@ -181,6 +181,96 @@ func (e *Engine) ApplyWinners(src StateReader, winners []state.WinningChange) er
 	})
 }
 
+// ApplyRows materializes the latest durable state for a coalesced set of
+// remote rows in one SQLite transaction. It reads values at flush time so
+// several remote transactions touching one row require only one SQL upsert.
+func (e *Engine) ApplyRows(src StateReader, rows []RowKey) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	return e.WriteSection(func(ctx context.Context) error {
+		e.SetCaptureMode(CaptureSuppressed)
+		defer e.SetCaptureMode(CaptureLocal)
+		if _, err := e.write.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+			return err
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				_, _ = e.write.ExecContext(context.Background(), "ROLLBACK")
+			}
+		}()
+		for _, key := range rows {
+			table := e.reg.TableByID(key.TableID)
+			if table == nil {
+				continue
+			}
+			cells, err := src.GetRow(key.TableID, key.RowID)
+			if err != nil {
+				return err
+			}
+			tomb, hasTomb, err := src.GetTombstone(key.TableID, key.RowID)
+			if err != nil {
+				return err
+			}
+			visible := rowMaterializable(table, cells) && crdt.Visible(len(cells) > 0,
+				newestOfCells(cells), crdt.TombstoneState{Present: hasTomb, Version: tomb})
+			if !visible {
+				if err := e.deleteRow(ctx, table, key.RowID); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := e.upsertFullRow(ctx, table, cells); err != nil {
+				return err
+			}
+		}
+		if _, err := e.write.ExecContext(ctx, "COMMIT"); err != nil {
+			return fmt.Errorf("sqlengine: bulk apply commit: %w", err)
+		}
+		committed = true
+		return nil
+	})
+}
+
+func (e *Engine) upsertFullRow(ctx context.Context, table *schema.TableSchema, cells map[uint32]codec.CellState) error {
+	var q strings.Builder
+	q.WriteString(fullInsertSQL(table))
+	q.WriteString(" ON CONFLICT(")
+	q.WriteString(quoteIdent(table.PKColumn().Name))
+	q.WriteString(") DO ")
+	if len(table.Columns) == 1 {
+		q.WriteString("NOTHING")
+	} else {
+		q.WriteString("UPDATE SET ")
+		first := true
+		for _, col := range table.Columns {
+			if col.ID == table.PK {
+				continue
+			}
+			if !first {
+				q.WriteString(", ")
+			}
+			first = false
+			q.WriteString(quoteIdent(col.Name))
+			q.WriteString(" = excluded.")
+			q.WriteString(quoteIdent(col.Name))
+		}
+	}
+	stmt, err := e.writeStmts.prepare(ctx, e.write, q.String())
+	if err != nil {
+		return err
+	}
+	args := make([]any, len(table.Columns))
+	for i, col := range table.Columns {
+		if cell, ok := cells[col.ID]; ok {
+			args[i] = cell.Value.ToAny()
+		}
+	}
+	_, err = stmt.ExecContext(ctx, args...)
+	return err
+}
+
 // RepairRows re-converges listed rows with durable state after a local
 // commit raced remote applies: a concurrent remote tombstone may have
 // deleted a just-written row from SQL (or hidden it while SQL still shows

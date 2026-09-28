@@ -12,6 +12,7 @@ func TestBridgeOwnershipPolicyReplicatesWithHighMutations(t *testing.T) {
 	ctx := context.Background()
 	cluster := ids.NewDBID()
 	cfgA, cfgB := testConfig(t.TempDir()), testConfig(t.TempDir())
+	cfgB.QueryStore.RemoteApplyMaxTransactions = 1
 	cfgA.DBID, cfgB.DBID = cluster, cluster
 	a, err := Open(ctx, cfgA)
 	if err != nil {
@@ -48,6 +49,7 @@ func TestBridgeOwnershipPolicyReplicatesWithHighMutations(t *testing.T) {
 			t.Fatalf("apply sequence %d: %v", seq, err)
 		}
 	}
+	waitForRemoteMaterialization(t, b)
 	rowPolicy, ok, err := b.BridgeRowProvenance("contacts", row)
 	if err != nil || !ok || rowPolicy.SourceDomain != lowSource || rowPolicy.Stream != stream {
 		t.Fatalf("replicated row policy=%+v present=%v err=%v", rowPolicy, ok, err)

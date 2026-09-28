@@ -271,11 +271,14 @@ Pebble is authoritative, so:
 5. Merge mutations against Pebble current state.
 6. Atomically store winners + log + receive watermark.
 7. Commit Pebble.
-8. Apply only winning changes to LumoSQL.
-9. Send acknowledgement.
+8. Add winning row identities to the in-memory materialization map.
+9. Send the durable-receive acknowledgement.
+10. At the next one-second tick or when 1,000 received transactions are queued, read each affected row's final state from Pebble and apply all rows in one SQLite transaction.
 ```
 
-If LumoSQL apply fails:
+The interval and transaction threshold are configurable through `QueryStore.RemoteApplyInterval` and `QueryStore.RemoteApplyMaxTransactions`. The map coalesces repeated writes to a row; reaching 10,000 distinct rows also wakes the flush worker early. A local SQL write flushes pending remote rows before it starts, and again at commit if remote data arrived during the transaction. Queries may see the previous SQLite state until the flush. `StateGeneration` advances with Pebble commits; `MaterializedGeneration` advances only after SQLite catches up. Startup always rebuilds SQLite from Pebble, so an interrupted process cannot lose queued changes.
+
+If the bulk SQLite apply fails:
 
 ```text
 Pebble remains correct.

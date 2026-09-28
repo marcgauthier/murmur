@@ -40,9 +40,10 @@ after network receive
 after merge calculation
 during Pebble synchronized batch
 after Pebble commit
-before LumoSQL apply
-during LumoSQL apply
 before ACK
+after ACK while SQLite rows are queued
+during bulk SQLite apply
+after bulk SQLite commit but before materialized-generation publication
 ```
 
 Restart must always converge to Pebble authoritative state.
@@ -50,6 +51,12 @@ Restart must always converge to Pebble authoritative state.
 Also inject crashes during chunk staging/completion, grouped apply, snapshot candidate merge/validation, intent sync, watermark/generation publication (atomic batch, or chunked merge with durable resume plus final publication batch), registry pinning, and post-publication SQL rebuild. Staging checks cover restart after a partial transfer, a pre-commit interruption with clean retry, and an over-budget transfer eviction; none may advance the applied watermark before complete apply. Before snapshot publication the old generation remains authoritative; afterward recovery completes from the published candidate. Never expose partial transaction effects or mixed-generation watermarks. Inject failures during schema manifest publication and backup restore identity rewriting; the persisted restore marker must prevent same-identity writable rollback on restart.
 
 Single remote apply writes a synced complete-batch prepare record before final apply. The crash test interrupts after prepare and reopens the store; recovery must atomically install winners, log, receipt, receive watermark, HLC, and state generation, remove the prepare record, and make a repeated delivery idempotent. SQL materialization generation is reconciled from authoritative state during open/rebuild.
+
+Remote materialization acceptance checks keep query rows out of SQLite until the
+one-second timer or 1,000 received-transaction threshold, confirm coalesced
+updates/delete/resurrection, and verify a local SQL write flushes pending rows.
+An open SQLite reader must not block durable remote Pebble receipt. Acknowledged
+Pebble progress may lead `MaterializedGeneration`; restart rebuilds from Pebble.
 
 ---
 
@@ -315,7 +322,7 @@ Implemented acceptance coverage: `replication.TestPeerScalingCapsAcrossChurn` si
 ### Recovery, dissemination, and overload acceptance
 
 - Supply the same origin out of order from several peers; retain missing ranges across restart, switch repair sources, and never acknowledge observed/staged heads as applied progress. Exercise unavailable retained history and snapshot fallback.
-- Transfer a transaction larger than a frame using chunks; interrupt/restart, duplicate chunks across peers, inject conflicting digests/indexes, and verify atomic SQL visibility and durable contiguous acknowledgement. Reject a local transaction above `MaxTransactionBytes` before success and enforce decompression/reassembly limits.
+- Transfer a transaction larger than a frame using chunks; interrupt/restart, duplicate chunks across peers, inject conflicting digests/indexes, and verify durable contiguous acknowledgement followed by atomic SQL visibility at the materialization flush. Reject a local transaction above `MaxTransactionBytes` before success and enforce decompression/reassembly limits.
 - Recover an offline node whose acknowledged insert/update/delete was never propagated. A peer snapshot must preserve its winning cells/tombstones and valid local sequence, while legitimately newer competing versions may win. Test source writes after the snapshot cut, candidate publication crashes, cancellation, and schema incompatibility.
 - Restore an older backup under its original identity and verify writable startup is rejected. Restore with a fresh identity/certificate and repair with the existing DBID; reseed a cluster with a new DBID and verify old nodes are isolated. Verify historical origin identities are preserved and source acknowledgement/retirement state is not inherited.
 - Merge independent compatible schema additions with equal and unequal epochs in different orders; repeat exchanges without epoch churn. Reject same-column type/default/nullability conflicts and identity collisions, preserve local additions, and leave mutation watermarks unchanged under strict policy or conflict.

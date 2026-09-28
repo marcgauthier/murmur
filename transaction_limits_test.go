@@ -38,8 +38,8 @@ func TestConfigMaxTransactionBytesValidation(t *testing.T) {
 func TestLocalTransactionMaxTransactionBytesEnforced(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir)
-	// Set small MaxTransactionBytes limit (e.g. 350 bytes)
-	cfg.MaxTransactionBytes = 350
+	// Allow one encoded contact while rejecting the multi-row transaction.
+	cfg.MaxTransactionBytes = 400
 	cfg.MaxReplicatedValueBytes = 300
 
 	db, err := Open(context.Background(), cfg)
@@ -62,7 +62,7 @@ func TestLocalTransactionMaxTransactionBytesEnforced(t *testing.T) {
 	}
 
 	// 2. Transaction exceeding MaxTransactionBytes:
-	// A transaction with 10 rows or large strings exceeding 350 bytes total
+	// A transaction with multiple rows exceeding the 400-byte limit
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("BeginTx: %v", err)

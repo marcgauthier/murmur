@@ -4,6 +4,8 @@ This document records completed features, milestones, and architectural implemen
 
 ## Completed Tasks
 
+- [x] REMOTE-MATERIALIZE-INTERVAL-001 | completed=2026-09-28 13:07:09 EDT | agent=codex | model=GPT-6 | Remote Pebble receives now queue affected rows for one bulk SQLite transaction every second or after 1,000 received transactions; repeated row updates coalesce, local writes flush pending rows, and failed bulk applies rebuild from Pebble. Checks: root and sqlengine tests PASS; targeted race tests PASS; fresh three-process partial-mesh replication PASS; go vet PASS; scoped formatting and documentation checks PASS.
+
 - [x] BENCH-TXN-SIZES-001 | completed=2026-09-28 12:34:47 EDT | agent=codex | model=GPT-6 | Added a local encrypted SQL transaction-size benchmark for 1, 10, 100, and 1,000 inserts per transaction, one/four writers, and synchronous/one-second-sync durability; reports transactions/sec and rows/sec and verifies acknowledged rows after reopen. Checks: 5-second-per-case 16-case run PASS (97s); formatting, scoped diff, and documentation link/fence checks PASS.
 
 - [x] DURABILITY-PERIODIC-SYNC-001 | completed=2026-09-28 12:22:19 EDT | agent=codex | model=GPT-6 | Added opt-in async durability with a scheduled one-second WAL sync and final sync on graceful close; fixed the previously no-op empty-batch Sync barrier with a WAL-only record; exposed success/failure metrics and fail-closed behavior. Direct local 10-second benchmark: 5,245.3 writes/sec (one writer), 5,186.6 writes/sec (four writers), with durable row-count checks after reopen. Checks: targeted state and root durability tests, targeted race test, live direct API benchmark, `go vet . ./state ./benchmark`, formatting, scoped diff, and documentation link/fence checks PASS.

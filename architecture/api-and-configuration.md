@@ -282,7 +282,11 @@ type StateStore interface {
 `DB.ApplyRemoteGroup` is the replication manager's optional grouped-applier
 entry point. It takes ordered, contiguous transactions and commits their
 independent receipts and sequence positions atomically; acknowledgements may
-advance only after the method returns successfully.
+advance after durable Pebble receipt, before SQLite query visibility. The query
+store batches affected rows until `QueryStore.RemoteApplyInterval` (default 1s)
+or `QueryStore.RemoteApplyMaxTransactions` (default 1,000) is reached. Zero
+selects the default for each; negative values are invalid. A local SQL write
+flushes pending remote rows first.
 
 ### Transport
 

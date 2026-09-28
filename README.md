@@ -50,6 +50,12 @@ build passes the focused read-snapshot/write-progress acceptance test.
 
 Startup rebuild materializes current Pebble state with bounded multi-row SQL
 inserts (900 bind parameters per statement, commits at most every 5,000 rows).
+Remote receives commit to Pebble first; affected rows are coalesced in memory
+and applied to SQLite in one transaction every second or after 1,000 received
+transactions, whichever comes first. Set `QueryStore.RemoteApplyInterval` and
+`QueryStore.RemoteApplyMaxTransactions` to change those thresholds. Remote rows
+can appear in queries after the receive acknowledgement; a local SQL write
+flushes pending rows before it starts.
 
 The optional `admin` package provides a TLS-only unlock/status/lock handler with
 a bearer token separate from mesh identity. It starts no listener by itself;

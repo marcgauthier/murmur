@@ -92,7 +92,9 @@ func shadowQueryName(t *testing.T, db *DB, row ids.RowID) (string, bool) {
 func TestBridgeShadowReorderConvergence(t *testing.T) {
 	ctx := context.Background()
 	newDB := func() *DB {
-		db, err := Open(ctx, testConfig(t.TempDir()))
+		cfg := testConfig(t.TempDir())
+		cfg.QueryStore.RemoteApplyMaxTransactions = 1
+		db, err := Open(ctx, cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -140,6 +142,8 @@ func TestBridgeShadowReorderConvergence(t *testing.T) {
 	if err := dbB.ApplyRemote(ctx, shadowLocalBatch(t, dbA, 1)); err != nil {
 		t.Fatal(err)
 	}
+	waitForRemoteMaterialization(t, dbA)
+	waitForRemoteMaterialization(t, dbB)
 
 	for name, db := range map[string]*DB{"A": dbA, "B": dbB} {
 		got, present := shadowQueryName(t, db, row)
@@ -173,6 +177,7 @@ func TestBridgeShadowReorderConvergence(t *testing.T) {
 	if err := dbB.ApplyRemote(ctx, shadowLocalBatch(t, dbA, 2)); err != nil {
 		t.Fatal(err)
 	}
+	waitForRemoteMaterialization(t, dbB)
 	for name, db := range map[string]*DB{"A": dbA, "B": dbB} {
 		got, present := shadowQueryName(t, db, row)
 		if !present || got != "low-2" {
@@ -208,7 +213,9 @@ func shadowDeleteBatch(db *DB, row ids.RowID, hlc, seq uint64, origin ids.NodeID
 func TestBridgeShadowDeleteReorderConvergence(t *testing.T) {
 	ctx := context.Background()
 	newDB := func() *DB {
-		db, err := Open(ctx, testConfig(t.TempDir()))
+		cfg := testConfig(t.TempDir())
+		cfg.QueryStore.RemoteApplyMaxTransactions = 1
+		db, err := Open(ctx, cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -244,6 +251,8 @@ func TestBridgeShadowDeleteReorderConvergence(t *testing.T) {
 	if err := dbB.ApplyRemote(ctx, shadowLocalBatch(t, dbA, 1)); err != nil {
 		t.Fatal(err)
 	}
+	waitForRemoteMaterialization(t, dbA)
+	waitForRemoteMaterialization(t, dbB)
 	for name, db := range map[string]*DB{"A": dbA, "B": dbB} {
 		got, present := shadowQueryName(t, db, row)
 		if !present || got != "high" {
@@ -256,6 +265,7 @@ func TestBridgeShadowDeleteReorderConvergence(t *testing.T) {
 	if err := dbB.ApplyRemote(ctx, shadowLocalBatch(t, dbA, 2)); err != nil {
 		t.Fatal(err)
 	}
+	waitForRemoteMaterialization(t, dbB)
 	for name, db := range map[string]*DB{"A": dbA, "B": dbB} {
 		if got, present := shadowQueryName(t, db, row); present {
 			t.Fatalf("peer %s after release: row visible with %q, want deleted", name, got)
@@ -432,8 +442,8 @@ func TestBridgeShadowResolveRow(t *testing.T) {
 	lim := codec.DefaultLimits()
 	cols := map[uint32]bool{1: true, 2: true}
 	raw := map[uint32]codec.CellState{
-		1: {Value: codec.Text("low")},
-		2: {Value: codec.Text("low2")},
+		1:              {Value: codec.Text("low")},
+		2:              {Value: codec.Text("low2")},
 		1 ^ 0x80000000: {Value: encodeBridgeShadowSet(codec.Text("high"))},
 		2 ^ 0x80000000: {Value: encodeBridgeShadowClear()},
 	}
@@ -465,7 +475,7 @@ func TestBridgeShadowSchemaGuards(t *testing.T) {
 		return schema.ColumnSchema{Name: name, ID: id, Type: schema.ColText, Nullable: true}
 	}
 	bad := [][]schema.TableSchema{
-		{{Name: "t", Columns: []schema.ColumnSchema{mkcol("a", 7), mkcol("b", 7 ^ 0x80000000)}}},
+		{{Name: "t", Columns: []schema.ColumnSchema{mkcol("a", 7), mkcol("b", 7^0x80000000)}}},
 		{{Name: "t", Columns: []schema.ColumnSchema{mkcol("a", 0x80000000)}}},
 		{{Name: "t", Columns: []schema.ColumnSchema{mkcol("a", 0x7FFFFFFF)}}},
 	}

@@ -24,6 +24,12 @@ const (
 // QueryStoreConfig configures the SQL materialization.
 type QueryStoreConfig struct {
 	Mode QueryStoreMode
+	// RemoteApplyInterval batches durable remote changes into one SQLite
+	// transaction. Zero selects one second. A negative value is invalid.
+	RemoteApplyInterval time.Duration
+	// RemoteApplyMaxTransactions flushes when this many received transactions
+	// are queued, even before RemoteApplyInterval. Zero selects 1,000.
+	RemoteApplyMaxTransactions int
 	// TempDir is the parent for the disposable mmap query directory. Empty uses
 	// the operating system temporary directory.
 	TempDir string
@@ -357,6 +363,12 @@ type Config struct {
 }
 
 func (c *Config) withDefaults() {
+	if c.QueryStore.RemoteApplyInterval == 0 {
+		c.QueryStore.RemoteApplyInterval = time.Second
+	}
+	if c.QueryStore.RemoteApplyMaxTransactions == 0 {
+		c.QueryStore.RemoteApplyMaxTransactions = 1_000
+	}
 	if c.Cache.StatementCacheEntries == 0 {
 		c.Cache.StatementCacheEntries = 256
 	}
@@ -511,6 +523,12 @@ func (c *Config) validate() error {
 	}
 	if c.QueryStore.MMapBytes < 0 {
 		return fmt.Errorf("replicateddb: query-store MMapBytes must be non-negative: %w", ErrUnsupportedSchema)
+	}
+	if c.QueryStore.RemoteApplyInterval <= 0 {
+		return fmt.Errorf("replicateddb: query-store RemoteApplyInterval must be positive: %w", ErrUnsupportedSchema)
+	}
+	if c.QueryStore.RemoteApplyMaxTransactions <= 0 {
+		return fmt.Errorf("replicateddb: query-store RemoteApplyMaxTransactions must be positive: %w", ErrUnsupportedSchema)
 	}
 	if len(c.Schema.Tables) == 0 {
 		return fmt.Errorf("replicateddb: at least one replicated table is required: %w", ErrUnsupportedSchema)

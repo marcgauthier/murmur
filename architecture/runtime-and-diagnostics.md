@@ -317,6 +317,11 @@ Regular SQLite in `:memory:` mode is connection-scoped and uses a rollback journ
 
 LumoSQL with its **LMDB backend** provides the planned MVCC behavior. The default `QueryStoreMMap` uses a disposable file-backed `modernc.org/sqlite` database with SQLite mmap enabled; readers and writers still follow SQLite locking. A tagged LumoSQL implementation now opens pooled read connections so readers retain LMDB snapshots while writes proceed. Actual-LMDB builds and acceptance runs remain pending.
 
+Remote Pebble commits can temporarily lead SQLite materialization. Compare
+`StateGeneration` with `MaterializedGeneration` to see this lag; the one-second
+or 1,000-transaction bulk flush closes it. A receive watermark certifies durable
+Pebble state and is not a query-visibility marker.
+
 The LMDB target is expected to provide:
 1. **Copy-on-Write MVCC:** Every write transaction creates a new root in an immutable B+ tree. Readers hold an immutable root pointer and read virtual memory pages directly with **zero locks** on database tables or pages.
 2. **Readers Never Block Writers:** Long-running read queries do not block write transactions.

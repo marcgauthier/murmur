@@ -24,7 +24,7 @@ type dbMetrics struct {
 	writeAcquisitions       atomic.Uint64
 	writeQueueWaitNanos     atomic.Uint64
 
-	// Remote apply (synchronous inline path; no apply queue yet).
+	// Remote apply and deferred SQLite materialization.
 	remoteApplies           atomic.Uint64
 	remoteApplyMutations    atomic.Uint64
 	remoteApplyWinners      atomic.Uint64
