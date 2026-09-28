@@ -161,6 +161,9 @@ SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./benchmark/ -run '^TestLocalWriter
 # Same local workload, async commits with a Pebble sync about once per second
 SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./benchmark/ -run '^TestLocalPeriodicSyncThroughput$' -v -count=1 -timeout=90s
 
+# Local transaction-size matrix: 1/10/100/1000 rows, 1/4 writers, both durability modes
+SPEDSQL_LOCAL_BATCH_BENCH_SECONDS=5 go test ./benchmark/ -run '^TestLocalTransactionBatchThroughput$' -v -count=1 -timeout=300s
+
 # Live daemon, one and four concurrent HTTP SQL writers (10s each)
 SPEDSQL_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-live/benchmark/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s
 ```
@@ -189,6 +192,39 @@ On 2026-09-28, a 10-second run on the same four-core Intel i5-6500 measured
 with four writers. The runs recorded 9 and 10 scheduled syncs respectively,
 and both reopened row-count checks passed. The result measures one WAL fsync
 about every second; individual commits still append to the WAL.
+
+The transaction-size matrix uses separate `INSERT` statements within one
+`BeginTx`/`Commit` for each batch. Each SQL transaction produces one atomic
+Pebble mutation batch. It reports completed transactions/sec and inserted
+rows/sec for 1, 10, 100, and 1,000 rows per transaction, with one and four
+application writers under both durability modes. The timed window includes
+completion of transactions started before its deadline; setup and reopen are
+excluded. Each case opens a fresh encrypted single-node store and verifies
+the acknowledged row count after graceful close and reopen.
+
+Results from a five-second-per-case run on 2026-09-28 (four-core Intel i5-6500;
+rates rounded to whole operations/sec):
+
+| Rows/transaction | Synchronous, 1 writer tx/s | Synchronous, 1 writer rows/s | Synchronous, 4 writers tx/s | Synchronous, 4 writers rows/s |
+|---:|---:|---:|---:|---:|
+| 1 | 340 | 340 | 329 | 329 |
+| 10 | 271 | 2,705 | 269 | 2,689 |
+| 100 | 107 | 10,673 | 106 | 10,563 |
+| 1,000 | 14 | 13,557 | 11 | 10,888 |
+
+| Rows/transaction | One-second sync, 1 writer tx/s | One-second sync, 1 writer rows/s | One-second sync, 4 writers tx/s | One-second sync, 4 writers rows/s |
+|---:|---:|---:|---:|---:|
+| 1 | 3,950 | 3,950 | 4,045 | 4,045 |
+| 10 | 783 | 7,830 | 709 | 7,085 |
+| 100 | 110 | 10,976 | 131 | 13,079 |
+| 1,000 | 14 | 13,816 | 13 | 12,759 |
+
+All 16 cases passed the durable row-count check. Four writers share one SQL
+write coordinator, so they add queueing rather than parallel local SQL work.
+At 100–1,000 inserts per transaction, SQL insert/change-capture work dominates
+the cost of the transaction's Pebble sync. These are inserts into a growing
+table; the earlier `BenchmarkTxn1000Rows` updates existing rows in a template
+with a different schema and is a separate workload.
 
 The live writer benchmark starts a fresh encrypted single-node daemon per
 writer count and measures acknowledged single-row `INSERT` statements per

@@ -42,22 +42,7 @@ func runLocalWriterThroughput(t *testing.T, durability replicateddb.DurabilityCo
 	for _, writers := range []int{1, 4} {
 		t.Run(fmt.Sprintf("%d_writers", writers), func(t *testing.T) {
 			ctx := context.Background()
-			cfg := replicateddb.Config{
-				Path:   t.TempDir(),
-				NodeID: replicateddb.NewNodeID(),
-				DBID:   replicateddb.NewDBID(),
-				Schema: replicateddb.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-					Name: "writer_bench", Columns: []schema.ColumnSchema{
-						{Name: "id", Type: schema.ColBlob},
-						{Name: "val", Type: schema.ColText},
-					},
-				}}},
-				Pebble:     replicateddb.DefaultPebbleConfig(),
-				Durability: durability,
-				Encryption: replicateddb.EncryptionConfig{
-					Key: bytes.Clone(benchKey), KeyID: "bench",
-				},
-			}
+			cfg := localWriterConfig(t.TempDir(), durability)
 			db, err := replicateddb.Open(ctx, cfg)
 			if err != nil {
 				t.Fatal(err)
@@ -140,5 +125,24 @@ func runLocalWriterThroughput(t *testing.T, durability replicateddb.DurabilityCo
 			t.Logf("writers=%d acknowledged_inserts=%d elapsed=%s writes_per_second=%.1f periodic_syncs=%d",
 				writers, total, elapsed, float64(total)/elapsed.Seconds(), periodicSyncs)
 		})
+	}
+}
+
+func localWriterConfig(path string, durability replicateddb.DurabilityConfig) replicateddb.Config {
+	return replicateddb.Config{
+		Path:   path,
+		NodeID: replicateddb.NewNodeID(),
+		DBID:   replicateddb.NewDBID(),
+		Schema: replicateddb.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
+			Name: "writer_bench", Columns: []schema.ColumnSchema{
+				{Name: "id", Type: schema.ColBlob},
+				{Name: "val", Type: schema.ColText},
+			},
+		}}},
+		Pebble:     replicateddb.DefaultPebbleConfig(),
+		Durability: durability,
+		Encryption: replicateddb.EncryptionConfig{
+			Key: bytes.Clone(benchKey), KeyID: "bench",
+		},
 	}
 }

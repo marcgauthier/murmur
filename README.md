@@ -240,6 +240,7 @@ go test ./benchmark/ -bench . -benchtime 1s          # 10K + 100K datasets
 REPLICATEDDB_BENCH_ROWS=1000000 go test ./benchmark/ -bench .  # 1M rows
 SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./benchmark/ -run '^TestLocalWriterThroughput$' -v -count=1 -timeout=90s  # direct local API, 1 vs 4 writers
 SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./benchmark/ -run '^TestLocalPeriodicSyncThroughput$' -v -count=1 -timeout=90s  # one-second disk sync, 1 vs 4 writers
+SPEDSQL_LOCAL_BATCH_BENCH_SECONDS=5 go test ./benchmark/ -run '^TestLocalTransactionBatchThroughput$' -v -count=1 -timeout=300s  # 1/10/100/1000 inserts per transaction
 SPEDSQL_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-live/benchmark/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s  # HTTP daemon, 1 vs 4 writers
 ```
 
@@ -252,6 +253,13 @@ one-second synchronization. On the Intel i5-6500, it measured about 5.2K
 single-row writes/sec for both one and four writers, versus about 320/sec
 with synchronous durability. These results include one scheduled WAL sync
 about each second and a durable row-count check after graceful close.
+`TestLocalTransactionBatchThroughput` compares both durability modes across
+1, 10, 100, and 1,000 inserts per SQL transaction, using one or four writers.
+It reports transactions/sec and rows/sec after verifying the durable row count.
+On the Intel i5-6500, one synchronous writer rose from 340 rows/sec with one
+insert per transaction to 13,557 rows/sec with 1,000; the one-second-sync
+mode measured 3,950 and 13,816 rows/sec at those sizes. See the full
+[transaction-size matrix](architecture/benchmarks.md#62-running-the-matrix).
 
 Fuzz targets live next to the decoders (`codec`, `replication`):
 

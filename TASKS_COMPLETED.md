@@ -4,6 +4,8 @@ This document records completed features, milestones, and architectural implemen
 
 ## Completed Tasks
 
+- [x] BENCH-TXN-SIZES-001 | completed=2026-09-28 12:34:47 EDT | agent=codex | model=GPT-6 | Added a local encrypted SQL transaction-size benchmark for 1, 10, 100, and 1,000 inserts per transaction, one/four writers, and synchronous/one-second-sync durability; reports transactions/sec and rows/sec and verifies acknowledged rows after reopen. Checks: 5-second-per-case 16-case run PASS (97s); formatting, scoped diff, and documentation link/fence checks PASS.
+
 - [x] DURABILITY-PERIODIC-SYNC-001 | completed=2026-09-28 12:22:19 EDT | agent=codex | model=GPT-6 | Added opt-in async durability with a scheduled one-second WAL sync and final sync on graceful close; fixed the previously no-op empty-batch Sync barrier with a WAL-only record; exposed success/failure metrics and fail-closed behavior. Direct local 10-second benchmark: 5,245.3 writes/sec (one writer), 5,186.6 writes/sec (four writers), with durable row-count checks after reopen. Checks: targeted state and root durability tests, targeted race test, live direct API benchmark, `go vet . ./state ./benchmark`, formatting, scoped diff, and documentation link/fence checks PASS.
 
 - [x] BENCH-LOCAL-WRITERS-001 | completed=2026-09-28 12:10:04 EDT | agent=codex | model=GPT-6 | Added a direct Go API benchmark on one encrypted database with no replication, measuring one and four concurrent single-row insert writers and verifying all acknowledged rows after reopen. Checks: 10-second targeted run PASS (320.4 and 327.3 writes/sec on Intel i5-6500); 1-second post-cleanup targeted run PASS; gofmt and scoped diff checks PASS.
