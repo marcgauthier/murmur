@@ -125,6 +125,51 @@ func TestRemoteMaterializationConfigRejectsNegativeThresholds(t *testing.T) {
 	}
 }
 
+func TestRemoteRowCountAloneDoesNotWakeFlush(t *testing.T) {
+	cfg := testConfig(t.TempDir())
+	cfg.QueryStore.RemoteApplyInterval = time.Hour
+	cfg.QueryStore.RemoteApplyMaxTransactions = 1_000
+	db, err := Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	peer, first := NewNodeID(), NewRowID()
+	batch := remoteBatchCells(db, peer, 1, 100, "contacts", first, map[string]codec.Value{
+		"id": codec.Blob(first[:]), "name": codec.Text("row"),
+	})
+	table := db.reg.Table("contacts")
+	var idColumn, nameColumn uint32
+	for _, column := range table.Columns {
+		switch column.Name {
+		case "id":
+			idColumn = column.ID
+		case "name":
+			nameColumn = column.ID
+		}
+	}
+	for i := 0; i < 10_000; i++ {
+		row := NewRowID()
+		batch.Mutations = append(batch.Mutations,
+			codec.Mutation{TableID: table.ID, RowID: row, ColumnID: idColumn, Value: codec.Blob(row[:])},
+			codec.Mutation{TableID: table.ID, RowID: row, ColumnID: nameColumn, Value: codec.Text("row")},
+		)
+	}
+	if err := db.ApplyRemote(context.Background(), batch); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := db.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM contacts").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("row-count-only flush made %d rows visible", count)
+	}
+	if db.Status().StateGeneration <= db.Status().MaterializedGeneration {
+		t.Fatal("bulk receive was marked materialized without time/count trigger")
+	}
+}
+
 func TestRemoteMaterializationFlushesAtInterval(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.QueryStore.RemoteApplyInterval = 20 * time.Millisecond

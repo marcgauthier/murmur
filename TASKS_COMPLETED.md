@@ -4,6 +4,8 @@ This document records completed features, milestones, and architectural implemen
 
 ## Completed Tasks
 
+- [x] REMOTE-MATERIALIZE-TWO-TRIGGERS-001 | completed=2026-09-28 13:13:04 EDT | agent=codex | model=GPT-6 | Removed the extra distinct-row wakeup so deferred SQLite bulk apply is triggered only by time or received-transaction count. Checks: targeted modernc tests including a 10,001-row single receive PASS; fresh three-process partial-mesh replication PASS; scoped formatting and diff checks PASS.
+
 - [x] REMOTE-MATERIALIZE-INTERVAL-001 | completed=2026-09-28 13:07:09 EDT | agent=codex | model=GPT-6 | Remote Pebble receives now queue affected rows for one bulk SQLite transaction every second or after 1,000 received transactions; repeated row updates coalesce, local writes flush pending rows, and failed bulk applies rebuild from Pebble. Checks: root and sqlengine tests PASS; targeted race tests PASS; fresh three-process partial-mesh replication PASS; go vet PASS; scoped formatting and documentation checks PASS.
 
 - [x] BENCH-TXN-SIZES-001 | completed=2026-09-28 12:34:47 EDT | agent=codex | model=GPT-6 | Added a local encrypted SQL transaction-size benchmark for 1, 10, 100, and 1,000 inserts per transaction, one/four writers, and synchronous/one-second-sync durability; reports transactions/sec and rows/sec and verifies acknowledged rows after reopen. Checks: 5-second-per-case 16-case run PASS (97s); formatting, scoped diff, and documentation link/fence checks PASS.

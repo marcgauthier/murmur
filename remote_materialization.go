@@ -9,10 +9,6 @@ import (
 	"github.com/nomadsql/replicateddb/state"
 )
 
-// A large receive burst wakes the flush worker early. Pebble remains the
-// recovery source if the process stops while rows are queued.
-const maxQueuedRemoteRows = 10_000
-
 // queueRemoteLocked records final row identities, not copies of values. Later
 // updates to the same row coalesce, and flush reads the authoritative state.
 // applyMu must be held.
@@ -29,7 +25,7 @@ func (db *DB) queueRemoteLocked(winners []state.WinningChange, generation uint64
 	if len(db.remoteRows) > 0 {
 		db.remoteTxnCount += transactions
 	}
-	if len(db.remoteRows) >= maxQueuedRemoteRows || db.remoteTxnCount >= db.cfg.QueryStore.RemoteApplyMaxTransactions {
+	if db.remoteTxnCount >= db.cfg.QueryStore.RemoteApplyMaxTransactions {
 		select {
 		case db.remoteFlushWake <- struct{}{}:
 		default:
