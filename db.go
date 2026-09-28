@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2/sstable"
@@ -64,11 +65,12 @@ type DB struct {
 	lastStatus   Status
 	lastStatusOK bool
 
-	writeMu         sync.Mutex                    // serialized local write coordinator
-	applyMu         sync.Mutex                    // serializes all durable commits + materialization
-	remoteRows      map[sqlengine.RowKey]struct{} // durable remote rows awaiting SQLite
-	remoteTxnCount  int                           // received transactions since the last SQLite flush
-	remoteFlushWake chan struct{}                 // count/row threshold wakes the bulk flush worker
+	writeMu                sync.Mutex                    // serialized local write coordinator
+	applyMu                sync.Mutex                    // serializes all durable commits + materialization
+	remoteRows             map[sqlengine.RowKey]struct{} // durable remote rows awaiting SQLite
+	remoteTxnCount         int                           // received transactions since the last SQLite flush
+	remoteFlushWake        chan struct{}                 // transaction-count threshold wakes the bulk flush worker
+	materializedGeneration atomic.Uint64                 // query-visible generation; rebuilt on every open
 
 	sched *writerScheduler // fair writer admission (see scheduler.go)
 
@@ -275,13 +277,8 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		db.closeStore()
 		db.cancel()
 		return nil, err
-	} else if err := store.SetMaterializedGeneration(gen); err != nil {
-		db.applyMu.Unlock()
-		db.setState(StateFailed)
-		_ = engine.Close()
-		db.closeStore()
-		db.cancel()
-		return nil, err
+	} else {
+		db.materializedGeneration.Store(gen)
 	}
 	db.applyMu.Unlock()
 
@@ -841,9 +838,7 @@ func (db *DB) commitTx(tx *Tx) error {
 		}
 	}
 	if !materializedByFlush {
-		if err := db.store.SetMaterializedGeneration(gen); err != nil {
-			return err
-		}
+		db.materializedGeneration.Store(gen)
 	}
 	if err := db.fireCrash(func(h *crashHooks) func() error { return h.afterDurable }); err != nil {
 		// Ambiguous commit: durable and materialized, acknowledgement lost.
@@ -891,10 +886,7 @@ func (db *DB) rebuildLocked() error {
 		db.log.Error("rebuild failed; node failed closed", "err", err.Error())
 		return err
 	}
-	if err := db.store.SetMaterializedGeneration(gen); err != nil {
-		db.log.Error("rebuild failed; node failed closed", "err", err.Error())
-		return err
-	}
+	db.materializedGeneration.Store(gen)
 	db.remoteRows = nil
 	db.remoteTxnCount = 0
 	if db.subMgr != nil {
@@ -1246,9 +1238,7 @@ func (db *DB) statusLive() Status {
 	if v, err := db.store.StateGeneration(); err == nil {
 		st.StateGeneration = v
 	}
-	if v, err := db.store.MaterializedGeneration(); err == nil {
-		st.MaterializedGeneration = v
-	}
+	st.MaterializedGeneration = db.materializedGeneration.Load()
 	if e, h, err := db.store.SchemaEpoch(); err == nil {
 		st.SchemaEpoch = e
 		st.SchemaHash = h

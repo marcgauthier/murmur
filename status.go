@@ -91,7 +91,9 @@ type Status struct {
 	NodeID NodeID
 	DBID   DBID
 
-	StateGeneration        uint64
+	StateGeneration uint64
+	// MaterializedGeneration is the in-memory SQL view's progress. It is
+	// initialized after rebuilding from Pebble on every open.
 	MaterializedGeneration uint64
 
 	HLC          uint64
@@ -107,9 +109,8 @@ type Status struct {
 	QUICConnections int
 	PendingDials    int
 
-	// PendingApply is the current in-flight remote-apply count (remote
-	// apply is synchronous; there is no apply queue yet). PendingSend is
-	// the total queued outbound control/need/schema frames.
+	// PendingApply is the current in-flight remote Pebble-apply count.
+	// PendingSend is queued outbound control/need/schema frames.
 	PendingApply int
 	PendingSend  int
 

@@ -32,7 +32,8 @@ func (db *DB) queueRemoteLocked(winners []state.WinningChange, generation uint64
 		}
 	}
 	if len(db.remoteRows) == 0 {
-		return db.store.SetMaterializedGeneration(generation)
+		db.materializedGeneration.Store(generation)
+		return nil
 	}
 	return nil
 }
@@ -62,9 +63,7 @@ func (db *DB) flushRemoteLocked() error {
 	if err != nil {
 		return err
 	}
-	if err := db.store.SetMaterializedGeneration(gen); err != nil {
-		return err
-	}
+	db.materializedGeneration.Store(gen)
 	db.remoteRows = nil
 	db.remoteTxnCount = 0
 	if db.subMgr != nil {

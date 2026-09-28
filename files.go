@@ -331,7 +331,7 @@ func (db *DB) DeleteFile(ctx context.Context, name string) error {
 
 // commit durably records one file-metadata transaction and notifies
 // replication. It mirrors the SQL commit tail: serialized under applyMu,
-// materialized generation advanced (file tables have no SQL rows, so no
+// in-memory materialized generation advanced (file tables have no SQL rows, so no
 // repair pass applies), then NotifyLocal.
 func (fs *fileStore) commit(mutations []codec.Mutation) error {
 	db := fs.db
@@ -365,9 +365,7 @@ func (fs *fileStore) commit(mutations []codec.Mutation) error {
 		return err
 	}
 	if len(db.remoteRows) == 0 {
-		if err := db.store.SetMaterializedGeneration(gen); err != nil {
-			return err
-		}
+		db.materializedGeneration.Store(gen)
 	}
 	if repl := db.replManager(); repl != nil {
 		repl.NotifyLocal()

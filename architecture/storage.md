@@ -132,7 +132,6 @@ Examples:
 07 | hlc
 07 | format_version
 07 | schema_epoch
-07 | last_materialized_generation
 07 | gc_floor
 ```
 
@@ -171,30 +170,31 @@ state_generation = uint64
 
 Every committed Pebble mutation batch increments it.
 
-LumoSQL maintains:
+The live DB tracks SQLite query visibility in memory:
 
 ```text
 materialized_generation
 ```
 
-Runtime invariant:
+After startup rebuild or a successful bulk apply:
 
 ```text
 materialized_generation == state_generation
 ```
 
-If false:
+If the values differ during normal remote receive:
 
 ```text
-materializer = stale/dirty
+SQLite has not yet applied all Pebble state
 ```
 
-Queries may either:
-
-- block until repair, or
-- be allowed only if explicitly configured for stale reads.
-
-Default should be to block or return a materialization error rather than silently serving known-stale data.
+Queries can see the previous SQLite view until the timed or count-triggered
+bulk apply. The materialized generation is not persisted: on every open,
+SQLite is rebuilt from authoritative Pebble state, then the in-memory marker
+is initialized to the current state generation. A failed bulk apply rebuilds
+SQLite; if rebuild fails, the node rejects reads and writes.
+Existing stores may retain the old `materialized_generation` Pebble key; it is
+ignored and no longer updated.
 
 ---
 
@@ -214,7 +214,7 @@ Startup sequence:
 9. Bulk rebuild current state from Pebble.
 10. Build non-unique secondary indexes only.
 11. Build FTS structures.
-12. Verify materialized generation.
+12. Initialize the in-memory materialized generation from the Pebble generation after rebuilding SQLite.
 13. Start shared QUIC listener and restore persisted peer retirement/GC obligations.
 14. Start SWIM membership, asynchronous bootstrap retry, and bounded peer replication/anti-entropy.
 15. Start GC/maintenance workers.
@@ -259,7 +259,7 @@ Avoid one SQL transaction per cell.
 7. Commit in large controlled batches if one giant transaction is not practical.
 8. Create non-unique secondary indexes only.
 9. Build FTS index.
-10. Set materialized generation.
+10. Set the in-memory materialized generation.
 
 Benchmark:
 
@@ -347,4 +347,3 @@ Current `/state/...` values remain untouched.
 If D stays offline beyond log retention and logs through its needed sequence are removed, D is required to snapshot-resync.
 
 ---
-

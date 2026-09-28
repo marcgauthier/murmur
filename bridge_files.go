@@ -338,9 +338,7 @@ func (db *DB) BridgeApplyFileMetadata(ctx context.Context, source ids.DBID, stre
 		return err
 	}
 	if len(db.remoteRows) == 0 {
-		if err := db.store.SetMaterializedGeneration(result.Generation); err != nil {
-			return err
-		}
+		db.materializedGeneration.Store(result.Generation)
 	}
 	if manager := db.replManager(); manager != nil {
 		manager.NotifyLocal()

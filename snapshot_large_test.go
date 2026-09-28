@@ -96,10 +96,7 @@ func TestSnapshotLargeChunkedMergeEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mgen, err := dbB.store.MaterializedGeneration()
-	if err != nil {
-		t.Fatal(err)
-	}
+	mgen := dbB.Status().MaterializedGeneration
 	if gen == 0 || mgen != gen {
 		t.Fatalf("state gen = %d, materialized gen = %d, want equal nonzero", gen, mgen)
 	}

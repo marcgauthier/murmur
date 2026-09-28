@@ -38,7 +38,6 @@ const (
 	sysSchemaEpoch = "schema_epoch"
 	sysSchemaHash  = "schema_hash"
 	sysGeneration  = "state_generation"
-	sysMaterial    = "materialized_generation"
 	// sysRemotePrepare holds one complete remote transaction whose prepare
 	// record is durable but whose final atomic apply has not committed yet.
 	sysRemotePrepare = "remote_prepare"

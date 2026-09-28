@@ -319,8 +319,10 @@ LumoSQL with its **LMDB backend** provides the planned MVCC behavior. The defaul
 
 Remote Pebble commits can temporarily lead SQLite materialization. Compare
 `StateGeneration` with `MaterializedGeneration` to see this lag; the one-second
-or 1,000-transaction bulk flush closes it. A receive watermark certifies durable
-Pebble state and is not a query-visibility marker.
+or 1,000-transaction bulk flush closes it. The materialized generation is held
+in memory and initialized after the startup rebuild; reporting it does not
+write to Pebble. A receive watermark certifies durable Pebble state and is not
+a query-visibility marker.
 
 The LMDB target is expected to provide:
 1. **Copy-on-Write MVCC:** Every write transaction creates a new root in an immutable B+ tree. Readers hold an immutable root pointer and read virtual memory pages directly with **zero locks** on database tables or pages.

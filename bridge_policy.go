@@ -267,9 +267,7 @@ func (db *DB) commitBridgePolicy(ctx context.Context, mutations ...codec.Mutatio
 			}
 		}
 	}
-	if err := db.store.SetMaterializedGeneration(result.Generation); err != nil {
-		return err
-	}
+	db.materializedGeneration.Store(result.Generation)
 	if manager := db.replManager(); manager != nil {
 		manager.NotifyLocal()
 	}

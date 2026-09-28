@@ -55,7 +55,9 @@ and applied to SQLite in one transaction every second or after 1,000 received
 transactions, whichever comes first. Set `QueryStore.RemoteApplyInterval` and
 `QueryStore.RemoteApplyMaxTransactions` to change those thresholds. Remote rows
 can appear in queries after the receive acknowledgement; a local SQL write
-flushes pending rows before it starts.
+flushes pending rows before it starts. SQLite materialization progress is held
+in memory; startup rebuilds SQLite from Pebble without a separate progress
+write to the durable store.
 
 The optional `admin` package provides a TLS-only unlock/status/lock handler with
 a bearer token separate from mesh identity. It starts no listener by itself;

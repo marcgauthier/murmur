@@ -276,7 +276,7 @@ Pebble is authoritative, so:
 10. At the next one-second tick or when 1,000 received transactions are queued, read each affected row's final state from Pebble and apply all rows in one SQLite transaction.
 ```
 
-The interval and transaction threshold are configurable through `QueryStore.RemoteApplyInterval` and `QueryStore.RemoteApplyMaxTransactions`. The map coalesces repeated writes to a row. A local SQL write flushes pending remote rows before it starts, and again at commit if remote data arrived during the transaction. Queries may see the previous SQLite state until the flush. `StateGeneration` advances with Pebble commits; `MaterializedGeneration` advances only after SQLite catches up. Startup always rebuilds SQLite from Pebble, so an interrupted process cannot lose queued changes.
+The interval and transaction threshold are configurable through `QueryStore.RemoteApplyInterval` and `QueryStore.RemoteApplyMaxTransactions`. The map coalesces repeated writes to a row. A local SQL write flushes pending remote rows before it starts, and again at commit if remote data arrived during the transaction. Queries may see the previous SQLite state until the flush. `StateGeneration` advances with Pebble commits; the in-memory `MaterializedGeneration` advances only after SQLite catches up. Startup always rebuilds SQLite from Pebble and reinitializes that marker, so an interrupted process cannot lose queued changes or require a separate Pebble marker write.
 
 If the bulk SQLite apply fails:
 

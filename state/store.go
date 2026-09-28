@@ -1058,27 +1058,6 @@ func (s *Store) StateGeneration() (uint64, error) {
 	return s.readU64Direct(sysGeneration)
 }
 
-// MaterializedGeneration returns the last generation applied to the query engine.
-func (s *Store) MaterializedGeneration() (uint64, error) {
-	s.gate.RLock()
-	defer s.gate.RUnlock()
-	return s.readU64Direct(sysMaterial)
-}
-
-// SetMaterializedGeneration records the query engine's generation.
-func (s *Store) SetMaterializedGeneration(gen uint64) error {
-	s.gate.RLock()
-	defer s.gate.RUnlock()
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	b := s.db.NewBatch()
-	defer b.Close()
-	if err := b.Set(SysKey(sysMaterial), encodeU64(gen), nil); err != nil {
-		return err
-	}
-	return s.commitBatch(b, s.writeOpts)
-}
-
 // SchemaEpoch returns the stored schema epoch and hash.
 func (s *Store) SchemaEpoch() (uint64, [32]byte, error) {
 	s.gate.RLock()
