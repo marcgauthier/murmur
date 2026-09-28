@@ -2,6 +2,7 @@ package replicateddb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -9,8 +10,9 @@ import (
 	"github.com/nomadsql/replicateddb/transport"
 )
 
+
 // testClusterCA issues node credentials for tests.
-func testClusterCA(t *testing.T, nodes ...NodeID) (*transport.CA, map[NodeID]*TLSCredential) {
+func testClusterCA(t testing.TB, nodes ...NodeID) (*transport.CA, map[NodeID]*TLSCredential) {
 	t.Helper()
 	ca, err := transport.GenerateCA(time.Hour)
 	if err != nil {
@@ -43,7 +45,7 @@ func replConfig(path string, node NodeID, dbid DBID, tls *TLSCredential, peers [
 	return cfg
 }
 
-func waitForAddr(t *testing.T, db *DB, timeout time.Duration) string {
+func waitForAddr(t testing.TB, db *DB, timeout time.Duration) string {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -56,11 +58,33 @@ func waitForAddr(t *testing.T, db *DB, timeout time.Duration) string {
 	return ""
 }
 
-func waitForRows(t *testing.T, db *DB, want int, timeout time.Duration) [][]any {
+func waitForRows(t testing.TB, db *DB, want int, timeout time.Duration) [][]any {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		got := queryAll(t, db, `SELECT name, phone FROM contacts ORDER BY name`)
+		rows, err := db.QueryContext(context.Background(), `SELECT name, phone FROM contacts ORDER BY name`)
+		if err != nil {
+			if errors.Is(err, ErrMaterializerDirty) {
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+			t.Fatal(err)
+		}
+		var got [][]any
+		cols := rows.Columns()
+		for rows.Next() {
+			dest := make([]any, len(cols))
+			ptrs := make([]any, len(cols))
+			for i := range dest {
+				ptrs[i] = &dest[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				rows.Close()
+				t.Fatal(err)
+			}
+			got = append(got, dest)
+		}
+		rows.Close()
 		if len(got) == want {
 			return got
 		}
@@ -69,6 +93,7 @@ func waitForRows(t *testing.T, db *DB, want int, timeout time.Duration) [][]any 
 	t.Fatalf("timed out waiting for %d rows", want)
 	return nil
 }
+
 
 func waitForValue(t *testing.T, db *DB, id RowID, want string, timeout time.Duration) {
 	t.Helper()
@@ -200,7 +225,11 @@ func TestReplicationSchemaMismatchRejected(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
-	dbA, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	// Strict policy on both nodes: sessions refuse without sync.
+	strict := false
+	cfgA := replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil)
+	cfgA.Schema.AcceptRemoteSchema = &strict
+	dbA, err := Open(ctx, cfgA)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,6 +241,7 @@ func TestReplicationSchemaMismatchRejected(t *testing.T) {
 	cfgB := replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
 	cfgB.Schema.Version = 2
+	cfgB.Schema.AcceptRemoteSchema = &strict
 	dbB, err := Open(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
@@ -283,6 +313,79 @@ func TestSnapshotJoinAfterLogGC(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForRows(t, dbA, 11, 15*time.Second)
+}
+
+func TestSnapshotTailRepairConcurrentWritesAndGC(t *testing.T) {
+	ctx := context.Background()
+	nodeA, nodeC := NewNodeID(), NewNodeID()
+	dbid := NewDBID()
+	_, creds := testClusterCA(t, nodeA, nodeC)
+
+	dbA, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbA.Close()
+	addrA := waitForAddr(t, dbA, 5*time.Second)
+
+	for i := 0; i < 10; i++ {
+		id := NewRowID()
+		if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
+			id[:], fmt.Sprintf("n%02d", i), fmt.Sprintf("p%02d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Wipe A's origin log for the first 10 rows so C must join via snapshot.
+	if n, err := dbA.store.CollectLog(nodeA, ^uint64(0), 1<<62, 0); err != nil || n != 10 {
+		t.Fatalf("CollectLog = %d, %v", n, err)
+	}
+
+	// Concurrently write new rows on A and trigger GC aggressively while C connects and syncs.
+	stopWriter := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		count := 10
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopWriter:
+				return
+			case <-ticker.C:
+				if count < 20 {
+					id := NewRowID()
+					_, _ = dbA.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
+						id[:], fmt.Sprintf("n%02d", count), fmt.Sprintf("p%02d", count))
+					count++
+				}
+				// Aggressive GC attempting to wipe all logs up to infinity.
+				// Retention leases during snapshot export must protect the tail.
+				_, _ = dbA.store.CollectLog(nodeA, ^uint64(0), 1<<62, 0)
+			}
+		}
+	}()
+
+	cfgC := replConfig(t.TempDir(), nodeC, dbid, creds[nodeC],
+		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
+	dbC, err := Open(ctx, cfgC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbC.Close()
+
+	// Wait for C to catch up all 20 rows (snapshot + tail repair).
+	waitForRows(t, dbC, 20, 20*time.Second)
+
+	close(stopWriter)
+	<-writerDone
+
+	// Verify both nodes have 20 rows and can exchange further mutations.
+	rowsA := waitForRows(t, dbA, 20, 10*time.Second)
+	rowsC := waitForRows(t, dbC, 20, 10*time.Second)
+	if len(rowsA) != 20 || len(rowsC) != 20 {
+		t.Fatalf("row count mismatch: A=%d C=%d", len(rowsA), len(rowsC))
+	}
 }
 
 // TestBidirectionalBulkConverges writes hundreds of rows concurrently on

@@ -48,6 +48,25 @@ func testConfig(path string) Config {
 	}
 }
 
+func TestReplicationDisseminationConfigValidation(t *testing.T) {
+	base := testConfig(t.TempDir())
+	base.withDefaults()
+	base.Replication.Dissemination = DisseminationPlumtree
+	base.Replication.Fanout = 1
+	if err := base.validate(); err == nil {
+		t.Fatal("Plumtree accepted fanout below two")
+	}
+
+	base.Replication.Fanout = 2
+	if err := base.validate(); err != nil {
+		t.Fatalf("valid Plumtree config rejected: %v", err)
+	}
+	base.Replication.Dissemination = "unknown"
+	if err := base.validate(); err == nil {
+		t.Fatal("unknown dissemination mode accepted")
+	}
+}
+
 // providerConfig returns cfg with provider-mode encryption under id.
 func providerConfig(cfg Config, id string, key []byte) Config {
 	cfg.Encryption = EncryptionConfig{

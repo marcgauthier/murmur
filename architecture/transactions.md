@@ -160,6 +160,10 @@ Once a transaction has been accepted for durable replication, a single Pebble ba
 
 Commit the batch with `pebble.Sync` and keep WAL enabled. Do not write these as independent batches.
 
+Ordinary remote apply writes the complete encoded transaction to a synced prepare record first. It then atomically commits winning cells, log, receipt, receive watermark, HLC, state generation, and removal of that record in one Pebble batch. Store open replays any surviving prepare record through the same idempotent apply path before exposing state. Thus a crash before the final batch leaves the transaction unapplied and recoverable; a crash after it leaves the complete transaction committed and no prepare record. Materialization generation is updated after applying winners to SQL; on restart, SQL is rebuilt from committed state before its generation is advanced.
+
+This prepare record is the recovery boundary needed before any ordinary remote winner state is staged with `DB.Ingest`. The current ordinary apply implementation still uses the atomic batch to install winners; it does not yet use external SSTable ingestion. Any future ingestion optimization must keep the prepare record until the final metadata batch commits, and recovery must tolerate replay after ingestion by applying the same CRDT versions idempotently. Large snapshot imports already use SSTable ingestion because their candidate is staged separately, progress is replayable, SQL remains gated, and snapshot watermarks/generation publish only in the final batch. Local commits continue to use one synced batch.
+
 Pebble batches do not provide Badger-style optimistic transaction conflict detection. Serialize the entire read/merge/write operation for all local, remote, metadata, acknowledgement, and GC mutations through one state-store writer coordinator. Use an indexed batch where a merge needs to read its own pending writes. Independent readers use Pebble snapshots and bounded iterators; close snapshots, iterators, and value closers on every path, and copy borrowed bytes before retaining them.
 
 This is one of the most important correctness requirements.
@@ -221,7 +225,7 @@ This is a normal ambiguous-commit scenario and must have explicit tests.
 
 ## 17. Alternative Write Optimization
 
-After correctness is established, consider a package-level write queue:
+Write optimizations must not compromise CRDT invariants or crash consistency.
 
 ```text
 SQL transaction
@@ -230,23 +234,23 @@ SQL transaction
 committed local delta
       |
       v
-durability queue
-      |
-      +----> batch Pebble commits
+Pebble commit (pebble.Sync or pebble.NoSync)
 ```
 
-Do not implement this in the first correctness milestone.
-
-Acknowledging before Pebble durability would change the durability contract.
-
-If an asynchronous durability mode is later added, it must be explicitly configured:
+Acknowledging before Pebble durability changes the durability contract. SPeD-SQL provides an explicit configuration:
 
 ```go
-DurabilitySynchronous
-DurabilityAsync
+DurabilitySynchronous // Default: fsync before acknowledging commit (pebble.Sync)
+DurabilityAsync       // Asynchronous: acknowledged at memory/WAL speed without waiting for fsync (pebble.NoSync)
 ```
 
-Default must remain synchronous.
+Default is synchronous (`DurabilitySynchronous`).
+
+When `DurabilityAsync` is explicitly configured:
+- Transactions commit at RAM speed via `pebble.NoSync` without blocking on disk sync.
+- Acknowledgements explicitly carry a weaker durability contract: in an ungraceful crash or power-loss scenario, transactions acknowledged since the last sync may not have reached disk.
+- Applications can invoke `db.Sync(ctx)` at any time to establish an explicit durable sync point to disk.
+- Replica convergence and CRDT invariants remain intact: query engine rebuilds and version ordering remain authoritative from the persisted Pebble state.
 
 ---
 
@@ -403,4 +407,3 @@ replication sender wakes
 ```
 
 ---
-

@@ -1,8 +1,10 @@
 package state
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"sort"
 
 	"github.com/cockroachdb/pebble/v2"
 
@@ -21,6 +23,18 @@ type Row struct {
 	Newest crdt.Version
 	// Tomb, when Present, is the row tombstone version.
 	Tomb crdt.TombstoneState
+}
+
+// OriginProgress is the bounded synchronization view for one origin.
+// Applied is contiguous durable state; FirstRetained/LastRetained describe
+// the contiguous retained transaction-log suffix, with FirstRetained ==
+// Applied+1 and LastRetained == 0 when no history remains.
+type OriginProgress struct {
+	Origin        ids.NodeID
+	Applied       uint64
+	Observed      uint64
+	FirstRetained uint64
+	LastRetained  uint64
 }
 
 // Visible reports whether the row is query-visible (LWW delete semantics).
@@ -128,60 +142,64 @@ func (s *Store) IterateCells(fn func(codec.SnapshotCell) error) error {
 
 func (s *Store) iterateCellsCore(fn func(codec.SnapshotCell) error) error {
 	return s.snapshot(func(snap *pebble.Snapshot) error {
-		// Cells.
-		cprefix := []byte{prefixCell}
-		it, err := prefixIter(snap, cprefix)
+		return s.iterateCellsSnap(snap, fn)
+	})
+}
+
+func (s *Store) iterateCellsSnap(snap *pebble.Snapshot, fn func(codec.SnapshotCell) error) error {
+	// Cells.
+	cprefix := []byte{prefixCell}
+	it, err := prefixIter(snap, cprefix)
+	if err != nil {
+		return err
+	}
+	for it.SeekGE(cprefix); it.Valid(); it.Next() {
+		table, row, col, ok := ParseCellKey(append([]byte(nil), it.Key()...))
+		if !ok {
+			continue
+		}
+		st, err := codec.DecodeCellState(append([]byte(nil), it.Value()...), s.limits)
 		if err != nil {
-			return err
+			it.Close()
+			return fmt.Errorf("state: corrupt cell: %w", err)
 		}
-		for it.SeekGE(cprefix); it.Valid(); it.Next() {
-			table, row, col, ok := ParseCellKey(append([]byte(nil), it.Key()...))
-			if !ok {
-				continue
-			}
-			st, err := codec.DecodeCellState(append([]byte(nil), it.Value()...), s.limits)
-			if err != nil {
-				it.Close()
-				return fmt.Errorf("state: corrupt cell: %w", err)
-			}
-			if err := fn(codec.SnapshotCell{
-				TableID: table, RowID: row, ColumnID: col,
-				Version: st.Version, Value: st.Value,
-			}); err != nil {
-				it.Close()
-				return err
-			}
-		}
-		if err := it.Error(); err != nil {
+		if err := fn(codec.SnapshotCell{
+			TableID: table, RowID: row, ColumnID: col,
+			Version: st.Version, Value: st.Value,
+		}); err != nil {
 			it.Close()
 			return err
 		}
+	}
+	if err := it.Error(); err != nil {
 		it.Close()
-		// Tombstones.
-		tprefix := []byte{prefixTomb}
-		tit, err := prefixIter(snap, tprefix)
+		return err
+	}
+	it.Close()
+	// Tombstones.
+	tprefix := []byte{prefixTomb}
+	tit, err := prefixIter(snap, tprefix)
+	if err != nil {
+		return err
+	}
+	defer tit.Close()
+	for tit.SeekGE(tprefix); tit.Valid(); tit.Next() {
+		table, row, ok := ParseTombKey(append([]byte(nil), tit.Key()...))
+		if !ok {
+			continue
+		}
+		v, err := codec.DecodeTombstone(append([]byte(nil), tit.Value()...))
 		if err != nil {
+			return fmt.Errorf("state: corrupt tombstone: %w", err)
+		}
+		if err := fn(codec.SnapshotCell{
+			TableID: table, RowID: row, ColumnID: codec.ColumnTombstone,
+			Version: v,
+		}); err != nil {
 			return err
 		}
-		defer tit.Close()
-		for tit.SeekGE(tprefix); tit.Valid(); tit.Next() {
-			table, row, ok := ParseTombKey(append([]byte(nil), tit.Key()...))
-			if !ok {
-				continue
-			}
-			v, err := codec.DecodeTombstone(append([]byte(nil), tit.Value()...))
-			if err != nil {
-				return fmt.Errorf("state: corrupt tombstone: %w", err)
-			}
-			if err := fn(codec.SnapshotCell{
-				TableID: table, RowID: row, ColumnID: codec.ColumnTombstone,
-				Version: v,
-			}); err != nil {
-				return err
-			}
-		}
-		return tit.Error()
-	})
+	}
+	return tit.Error()
 }
 
 // LogScan reads one origin's log starting at fromSeq (inclusive), invoking
@@ -264,30 +282,126 @@ func (s *Store) FirstRetainedSeq(origin ids.NodeID) (uint64, error) {
 	defer s.gate.RUnlock()
 	var first uint64
 	err := s.snapshot(func(snap *pebble.Snapshot) error {
-		prefix := LogOriginPrefix(origin)
-		it, err := prefixIter(snap, prefix)
-		if err != nil {
-			return err
-		}
-		defer it.Close()
-		if it.SeekGE(prefix); it.Valid() {
-			_, seq, ok := ParseLogKey(append([]byte(nil), it.Key()...))
-			if ok {
-				first = seq
-				return nil
-			}
-		}
-		if err := it.Error(); err != nil {
-			return err
-		}
 		wm, err := recvWatermarkSnap(snap, origin)
 		if err != nil {
 			return err
 		}
-		first = wm + 1
-		return nil
+		first, err = firstRetainedSeqSnap(snap, origin, wm)
+		return err
 	})
 	return first, err
+}
+
+func firstRetainedSeqSnap(snap *pebble.Snapshot, origin ids.NodeID, watermark uint64) (uint64, error) {
+	prefix := LogOriginPrefix(origin)
+	it, err := prefixIter(snap, prefix)
+	if err != nil {
+		return 0, err
+	}
+	defer it.Close()
+	if it.SeekGE(prefix); it.Valid() {
+		_, seq, ok := ParseLogKey(append([]byte(nil), it.Key()...))
+		if ok {
+			return seq, nil
+		}
+	}
+	if err := it.Error(); err != nil {
+		return 0, err
+	}
+	return watermark + 1, nil
+}
+
+// ReceiveProgressPage returns at most limit sorted origin records strictly
+// after afterOrigin. One Pebble snapshot keeps applied and retained-history
+// bounds consistent within the page.
+func (s *Store) ReceiveProgressPage(afterOrigin ids.NodeID, limit int) ([]OriginProgress, bool, error) {
+	if limit <= 0 || limit > 1024 {
+		return nil, false, fmt.Errorf("state: progress page limit %d outside 1..1024", limit)
+	}
+	s.gate.RLock()
+	defer s.gate.RUnlock()
+	var out []OriginProgress
+	more := false
+	err := s.snapshot(func(snap *pebble.Snapshot) error {
+		progress := make(map[ids.NodeID]OriginProgress)
+		recv, err := prefixIter(snap, []byte{prefixRecv})
+		if err != nil {
+			return err
+		}
+		for valid := recv.First(); valid; valid = recv.Next() {
+			k := append([]byte(nil), recv.Key()...)
+			if len(k) != 17 {
+				continue
+			}
+			var origin ids.NodeID
+			copy(origin[:], k[1:])
+			applied, ok := decodeU64(append([]byte(nil), recv.Value()...))
+			if !ok {
+				_ = recv.Close()
+				return fmt.Errorf("state: corrupt watermark")
+			}
+			progress[origin] = OriginProgress{Origin: origin, Applied: applied, Observed: applied}
+		}
+		if err := recv.Error(); err != nil {
+			_ = recv.Close()
+			return err
+		}
+		_ = recv.Close()
+		staged, err := prefixIter(snap, []byte{prefixTxnStage})
+		if err != nil {
+			return err
+		}
+		for valid := staged.First(); valid; valid = staged.Next() {
+			key := append([]byte(nil), staged.Key()...)
+			if len(key) != 21 || binary.BigEndian.Uint32(key[17:21]) != ^uint32(0) {
+				continue
+			}
+			meta, received, e := decodeStagedMeta(append([]byte(nil), staged.Value()...))
+			if e != nil {
+				_ = staged.Close()
+				return e
+			}
+			if received == 0 {
+				continue
+			}
+			item := progress[meta.Origin]
+			item.Origin = meta.Origin
+			if item.Observed < meta.Sequence {
+				item.Observed = meta.Sequence
+			}
+			progress[meta.Origin] = item
+		}
+		if err := staged.Error(); err != nil {
+			_ = staged.Close()
+			return err
+		}
+		_ = staged.Close()
+		origins := make([]ids.NodeID, 0, len(progress))
+		for origin := range progress {
+			if afterOrigin.IsZero() || bytes.Compare(origin[:], afterOrigin[:]) > 0 {
+				origins = append(origins, origin)
+			}
+		}
+		sort.Slice(origins, func(i, j int) bool { return bytes.Compare(origins[i][:], origins[j][:]) < 0 })
+		if len(origins) > limit {
+			more = true
+			origins = origins[:limit]
+		}
+		for _, origin := range origins {
+			item := progress[origin]
+			first, e := firstRetainedSeqSnap(snap, origin, item.Applied)
+			if e != nil {
+				return e
+			}
+			item.FirstRetained = first
+			if first <= item.Applied {
+				item.LastRetained = item.Applied
+			}
+			out = append(out, item)
+		}
+		return nil
+	})
+	return out, more, err
 }
 
 // KnownOrigins lists origins with a receive watermark or retained log.
@@ -311,10 +425,21 @@ func (s *Store) KnownOrigins() ([]ids.NodeID, error) {
 
 // CollectLog deletes origin-log entries with sequence <= throughSeq whose
 // HLC wall time is older than keepNewerThanMillis, except it always retains
-// the newest minRetain entries.
+// the newest minRetain entries. Active unexpired retention leases and bridge
+// export resume points bound throughSeq.
 func (s *Store) CollectLog(origin ids.NodeID, throughSeq uint64, keepNewerThanMillis int64, minRetain uint64) (int, error) {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
+	if rFloor, ok := s.RetentionFloor(origin); ok {
+		if throughSeq > rFloor {
+			throughSeq = rFloor
+		}
+	}
+	if bFloor, ok := s.BridgeExportFloor(origin); ok {
+		if throughSeq > bFloor {
+			throughSeq = bFloor
+		}
+	}
 	// Find the newest sequence to enforce minRetain.
 	wm, err := s.recvWatermarkDirect(origin)
 	if err != nil {
@@ -372,7 +497,7 @@ func (s *Store) CollectLog(origin ids.NodeID, throughSeq uint64, keepNewerThanMi
 			return 0, err
 		}
 	}
-	if err := b.Commit(pebble.Sync); err != nil {
+	if err := s.commitBatch(b, s.writeOpts); err != nil {
 		return 0, err
 	}
 	return len(keys), nil
@@ -380,10 +505,25 @@ func (s *Store) CollectLog(origin ids.NodeID, throughSeq uint64, keepNewerThanMi
 
 // CollectReceipts deletes TxID receipts whose origin sequence is at or below
 // the given per-origin floors. Re-application after receipt loss is
-// value-idempotent (same content, newer version), so this is safe.
+// value-idempotent (same content, newer version), so this is safe. Active
+// unexpired retention leases and bridge export resume points bound the per-origin floors.
 func (s *Store) CollectReceipts(floors map[ids.NodeID]uint64) (int, error) {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
+	effectiveFloors := make(map[ids.NodeID]uint64, len(floors))
+	for k, v := range floors {
+		effectiveFloors[k] = v
+		if rFloor, ok := s.RetentionFloor(k); ok {
+			if effectiveFloors[k] > rFloor {
+				effectiveFloors[k] = rFloor
+			}
+		}
+		if bFloor, ok := s.BridgeExportFloor(k); ok {
+			if effectiveFloors[k] > bFloor {
+				effectiveFloors[k] = bFloor
+			}
+		}
+	}
 	var keys [][]byte
 	err := s.snapshot(func(snap *pebble.Snapshot) error {
 		prefix := []byte{prefixReceipt}
@@ -400,7 +540,7 @@ func (s *Store) CollectReceipts(floors map[ids.NodeID]uint64) (int, error) {
 			var origin ids.NodeID
 			copy(origin[:], raw[:16])
 			seq := binary.BigEndian.Uint64(raw[16:])
-			if fl, ok := floors[origin]; ok && seq <= fl {
+			if fl, ok := effectiveFloors[origin]; ok && seq <= fl {
 				keys = append(keys, append([]byte(nil), it.Key()...))
 				if len(keys) >= 4096 {
 					break
@@ -425,7 +565,7 @@ func (s *Store) CollectReceipts(floors map[ids.NodeID]uint64) (int, error) {
 			return 0, err
 		}
 	}
-	if err := b.Commit(pebble.Sync); err != nil {
+	if err := s.commitBatch(b, s.writeOpts); err != nil {
 		return 0, err
 	}
 	return len(keys), nil

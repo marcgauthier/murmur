@@ -1,8 +1,8 @@
-// Package sqlengine implements the rebuildable in-memory query database.
+// Package sqlengine implements the rebuildable SQL query materialization.
 //
-// The engine is SQLite-compatible (via modernc.org/sqlite, a pure-Go build
-// with pre-update hook support) and sits behind a narrow interface so the
-// LumoSQL CGO driver can replace it under a build tag later. It owns:
+// The default engine uses modernc.org/sqlite, a pure-Go build with pre-update
+// hook support. A build-tagged LumoSQL backend can instead use its CGO driver.
+// It owns:
 //
 //   - base-table DDL creation and ordinal validation
 //   - pre-update-hook change capture with a suppression mode for
@@ -17,10 +17,11 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
-
-	_ "modernc.org/sqlite"
 
 	"github.com/nomadsql/replicateddb/codec"
 	"github.com/nomadsql/replicateddb/ids"
@@ -95,13 +96,41 @@ type Engine struct {
 	// failCommit injects COMMIT failures (tests only).
 	failCommit func() error
 
-	closed bool
+	closed         bool
+	cleanupDir     string
+	concurrentMVCC bool
 }
 
 // Open creates the in-memory query database, registers change capture, and
 // creates the schema. ddl overrides generated DDL; localDDL holds
 // local-only objects applied after every (re)build.
 func Open(reg *schema.Registry, ddl, localDDL []string, stmtCacheEntries int) (*Engine, error) {
+	return open(reg, ddl, localDDL, stmtCacheEntries, "", 0)
+}
+
+// OpenMMap opens a file-backed, disposable SQLite materialization with mmap
+// enabled. Pebble remains authoritative; the temporary directory is removed
+// when the engine closes and the materialization is rebuilt on the next open.
+// This provides mmap-backed pages with the current pure-Go SQLite driver, but
+// does not provide LMDB's lock-free MVCC semantics.
+func OpenMMap(reg *schema.Registry, ddl, localDDL []string, stmtCacheEntries int, tempBase string, mmapBytes int64) (*Engine, error) {
+	if mmapBytes <= 0 {
+		mmapBytes = 256 << 20
+	}
+	dir, err := os.MkdirTemp(tempBase, "spedsql-query-")
+	if err != nil {
+		return nil, fmt.Errorf("sqlengine: create disposable query directory: %w", err)
+	}
+	e, err := open(reg, ddl, localDDL, stmtCacheEntries, filepath.Join(dir, "query.db"), mmapBytes)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+	e.cleanupDir = dir
+	return e, nil
+}
+
+func open(reg *schema.Registry, ddl, localDDL []string, stmtCacheEntries int, filePath string, mmapBytes int64) (*Engine, error) {
 	if stmtCacheEntries <= 0 {
 		stmtCacheEntries = 256
 	}
@@ -113,48 +142,86 @@ func Open(reg *schema.Registry, ddl, localDDL []string, stmtCacheEntries int) (*
 		return nil, fmt.Errorf("sqlengine: rand: %w", err)
 	}
 	dsn := fmt.Sprintf("file:replicateddb_%x?mode=memory&cache=shared", randSuffix)
-	db, err := sql.Open("sqlite", dsn)
+	if filePath != "" {
+		dsn = (&url.URL{Scheme: "file", Path: filePath}).String()
+	}
+	if backendConcurrentMVCC {
+		if strings.Contains(dsn, "?") {
+			dsn += "&_busy_timeout=5000&_foreign_keys=off&_sync=off"
+		} else {
+			dsn += "?_busy_timeout=5000&_foreign_keys=off&_sync=off"
+		}
+	}
+	db, err := sql.Open(sqlDriverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sqlengine: open: %w", err)
 	}
-	db.SetMaxOpenConns(2)
-	db.SetMaxIdleConns(2)
+	// LumoSQL's independent MVCC readers require a file-backed LMDB
+	// environment. Its named in-memory DSN is connection-local, so keep the
+	// reserved read connection for Open() and enable the pool only for
+	// OpenMMap().
+	concurrentMVCC := backendConcurrentMVCC && filePath != ""
+	maxConns := 2
+	if concurrentMVCC {
+		maxConns = 32
+	}
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
 	ctx := context.Background()
 	write, err := db.Conn(ctx)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("sqlengine: write conn: %w", err)
 	}
-	read, err := db.Conn(ctx)
-	if err != nil {
-		write.Close()
-		db.Close()
-		return nil, fmt.Errorf("sqlengine: read conn: %w", err)
+	var read *sql.Conn
+	if backendConcurrentMVCC && filePath == "" {
+		// The LumoSQL memory DSN creates a private environment per connection.
+		// Open() promises an in-memory engine, so share its one connection and
+		// use the ordinary reader/writer lock instead of the file-backed MVCC
+		// pool.
+		read = write
+	} else {
+		read, err = db.Conn(ctx)
+		if err != nil {
+			write.Close()
+			db.Close()
+			return nil, fmt.Errorf("sqlengine: read conn: %w", err)
+		}
 	}
 	e := &Engine{
-		reg:        reg,
-		db:         db,
-		write:      write,
-		read:       read,
-		tables:     make(map[string]*schema.TableSchema, len(reg.Tables)),
-		writeStmts: newStmtCache(stmtCacheEntries),
-		readStmts:  newStmtCache(stmtCacheEntries),
-		ddl:        ddl,
-		localDDL:   localDDL,
+		reg:            reg,
+		db:             db,
+		write:          write,
+		read:           read,
+		tables:         make(map[string]*schema.TableSchema, len(reg.Tables)),
+		writeStmts:     newStmtCache(stmtCacheEntries),
+		readStmts:      newStmtCache(stmtCacheEntries),
+		ddl:            ddl,
+		localDDL:       localDDL,
+		concurrentMVCC: concurrentMVCC,
 	}
 	for _, t := range reg.Tables {
 		e.tables[strings.ToLower(t.Name)] = t
 	}
 	for _, c := range []*sql.Conn{write, read} {
-		for _, pr := range []string{
+		pragmas := []string{
 			"PRAGMA busy_timeout = 5000",
 			"PRAGMA synchronous = OFF",
-			"PRAGMA journal_mode = MEMORY",
 			"PRAGMA foreign_keys = OFF",
-		} {
+		}
+		if !e.concurrentMVCC {
+			pragmas = append(pragmas, "PRAGMA journal_mode = MEMORY")
+		}
+		for _, pr := range pragmas {
 			if _, err := c.ExecContext(ctx, pr); err != nil {
 				e.Close()
 				return nil, fmt.Errorf("sqlengine: pragma %q: %w", pr, err)
+			}
+		}
+		if mmapBytes > 0 && !e.concurrentMVCC {
+			if _, err := c.ExecContext(ctx, fmt.Sprintf("PRAGMA mmap_size = %d", mmapBytes)); err != nil {
+				e.Close()
+				return nil, fmt.Errorf("sqlengine: configure mmap: %w", err)
 			}
 		}
 	}
@@ -180,6 +247,8 @@ func (e *Engine) Registry() *schema.Registry { return e.reg }
 func (e *Engine) Close() error {
 	e.wmu.Lock()
 	defer e.wmu.Unlock()
+	e.rw.Lock()
+	defer e.rw.Unlock()
 	if e.closed {
 		return nil
 	}
@@ -189,13 +258,19 @@ func (e *Engine) Close() error {
 	if e.write != nil {
 		e.write.Close()
 	}
-	if e.read != nil {
+	if e.read != nil && e.read != e.write {
 		e.read.Close()
 	}
+	var first error
 	if e.db != nil {
-		return e.db.Close()
+		first = e.db.Close()
 	}
-	return nil
+	if e.cleanupDir != "" {
+		if err := os.RemoveAll(e.cleanupDir); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 // createSchema builds replicated tables then local-only objects.

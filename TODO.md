@@ -1,12 +1,9 @@
-ask muse to review all the tests-live in ../GALVANIZE and when possible convert those tests to golang for SPeD-SQL
+When schema is declare:
+  Primary Keys: Every replicated table requires an explicit BLOB(16) primary key (e.g. replicateddb.NewRowID()). SQLite rowid /         
+  autoincrement is not replicated.
+  - this should be done automatically the user must flag a column name:
+        if no column is selected the Primary Keys is a UUIDv4 column name id
+        if column is selected the Primary Keys is a UUIDv5 (tablename + colunmn name value)
+        
+        
 
-ask muse to create tests for the code to increase tests coverage of the code.
-
-ask codex to review architecture/README.md and its linked documents and confirm if parts of the architecture are not implemented yet.
-
-
-- [x] add schema storage and migration in pebble.
-
-- [x] are the cache settings for pebble available for the user to set when opening the database? (Available via Config.Pebble / DefaultPebbleConfig)
-
-- [x] add Backup and restore function (Implemented in backup/ with online hard-link checkpoints and pure ciphertext streaming)

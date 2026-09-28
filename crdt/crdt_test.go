@@ -115,3 +115,79 @@ func TestVisible(t *testing.T) {
 		t.Fatal("newer tombstone should hide row")
 	}
 }
+
+func TestVersionOrderLaws(t *testing.T) {
+	idsInOrder := []ids.NodeID{
+		ids.MustNodeID("00000000-0000-0000-0000-000000000001"),
+		ids.MustNodeID("00000000-0000-0000-0000-000000000002"),
+		ids.MustNodeID("00000000-0000-0000-0000-000000000003"),
+	}
+	versions := []Version{
+		{},
+		{HLC: 1, NodeID: idsInOrder[0]},
+		{HLC: 1, NodeID: idsInOrder[1]},
+		{HLC: 1, NodeID: idsInOrder[2]},
+		{HLC: 2, NodeID: idsInOrder[0]},
+	}
+	for i, a := range versions {
+		if CompareVersion(a, a) != 0 {
+			t.Fatalf("version %d is not equal to itself", i)
+		}
+		for j, b := range versions {
+			ab, ba := CompareVersion(a, b), CompareVersion(b, a)
+			if ab != -ba {
+				t.Fatalf("comparison is not antisymmetric for versions %d and %d: %d, %d", i, j, ab, ba)
+			}
+			for k, c := range versions {
+				if ab < 0 && CompareVersion(b, c) < 0 && CompareVersion(a, c) >= 0 {
+					t.Fatalf("comparison is not transitive for versions %d, %d, %d", i, j, k)
+				}
+			}
+		}
+	}
+}
+
+func TestCellMergeConvergesAcrossDeliveryOrders(t *testing.T) {
+	low := ids.MustNodeID("00000000-0000-0000-0000-000000000001")
+	high := ids.MustNodeID("00000000-0000-0000-0000-000000000002")
+	writes := []Version{
+		{HLC: 4, NodeID: high}, // equal HLC is resolved by origin identity
+		{HLC: 3, NodeID: low},
+		{HLC: 4, NodeID: low},
+		{HLC: 2, NodeID: high},
+	}
+	orders := [][]int{
+		{0, 1, 2, 3}, {3, 2, 1, 0}, {1, 3, 0, 2}, {2, 0, 3, 1},
+	}
+	want := Version{HLC: 4, NodeID: high}
+	for _, order := range orders {
+		var winner Version
+		present := false
+		for _, index := range order {
+			incoming := writes[index]
+			switch MergeCell(incoming, winner, present) {
+			case MergeTake:
+				winner, present = incoming, true
+			case MergeKeep, MergeEqual:
+			}
+		}
+		if !present || winner != want {
+			t.Fatalf("order %v converged to %+v (present=%t), want %+v", order, winner, present, want)
+		}
+	}
+}
+
+func TestRowTombstoneVisibilityBoundaries(t *testing.T) {
+	row := Version{HLC: 8, NodeID: ids.MustNodeID("00000000-0000-0000-0000-000000000001")}
+	equal := row
+	newer := Version{HLC: 8, NodeID: ids.MustNodeID("00000000-0000-0000-0000-000000000002")}
+	if !Visible(true, row, TombstoneState{Present: true, Version: equal}) {
+		t.Fatal("equal cell and tombstone versions should remain visible")
+	}
+	if Visible(true, row, TombstoneState{Present: true, Version: newer}) {
+		t.Fatal("equal-HLC tombstone with greater origin should hide row")
+	}
+	if Visible(false, newer, TombstoneState{Present: true, Version: row}) {
+		t.Fatal("tombstone must not make a row with no cells visible")
+	}
+}

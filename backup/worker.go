@@ -21,6 +21,8 @@ type ScheduleConfig struct {
 	RetentionDays int
 	// MaxBackups retains at most this many latest backups (0 disables).
 	MaxBackups int
+	// IncludeFiles packs file objects into scheduled backups.
+	IncludeFiles bool
 	// Logger for progress and error logs.
 	Logger Logger
 }
@@ -97,9 +99,10 @@ func (w *Worker) Stop() {
 func (w *Worker) TriggerOnDemand(ctx context.Context) (*Metadata, error) {
 	w.log.Info("backup worker: on-demand backup triggered")
 	meta, err := CreateBackup(ctx, w.src, Config{
-		Destination: w.cfg.Destination,
-		Compression: w.cfg.Compression,
-		Logger:      w.log,
+		Destination:  w.cfg.Destination,
+		Compression:  w.cfg.Compression,
+		IncludeFiles: w.cfg.IncludeFiles,
+		Logger:       w.log,
 	})
 	w.mu.Lock()
 	w.lastBackup = time.Now()
@@ -132,9 +135,10 @@ func (w *Worker) loop(ctx context.Context) {
 		case <-ticker.C:
 			w.log.Info("backup worker: interval triggered")
 			_, err := CreateBackup(ctx, w.src, Config{
-				Destination: w.cfg.Destination,
-				Compression: w.cfg.Compression,
-				Logger:      w.log,
+				Destination:  w.cfg.Destination,
+				Compression:  w.cfg.Compression,
+				IncludeFiles: w.cfg.IncludeFiles,
+				Logger:       w.log,
 			})
 			w.mu.Lock()
 			w.lastBackup = time.Now()

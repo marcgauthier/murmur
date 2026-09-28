@@ -13,15 +13,19 @@ import (
 
 // Key prefixes (PLAN section 14).
 const (
-	prefixCell     byte = 0x01
-	prefixTomb     byte = 0x02
-	prefixLog      byte = 0x03
-	prefixRecv     byte = 0x04
-	prefixPeerAck  byte = 0x05
-	prefixSchema   byte = 0x06
-	prefixSys      byte = 0x07
-	prefixReceipt  byte = 0x08
-	prefixSnapshot byte = 0x09
+	prefixCell           byte = 0x01
+	prefixTomb           byte = 0x02
+	prefixLog            byte = 0x03
+	prefixRecv           byte = 0x04
+	prefixPeerAck        byte = 0x05
+	prefixSchema         byte = 0x06
+	prefixSys            byte = 0x07
+	prefixReceipt        byte = 0x08
+	prefixSnapshot       byte = 0x09
+	prefixPeerExcluded   byte = 0x0a
+	prefixMember         byte = 0x0b
+	prefixBridgeProgress byte = 0x0c
+	prefixTxnStage       byte = 0x0d
 )
 
 const (
@@ -29,16 +33,35 @@ const (
 	sysLocalSeq    = "local_sequence"
 	sysHLC         = "hlc"
 	sysFormat      = "format_version"
+	sysMinReader   = "minimum_reader_version"
+	sysMinWriter   = "minimum_writer_version"
 	sysSchemaEpoch = "schema_epoch"
 	sysSchemaHash  = "schema_hash"
 	sysGeneration  = "state_generation"
 	sysMaterial    = "materialized_generation"
-	sysDBID        = "db_id"
+	// sysRemotePrepare holds one complete remote transaction whose prepare
+	// record is durable but whose final atomic apply has not committed yet.
+	sysRemotePrepare = "remote_prepare"
+	sysDBID          = "db_id"
+	// sysRestoreMarker records the last restore adoption (JSON): the backup
+	// and the retired source identity. It is written atomically with the
+	// fresh identity swap so old origin sequences can never be reused.
+	sysRestoreMarker = "restore_marker"
 )
 
 // FormatVersion is the persistent Pebble format version. It is incompatible
 // with the old Badger store (which used 1); old directories are rejected.
 const FormatVersion uint64 = 2
+
+// MinReaderVersion and MinWriterVersion are the oldest store versions this
+// binary can read and write. Both equal FormatVersion: v1 (Badger) stores
+// are unreadable, and anything newer needs a newer binary. Fresh stores
+// record all three markers; pre-marker v2 stores default the minima to
+// their format version on open.
+const (
+	MinReaderVersion uint64 = 2
+	MinWriterVersion uint64 = 2
+)
 
 // CellKey builds 01 | tableID:u32 | rowUUID:16 | columnID:u32.
 func CellKey(tableID uint32, row ids.RowID, col uint32) []byte {
@@ -155,6 +178,93 @@ func SnapshotKey(name string) []byte {
 	k := []byte{prefixSnapshot}
 	return append(k, name...)
 }
+
+// PeerExcludedKey builds 0a | nodeID:16.
+func PeerExcludedKey(node ids.NodeID) []byte {
+	return append([]byte{prefixPeerExcluded}, node[:]...)
+}
+
+// PeerExcludedPrefix scans all excluded peers.
+func PeerExcludedPrefix() []byte {
+	return []byte{prefixPeerExcluded}
+}
+
+// ParsePeerExcludedKey splits a peer excluded key.
+func ParsePeerExcludedKey(k []byte) (ids.NodeID, bool) {
+	if len(k) != 17 || k[0] != prefixPeerExcluded {
+		return ids.NodeID{}, false
+	}
+	var node ids.NodeID
+	copy(node[:], k[1:17])
+	return node, true
+}
+
+// MemberKey builds 0b | nodeID:16 (persisted admission record).
+func MemberKey(node ids.NodeID) []byte {
+	return append([]byte{prefixMember}, node[:]...)
+}
+
+// MemberPrefix scans all member admission records.
+func MemberPrefix() []byte {
+	return []byte{prefixMember}
+}
+
+// ParseMemberKey splits a member record key.
+func ParseMemberKey(k []byte) (ids.NodeID, bool) {
+	if len(k) != 17 || k[0] != prefixMember {
+		return ids.NodeID{}, false
+	}
+	var node ids.NodeID
+	copy(node[:], k[1:17])
+	return node, true
+}
+
+// PeerAckPrefix scans all persisted peer acknowledgements.
+func PeerAckPrefix() []byte {
+	return []byte{prefixPeerAck}
+}
+
+// ParsePeerAckKey splits a peer acknowledgement key.
+func ParsePeerAckKey(k []byte) (peer, origin ids.NodeID, ok bool) {
+	if len(k) != 33 || k[0] != prefixPeerAck {
+		return ids.NodeID{}, ids.NodeID{}, false
+	}
+	copy(peer[:], k[1:17])
+	copy(origin[:], k[17:33])
+	return peer, origin, true
+}
+
+// BridgeProgressKey builds 0c | stream.
+func BridgeProgressKey(stream string) []byte {
+	k := []byte{prefixBridgeProgress}
+	return append(k, stream...)
+}
+
+// BridgeProgressPrefix scans all bridge stream progress entries.
+func BridgeProgressPrefix() []byte {
+	return []byte{prefixBridgeProgress}
+}
+
+// ParseBridgeProgressKey splits a bridge stream progress key.
+func ParseBridgeProgressKey(k []byte) (string, bool) {
+	if len(k) <= 1 || k[0] != prefixBridgeProgress {
+		return "", false
+	}
+	return string(k[1:]), true
+}
+
+// TransactionStagePrefix selects resumable transaction chunk records.
+func TransactionStagePrefix(tx ids.TxID) []byte {
+	k := []byte{prefixTxnStage}
+	return append(k, tx[:]...)
+}
+
+func transactionStageKey(tx ids.TxID, index uint32) []byte {
+	k := TransactionStagePrefix(tx)
+	return binary.BigEndian.AppendUint32(k, index)
+}
+
+func transactionStageMetaKey(tx ids.TxID) []byte { return transactionStageKey(tx, ^uint32(0)) }
 
 func encodeU64(v uint64) []byte {
 	var b [8]byte

@@ -8,6 +8,7 @@ SWIM/memberlist over QUIC, discovery, transport configuration, and authenticatio
 
 - [26. Replication Transport](#26-replication-transport)
 - [27. Peer Identity and Authentication](#27-peer-identity-and-authentication)
+- [IP and CIDR admission policy](#ip-and-cidr-admission-policy)
 
 ---
 
@@ -44,6 +45,7 @@ Implement `memberlist.NodeAwareTransport`, including its underlying `Transport` 
 - Enable QUIC DATAGRAM negotiation and reject peers without support. Use a versioned membership envelope and stream header to distinguish membership, replication control, and bulk traffic. Authenticate and validate DBID before dispatching either datagrams or streams.
 - Set memberlist's packet budget to a conservative 1,000 bytes including its label, leaving room within a 1,200-byte QUIC packet for encryption and the envelope. Enforce the negotiated datagram limit too; return an explicit oversized-packet error rather than fragmenting or silently switching to reliable delivery.
 - Keep membership receive queues and per-peer pending sends bounded. Apply deadlines to connection setup and reliable exchanges; avoid blocking memberlist behind database transfers. Memberlist's reliable fallback probes use QUIC streams despite its legacy TCP configuration names.
+- Membership sessions use the pool's reserved connection allowance and do not consume replication session slots. This keeps SWIM admission available while selected-target, repair, and inbound bulk replication sessions are saturated; the 8-slot/8-reserved default arrangement is covered by the QUIC responsiveness test in [testing acceptance](testing.md#57-network-partition-tests).
 - `Shutdown` stops membership delivery and closes its streams without closing the shared endpoint still used by replication. The replication manager owns the endpoint's final shutdown.
 
 Pin a memberlist release compatible with the repository's Go version during implementation and verify its transport API in the feasibility spike. Do not fork memberlist or implement a second SWIM state machine.
@@ -125,9 +127,48 @@ AllowedPeers []NodeID
 
 and optionally an address allow-list.
 
+The standalone daemon accepts `allowed_peers` as a JSON array of NodeID strings
+and applies it as `ReplicationConfig.AllowedPeers`. Entries are parsed before
+database open; malformed IDs fail startup. Use `tests-live/allow-nodes/` to
+exercise admission across independent daemon processes.
+
 Apply the same CA trust and `AllowedPeers` policy to membership and replication. For address-only bootstrap, verify the certificate chain, extract its NodeID SAN, enforce the allow-list, and then validate DBID in the authenticated protocol. Subsequent connections with a known identity must match that expected NodeID. Advertised metadata is not authorization.
 
 Relayed SWIM records legitimately describe nodes other than the authenticated sender. Treat those records as discovery hints rather than requiring every relayed NodeID to equal the sender's certificate. When contacting a discovered endpoint directly, verify that endpoint's certificate matches its claimed identity before admitting its application traffic or durable GC obligation.
 
 ---
 
+---
+
+## IP and CIDR admission policy
+
+Configure optional allowed IP addresses/networks with
+`ReplicationConfig.AllowedNetworks`, parsed into package-owned
+`transport.AddressPolicy` values and validated in `Config.validate` before any
+listener opens. An absent address filter preserves the certificate/NodeID-only
+policy. A configured filter must match in addition to CA, NodeID, and DBID
+authorization; network location never substitutes for identity.
+
+The standalone daemon JSON config exposes the same policy as
+`allowed_networks`; each node process can therefore apply an independent
+address policy. The multi-process acceptance topology is documented in
+[`architecture/testing.md`](testing.md) and exercised by
+`tests-live/addrpolicy/`.
+
+Filtering applies to inbound QUIC remote addresses (checked in `Accept` before
+certificate parsing and any application work) and outbound resolved addresses
+(resolved and filtered in `Dial` before dialing; hostnames re-resolve on every
+dial so DNS changes and reconnects are rechecked, with mixed allowed/denied
+answers filtered to the allowed subset). Sessions recheck the current remote
+address on every stream open, closing the session instead of serving traffic
+that migrated (or rebound) onto a denied address. IPv4-mapped IPv6 addresses
+are normalized before matching. Advertised membership endpoints are discovery
+hints, not evidence that an actual socket address is permitted.
+
+The single shared QUIC endpoint applies the same policy to membership,
+mutation traffic, snapshots, and file fetches. Rejections return the
+`ErrAddressNotAllowed` sentinel through existing accept/dial diagnostics with
+bounded messages; IPv6 addresses are redacted to the /64 prefix. Acceptance
+covers IPv4/IPv6 CIDRs, invalid configuration, DNS with mixed allowed/denied
+answers, denied inbound and outbound peers, address changes, and allowed
+addresses with unauthorized NodeIDs (see `transport/addrs_test.go`).

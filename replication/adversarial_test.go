@@ -29,10 +29,23 @@ func (f *fakeApplier) ApplyRemote(_ context.Context, b *codec.MutationBatch) err
 	return nil
 }
 
-func (f *fakeApplier) ApplySnapshotChunk(_ context.Context, _ *codec.SnapshotManifest, _ []codec.SnapshotCell, _ bool) error {
+func (f *fakeApplier) ApplySnapshotChunk(_ context.Context, _ *codec.SnapshotManifest, _ uint64, _ []codec.SnapshotCell, _ bool) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.chunks++
+	return false, nil
+}
+
+type groupedFakeApplier struct {
+	fakeApplier
+	groups [][]*codec.MutationBatch
+}
+
+func (f *groupedFakeApplier) ApplyRemoteGroup(_ context.Context, batches []*codec.MutationBatch) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	group := append([]*codec.MutationBatch(nil), batches...)
+	f.groups = append(f.groups, group)
 	return nil
 }
 
@@ -40,6 +53,40 @@ func (f *fakeApplier) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.batches)
+}
+
+func TestOnBatchesUsesBoundedAtomicApplyGroups(t *testing.T) {
+	store, err := state.Open(t.TempDir(), ids.NewNodeID(), ids.NewDBID(), state.Options{Limits: codec.DefaultLimits()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	applier := &groupedFakeApplier{}
+	m := &Manager{
+		cfg: ManagerConfig{Store: store, Applier: applier, Limits: codec.DefaultLimits()},
+		ctx: context.Background(), notifyCh: make(chan struct{}, 1), peers: make(map[ids.NodeID]*peerState),
+		chunkRepairAt: make(map[ids.TxID]time.Time), chunkRepairNeed: make(map[ids.TxID]ChunkNeed),
+		schemaId: SchemaIdentity{Epoch: 1},
+	}
+	m.applyGroupTarget.Store(2)
+	p := newPeerState(ids.NewNodeID(), nil, true)
+	origin := ids.NewNodeID()
+	batches := []*codec.MutationBatch{
+		{ProtocolVersion: ProtocolVersion, TxID: ids.NewTxID(), OriginNode: origin, Sequence: 1, HLC: 10, SchemaEpoch: 1, Mutations: []codec.Mutation{{TableID: 1, RowID: ids.NewRowID(), ColumnID: 1, Value: codec.Int(1)}}},
+		{ProtocolVersion: ProtocolVersion, TxID: ids.NewTxID(), OriginNode: origin, Sequence: 2, HLC: 20, SchemaEpoch: 1, Mutations: []codec.Mutation{{TableID: 1, RowID: ids.NewRowID(), ColumnID: 1, Value: codec.Int(2)}}},
+	}
+	if err := m.onBatches(p, nil, EncodeBatches(nil, batches)); err != nil {
+		t.Fatal(err)
+	}
+	if len(applier.groups) != 1 || len(applier.groups[0]) != 2 {
+		t.Fatalf("group calls = %+v", applier.groups)
+	}
+	if applier.groups[0][0].TxID != batches[0].TxID || applier.groups[0][1].TxID != batches[1].TxID {
+		t.Fatal("apply group changed transaction identities or order")
+	}
+	if got := m.applyGroupLimit(); got != 4 {
+		t.Fatalf("successful group did not grow target: %d", got)
+	}
 }
 
 type testCluster struct {
@@ -138,6 +185,8 @@ func (c *testCluster) rawClient(t *testing.T, ctx context.Context, addr string,
 }
 
 func validTestBatch(node ids.NodeID, seq uint64) *codec.MutationBatch {
+	var hash [32]byte
+	hash[0] = 1 // test managers use hash[0] = epoch
 	return &codec.MutationBatch{
 		ProtocolVersion: ProtocolVersion,
 		TxID:            ids.NewTxID(),
@@ -145,6 +194,7 @@ func validTestBatch(node ids.NodeID, seq uint64) *codec.MutationBatch {
 		Sequence:        seq,
 		HLC:             seq * 100,
 		SchemaEpoch:     1,
+		SchemaHash:      hash,
 		Mutations: []codec.Mutation{
 			{TableID: 1, RowID: ids.NewRowID(), ColumnID: 2, Value: codec.Text("ok")},
 		},

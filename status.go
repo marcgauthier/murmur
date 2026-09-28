@@ -3,10 +3,22 @@ package replicateddb
 import (
 	"log/slog"
 	"time"
+
+	"github.com/nomadsql/replicateddb/replication"
+	"github.com/nomadsql/replicateddb/transport"
 )
 
 // Attr is a structured log attribute.
 type Attr = slog.Attr
+
+// PeerStatus is a point-in-time peer status snapshot.
+type PeerStatus = replication.PeerStatus
+
+// PoolStats is a point-in-time connection pool status snapshot.
+type PoolStats = transport.PoolStats
+
+// MembershipStats is a point-in-time SWIM membership status snapshot.
+type MembershipStats = replication.MembershipStats
 
 // Logger is the package logging interface. The standard library's
 // *slog.Logger satisfies it, so applications can pass slog directly.
@@ -69,6 +81,11 @@ func (s DBState) String() string {
 func (s DBState) WritesAllowed() bool { return s == StateReady }
 
 // Status is a point-in-time diagnostic snapshot. It never contains secrets.
+//
+// Membership fields describe the static mesh until SWIM discovery lands:
+// MembershipCount equals known peers (configured plus inbound-discovered)
+// and SelectedPeers equals connected sessions (every connected peer is a
+// replication target; bounded selection is pending).
 type Status struct {
 	State  DBState
 	NodeID NodeID
@@ -83,11 +100,29 @@ type Status struct {
 	SchemaHash   [32]byte
 	FormatFormat uint64
 
-	PeerCount      int
-	ConnectedPeers int
+	PeerCount       int
+	ConnectedPeers  int
+	MembershipCount int
+	SelectedPeers   int
+	QUICConnections int
+	PendingDials    int
 
+	// PendingApply is the current in-flight remote-apply count (remote
+	// apply is synchronous; there is no apply queue yet). PendingSend is
+	// the total queued outbound control/need/schema frames.
 	PendingApply int
 	PendingSend  int
+
+	// Peers holds one diagnostic record per known peer.
+	Peers []PeerDiagnostics
+	// Replication holds aggregate replication counters and queue depths.
+	Replication replication.StatsSnapshot
+	// Pool holds connection and session pooling diagnostics.
+	Pool PoolStats
+	// Membership holds SWIM membership and discovery diagnostics.
+	Membership MembershipStats
+	// Metrics holds node-local writer, apply, GC, and schema counters.
+	Metrics MetricsSnapshot
 
 	PebbleSizeBytes     uint64
 	PebbleCacheHits     int64
@@ -95,4 +130,39 @@ type Status struct {
 	PebbleMemTableBytes uint64
 
 	Uptime time.Duration
+}
+
+// PeerDiagnostics is the per-peer diagnostic record: session state,
+// schema compatibility, watermarks, per-origin lag, traffic totals, queue
+// depths, and persisted retirement/exclusion state. It never contains
+// secrets.
+type PeerDiagnostics struct {
+	NodeID             NodeID
+	Addrs              []string
+	Connected          bool
+	Dynamic            bool
+	SchemaAgreed       bool
+	SnapshotRequired   bool
+	AwaitingSnapshot   bool
+	Retired            bool
+	Excluded           bool
+	Selected           bool
+	MembershipState    string
+	RetirementDeadline time.Time
+	RTT                time.Duration
+	LastSeen           time.Time
+	LastHandshake      time.Time
+	LastSend           time.Time
+	LastRecv           time.Time
+	LastAntiEntropy    time.Time
+	RemoteSchemaEpoch  uint64
+	RemoteSchemaHash   [32]byte
+	BytesSent          uint64
+	BytesReceived      uint64
+	QueuedNeed         int
+	QueuedCtrl         int
+	QueuedSchema       int
+	Have               map[NodeID]uint64
+	Sent               map[NodeID]uint64
+	LagByOrigin        map[NodeID]uint64
 }

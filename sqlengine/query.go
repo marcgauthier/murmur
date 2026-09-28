@@ -26,6 +26,31 @@ func (e *Engine) Query(ctx context.Context, query string, args ...any) (*Rows, e
 		e.rw.RUnlock()
 		return nil, fmt.Errorf("sqlengine: closed")
 	}
+	if e.concurrentMVCC {
+		conn, err := e.db.Conn(ctx)
+		if err != nil {
+			e.rw.RUnlock()
+			return nil, err
+		}
+		stmt, err := conn.PrepareContext(ctx, query)
+		if err != nil {
+			_ = conn.Close()
+			e.rw.RUnlock()
+			return nil, fmt.Errorf("sqlengine: prepare read: %w", err)
+		}
+		rows, err := stmt.QueryContext(ctx, args...)
+		if err != nil {
+			_ = stmt.Close()
+			_ = conn.Close()
+			e.rw.RUnlock()
+			return nil, err
+		}
+		return &Rows{rows: rows, release: func() {
+			_ = stmt.Close()
+			_ = conn.Close()
+			e.rw.RUnlock()
+		}, engine: e}, nil
+	}
 	stmt, err := e.readStmts.prepare(ctx, e.read, query)
 	if err != nil {
 		e.rw.RUnlock()
@@ -48,6 +73,19 @@ func (e *Engine) QueryRowContext(ctx context.Context, query string, args []any, 
 	if e.closed {
 		return fmt.Errorf("sqlengine: closed")
 	}
+	if e.concurrentMVCC {
+		conn, err := e.db.Conn(ctx)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		stmt, err := conn.PrepareContext(ctx, query)
+		if err != nil {
+			return fmt.Errorf("sqlengine: prepare read: %w", err)
+		}
+		defer stmt.Close()
+		return fn(stmt.QueryRowContext(ctx, args...))
+	}
 	stmt, err := e.readStmts.prepare(ctx, e.read, query)
 	if err != nil {
 		return err
@@ -67,7 +105,15 @@ func (r *Rows) Columns() []string {
 }
 
 // Next delegates to sql.Rows.
-func (r *Rows) Next() bool { return r.rows.Next() }
+func (r *Rows) Next() bool {
+	if r.rows.Next() {
+		return true
+	}
+	if r.engine != nil && r.engine.concurrentMVCC {
+		_ = r.Close()
+	}
+	return false
+}
 
 // Scan delegates to sql.Rows.
 func (r *Rows) Scan(dest ...any) error { return r.rows.Scan(dest...) }

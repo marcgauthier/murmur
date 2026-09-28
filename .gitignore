@@ -15,3 +15,9 @@ coverage.txt
 .DS_Store
 .vscode/
 .idea/
+
+# Local build and live test runtime artifacts
+/bin/
+/spedsql
+tests-live/runtime/
+tests-live/failures/

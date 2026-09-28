@@ -138,7 +138,7 @@ LumoSQL is the embedded SQL/query engine.
 
 Regular SQLite is strictly a Two-Phase Locking (2PL) single-version database; even in WAL mode, it is not true MVCC and suffers from checkpoint lock contention where readers block checkpoints and writers stall. LumoSQL replaces SQLite's monolithic B-tree with pluggable key-value storage engines, notably **LMDB** (and MDBX), which provide **true Multi-Version Concurrency Control (MVCC)** via Copy-on-Write (COW) B+ trees.
 
-For this project, the primary query engine architecture is **LumoSQL with its LMDB backend memory-mapped on disk (`QueryStoreMMap`)**.
+`QueryStoreMMap` is a disposable file-backed SQL materialization. In the default build it uses `modernc.org/sqlite` with SQLite mmap enabled and keeps SQLite's locking behavior. With the `lumosql` build tag it uses an externally built LumoSQL LMDB driver, opens pooled MVCC read connections, and allows reads to proceed during writes. The LumoSQL LMDBv1 build passes the focused external MVCC acceptance test; see [the LumoSQL backend guide](lumosql-backend.md) for build flags and platform limitations.
 
 In this design:
 - Readers hold an immutable root pointer and read memory-mapped pages directly with **zero locks** on database pages or tables.
@@ -158,20 +158,18 @@ Design the package so the SQL materialization mode is configurable:
 type QueryStoreMode int
 
 const (
-    QueryStoreMMap QueryStoreMode = iota // Primary: LumoSQL LMDB MVCC memory-mapped engine
-    QueryStoreMemory                     // Fallback: Pure-Go in-memory SQLite (modernc.org/sqlite)
+    QueryStoreMemory QueryStoreMode = iota // Pure-Go in-memory SQLite (modernc.org/sqlite)
+    QueryStoreMMap                         // Disposable file-backed SQLite with mmap; LMDB is pending
 )
 ```
 
-#### `QueryStoreMMap` (Primary Target)
+#### `QueryStoreMMap` (Implemented Disposable Mode)
 
-Primary production target for multi-user and high-concurrency workloads.
+Uses a disposable database file in a temporary directory and rebuilds from Pebble at startup. In the default Go build it is mmap-enabled SQLite and retains SQLite locking. In a `lumosql` CGO build the file is an LMDB-backed LumoSQL database with concurrent MVCC read snapshots.
 
-- Backed by LumoSQL's LMDB/MDBX engine on a local disposable file path with a large virtual memory map (`mmap`).
-- True MVCC: completely non-blocking concurrent readers during write transactions.
-- Zero physical disk sync wait: `PRAGMA synchronous = OFF` (`MDB_NOSYNC | MDB_NOMETASYNC`) keeps commits in memory cache at RAM speeds.
-- Easy deployment on Windows and Linux: uses a standard directory without requiring RAM disk setup or third-party drivers.
-- Non-authoritative: verified against Pebble's `state_generation` on startup; purged and rebuilt if stale or missing.
+- Configure `QueryStore.TempDir` to choose the parent directory and `QueryStore.MMapBytes` to choose the SQLite mmap limit (default 256 MiB).
+- The temporary materialization is non-authoritative and is rebuilt from Pebble on startup.
+- Configure the LumoSQL dependency and build tags as described in [the backend guide](lumosql-backend.md); external LMDBv1 MVCC acceptance is implemented and tested.
 
 #### `QueryStoreMemory` (Pure-Go CGO-Free Fallback)
 
@@ -369,4 +367,3 @@ At-rest protection        -> encrypted Pebble VFS/key manager
 That separation is the core reason the package can remain embedded, fast, recoverable, and replaceable component-by-component.
 
 ---
-

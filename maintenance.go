@@ -198,13 +198,24 @@ func (db *DB) RewriteEncryptedFiles(ctx context.Context) error {
 		db.mu.Unlock()
 		return fmt.Errorf("%w: rewrite requires an encrypted store", ErrEncryptionKey)
 	}
-	db.dbState = StateMaintenance
-	db.encPhase = crypto.PhaseRewriting
 	db.mu.Unlock()
 
 	// Serialize with scheduled backups, then drain local transactions and
-	// remote applies. Lock order (outer to inner): backupMu, writeMu,
-	// applyMu, store gate; every other path nests the same way.
+	// remote applies. Lock order (outer to inner): scheduler ticket,
+	// backupMu, writeMu, applyMu, store gate; every other path nests the
+	// same way. Rewrites are maintenance-class writers admitted before
+	// the state flips, so a refused admission leaves no residue.
+	ticket, err := db.sched.Admit(ctx, WriterMaintenance)
+	if err != nil {
+		return fmt.Errorf("replicateddb: writer admission: %w", err)
+	}
+	defer ticket.Release()
+
+	db.mu.Lock()
+	db.dbState = StateMaintenance
+	db.encPhase = crypto.PhaseRewriting
+	mgr = db.encMgr
+	db.mu.Unlock()
 	db.backupMu.Lock()
 	defer db.backupMu.Unlock()
 	db.writeMu.Lock()

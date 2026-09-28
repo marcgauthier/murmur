@@ -152,6 +152,27 @@ func (v Value) Size() int {
 	}
 }
 
+// EncodedSize returns the exact binary encoding size of the value, including its type tag.
+func (v Value) EncodedSize() int {
+	switch v.Type {
+	case TypeNull:
+		return 1
+	case TypeInteger:
+		var buf [binary.MaxVarintLen64]byte
+		return 1 + binary.PutVarint(buf[:], v.I)
+	case TypeReal:
+		return 1 + 8
+	case TypeText:
+		var buf [binary.MaxVarintLen64]byte
+		return 1 + binary.PutUvarint(buf[:], uint64(len(v.S))) + len(v.S)
+	case TypeBlob:
+		var buf [binary.MaxVarintLen64]byte
+		return 1 + binary.PutUvarint(buf[:], uint64(len(v.B))) + len(v.B)
+	default:
+		return 1
+	}
+}
+
 // AppendValue appends the binary encoding of v to b.
 func AppendValue(b []byte, v Value) []byte {
 	b = append(b, byte(v.Type))

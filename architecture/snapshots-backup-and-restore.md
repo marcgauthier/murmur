@@ -8,6 +8,7 @@ Log retention, safe snapshot merging/publication, backups, restore identities, a
 
 - [36. Replication Log Garbage Collection](#36-replication-log-garbage-collection)
 - [37. Snapshot / Full Seed](#37-snapshot--full-seed)
+- [Current implementation and remaining gap](#current-implementation-and-remaining-gap)
 - [38. Pebble Online Zero-Downtime Backup and Restore](#38-pebble-online-zero-downtime-backup-and-restore)
 
 ---
@@ -78,16 +79,64 @@ excluded_from_discovery
 
 `RemovePeer` persists local retirement/exclusion and closes its replication session; subsequent discovery cannot recreate that obligation. `AddPeer` clears the exclusion and starts a new admission obligation on successful authentication. A graceful remote leave or SWIM failure notification is temporary unavailability, not administrative retirement. Local retirement does not revoke that node's access to other cluster members.
 
+Implementation status: admission records (`first_admitted_at`,
+`last_durable_ack_progress_at`, `retention_deadline`, active/retired) persist
+in Pebble (`state/members.go`) and are created on first successful
+authenticated handshake. `AdvanceMemberAck` renews the deadline only when an
+acknowledgement advances durable per-origin progress; repeated or stale acks
+renew nothing. `RemovePeer` persists retirement plus exclusion and refuses
+rejoining handshakes; `AddPeer` clears both for a fresh admission. Log GC
+gates on the persisted live-obligation set only, never on session `lastSeen`,
+and grants pre-upgrade durable ack progress one explicit window instead of
+dropping it. Retirement/exclusion surface per peer in `Status` and the
+`metrics` collectors.
+
 ---
 
 ## 37. Snapshot / Full Seed
 
 A snapshot is a logical copy of current replicated state, not a copy of LumoSQL.
 
+### Current implementation and remaining gap
+
+Export now captures cells, tombstones, schema identity, generation, HLC, and
+watermarks from one Pebble read snapshot. The versioned manifest declares indexed
+chunks, encoded size, and a canonical content digest. Receivers persist encrypted
+chunks in a reserved Pebble keyspace, independently of applied state. After every
+chunk is present and the complete digest validates, one synced Pebble batch merges
+the snapshot with current local winners and advances covered watermarks. The SQL
+materializer is gated and rebuilt after publication. Staging survives restart and
+same-transfer retries; starting a new transfer removes abandoned staging.
+
+`Replication.MaxSnapshotBytes` defaults to 512 MiB. That limit bounds staging;
+snapshots above it are rejected. Snapshots at or below the atomic merge
+threshold (`state.DefaultSnapshotAtomicMergeBytes`, 8 MiB) merge and publish
+in one synced batch. Larger validated snapshots merge chunk by chunk. Each
+chunk writes only CRDT-winning cells to an external SSTable through the same
+encrypted Pebble VFS, ingests it, then records durable resume progress
+(`nextChunk` plus the last merged key, so the canonical-order check continues
+across chunks and restarts). The writer lock is released between chunks so
+local commits and remote apply proceed. The receiver then publishes watermarks,
+HLC, and the storage generation in one final atomic batch that also clears
+staging. A crash after ingestion but before progress replays that chunk safely
+through the same LWW comparison; orphan external tables are removed on reopen.
+A crash
+exposes merged state with unadvanced watermarks (resumable, never partially
+published) or the complete merged state; a preempting newer transfer can
+never publish the older partial merge. SQL stays gated on the pre-snapshot
+materialization until publication completes, then rebuilds once from the
+committed state. The source holds its consistent Pebble read cut for at most
+`Replication.SnapshotTransferTimeout` (10 minutes by default) and acquires a bounded
+source log-retention lease covering the snapshot's watermarks so concurrent source
+writes and log GC preserve tail repair history until transfer completion or expiry.
+Explicit progress diagnostics and fault injection at every publication boundary
+remain outstanding.
+
 Snapshot manifest:
 
 ```go
 type SnapshotManifest struct {
+    FormatVersion uint16
     SnapshotID    [16]byte
     DBID          [16]byte
     SchemaEpoch   uint64
@@ -126,31 +175,34 @@ Allow source writes after the cut. Tail mutations remain normal replication traf
 
 ### Receive, merge, and publish
 
-For both empty and stale nodes:
+For both empty and stale nodes within the configured size bound:
 
 ```text
 1. Validate DBID, schema compatibility, format, manifest, and receiver budgets.
-2. Receive into encrypted staging storage; persist bounded transfer progress.
+2. Receive into the encrypted Pebble staging keyspace; persist bounded chunks.
 3. Verify all chunks and the complete content digest.
-4. Pause local writes/remote apply and drain the state writer/GC coordinator.
-5. Merge authoritative local cells/tombstones into the staged candidate by version.
-6. Preserve local identity/counters, receipts, logs, GC obligations, and configuration.
-7. Persist/validate the complete candidate and a recoverable publication intent.
-8. Atomically publish the active storage generation and rebuild LumoSQL.
-9. Resume writes/apply and repair mutations after the merged snapshot cut.
+4. Pause local writes/remote apply for the final merge.
+5. Merge incoming cells/tombstones against current local winners by version.
+6. Preserve local identity, counters, receipts, logs, GC obligations, and configuration.
+7. Commit cells, HLC, generation, and covered watermarks in one synced Pebble batch.
+8. Gate SQL reads/writes and rebuild the materializer from the committed state.
+9. Resume writes/apply and repair mutations after the snapshot cut.
 ```
 
 An empty node has no local state to merge. A stale existing node must never replace acknowledged local data blindly: retain local winning cells and tombstones, and allow only a legitimately newer conflicting version to supersede them. Keep local origin sequence and HLC monotonic, raising the sequence to cover any validated local-origin prefix in the merged cut; observe the merged state before permitting new local writes. Preserve local origin logs/receipts under retention policy so peer dissemination remains possible. If history is absent, forward the preserved winning state through a subsequent logical snapshot rather than inventing an old mutation payload.
 
 For an origin represented in both consistent cuts, the merged watermark may use the maximum of their contiguous covered prefixes only after all corresponding state/tombstones are merged. Never promote a staged/observed head to a watermark. Keep out-of-order pending transactions separately until gaps or snapshot-covered prefixes resolve them. Snapshot watermarks provide state coverage, not permission to fabricate missing historical log entries; track retained-log availability independently.
 
-Receive/download while the previous generation remains active. The final merge/publication pauses durable writes and remote apply; do not promise zero-downtime snapshot installation. Preserve the old generation until the new generation, registry references, and publication marker are synced. Use a package-owned durable generation pointer/intent with directory sync, not an in-place clear/reload or a non-atomic series of per-chunk authoritative writes. Recovery selects the previously committed generation before publication, or completes recovery/rebuild from the newly committed generation afterward. Never expose partial state, mixed generations, or candidate watermarks before publication.
-
-Stage encrypted files with retained key references; only retire the previous generation after publication recovery and readers have drained. SQL remains gated during final publication/rebuild under the existing lifecycle rules. Cancellation, bad hashes, incompatible schema, or staging budget exhaustion leave the active state untouched. Use [Section 32](synchronization-and-overload.md#32-mutation-batching)'s repair admission limits and report snapshot progress/deferrals explicitly.
+The final publication uses a single bounded Pebble batch rather than swapping database directories. Pebble's synced batch is the durable publication boundary: a crash exposes either the complete old state or the complete merged state, never a partial set of chunks or watermarks. Startup rebuilds SQL from that authoritative state. Cancellation, bad hashes, incompatible schema, or staging budget exhaustion leave applied cells and watermarks untouched. Larger snapshots merge chunk by chunk with durable resume progress (see above) and publish through the same single-batch boundary, so the configured bound no longer depends on fitting the whole merge in one batch. Use [Section 32](synchronization-and-overload.md#32-mutation-batching)'s repair admission limits and add snapshot progress/deferral diagnostics.
 
 ---
 
 ## 38. Pebble Online Zero-Downtime Backup and Restore
+
+Whole-database checkpoint backups do not implement one-way change replication or
+independent file objects. Those additions have separate protocols and retention
+requirements: [High/Low replication](high-low-replication.md) and
+[encrypted file replication](file-replication.md).
 
 For an online, zero-downtime backup of a 10–20+ GB dataset, executing a raw Key-Value snapshot loop is prohibited. At that scale, string formatting, decoding, and disk writing via standard iterators cause severe CPU starvation, GC thrashing, and multi-gigabyte heap inflation, degrading live query performance for tens of minutes. NOMADSQL leverages **Pebble's native Checkpoint primitive** (`db.Checkpoint(stagingDir)`), creating a point-in-time snapshot of the database on disk completely online.
 
@@ -220,10 +272,13 @@ For an online, zero-downtime backup of a 10–20+ GB dataset, executing a raw Ke
 
 Add restore-mode/identity metadata to backup metadata and persisted restore intent. Expose an explicit restore mode (`RestoreClone` by default, or `RestoreReseed`) plus the required fresh NodeID and, for reseed, new DBID through restore configuration. Validate the new identity, baseline, registry, and restore publication before networking; a crash cannot clear the fresh-identity requirement prematurely. An incompatible schema fails closed before catch-up. NodeID trust/certificates remain application-owned; restoring cannot mint authorization automatically.
 
+Implemented (clone): `Restore` requires `FreshNodeID` (UUID, must differ from the backup source) and writes `restore-intent.json` into the target directory. `Open` refuses any NodeID except the intent's fresh identity, then `state` adoption atomically swaps the stored identity, resets the local origin sequence, records a durable restore marker (backup, retired source, fresh identity), and clears snapshot receive staging, peer-ack records, inherited member admission/retention records, and peer exclusion/retirement policies — while preserving cells, tombstones, origin IDs, TxIDs, versions, logs, receive watermarks, receipts, schema, HLC floor, generation, and DBID. The fresh identity must also be absent from historical origins. The intent file is removed after a successful rebuild, before networking; a crash replays adoption idempotently. Replication additionally fails fast when the TLS certificate's NodeID does not match configuration.
+
+Implemented (reseed): `Restore` with `Mode: RestoreReseed` requires `NewDBID` (must differ from the backup's DBID) and records it in the intent; `Open` requires the same new DBID explicitly in config, first runs a crash-safe ciphertext rebind (`crypto.RebindStore`: every file container decrypted and re-sealed with new-DBID-bound headers, file keys, and record AADs via verified-temp plus atomic rename, then the key registry KEK re-derived and payload re-sealed under the new DBID with key material preserved), and state adoption moves the stored cluster identity in the same atomic batch (marker mode `reseed`). The rebind is idempotent with the registry persisted last, so a crash anywhere retries to convergence on the next Open; a missing registry is a no-op and a registry opening under neither identity fails closed. The replication handshake and snapshot manifest checks reject any peer whose DBID differs, proven end to end by `TestReseedFlowRejectsOldCluster`.
+
 ### 38.5 Automated Background Worker & Retention
 `DB` includes an automated non-blocking backup worker (`backup.Worker`):
 - Executes on a configurable interval (e.g. daily) or ticker.
 - Automatically prunes expired backups on the destination based on `MaxBackups` (retaining the N latest archives) and `RetentionDays` (deleting backups older than a cutoff date).
 
 ---
-

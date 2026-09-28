@@ -8,6 +8,7 @@
 package benchmark
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
@@ -16,6 +17,7 @@ import (
 	"testing"
 
 	replicateddb "github.com/nomadsql/replicateddb"
+	"github.com/nomadsql/replicateddb/crypto"
 	"github.com/nomadsql/replicateddb/schema"
 )
 
@@ -87,16 +89,44 @@ func sizeName(n int) string {
 	return fmt.Sprintf("%dk", n/1_000)
 }
 
-// openBenchDB opens a fresh single-node database.
-func openBenchDB(b *testing.B, path string) *replicateddb.DB {
-	b.Helper()
-	db, err := replicateddb.Open(context.Background(), replicateddb.Config{
+// benchKey is the fixed benchmark storage key (explicit encryption is
+// mandatory and part of the measured production configuration).
+var benchKey = bytes.Repeat([]byte{0x62}, 32)
+
+// benchProvider returns the storage-key provider matching benchConfig:
+// key "bench" under the default AES-256-GCM write algorithm. Direct
+// registry opens must use it (an empty algorithm derives a different
+// KEK and fails authentication).
+func benchProvider() *crypto.MapProvider {
+	return &crypto.MapProvider{
+		Keys:      map[string][]byte{"bench": benchKey},
+		CurrentID: "bench",
+		Algorithm: crypto.DefaultAlgorithm,
+	}
+}
+
+// benchConfig returns the standard single-node benchmark configuration:
+// benchmark schema with local indexes/FTS plus explicit encryption and
+// database identity.
+func benchConfig(path string, node replicateddb.NodeID, dbid replicateddb.DBID) replicateddb.Config {
+	return replicateddb.Config{
 		Path:   path,
-		NodeID: replicateddb.NewNodeID(),
+		NodeID: node,
+		DBID:   dbid,
 		Schema: replicateddb.SchemaConfig{
 			Version: 1, Tables: benchSchema(), LocalDDL: benchLocalDDL(),
 		},
-	})
+		Pebble: replicateddb.DefaultPebbleConfig(),
+		Encryption: replicateddb.EncryptionConfig{
+			Key: bytes.Clone(benchKey), KeyID: "bench",
+		},
+	}
+}
+
+// openBenchDB opens a fresh single-node database.
+func openBenchDB(b *testing.B, path string) *replicateddb.DB {
+	b.Helper()
+	db, err := replicateddb.Open(context.Background(), benchConfig(path, replicateddb.NewNodeID(), replicateddb.NewDBID()))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -104,14 +134,15 @@ func openBenchDB(b *testing.B, path string) *replicateddb.DB {
 	return db
 }
 
-// populate inserts n contacts (+2 orders each) in 1000-row transactions.
+// populate inserts n contacts (+2 orders each) in 5000-row transactions
+// (sized under MaxBatchMutations/MaxTransactionBytes for fast setup).
 // It returns the contact row IDs for point lookups.
 func populate(b *testing.B, db *replicateddb.DB, n int) []replicateddb.RowID {
 	b.Helper()
 	ctx := context.Background()
 	rng := rand.New(rand.NewSource(42))
 	ids := make([]replicateddb.RowID, 0, n)
-	const perTx = 1000
+	const perTx = 5000
 	for base := 0; base < n; base += perTx {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {

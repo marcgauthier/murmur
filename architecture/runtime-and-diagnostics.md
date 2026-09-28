@@ -14,6 +14,7 @@ Lifecycle, workers, metrics, logging/errors, resource budgeting, and concurrency
 - [62. Memory Budgeting](#62-memory-budgeting)
 - [63. Concurrency Model](#63-concurrency-model)
 - [64. LumoSQL Connection & MVCC Concurrency Model](#64-lumosql-connection--mvcc-concurrency-model)
+- [Optional service and administration adapters](#optional-service-and-administration-adapters)
 
 ---
 
@@ -56,6 +57,15 @@ Failed
 unless a specific state safely permits them.
 
 Reads may be allowed during key rotation because LumoSQL is in memory, but this should be explicit.
+
+Storage failure (disk full, unrecoverable I/O error, MANIFEST or background
+flush/compaction failure) fails the node closed: the store records the first
+Pebble fatal signal and every subsequent store operation returns
+`state.ErrStorageFailed` (wrapping the underlying cause, so
+`errors.Is(err, syscall.ENOSPC)` identifies a full disk). The DB layer
+rejects reads and writes with that error and transitions to `StateFailed`;
+only a process restart — after the operator resolves the underlying problem —
+recovers, replaying the last durable WAL prefix with failed writes absent.
 
 ---
 
@@ -163,6 +173,17 @@ Expose queued bytes/entries/oldest age, bandwidth-token wait time, pending gap r
 
 Optionally provide Prometheus collectors as a separate subpackage instead of forcing an HTTP endpoint into the core.
 
+Implementation status: `DB.Status` carries the node snapshot above plus
+per-peer records (`PeerDiagnostics`: session state, schema agreement,
+watermarks, per-origin lag, traffic totals, queue depths, SWIM membership state,
+selection state, and retention deadlines), `DB.Metrics` carries node-local writer/apply/GC/schema
+counters, `Status.Pool` and `Status.Membership` expose shared connection pool and SWIM
+diagnostics, and the `metrics` subpackage provides Prometheus collectors over a caller-owned
+registry with no HTTP listener. Counters cover implemented subsystems (SWIM membership and datagram transport,
+shared connection pool and admission/eviction, QUIC sessions, origin-log repair, snapshots, schema sync).
+Metrics for Plumtree and overload integration land with those subsystems; remaining observability work is tracked
+in [TASKS_PENDING.md](../TASKS_PENDING.md#pending-tasks).
+
 ---
 
 ## 53. Logging
@@ -215,6 +236,11 @@ ErrValueTooLarge
 ErrUnsupportedSchema
 ErrAmbiguousCommit
 ```
+
+Storage failures use `state.ErrStorageFailed` (with `state.IsStorageFailure`
+for detection). The first data-path I/O error is preserved as the wrapped
+cause, so operators can distinguish a full disk via
+`errors.Is(err, syscall.ENOSPC)`.
 
 Wrap underlying errors with context while preserving `errors.Is` / `errors.As`.
 
@@ -289,7 +315,9 @@ Increase concurrency only after profiling.
 
 Regular SQLite in `:memory:` mode is connection-scoped and uses a rollback journal (`PRAGMA journal_mode = MEMORY`). Under shared-cache mode (`cache=shared`), regular SQLite introduces coarse table-level locks: active readers block writes (`SQLITE_LOCKED`), and active writes freeze all readers. Furthermore, regular SQLite lacks MVCC, and SQLite WAL mode is unsupported in pure `:memory:` and prone to checkpoint starvation when readers are active.
 
-LumoSQL with its **LMDB backend (`QueryStoreMMap`)** solves this fundamentally:
+LumoSQL with its **LMDB backend** provides the planned MVCC behavior. The default `QueryStoreMMap` uses a disposable file-backed `modernc.org/sqlite` database with SQLite mmap enabled; readers and writers still follow SQLite locking. A tagged LumoSQL implementation now opens pooled read connections so readers retain LMDB snapshots while writes proceed. Actual-LMDB builds and acceptance runs remain pending.
+
+The LMDB target is expected to provide:
 1. **Copy-on-Write MVCC:** Every write transaction creates a new root in an immutable B+ tree. Readers hold an immutable root pointer and read virtual memory pages directly with **zero locks** on database tables or pages.
 2. **Readers Never Block Writers:** Long-running read queries do not block write transactions.
 3. **Writers Never Block Readers:** Writing new transactions does not block existing or new read queries.
@@ -301,3 +329,53 @@ For lightweight environments without a C compiler, `QueryStoreMemory` provides a
 
 ---
 
+---
+
+## Optional service and administration adapters
+
+GALVANIZE includes HTTP APIs, a remote client SDK, administration/unlock endpoints,
+and Prometheus instrumentation. NOMADSQL remains an embedded library; these are
+optional deployment extensions rather than a mandatory daemon or sidecar.
+
+Expose new High/Low status, provenance/replay, file, subscription, and writer
+scheduling diagnostics through package-owned APIs first. Extend planned metrics
+with backlog age/bytes, held imports, stream gaps, file availability/fetch failures,
+and per-class writer service time/wait. Optional Prometheus collectors are
+provided without requiring a globally registered exporter or HTTP listener
+(implemented: `metrics` package over `DB.Status`).
+
+An optional service adapter may expose authenticated SQL, streaming subscriptions,
+file operations, and narrowly authorized administrative controls. A corresponding
+SDK consumes those interfaces; it does not replace the embedded Go API. Version
+and authenticate service interfaces separately from the inter-node QUIC protocol.
+
+Implemented: the `service` package serves `GET /v1/status` (redacted snapshot),
+`POST /v1/query` (read-only statements only; writes are rejected so change
+capture cannot be bypassed), `POST /v1/exec` (implicit-transaction path), and
+`GET /v1/subscribe` (SSE stream of initial/update/reset subscription events
+with resume cursors). Every endpoint requires TLS plus a 32-byte-or-longer
+Bearer [REDACTED] compared in constant time, mirroring the `admin` package; the
+core library starts no listener and the handler never closes the caller's DB.
+Results are bounded (10,000 rows and 1 MiB request bodies by default) with
+explicit too-large failures, and values use a typed JSON codec that preserves
+int64 precision and base64 blobs. `service.Client` is the remote SDK (status,
+query, exec, streaming subscribe over TLS-only https URLs). File operations
+are absent until encrypted file replication exists; unlock stays in `admin`.
+
+Remote unlock is a separate lifecycle extension. A locked service may expose only
+its authenticated control surface; it must not initialize/open encrypted state or
+start replication/bridge workers before key verification. Do not reuse mesh access
+as administrative permission or expose keys in status/logging. Existing direct or
+provider-based key loading at Open remains the default.
+
+The optional `admin` package provides a TLS-only handler with a separate
+32-byte-or-longer bearer token. Its `POST /v1/unlock` accepts a key ID, cipher
+name, and 32-byte key, then invokes the application's open callback; failures
+return a generic response and do not publish an unlocked runtime. `GET
+/v1/status` reports only locked/unlocked state, and `POST /v1/lock` closes the
+active DB. Applications mount the handler on their own TLS listener; the core
+library starts no HTTP listener and existing `db.Open` behavior is unchanged.
+
+Acceptance for an adapter includes authorization separation, failed unlock,
+worker startup only after successful unlock, streaming cancellation, shutdown,
+redacted diagnostics, and an embedded application running with no service listener.

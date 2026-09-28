@@ -149,6 +149,17 @@ func BuildRegistry(epoch uint64, tables []TableSchema) (*Registry, error) {
 			if seenCols[c.ID] {
 				return nil, fmt.Errorf("schema: table %q duplicate column id %d: %w", t.Name, c.ID, ErrUnsupportedSchema)
 			}
+			// Bridge shadow columns mirror app columns across the high bit
+			// (c^0x80000000, same row). Ambiguous pairs and mappings onto
+			// reserved IDs would make stored cells undecodable, so new
+			// schemas reject them; legacy rows fail shadow writes closed
+			// instead of corrupting.
+			if c.ID == 0x80000000 || c.ID == 0x7FFFFFFF {
+				return nil, fmt.Errorf("schema: table %q column %q maps to a reserved bridge shadow id: %w", t.Name, c.Name, ErrUnsupportedSchema)
+			}
+			if seenCols[c.ID^0x80000000] {
+				return nil, fmt.Errorf("schema: table %q column %q collides with a bridge shadow id: %w", t.Name, c.Name, ErrUnsupportedSchema)
+			}
 			seenCols[c.ID] = true
 			if c.Type == 0 {
 				return nil, fmt.Errorf("schema: table %q column %q has no type: %w", t.Name, c.Name, ErrUnsupportedSchema)

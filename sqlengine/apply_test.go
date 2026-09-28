@@ -2,6 +2,8 @@ package sqlengine
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"testing"
 
 	"github.com/nomadsql/replicateddb/codec"
@@ -212,5 +214,49 @@ func TestApplyWinnersPaths(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("count = %d after tombstone", n)
+	}
+}
+
+func TestRebuildUsesBoundedMultiRowInserts(t *testing.T) {
+	ctx := context.Background()
+	e, err := Open(testRegistry(t), nil, nil, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	tableID, nameID := colID(t, e, "contacts", "name")
+	_, phoneID := colID(t, e, "contacts", "phone")
+	_, idID := colID(t, e, "contacts", "id")
+	version := crdt.Version{HLC: 1, NodeID: ids.NewNodeID()}
+	const rows = 1200 // crosses several 900-bind batches for this three-column table
+	reader := &fakeReader{tables: map[uint32]map[ids.RowID]map[uint32]codec.CellState{tableID: {}}}
+	for i := 0; i < rows; i++ {
+		id := ids.NewRowID()
+		reader.tables[tableID][id] = map[uint32]codec.CellState{
+			idID:    {Version: version, Value: codec.Blob(id[:])},
+			nameID:  {Version: version, Value: codec.Text(fmt.Sprintf("row-%04d", i))},
+			phoneID: {Version: version, Value: codec.Text("555")},
+		}
+	}
+	if err := e.Rebuild(reader); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	var count int
+	if err := e.QueryRowContext(ctx, `SELECT count(*) FROM contacts`, nil, func(row *sql.Row) error {
+		return row.Scan(&count)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != rows {
+		t.Fatalf("rebuilt rows=%d, want %d", count, rows)
+	}
+	var name, phone string
+	if err := e.QueryRowContext(ctx, `SELECT name, phone FROM contacts WHERE name = ?`, []any{"row-1199"}, func(row *sql.Row) error {
+		return row.Scan(&name, &phone)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if name != "row-1199" || phone != "555" {
+		t.Fatalf("last rebuilt row=(%q,%q), want (row-1199,555)", name, phone)
 	}
 }

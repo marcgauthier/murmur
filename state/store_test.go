@@ -206,7 +206,12 @@ func TestRemoteGapAndDuplicate(t *testing.T) {
 func TestSnapshotExportImport(t *testing.T) {
 	ctx := context.Background()
 	a := openTestStore(t, ids.NewNodeID())
-	b := openTestStore(t, ids.NewNodeID())
+	bPath, bNode := t.TempDir(), ids.NewNodeID()
+	b, err := Open(bPath, bNode, a.DBID(), Options{Limits: codec.DefaultLimits()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
 	row1, row2 := ids.NewRowID(), ids.NewRowID()
 	if _, err := a.CommitLocal(ctx, localBatch(a, a.ClockNow(),
 		codec.Mutation{TableID: 1, RowID: row1, ColumnID: 1, Value: codec.Text("a")},
@@ -219,12 +224,33 @@ func TestSnapshotExportImport(t *testing.T) {
 		codec.Mutation{TableID: 1, RowID: row2, ColumnID: codec.ColumnTombstone, Flags: codec.FlagTombstone})); err != nil {
 		t.Fatal(err)
 	}
+	var index uint64
 	if err := a.ExportSnapshot(2, func(m *codec.SnapshotManifest, chunk []codec.SnapshotCell, last bool) error {
 		if m.DBID != a.DBID() {
 			t.Fatalf("manifest db mismatch")
 		}
-		_, err := b.ImportSnapshotChunk(ctx, m, chunk)
-		return err
+		_, complete, err := b.ImportSnapshotChunk(ctx, m, index, chunk, last, 512<<20)
+		if err != nil {
+			return err
+		}
+		if index == 0 && !complete {
+			if wm, _ := b.ReceiveWatermark(a.NodeID()); wm != 0 {
+				t.Fatalf("staging advanced watermark: %d", wm)
+			}
+			if _, ok, _ := b.GetCell(1, row1, 1); ok {
+				t.Fatal("staged cell became visible before completion")
+			}
+			path, node, dbid := b.openPath, b.NodeID(), b.DBID()
+			if err := b.Close(); err != nil {
+				return err
+			}
+			b, err = Open(path, node, dbid, Options{Limits: codec.DefaultLimits()})
+			if err != nil {
+				return err
+			}
+		}
+		index++
+		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -240,17 +266,353 @@ func TestSnapshotExportImport(t *testing.T) {
 		t.Fatalf("watermark = %d, want 2", wm)
 	}
 	// Re-importing the same snapshot is idempotent (no new winners).
+	index = 0
 	if err := a.ExportSnapshot(100, func(m *codec.SnapshotManifest, chunk []codec.SnapshotCell, last bool) error {
-		res, err := b.ImportSnapshotChunk(ctx, m, chunk)
+		res, _, err := b.ImportSnapshotChunk(ctx, m, index, chunk, last, 512<<20)
+		index++
 		if err != nil {
 			return err
 		}
 		if len(res.Winners) != 0 {
 			t.Fatalf("re-import produced %d winners", len(res.Winners))
 		}
+		if res.Applied {
+			t.Fatal("identical re-import changed durable state")
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+	badPath := t.TempDir()
+	bad, err := Open(badPath, ids.NewNodeID(), a.DBID(), Options{Limits: codec.DefaultLimits()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bad.Close() })
+	index = 0
+	err = a.ExportSnapshot(100, func(m *codec.SnapshotManifest, chunk []codec.SnapshotCell, last bool) error {
+		if index == 0 {
+			m.ContentHash[0] ^= 0x80
+		}
+		_, _, applyErr := bad.ImportSnapshotChunk(ctx, m, index, chunk, last, 512<<20)
+		index++
+		return applyErr
+	})
+	if err == nil {
+		t.Fatal("corrupt snapshot digest was accepted")
+	}
+	if wm, _ := bad.ReceiveWatermark(a.NodeID()); wm != 0 {
+		t.Fatalf("corrupt snapshot advanced watermark: %d", wm)
+	}
+	if _, ok, _ := bad.GetCell(1, row1, 1); ok {
+		t.Fatal("corrupt snapshot state became visible")
+	}
+}
+
+func TestSnapshotExportUsesOneReadCut(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, ids.NewNodeID())
+	first, later := ids.NewRowID(), ids.NewRowID()
+	if _, err := s.CommitLocal(ctx, localBatch(s, s.ClockNow(), codec.Mutation{TableID: 1, RowID: first, ColumnID: 1, Value: codec.Text("before")})); err != nil {
+		t.Fatal(err)
+	}
+	var cut uint64
+	seenLater := false
+	err := s.ExportSnapshot(1, func(m *codec.SnapshotManifest, cells []codec.SnapshotCell, _ bool) error {
+		if cut == 0 {
+			for _, w := range m.Watermarks {
+				if w.Origin == s.NodeID() {
+					cut = w.Sequence
+				}
+			}
+			if _, err := s.CommitLocal(ctx, localBatch(s, s.ClockNow(), codec.Mutation{TableID: 1, RowID: later, ColumnID: 1, Value: codec.Text("after")})); err != nil {
+				return err
+			}
+		}
+		for _, c := range cells {
+			if c.RowID == later {
+				seenLater = true
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cut != 1 {
+		t.Fatalf("snapshot cut watermark = %d, want 1", cut)
+	}
+	if seenLater {
+		t.Fatal("snapshot included a cell committed after its read cut")
+	}
+	if wm, _ := s.ReceiveWatermark(s.NodeID()); wm != 2 {
+		t.Fatalf("live watermark = %d, want tail sequence 2", wm)
+	}
+}
+
+func TestSnapshotManifestCellsAndTombstonesShareOneReadCut(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, ids.NewNodeID())
+	oldHash, newHash := [32]byte{1, 2, 3}, [32]byte{4, 5, 6}
+	if err := s.SetSchemaEpoch(7, oldHash); err != nil {
+		t.Fatal(err)
+	}
+	visible, deleted, later, laterDeleted := ids.NewRowID(), ids.NewRowID(), ids.NewRowID(), ids.NewRowID()
+	if _, err := s.CommitLocal(ctx, localBatch(s, s.ClockNow(),
+		codec.Mutation{TableID: 1, RowID: visible, ColumnID: 1, Value: codec.Text("at-cut")},
+		codec.Mutation{TableID: 1, RowID: deleted, ColumnID: codec.ColumnTombstone, Flags: codec.FlagTombstone},
+	)); err != nil {
+		t.Fatal(err)
+	}
+	manifestChecked := false
+	updated := false
+	seenOldCell, seenOldTomb := false, false
+	seenLaterCell, seenLaterTomb := false, false
+	err := s.ExportSnapshot(1, func(m *codec.SnapshotManifest, chunk []codec.SnapshotCell, _ bool) error {
+		if !manifestChecked {
+			manifestChecked = true
+			if m.SchemaEpoch != 7 || m.SchemaHash != oldHash || m.StateGeneration != 1 {
+				return fmt.Errorf("manifest metadata not from original cut: epoch=%d hash=%x generation=%d", m.SchemaEpoch, m.SchemaHash, m.StateGeneration)
+			}
+			wm := uint64(0)
+			for _, w := range m.Watermarks {
+				if w.Origin == s.NodeID() {
+					wm = w.Sequence
+				}
+			}
+			if wm != 1 {
+				return fmt.Errorf("manifest watermark=%d, want original sequence 1", wm)
+			}
+			if err := s.SetSchemaEpoch(8, newHash); err != nil {
+				return err
+			}
+			if _, err := s.CommitLocal(ctx, localBatch(s, s.ClockNow(),
+				codec.Mutation{TableID: 1, RowID: later, ColumnID: 1, Value: codec.Text("after-cut")},
+				codec.Mutation{TableID: 1, RowID: laterDeleted, ColumnID: codec.ColumnTombstone, Flags: codec.FlagTombstone},
+			)); err != nil {
+				return err
+			}
+			updated = true
+		}
+		for _, c := range chunk {
+			switch {
+			case c.RowID == visible && c.ColumnID == 1:
+				seenOldCell = c.Value.S == "at-cut"
+			case c.RowID == deleted && c.ColumnID == codec.ColumnTombstone:
+				seenOldTomb = true
+			case c.RowID == later && c.ColumnID == 1:
+				seenLaterCell = true
+			case c.RowID == laterDeleted && c.ColumnID == codec.ColumnTombstone:
+				seenLaterTomb = true
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated || !seenOldCell || !seenOldTomb || seenLaterCell || seenLaterTomb {
+		t.Fatalf("snapshot cut cells: updated=%v oldCell=%v oldTomb=%v laterCell=%v laterTomb=%v", updated, seenOldCell, seenOldTomb, seenLaterCell, seenLaterTomb)
+	}
+	epoch, hash, err := s.SchemaEpoch()
+	if err != nil || epoch != 8 || hash != newHash {
+		t.Fatalf("live schema after export=(%d,%x), err=%v", epoch, hash, err)
+	}
+	gen, err := s.StateGeneration()
+	if err != nil || gen != 2 {
+		t.Fatalf("live state generation=%d err=%v, want 2", gen, err)
+	}
+}
+
+func TestSnapshotExportContextStopsAndReleasesSourceCut(t *testing.T) {
+	s := openTestStore(t, ids.NewNodeID())
+	for i := 0; i < 2; i++ {
+		row := ids.NewRowID()
+		if _, err := s.CommitLocal(context.Background(), localBatch(s, s.ClockNow(), codec.Mutation{TableID: 1, RowID: row, ColumnID: 1, Value: codec.Text("lease")})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	called := false
+	err := s.ExportSnapshotContext(ctx, 1, func(_ *codec.SnapshotManifest, _ []codec.SnapshotCell, _ bool) error {
+		if !called {
+			called = true
+			cancel()
+		}
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expired snapshot transfer err=%v, want context.Canceled", err)
+	}
+	row := ids.NewRowID()
+	if _, err := s.CommitLocal(context.Background(), localBatch(s, s.ClockNow(), codec.Mutation{TableID: 1, RowID: row, ColumnID: 1, Value: codec.Text("after-lease")})); err != nil {
+		t.Fatalf("write after canceled snapshot lease: %v", err)
+	}
+}
+
+func TestSnapshotTailRetentionLeaseConcurrentWritesAndGC(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, ids.NewNodeID())
+	for i := 0; i < 5; i++ {
+		row := ids.NewRowID()
+		if _, err := s.CommitLocal(ctx, localBatch(s, s.ClockNow(),
+			codec.Mutation{TableID: 1, RowID: row, ColumnID: 1, Value: codec.Int(int64(i))})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Initial watermark is 5.
+	wm, err := s.ReceiveWatermark(s.NodeID())
+	if err != nil || wm != 5 {
+		t.Fatalf("initial watermark = %d, %v", wm, err)
+	}
+
+	blockExport := make(chan struct{})
+	exportStarted := make(chan struct{})
+	exportDone := make(chan error, 1)
+	go func() {
+		err := s.ExportSnapshotContext(ctx, 1, func(manifest *codec.SnapshotManifest, chunk []codec.SnapshotCell, last bool) error {
+			select {
+			case exportStarted <- struct{}{}:
+			default:
+			}
+			<-blockExport
+			return nil
+		})
+		exportDone <- err
+	}()
+
+	<-exportStarted
+
+	// Verify an active retention lease exists holding watermark 5.
+	leases := s.ActiveRetentionLeases()
+	if len(leases) != 1 {
+		t.Fatalf("expected 1 active lease, got %d", len(leases))
+	}
+	if w, ok := leases[0].Watermarks[s.NodeID()]; !ok || w != 5 {
+		t.Fatalf("lease watermark = %d, want 5", w)
+	}
+
+	// Perform concurrent writes while export lease is active (seq 6 to 10).
+	for i := 5; i < 10; i++ {
+		row := ids.NewRowID()
+		if _, err := s.CommitLocal(ctx, localBatch(s, s.ClockNow(),
+			codec.Mutation{TableID: 1, RowID: row, ColumnID: 1, Value: codec.Int(int64(i))})); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Attempt aggressive log GC for ALL sequences up to infinity.
+	// Since the lease holds seq 5, GC should delete at most entries <= 5, and preserve entries 6..10.
+	n, err := s.CollectLog(s.NodeID(), ^uint64(0), 1<<62, 0)
+	if err != nil {
+		t.Fatalf("CollectLog error: %v", err)
+	}
+	if n != 5 {
+		t.Fatalf("CollectLog during active lease deleted %d entries, want 5", n)
+	}
+
+	// Verify entries 6..10 (the tail) are still readable via LogScan!
+	scanned := 0
+	lastSeq, err := s.LogScan(s.NodeID(), 6, 10, 1<<20, func(b *codec.MutationBatch) error {
+		scanned++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("LogScan for tail failed: %v", err)
+	}
+	if scanned != 5 || lastSeq != 10 {
+		t.Fatalf("LogScan scanned %d entries lastSeq=%d, want 5 and 10", scanned, lastSeq)
+	}
+
+	// Unblock and finish snapshot export.
+	close(blockExport)
+	if err := <-exportDone; err != nil {
+		t.Fatalf("ExportSnapshotContext failed: %v", err)
+	}
+
+	// After export completes, lease must be released.
+	if remaining := s.ActiveRetentionLeases(); len(remaining) != 0 {
+		t.Fatalf("expected 0 active leases after export, got %d", len(remaining))
+	}
+
+	// Now GC can collect the remaining tail logs (6..10).
+	n2, err := s.CollectLog(s.NodeID(), ^uint64(0), 1<<62, 0)
+	if err != nil {
+		t.Fatalf("CollectLog error: %v", err)
+	}
+	if n2 != 5 {
+		t.Fatalf("CollectLog after lease release deleted %d entries, want 5", n2)
+	}
+}
+
+func TestSnapshotTailRetentionLeaseCancellationAndRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s := openTestStore(t, ids.NewNodeID())
+	for i := 0; i < 3; i++ {
+		row := ids.NewRowID()
+		if _, err := s.CommitLocal(ctx, localBatch(s, s.ClockNow(),
+			codec.Mutation{TableID: 1, RowID: row, ColumnID: 1, Value: codec.Int(int64(i))})); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err := s.ExportSnapshotContext(ctx, 1, func(_ *codec.SnapshotManifest, _ []codec.SnapshotCell, _ bool) error {
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	// Lease must be cleaned up on cancellation.
+	if leases := s.ActiveRetentionLeases(); len(leases) != 0 {
+		t.Fatalf("expected 0 leases after cancellation, got %d", len(leases))
+	}
+
+	// Safe retry with fresh context succeeds.
+	retryCtx := context.Background()
+	chunks := 0
+	err = s.ExportSnapshotContext(retryCtx, 1, func(_ *codec.SnapshotManifest, _ []codec.SnapshotCell, _ bool) error {
+		chunks++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retry snapshot export failed: %v", err)
+	}
+	if chunks == 0 {
+		t.Fatalf("retry exported 0 chunks")
+	}
+	if leases := s.ActiveRetentionLeases(); len(leases) != 0 {
+		t.Fatalf("expected 0 leases after successful retry, got %d", len(leases))
+	}
+}
+
+func TestSnapshotTailRetentionLeaseExpiry(t *testing.T) {
+	s := openTestStore(t, ids.NewNodeID())
+	for i := 0; i < 4; i++ {
+		row := ids.NewRowID()
+		if _, err := s.CommitLocal(context.Background(), localBatch(s, s.ClockNow(),
+			codec.Mutation{TableID: 1, RowID: row, ColumnID: 1, Value: codec.Int(int64(i))})); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Acquire a lease that is already expired.
+	release, err := s.AcquireRetentionLease("expired-test", time.Now().Add(-1*time.Minute), map[ids.NodeID]uint64{
+		s.NodeID(): 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	// GC should ignore the expired lease and collect all 4 entries.
+	n, err := s.CollectLog(s.NodeID(), ^uint64(0), 1<<62, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 4 {
+		t.Fatalf("CollectLog with expired lease deleted %d entries, want 4", n)
 	}
 }
 
@@ -514,4 +876,62 @@ func valueString(v codec.Value) string {
 		return fmt.Sprintf("b%x", v.B)
 	}
 	return "?"
+}
+
+func TestAsyncDurabilityMode(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	node := ids.NewNodeID()
+	s, err := Open(dir, node, ids.DBID{}, Options{
+		Limits:          codec.DefaultLimits(),
+		AsyncDurability: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.AsyncDurability() {
+		t.Fatal("expected AsyncDurability to be true")
+	}
+	if s.DurabilityWriteOptions() != pebble.NoSync {
+		t.Fatalf("expected writeOpts to be pebble.NoSync, got %v", s.DurabilityWriteOptions())
+	}
+
+	row := ids.NewRowID()
+	res, err := s.CommitLocal(ctx, localBatch(s, s.ClockNow(),
+		codec.Mutation{TableID: 10, RowID: row, ColumnID: 1, Value: codec.Text("async_val")}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Applied {
+		t.Fatal("expected batch to be applied")
+	}
+
+	cell, ok, err := s.GetCell(10, row, 1)
+	if err != nil || !ok || cell.Value.S != "async_val" {
+		t.Fatalf("unexpected cell: ok=%v val=%v err=%v", ok, cell, err)
+	}
+
+	// Test explicit sync.
+	if err := s.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen and ensure data persisted.
+	s2, err := Open(dir, node, s.DBID(), Options{
+		Limits:          codec.DefaultLimits(),
+		AsyncDurability: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	cell2, ok, err := s2.GetCell(10, row, 1)
+	if err != nil || !ok || cell2.Value.S != "async_val" {
+		t.Fatalf("reopened cell mismatch: ok=%v val=%v err=%v", ok, cell2, err)
+	}
 }

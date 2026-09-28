@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-linux:
+    name: Test Linux amd64 (Go ${{ matrix.go-version }}, CGO=${{ matrix.cgo }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ['1.26.x']
+        cgo: ['0', '1']
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Go vet
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+        run: go vet ./...
+
+      - name: Run tests (pure Go / default)
+        if: matrix.cgo == '0'
+        env:
+          CGO_ENABLED: 0
+        run: go test -v ./...
+
+      - name: Run tests with race detector (CGO enabled)
+        if: matrix.cgo == '1'
+        env:
+          CGO_ENABLED: 1
+        run: go test -race -v ./...
+
+      - name: Run LumoSQL tag build validation
+        if: matrix.cgo == '1'
+        env:
+          CGO_ENABLED: 1
+        run: go test -tags "lumosql sqlite_preupdate_hook" -run '^TestLumoSQLPreUpdatePreservesTextAndBlobTypes|TestPreUpdateCaptureInsertUpdateDelete$' ./sqlengine
+
+  test-windows:
+    name: Test Windows amd64 (Go ${{ matrix.go-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ['1.26.x']
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Run tests (Windows default pure Go)
+        env:
+          CGO_ENABLED: 0
+        run: go test -v ./...
+
+  cross-compile:
+    name: Cross-Compilation Matrix (arm64/windows/linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+
+      - name: Build Linux amd64 (Default)
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: go build ./...
+
+      - name: Build Linux arm64
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: 0
+        run: go build ./...
+
+      - name: Build Windows amd64
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: go build ./...

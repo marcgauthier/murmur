@@ -81,11 +81,20 @@ func TestBatchRoundTrip(t *testing.T) {
 func TestBatchLimits(t *testing.T) {
 	b := &MutationBatch{Mutations: []Mutation{{Value: Text("0123456789")}}}
 	enc := EncodeBatch(nil, b)
+	if sz := EncodedBatchSize(b); sz != len(enc) {
+		t.Fatalf("EncodedBatchSize = %d, want %d", sz, len(enc))
+	}
 	if _, _, err := DecodeBatch(enc, Limits{MaxValueBytes: 4, MaxMutations: 100}); err == nil {
 		t.Fatal("expected value limit error")
 	}
 	if _, _, err := DecodeBatch(enc, Limits{MaxValueBytes: 1 << 20, MaxMutations: 0}); err == nil {
 		t.Fatal("expected mutation count error")
+	}
+	if _, _, err := DecodeBatch(enc, Limits{MaxValueBytes: 1 << 20, MaxMutations: 100, MaxTransactionBytes: int64(len(enc) - 1)}); err == nil {
+		t.Fatal("expected MaxTransactionBytes rejection")
+	}
+	if _, _, err := DecodeBatch(enc, Limits{MaxValueBytes: 1 << 20, MaxMutations: 100, MaxTransactionBytes: int64(len(enc))}); err != nil {
+		t.Fatalf("expected exact MaxTransactionBytes to pass, got %v", err)
 	}
 	if _, _, err := DecodeBatch(enc[:10], DefaultLimits()); err == nil {
 		t.Fatal("expected truncation error")
@@ -109,10 +118,14 @@ func TestCellStateRoundTrip(t *testing.T) {
 
 func TestManifestRoundTrip(t *testing.T) {
 	m := &SnapshotManifest{
-		SnapshotID:  ids.NewTxID(),
-		DBID:        ids.NewDBID(),
-		SchemaEpoch: 3,
-		CreatedHLC:  999,
+		FormatVersion:   1,
+		SnapshotID:      ids.NewTxID(),
+		DBID:            ids.NewDBID(),
+		SchemaEpoch:     3,
+		CreatedHLC:      999,
+		StateGeneration: 42,
+		ChunkCount:      7,
+		EncodedBytes:    4096,
 		Watermarks: []OriginWatermark{
 			{Origin: ids.NewNodeID(), Sequence: 10},
 			{Origin: ids.NewNodeID(), Sequence: 20},
@@ -124,12 +137,16 @@ func TestManifestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rest) != 0 || got.SchemaEpoch != 3 || got.CreatedHLC != 999 ||
+	if len(rest) != 0 || got.FormatVersion != 1 || got.SchemaEpoch != 3 || got.CreatedHLC != 999 ||
+		got.StateGeneration != 42 || got.ChunkCount != 7 || got.EncodedBytes != 4096 ||
 		len(got.Watermarks) != 2 || got.SnapshotID != m.SnapshotID {
 		t.Fatalf("mismatch: %+v rest=%d", got, len(rest))
 	}
 	if !bytes.Equal(got.SchemaHash[:], m.SchemaHash[:]) {
 		t.Fatal("hash mismatch")
+	}
+	if !bytes.Equal(got.ContentHash[:], m.ContentHash[:]) {
+		t.Fatal("content hash mismatch")
 	}
 }
 

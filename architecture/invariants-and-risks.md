@@ -61,7 +61,8 @@ Mitigation:
 Mitigation:
 
 - optimized current-state scan
-- bulk inserts
+- bounded multi-row inserts with at most 900 bind parameters per statement and
+  transaction commits in groups of at most 5,000 rows
 - indexes after load
 - optional disposable persistent materialization later
 
@@ -152,6 +153,24 @@ Only complete, validated transactions with resolved contiguous progress are ackn
 
 Compatible schema merges are deterministic and idempotent; conflicts fail closed without advancing affected mutation watermarks. Overload may discard transient work but never acknowledged authoritative data.
 
+### Invariant Q
+
+An enabled High/Low bridge exports Low application changes to High only. Signed,
+recipient-encrypted artifacts and schema validation are required even when the
+transport is trusted. Import staging is not applied stream progress.
+
+### Invariant R
+
+High ownership and provenance are durable, replicated policy state. Later Low
+updates cannot bypass High-owned fields through timestamp ordering, duplicate
+import, replay, snapshots, or arrival order across High peers.
+
+### Invariant S
+
+File metadata convergence is distinct from verified local payload availability.
+Incomplete or unverified objects are never returned as complete file content;
+object collection respects reader, backup, and pending-export references.
+
 ---
 
 ## 85. Security Review Checklist
@@ -179,8 +198,11 @@ Before stable release:
 - test malicious sequence gaps.
 - test mutation claiming another origin.
 - verify forwarding preserves original authenticated origin metadata rules.
+- when enabled, enforce IP/CIDR policy alongside identity on inbound/outbound and migrated QUIC paths.
+- validate High/Low signatures, recipients, source streams, schema holds, replay identities, and bounded artifact/decompression handling.
+- verify High ownership protection and file-object integrity across imports, snapshots, and restore.
+- keep optional service administration/unlock authorization separate from mesh permissions.
 
 If forwarded origin records are accepted, the batch must be cryptographically attributable or trusted according to the cluster trust model. In an all-trusted-node cluster, mTLS plus protocol validation may be sufficient. If nodes are not mutually trusted, add origin signatures in a future security phase.
 
 ---
-

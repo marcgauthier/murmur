@@ -15,10 +15,12 @@ type TxOptions struct{}
 // Tx is one explicit local transaction. It holds the serialized write
 // coordinator until Commit or Rollback and is not safe for concurrent use.
 type Tx struct {
-	db   *DB
-	stx  *sqlengine.Tx
-	txID TxID
-	done bool
+	db           *DB
+	stx          *sqlengine.Tx
+	txID         TxID
+	done         bool
+	ticket       *Ticket
+	bridgeImport *bridgeImportInfo
 }
 
 // ExecContext executes a statement inside the transaction.
@@ -58,6 +60,7 @@ func (tx *Tx) Commit() error {
 	}
 	tx.done = true
 	defer tx.db.writeMu.Unlock()
+	defer tx.ticket.Release()
 	return tx.db.commitTx(tx)
 }
 
@@ -68,6 +71,7 @@ func (tx *Tx) Rollback() error {
 	}
 	tx.done = true
 	defer tx.db.writeMu.Unlock()
+	defer tx.ticket.Release()
 	return tx.stx.Rollback()
 }
 

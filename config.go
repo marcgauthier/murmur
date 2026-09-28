@@ -4,32 +4,43 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/nomadsql/replicateddb/backup"
 	"github.com/nomadsql/replicateddb/schema"
+	"github.com/nomadsql/replicateddb/transport"
 )
 
 // QueryStoreMode selects how the SQL materialization is stored.
 type QueryStoreMode int
 
 const (
-	// QueryStoreMemory keeps the query database memory-resident (primary target).
+	// QueryStoreMemory keeps the query database memory-resident (pure-Go fallback).
 	QueryStoreMemory QueryStoreMode = iota
-	// QueryStoreMMap is a future disposable mmap-backed mode. Not implemented yet.
+	// QueryStoreMMap uses a disposable file-backed SQLite materialization with mmap.
+	// It is rebuilt from Pebble and removed when the DB closes.
 	QueryStoreMMap
 )
 
 // QueryStoreConfig configures the SQL materialization.
 type QueryStoreConfig struct {
 	Mode QueryStoreMode
+	// TempDir is the parent for the disposable mmap query directory. Empty uses
+	// the operating system temporary directory.
+	TempDir string
+	// MMapBytes is SQLite's mmap limit in the default backend. Zero selects
+	// 256 MiB. The LumoSQL/LMDB backend uses LUMO_LMDB_MAPSIZE instead.
+	MMapBytes int64
 }
 
 // DurabilityMode selects the acknowledgement contract for local writes.
 type DurabilityMode int
 
 const (
-	// DurabilitySynchronous acknowledges only after the durable commit. Default.
+	// DurabilitySynchronous acknowledges only after the durable commit (fsync). Default.
 	DurabilitySynchronous DurabilityMode = iota
-	// DurabilityAsync is reserved for a future explicitly-configured mode.
+	// DurabilityAsync acknowledges once mutations are committed in memory/WAL without
+	// waiting for synchronous disk sync. Weaker durability contract: in an ungraceful crash
+	// or power-loss scenario, transactions acknowledged since the last sync may be lost.
 	DurabilityAsync
 )
 
@@ -52,6 +63,76 @@ type BackupScheduleConfig struct {
 	RetentionDays int
 	// MaxBackups retains at most this many latest backups (0 disables).
 	MaxBackups int
+	// IncludeFiles packs file objects into scheduled backups
+	// (object-inclusive). False leaves object bytes out (metadata-only).
+	IncludeFiles bool
+}
+
+// FilesConfig configures replicated file metadata with node-local
+// content-addressed object storage. Metadata (name, digest, size)
+// replicates through the normal durable log under a reserved table;
+// object bytes stay on the node that uploaded them until a transfer
+// protocol fetches them (see architecture/file-replication.md).
+type FilesConfig struct {
+	// Enabled activates the file APIs and the local object store.
+	Enabled bool
+	// ObjectKey is the independent 256-bit object-storage key (32 bytes,
+	// required when Enabled). Every node that stores objects needs its
+	// key configured; key loss makes local objects unreadable while
+	// replicated metadata is unaffected. Rotation must install the same
+	// new key on every node: mixed generations fail mesh fetches closed.
+	ObjectKey []byte
+	// PrevObjectKey is the previous generation's key (32 bytes). It is
+	// only needed to recover an interrupted rotation (objects spanning
+	// generations); otherwise it is accepted and ignored. Remove it once
+	// every node reports the new generation.
+	PrevObjectKey []byte
+	// MaxFileBytes caps one uploaded file. Zero selects the default
+	// (4 GiB). Negative disables uploads.
+	MaxFileBytes int64
+	// FetchAddr is the listen address of the node-local fetch endpoint
+	// serving object bytes to peers (e.g. "127.0.0.1:7844"). Empty
+	// disables serving; the node can still fetch from peers. Serving
+	// requires replication TLS credentials. Fetching peers must run the
+	// same ObjectKey: receivers verify containers with the local key.
+	FetchAddr string
+	// FetchPeers statically lists fetch sources (NodeID plus fetch
+	// endpoint addresses). Empty disables background and on-demand
+	// fetching; the node serves (when FetchAddr is set) but never pulls.
+	FetchPeers []Peer
+	// FetchInterval is the background scan period for missing objects.
+	// Zero selects 30 seconds. Negative disables the background worker
+	// (FetchFile still works on demand).
+	FetchInterval time.Duration
+	// MaxConcurrentFetches bounds simultaneous object fetches. Zero
+	// selects 2.
+	MaxConcurrentFetches int
+	// MaxStagingBytes caps the total fetch staging directory. Zero
+	// selects 1 GiB.
+	MaxStagingBytes int64
+	// FetchTimeout bounds one file fetch across all sources. Zero
+	// selects 5 minutes.
+	FetchTimeout time.Duration
+	// MaxFetchConns bounds concurrent serving connections. Zero
+	// selects 16.
+	MaxFetchConns int
+}
+
+// DefaultMaxFileBytes is the default per-file upload cap.
+const DefaultMaxFileBytes = 4 << 30
+
+// SubscriptionConfig configures reactive query subscriptions.
+type SubscriptionConfig struct {
+	// MaxSubscribers is the maximum number of concurrent active query subscriptions.
+	// Defaults to 1024.
+	MaxSubscribers int
+	// EventBufferSize is the channel buffer size for each subscription.
+	// Defaults to 64.
+	EventBufferSize int
+	// MaxRetainedEvents is the number of historical change events retained
+	// in memory to support resumption from a cursor.
+	// Defaults to 256.
+	MaxRetainedEvents int
 }
 
 // CacheConfig sizes the caches.
@@ -95,6 +176,10 @@ type PebbleConfig struct {
 	MaxConcurrentCompactions int
 	// Compression selects block compression. Default zstd level 3.
 	Compression CompressionConfig
+	// BaseFS is the filesystem under the encrypted VFS. Nil means
+	// vfs.Default. Tests use it for fault injection (for example,
+	// simulated disk-full failures).
+	BaseFS vfs.FS
 }
 
 // DefaultPebbleConfig returns standard Pebble settings (16MiB cache, 4MiB
@@ -122,6 +207,19 @@ type SchemaConfig struct {
 	// LocalDDL holds local-only objects (indexes, views, FTS) applied after
 	// replicated tables on every open/rebuild. Never replicated.
 	LocalDDL []string
+	// AcceptRemoteSchema controls schema synchronization from peers during
+	// replication (architecture/schema.md section 50). Nil (the default)
+	// adopts compatible remote schemas and merges concurrent additive
+	// branches automatically. Set an explicit false to refuse remote
+	// schemas: mismatched peers exchange no data until this node is
+	// explicitly upgraded with Migrate. A pointer distinguishes "unset"
+	// from "strict" because the default adopts.
+	AcceptRemoteSchema *bool
+}
+
+// acceptRemoteSchema resolves the schema-sync policy: default adopt.
+func (c SchemaConfig) acceptRemoteSchema() bool {
+	return c.AcceptRemoteSchema == nil || *c.AcceptRemoteSchema
 }
 
 // ReplicationConfig configures QUIC replication. A zero ListenAddr disables
@@ -134,6 +232,13 @@ type ReplicationConfig struct {
 	Peers []Peer
 	// AllowedPeers, when non-empty, restricts which NodeIDs may connect.
 	AllowedPeers []NodeID
+	// AllowedNetworks, when non-empty, additionally restricts peer network
+	// addresses to the listed IPs/CIDRs (e.g. "192.0.2.0/24", "2001:db8::1").
+	// It applies to inbound QUIC remotes and outbound resolved addresses in
+	// addition to CA/NodeID/DBID authorization; absent means no address
+	// filtering. Invalid entries fail Open. See
+	// architecture/membership-and-transport.md ("IP and CIDR admission policy").
+	AllowedNetworks []string
 	// MaxBatchBytes caps one replication frame payload.
 	MaxBatchBytes int
 	// MaxBatchMutations caps mutations pulled per send round.
@@ -154,7 +259,45 @@ type ReplicationConfig struct {
 	MinRetainedBatches uint64
 	// SnapshotChunkCells bounds cells per snapshot chunk.
 	SnapshotChunkCells int
+	// MaxSnapshotBytes bounds snapshot staging. Default 512 MiB.
+	// Snapshots above the atomic merge threshold (state
+	// DefaultSnapshotAtomicMergeBytes) merge chunk by chunk with durable
+	// resume progress and publish watermarks/generation atomically last.
+	MaxSnapshotBytes int64
+	// SnapshotTransferTimeout bounds how long the source holds its consistent read cut.
+	// Default 10 minutes.
+	SnapshotTransferTimeout time.Duration
+	// Fanout is the number of active replication targets selected per push round.
+	// Default 4.
+	Fanout int
+	// PeerRotationInterval is the interval at which one selected peer is rotated toward an off-subset member.
+	// Default 30s.
+	PeerRotationInterval time.Duration
+	// AntiEntropyInterval is the interval at which jittered anti-entropy synchronizes with an off-subset peer.
+	// Default 10s.
+	AntiEntropyInterval time.Duration
+	// MaxConcurrentRepairs bounds concurrent repair sessions.
+	// Default 2.
+	MaxConcurrentRepairs int
+	// MaxReplicationSessions bounds concurrent replication sessions.
+	// Default 32.
+	MaxReplicationSessions int
+	// MaxQUICConnections bounds the total physical QUIC connections maintained.
+	// Must be at least MaxReplicationSessions + 8 (reserving 8 connections for membership).
+	// Default 64.
+	MaxQUICConnections int
+	// Dissemination selects bounded gossip (the zero/default) or optional
+	// Plumtree eager/lazy routing. All peers in the cluster must agree.
+	Dissemination DisseminationMode
 }
+
+// DisseminationMode selects how mutation batches are propagated.
+type DisseminationMode string
+
+const (
+	DisseminationGossip   DisseminationMode = "gossip"
+	DisseminationPlumtree DisseminationMode = "plumtree"
+)
 
 // TLSCredential carries this node's certificate material for mTLS.
 type TLSCredential struct {
@@ -189,12 +332,20 @@ type Config struct {
 	Schema      SchemaConfig
 	Durability  DurabilityConfig
 	Backup      BackupScheduleConfig
+	Files       FilesConfig
+	// Scheduling configures local/replication writer-time shares.
+	// Zero resolves to the 90/10 defaults.
+	Scheduling   WriterSchedulingConfig
+	Subscription SubscriptionConfig
 
 	// MaxReplicatedValueBytes caps one replicated cell value. Default 16 MiB.
 	MaxReplicatedValueBytes int
 	// MaxBatchMutations caps cells+deletes in one local transaction.
 	// Default 100_000.
 	MaxBatchMutations int
+	// MaxTransactionBytes caps the total encoded canonical transaction size.
+	// Default 64 MiB.
+	MaxTransactionBytes int64
 
 	// Logger receives package logs. Nil means discard.
 	Logger Logger
@@ -237,6 +388,9 @@ func (c *Config) withDefaults() {
 	if c.MaxBatchMutations == 0 {
 		c.MaxBatchMutations = 100_000
 	}
+	if c.MaxTransactionBytes == 0 {
+		c.MaxTransactionBytes = 64 << 20
+	}
 	if c.Encryption.DataKeyRotation == 0 {
 		c.Encryption.DataKeyRotation = 10 * 24 * time.Hour
 	}
@@ -268,9 +422,61 @@ func (c *Config) withDefaults() {
 	if r.SnapshotChunkCells == 0 {
 		r.SnapshotChunkCells = 2_000
 	}
+	if r.MaxSnapshotBytes == 0 {
+		r.MaxSnapshotBytes = 512 << 20
+	}
+	if r.SnapshotTransferTimeout == 0 {
+		r.SnapshotTransferTimeout = 10 * time.Minute
+	}
+	if r.Fanout == 0 {
+		r.Fanout = 4
+	}
+	if r.PeerRotationInterval == 0 {
+		r.PeerRotationInterval = 30 * time.Second
+	}
+	if r.AntiEntropyInterval == 0 {
+		r.AntiEntropyInterval = 10 * time.Second
+	}
+	if r.MaxConcurrentRepairs == 0 {
+		r.MaxConcurrentRepairs = 2
+	}
+	if r.MaxReplicationSessions == 0 {
+		r.MaxReplicationSessions = 32
+	}
+	if r.MaxQUICConnections == 0 {
+		r.MaxQUICConnections = 64
+	}
+	if c.Subscription.MaxSubscribers == 0 {
+		c.Subscription.MaxSubscribers = 1024
+	}
+	if c.Subscription.EventBufferSize == 0 {
+		c.Subscription.EventBufferSize = 64
+	}
+	if c.Subscription.MaxRetainedEvents == 0 {
+		c.Subscription.MaxRetainedEvents = 256
+	}
+	if c.Files.MaxFileBytes == 0 {
+		c.Files.MaxFileBytes = DefaultMaxFileBytes
+	}
+	if c.Files.FetchInterval == 0 {
+		c.Files.FetchInterval = 30 * time.Second
+	}
+	if c.Files.MaxConcurrentFetches <= 0 {
+		c.Files.MaxConcurrentFetches = 2
+	}
+	if c.Files.MaxStagingBytes <= 0 {
+		c.Files.MaxStagingBytes = 1 << 30
+	}
+	if c.Files.FetchTimeout <= 0 {
+		c.Files.FetchTimeout = 5 * time.Minute
+	}
+	if c.Files.MaxFetchConns <= 0 {
+		c.Files.MaxFetchConns = 16
+	}
 	if c.Logger == nil {
 		c.Logger = DiscardLogger{}
 	}
+	c.Scheduling.withDefaults()
 }
 
 func (c *Config) validate() error {
@@ -280,11 +486,23 @@ func (c *Config) validate() error {
 	if c.NodeID.IsZero() {
 		return fmt.Errorf("replicateddb: NodeID is required: %w", ErrUnsupportedSchema)
 	}
-	if c.Durability.Mode != DurabilitySynchronous {
-		return fmt.Errorf("replicateddb: only synchronous durability is implemented: %w", ErrUnsupportedSchema)
+	if c.Durability.Mode != DurabilitySynchronous && c.Durability.Mode != DurabilityAsync {
+		return fmt.Errorf("replicateddb: unsupported durability mode %d: %w", c.Durability.Mode, ErrUnsupportedSchema)
 	}
-	if c.QueryStore.Mode != QueryStoreMemory {
-		return fmt.Errorf("replicateddb: only QueryStoreMemory is implemented: %w", ErrUnsupportedSchema)
+	if c.MaxTransactionBytes <= 0 {
+		return fmt.Errorf("replicateddb: MaxTransactionBytes must be positive: %w", ErrUnsupportedSchema)
+	}
+	if int64(c.MaxReplicatedValueBytes) > c.MaxTransactionBytes {
+		return fmt.Errorf("replicateddb: MaxReplicatedValueBytes (%d) cannot exceed MaxTransactionBytes (%d): %w", c.MaxReplicatedValueBytes, c.MaxTransactionBytes, ErrUnsupportedSchema)
+	}
+	if c.Subscription.MaxSubscribers < 0 || c.Subscription.EventBufferSize < 0 || c.Subscription.MaxRetainedEvents < 0 {
+		return fmt.Errorf("replicateddb: subscription limits must be non-negative: %w", ErrUnsupportedSchema)
+	}
+	if c.QueryStore.Mode != QueryStoreMemory && c.QueryStore.Mode != QueryStoreMMap {
+		return fmt.Errorf("replicateddb: unsupported query-store mode %d: %w", c.QueryStore.Mode, ErrUnsupportedSchema)
+	}
+	if c.QueryStore.MMapBytes < 0 {
+		return fmt.Errorf("replicateddb: query-store MMapBytes must be non-negative: %w", ErrUnsupportedSchema)
 	}
 	if len(c.Schema.Tables) == 0 {
 		return fmt.Errorf("replicateddb: at least one replicated table is required: %w", ErrUnsupportedSchema)
@@ -297,6 +515,64 @@ func (c *Config) validate() error {
 	}
 	if err := c.Encryption.validate(); err != nil {
 		return err
+	}
+	if c.Replication.MaxSnapshotBytes <= 0 {
+		return fmt.Errorf("replicateddb: Replication.MaxSnapshotBytes must be positive")
+	}
+	if c.Replication.SnapshotTransferTimeout <= 0 {
+		return fmt.Errorf("replicateddb: Replication.SnapshotTransferTimeout must be positive")
+	}
+	if c.Replication.Fanout <= 0 {
+		return fmt.Errorf("replicateddb: Replication.Fanout must be positive")
+	}
+	if c.Replication.Dissemination != "" && c.Replication.Dissemination != DisseminationGossip && c.Replication.Dissemination != DisseminationPlumtree {
+		return fmt.Errorf("replicateddb: unsupported replication dissemination mode %q", c.Replication.Dissemination)
+	}
+	if c.Replication.Dissemination == DisseminationPlumtree && c.Replication.Fanout < 2 {
+		return fmt.Errorf("replicateddb: Replication.Fanout must be at least 2 for Plumtree")
+	}
+	if c.Replication.PeerRotationInterval <= 0 {
+		return fmt.Errorf("replicateddb: Replication.PeerRotationInterval must be positive")
+	}
+	if c.Replication.AntiEntropyInterval <= 0 {
+		return fmt.Errorf("replicateddb: Replication.AntiEntropyInterval must be positive")
+	}
+	if c.Replication.MaxConcurrentRepairs <= 0 {
+		return fmt.Errorf("replicateddb: Replication.MaxConcurrentRepairs must be positive")
+	}
+	if c.Replication.MaxReplicationSessions <= 0 {
+		return fmt.Errorf("replicateddb: Replication.MaxReplicationSessions must be positive")
+	}
+	if c.Replication.Fanout+c.Replication.MaxConcurrentRepairs > c.Replication.MaxReplicationSessions {
+		return fmt.Errorf("replicateddb: Replication.Fanout + MaxConcurrentRepairs (%d) cannot exceed MaxReplicationSessions (%d)",
+			c.Replication.Fanout+c.Replication.MaxConcurrentRepairs, c.Replication.MaxReplicationSessions)
+	}
+	if c.Replication.MaxQUICConnections < c.Replication.MaxReplicationSessions+8 {
+		return fmt.Errorf("replicateddb: Replication.MaxQUICConnections (%d) must be at least MaxReplicationSessions + 8 (%d)",
+			c.Replication.MaxQUICConnections, c.Replication.MaxReplicationSessions+8)
+	}
+	if _, err := transport.ParseAddressPolicy(c.Replication.AllowedNetworks); err != nil {
+		return err
+	}
+	if err := c.Scheduling.validate(); err != nil {
+		return err
+	}
+	if c.Files.Enabled && len(c.Files.ObjectKey) != 32 {
+		return fmt.Errorf("replicateddb: Files.ObjectKey must be 32 bytes when Files.Enabled")
+	}
+	if len(c.Files.PrevObjectKey) != 0 && len(c.Files.PrevObjectKey) != 32 {
+		return fmt.Errorf("replicateddb: Files.PrevObjectKey must be 32 bytes when set")
+	}
+	if c.Files.Enabled && (c.Files.FetchAddr != "" || len(c.Files.FetchPeers) > 0) && c.Replication.TLS == nil {
+		return fmt.Errorf("replicateddb: Files fetch requires Replication.TLS credentials")
+	}
+	for i, p := range c.Files.FetchPeers {
+		if p.NodeID.IsZero() {
+			return fmt.Errorf("replicateddb: Files.FetchPeers[%d] needs a NodeID", i)
+		}
+		if len(p.Addrs) == 0 {
+			return fmt.Errorf("replicateddb: Files.FetchPeers[%d] needs at least one address", i)
+		}
 	}
 	return nil
 }

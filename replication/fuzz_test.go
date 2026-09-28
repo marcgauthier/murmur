@@ -44,6 +44,12 @@ func FuzzFrame(f *testing.F) {
 			_, _ = DecodeSnapshotChunk(fr.Payload, codec.DefaultLimits(), 10000)
 		case MsgError:
 			_, _, _ = DecodeError(fr.Payload)
+		case MsgSchemaRequest:
+			_, _ = DecodeSchemaRequest(fr.Payload)
+		case MsgSchemaManifest:
+			_, _ = DecodeSchemaManifest(fr.Payload)
+		case MsgSchemaAck:
+			_, _ = DecodeSchemaAck(fr.Payload)
 		}
 	})
 }

@@ -32,6 +32,9 @@ type SourceDB interface {
 	SchemaInfo() (epoch uint64, version uint64, hash string)
 	// DataDir returns the root data directory.
 	DataDir() string
+	// FilesDir returns the file-object root directory, or "" when the
+	// source runs without file storage.
+	FilesDir() string
 }
 
 // CreateBackup executes the 4-step online zero-downtime backup pipeline:
@@ -95,6 +98,28 @@ func CreateBackup(ctx context.Context, src SourceDB, cfg Config) (*Metadata, err
 		_ = copyRawFile(srcRegBak, filepath.Join(stagingKeys, "KEYREGISTRY.bak"))
 	}
 
+	// 4b. Snapshot file objects when object-inclusive coverage is asked.
+	// File metadata always rides inside the Pebble checkpoint; this step
+	// only adds object bytes plus the key-generation marker.
+	var filesMode string
+	var filesObjects int
+	var filesBytes int64
+	filesStaged := false
+	if cfg.IncludeFiles {
+		filesDir := src.FilesDir()
+		if filesDir == "" {
+			return nil, fmt.Errorf("backup: object-inclusive backup requested but the source has no file store")
+		}
+		stagingFiles := filepath.Join(stagingDir, "files")
+		count, total, err := snapshotFiles(filesDir, stagingFiles, log)
+		if err != nil {
+			return nil, err
+		}
+		filesMode, filesObjects, filesBytes = FilesModeObjects, count, total
+		filesStaged = true
+		log.Debug("backup: files snapshot staged", "objects", count, "bytes", total)
+	}
+
 	// 5. Gather file metrics and build metadata
 	var dataFilesCount int
 	var totalBytes int64
@@ -120,6 +145,9 @@ func CreateBackup(ctx context.Context, src SourceDB, cfg Config) (*Metadata, err
 		TotalBytes:     totalBytes,
 		PebbleFormat:   1,
 		Compression:    cfg.Compression,
+		FilesMode:      filesMode,
+		FilesObjects:   filesObjects,
+		FilesBytes:     filesBytes,
 	}
 
 	filename := fmt.Sprintf("nomadsql-backup-%s-%s-%s.tar.gz", meta.DBID, meta.CreatedAt.Format("20060102-150405"), meta.BackupID[:8])
@@ -177,8 +205,12 @@ func CreateBackup(ctx context.Context, src SourceDB, cfg Config) (*Metadata, err
 			return
 		}
 
-		// B. Write keys/ and data/ files
-		for _, sub := range []string{"keys", "data"} {
+		// B. Write keys/, data/ (and files/ when staged) files
+		subs := []string{"keys", "data"}
+		if filesStaged {
+			subs = append(subs, "files")
+		}
+		for _, sub := range subs {
 			subDir := filepath.Join(stagingDir, sub)
 			err := filepath.Walk(subDir, func(path string, info os.FileInfo, err error) error {
 				if err != nil {

@@ -1,0 +1,124 @@
+package replication
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/nomadsql/replicateddb/ids"
+	"github.com/nomadsql/replicateddb/transport"
+)
+
+func TestNegotiateCapabilities(t *testing.T) {
+	const futureOptional = uint64(1) << 20
+	for _, tc := range []struct {
+		name    string
+		peer    uint64
+		want    uint64
+		wantErr bool
+	}{
+		{"none", 0, 0, false},
+		{"known", CapZstd, CapZstd, false},
+		{"unknown optional ignored", futureOptional, 0, false},
+		{"known plus unknown optional", CapZstd | futureOptional, CapZstd, false},
+		{"required marker alone", CapRequiredMask, 0, false},
+		{"required known", CapRequiredMask | CapZstd, CapZstd, false},
+		{"required unknown refused", CapRequiredMask | futureOptional, 0, true},
+		{"required known plus unknown refused", CapRequiredMask | CapZstd | futureOptional, 0, true},
+	} {
+		got, err := NegotiateCapabilities(tc.peer)
+		if tc.wantErr != (err != nil) {
+			t.Fatalf("%s: err = %v", tc.name, err)
+		}
+		if got != tc.want {
+			t.Fatalf("%s: usable = %#x, want %#x", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestDisseminationCapabilityMismatchRefuses(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		peer    uint64
+		local   bool
+		wantErr bool
+	}{
+		{"gossip peers agree", CapZstd, false, false},
+		{"plumtree peers agree", CapZstd | CapPlumtree | CapRequiredMask, true, false},
+		{"enabled local rejects gossip peer", CapZstd, true, true},
+		{"gossip local rejects enabled peer", CapZstd | CapPlumtree | CapRequiredMask, false, true},
+	} {
+		if _, err := NegotiateDisseminationCapabilities(tc.peer, tc.local); tc.wantErr != (err != nil) {
+			t.Fatalf("%s: err=%v wantErr=%t", tc.name, err, tc.wantErr)
+		}
+	}
+}
+
+// TestHandshakeCapabilityNegotiation proves unknown required capabilities
+// refuse the session before any peer state exists, while unknown optional
+// capabilities still shake hands.
+func TestHandshakeCapabilityNegotiation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	c := newTestCluster(t)
+	server := ids.NewNodeID()
+	mgr, _, addr := c.testManager(t, server, 1)
+
+	dial := func(t *testing.T, self ids.NodeID, caps uint64) *Frame {
+		t.Helper()
+		sess, err := transport.Dial(ctx, addr, c.creds(t, self), server)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = sess.Close() })
+		stream, err := sess.OpenStream(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var hash [32]byte
+		hash[0] = 1
+		if err := WriteFrame(stream, MsgHello, 0, EncodeHello(nil, &Hello{
+			ProtocolVersion: ProtocolVersion, MinProtocolVersion: MinProtocolVersion,
+			NodeID: self, DBID: c.dbid, SchemaEpoch: 1, SchemaHash: hash,
+			Capabilities: caps,
+		})); err != nil {
+			t.Fatal(err)
+		}
+		fr, err := ReadFrame(stream)
+		if err != nil {
+			return nil // close without error frame is also a rejection
+		}
+		return fr
+	}
+
+	// Unknown required: error (or close), no session, no peer state.
+	fr := dial(t, ids.NewNodeID(), CapRequiredMask|(uint64(1)<<40))
+	if fr != nil && fr.Type != MsgError {
+		t.Fatalf("required-unknown handshake reply = %d, want MsgError", fr.Type)
+	}
+	if n := len(mgr.PeerStatus()); n != 0 {
+		t.Fatalf("peers after refused handshake = %d", n)
+	}
+	if got := mgr.Stats().HandshakeCapabilityRefl; got != 1 {
+		t.Fatalf("HandshakeCapabilityRefl = %d, want 1", got)
+	}
+
+	// Unknown optional: normal welcome and session.
+	fr = dial(t, ids.NewNodeID(), CapZstd|(uint64(1)<<40))
+	if fr == nil || fr.Type != MsgWelcome {
+		t.Fatalf("optional-unknown handshake reply = %v, want MsgWelcome", fr)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if n := len(mgr.PeerStatus()); n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("optional-unknown peer never attached")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := mgr.Stats().HandshakeCapabilityRefl; got != 1 {
+		t.Fatalf("HandshakeCapabilityRefl = %d, want 1", got)
+	}
+}

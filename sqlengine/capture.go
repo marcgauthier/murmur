@@ -1,3 +1,5 @@
+//go:build !lumosql
+
 package sqlengine
 
 import (

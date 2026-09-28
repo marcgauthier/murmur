@@ -29,6 +29,7 @@ type Config struct {
     Schema      SchemaConfig
     Pebble      PebbleConfig
     Durability  DurabilityConfig
+    Scheduling  WriterSchedulingConfig
 }
 
 func Open(ctx context.Context, cfg Config) (*DB, error)
@@ -65,6 +66,9 @@ func (db *DB) PrepareContext(
     query string,
 ) (*Stmt, error)
 
+func (db *DB) Subscribe(ctx context.Context, query string, args ...any) (*Subscription, error)
+func (db *DB) SubscribeWithOptions(ctx context.Context, query string, opts SubscriptionOptions, args ...any) (*Subscription, error)
+
 func (db *DB) AddPeer(ctx context.Context, peer Peer) error
 func (db *DB) RemovePeer(ctx context.Context, nodeID NodeID) error
 func (db *DB) ForceSync(ctx context.Context, nodeID NodeID) error
@@ -80,18 +84,29 @@ func (db *DB) RewriteEncryptedFiles(ctx context.Context) error
 func (db *DB) EncryptionStatus() EncryptionStatus
 
 func (db *DB) Status() Status
+func (db *DB) Metrics() MetricsSnapshot
+func (db *DB) DurabilityMode() DurabilityMode
+func (db *DB) Sync(ctx context.Context) error
 func (db *DB) Close() error
 ```
 
 `Peers` and `AddPeer` supply bootstrap candidates, not permanent replication links. Discovery and the bounded scheduler select actual connections. `RemovePeer` explicitly retires and persistently excludes a NodeID locally, including from subsequent discovery; `AddPeer` clears that exclusion. This is local administrative policy, not a cluster-wide revocation. `ForceSync` schedules immediate synchronization subject to the same session and connection limits as background work. See [Sections 26](membership-and-transport.md#26-replication-transport)–[28](replication-and-dissemination.md#28-quic-connection-model) for membership configuration and connection budgets.
 
-A later phase may implement a `database/sql/driver.Driver` so applications can do:
+A `database/sql/driver.Driver` is implemented (`driver.go`, registered as
+`replicateddb`) so applications can do:
 
 ```go
-sql.Open("replicateddb", dsn)
+replicateddb.RegisterDriverDB("primary", db)
+sqldb, err := sql.Open("replicateddb", "primary")
+// or: sqldb := sql.OpenDB(replicateddb.NewConnector(db))
 ```
 
-Do not make that the first milestone. Transaction interception and connection-specific hooks are easier to prove with an explicit API first.
+Exec runs through implicit transactions, Query through reads, and Begin maps
+to `DB.BeginTx`; write statements issued as Query outside an explicit
+transaction are rejected so change capture cannot be bypassed. Closing sql
+handles never closes the underlying `*DB`. The explicit `DB`/`Tx` API remains
+the primary interface: transaction interception and connection-specific hooks
+are easier to prove there first.
 
 `Open` requires both `cfg.Schema` and `cfg.Pebble`. The schema must include its version and complete table, column, constraint, and index declarations; do not infer it from existing data. Validate it against [Section 6](schema.md#6-schema-rules-for-version-1) and persisted schema metadata before creating tables, rebuilding data, or starting replication. Errors must identify the offending table, column, or index.
 
@@ -124,7 +139,7 @@ const (
 
 The default constructor sets a 16 MiB block cache, 4 MiB memtable, two memtables, 1,000 open files, one concurrent compaction, and `CompressionZstd` at level 3. Explicit `CompressionNone` disables compression; zero compression configuration resolves to enabled Zstd level 3. A missing/invalid storage budget is an error rather than silently allocating an unbounded cache.
 
-Target `github.com/cockroachdb/pebble/v2` v2.1.6 and its versioned APIs. This is a new-database architecture change: detect and reject existing Badger directories with `ErrUnsupportedStorageFormat` before creating or modifying storage files. No importer, automatic conversion, or Badger runtime fallback is planned. The current Go implementation still uses Badger; the implementation phases below describe the required replacement.
+Target `github.com/cockroachdb/pebble/v2` v2.1.6 and its versioned APIs. This is a new-database architecture change: detect and reject existing Badger directories with `ErrUnsupportedStorageFormat` before creating or modifying storage files. No importer, automatic conversion, or Badger runtime fallback is planned. The current Go implementation uses Pebble; the roadmap describes target capabilities and is not a record of completed phases. See the [implementation inventory](capability-gaps.md).
 
 `Open` also requires `cfg.Encryption`: a write algorithm (default AES-256-GCM), application wrapping key (directly or via a provider), and positive internal data-key rotation duration. Validate wrapping-material key length against its own algorithm and validate the selected write algorithm before opening Pebble; see [Sections 39](encryption.md#39-encrypted-pebble-vfs)–[43](encryption.md#43-application-key-rotation-and-file-rewriting) for rotation semantics.
 
@@ -161,7 +176,9 @@ db, err := replicateddb.Open(ctx, replicateddb.Config{
     Pebble: replicateddb.DefaultPebbleConfig(), // includes Zstd level 3
 
     QueryStore: replicateddb.QueryStoreConfig{
-        Mode: replicateddb.QueryStoreMMap, // LumoSQL LMDB MVCC engine
+        Mode: replicateddb.QueryStoreMMap, // disposable; LumoSQL LMDB with lumosql build tag
+        TempDir: "./tmp",                // optional parent directory
+        MMapBytes: 256 << 20,             // optional; default 256 MiB
     },
 
     Schema: replicateddb.SchemaConfig{
@@ -195,6 +212,8 @@ db, err := replicateddb.Open(ctx, replicateddb.Config{
         MaxQUICConnections:     32,
         Dissemination:          replicateddb.DisseminationGossip, // optional: DisseminationPlumtree
         MaxTransactionBytes:    64 << 20,
+        MaxSnapshotBytes:       512 << 20, // default staging/publication bound
+        SnapshotTransferTimeout: 10 * time.Minute, // source read-cut lease
         // Overload's zero fields select the bounded defaults in Section 32.
     },
 })
@@ -240,6 +259,7 @@ type QueryEngine interface {
 type StateStore interface {
     CommitLocal(ctx context.Context, batch MutationBatch) (MergeResult, error)
     CommitRemote(ctx context.Context, batch MutationBatch) (MergeResult, error)
+    CommitRemoteGroup(ctx context.Context, batches []*MutationBatch) (MergeResult, error)
 
     GetCell(...)
     IterateTable(...)
@@ -250,6 +270,11 @@ type StateStore interface {
     Close() error
 }
 ```
+
+`DB.ApplyRemoteGroup` is the replication manager's optional grouped-applier
+entry point. It takes ordered, contiguous transactions and commits their
+independent receipts and sequence positions atomically; acknowledgements may
+advance only after the method returns successfully.
 
 ### Transport
 
@@ -275,4 +300,3 @@ Keep storage and transport interfaces internal until real alternate implementati
 The internal membership adapter implements `memberlist.NodeAwareTransport` on the shared QUIC pool and publishes a membership view/events to the scheduler. The scheduler owns target selection and work admission; the replication manager retains durable batch/acknowledgement processing. Keep memberlist and QUIC implementation types internal rather than exposing them through configuration or status.
 
 ---
-

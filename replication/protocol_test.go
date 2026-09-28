@@ -44,10 +44,11 @@ func TestFrameRejects(t *testing.T) {
 
 func TestHelloRoundTrip(t *testing.T) {
 	h := &Hello{
-		ProtocolVersion: 1, MinProtocolVersion: 1,
+		ProtocolVersion: ProtocolVersion, MinProtocolVersion: MinProtocolVersion,
 		NodeID: ids.NewNodeID(), DBID: ids.NewDBID(),
-		SchemaEpoch: 9, Capabilities: CapZstd,
-		Have: []codec.OriginWatermark{{Origin: ids.NewNodeID(), Sequence: 12}},
+		SchemaEpoch: 9, SchemaAuthorNode: ids.NewNodeID(), SchemaTimeCreated: 77,
+		Capabilities: CapZstd,
+		Have:         []codec.OriginWatermark{{Origin: ids.NewNodeID(), Sequence: 12}},
 	}
 	h.SchemaHash[31] = 7
 	got, err := DecodeHello(EncodeHello(nil, h))
@@ -55,8 +56,41 @@ func TestHelloRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.NodeID != h.NodeID || got.SchemaEpoch != 9 || len(got.Have) != 1 ||
-		got.Have[0].Sequence != 12 || got.SchemaHash != h.SchemaHash {
+		got.Have[0].Sequence != 12 || got.SchemaHash != h.SchemaHash ||
+		got.SchemaAuthorNode != h.SchemaAuthorNode || got.SchemaTimeCreated != 77 {
 		t.Fatalf("mismatch: %+v", got)
+	}
+}
+
+func TestSchemaMessagesRoundTrip(t *testing.T) {
+	req := &SchemaRequest{WantCurrent: true, WantIDs: [][32]byte{{1}, {2}}}
+	gotReq, err := DecodeSchemaRequest(EncodeSchemaRequest(nil, req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !gotReq.WantCurrent || len(gotReq.WantIDs) != 2 || gotReq.WantIDs[1] != [32]byte{2} {
+		t.Fatalf("request mismatch: %+v", gotReq)
+	}
+	if _, err := DecodeSchemaRequest([]byte{1, 2}); err == nil {
+		t.Fatal("truncated schema request accepted")
+	}
+
+	ack := &SchemaAck{Version: 5, Hash: [32]byte{9}}
+	gotAck, err := DecodeSchemaAck(EncodeSchemaAck(nil, ack))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *gotAck != *ack {
+		t.Fatalf("ack mismatch: %+v", gotAck)
+	}
+	if _, err := DecodeSchemaAck([]byte{1, 2, 3}); err == nil {
+		t.Fatal("malformed schema ack accepted")
+	}
+
+	// Manifest messages authenticate every revision through schema.Decode.
+	empty := EncodeSchemaManifest(nil, &SchemaManifestMsg{})
+	if _, err := DecodeSchemaManifest(empty); err == nil {
+		t.Fatal("empty manifest message accepted")
 	}
 }
 
@@ -90,14 +124,17 @@ func TestNeedAndErrorRoundTrip(t *testing.T) {
 }
 
 func TestSnapshotChunkRoundTrip(t *testing.T) {
-	c := &SnapshotChunk{Last: true, Cells: []codec.SnapshotCell{
+	c := &SnapshotChunk{Index: 7, Last: true, Cells: []codec.SnapshotCell{
 		{TableID: 1, RowID: ids.NewRowID(), ColumnID: 2, Value: codec.Int(3)},
 	}}
 	got, err := DecodeSnapshotChunk(EncodeSnapshotChunk(nil, c), codec.DefaultLimits(), 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.Last || len(got.Cells) != 1 {
+	if !got.Last || got.Index != 7 || len(got.Cells) != 1 {
 		t.Fatalf("mismatch: %+v", got)
+	}
+	if ProtocolVersion != 3 || MinProtocolVersion != 3 {
+		t.Fatal("snapshot format requires replication protocol v3")
 	}
 }

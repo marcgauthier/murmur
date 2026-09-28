@@ -253,5 +253,9 @@ application-specific search indexes
 
 This keeps replication lean.
 
----
+Configured local views are dropped and recreated around an authoritative-state
+rebuild, after their replicated base tables have been reconstructed. This
+ensures startup and recovery restore the view definition without replicating
+the view itself.
 
+---

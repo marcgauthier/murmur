@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +24,7 @@ type mockDB struct {
 	mu          sync.Mutex
 	dataDir     string
 	keysDir     string
+	filesDir    string
 	dbID        string
 	nodeID      string
 	schemaEpoch uint64
@@ -81,6 +83,11 @@ func (m *mockDB) SchemaInfo() (uint64, uint64, string) {
 	return m.schemaEpoch, m.schemaVer, m.schemaHash
 }
 func (m *mockDB) DataDir() string { return m.dataDir }
+
+func (m *mockDB) FilesDir() string { return m.filesDir }
+
+// testFreshNodeID is a valid UUID distinct from setupMockDB's nodeID.
+const testFreshNodeID = "123e4567-e89b-12d3-a456-426614174000"
 
 func setupMockDB(t *testing.T) *mockDB {
 	t.Helper()
@@ -166,6 +173,7 @@ func TestLocalBackupAndRestoreRoundTrip(t *testing.T) {
 		TargetPath:   targetDir,
 		KeysPath:     keysTarget,
 		ExpectedDBID: db.dbID,
+		FreshNodeID:  testFreshNodeID,
 	})
 	if err != nil {
 		t.Fatalf("Restore failed: %v", err)
@@ -195,21 +203,23 @@ func TestLocalBackupAndRestoreRoundTrip(t *testing.T) {
 
 	// 4. Test non-empty directory restore protection
 	_, err = Restore(ctx, RestoreConfig{
-		Source:     localDest,
-		BackupName: backups[0].Name,
-		TargetPath: targetDir,
-		Overwrite:  false,
+		Source:      localDest,
+		BackupName:  backups[0].Name,
+		TargetPath:  targetDir,
+		Overwrite:   false,
+		FreshNodeID: testFreshNodeID,
 	})
-	if err == nil {
-		t.Fatal("expected ErrRestoreTargetNotEmpty, got nil")
+	if !errors.Is(err, ErrRestoreTargetNotEmpty) {
+		t.Fatalf("expected ErrRestoreTargetNotEmpty, got %v", err)
 	}
 
 	// 5. Test overwrite success
 	_, err = Restore(ctx, RestoreConfig{
-		Source:     localDest,
-		BackupName: backups[0].Name,
-		TargetPath: targetDir,
-		Overwrite:  true,
+		Source:      localDest,
+		BackupName:  backups[0].Name,
+		TargetPath:  targetDir,
+		Overwrite:   true,
+		FreshNodeID: testFreshNodeID,
 	})
 	if err != nil {
 		t.Fatalf("Restore with Overwrite=true failed: %v", err)
@@ -300,8 +310,9 @@ func TestHTTPSBackupAndRestore(t *testing.T) {
 	// 2. Restore from HTTPS GET stream
 	targetDir := filepath.Join(t.TempDir(), "https-restored")
 	restoredMeta, err := Restore(ctx, RestoreConfig{
-		Source:     dest,
-		TargetPath: targetDir,
+		Source:      dest,
+		TargetPath:  targetDir,
+		FreshNodeID: testFreshNodeID,
 	})
 	if err != nil {
 		t.Fatalf("Restore from HTTPS failed: %v", err)

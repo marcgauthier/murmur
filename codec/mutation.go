@@ -24,7 +24,7 @@ const (
 const ColumnTombstone uint32 = 0xFFFFFFFF
 
 // Mutation is one replicated cell write or row delete. Batch-level metadata
-// (origin, sequence, HLC, schema epoch) lives in MutationBatch.
+// (origin, sequence, HLC, schema epoch/hash) lives in MutationBatch.
 type Mutation struct {
 	TableID  uint32
 	RowID    ids.RowID
@@ -40,11 +40,16 @@ func (m *Mutation) IsTombstone() bool { return m.Flags&FlagTombstone != 0 }
 type MutationBatch struct {
 	ProtocolVersion uint16
 
-	TxID        ids.TxID
-	OriginNode  ids.NodeID
-	Sequence    uint64
-	HLC         uint64
+	TxID       ids.TxID
+	OriginNode ids.NodeID
+	Sequence   uint64
+	HLC        uint64
+	// SchemaEpoch/SchemaHash carry the writer's schema provenance. Equal
+	// epochs need not mean equal content across concurrent branches, so
+	// receivers match both against the current manifest or a persisted
+	// compatible ancestor before applying.
 	SchemaEpoch uint64
+	SchemaHash  [32]byte
 
 	Mutations []Mutation
 }
@@ -56,12 +61,40 @@ func (b *MutationBatch) Version() crdt.Version {
 
 // Limits guards decoding. Values larger than MaxValueBytes are rejected.
 type Limits struct {
-	MaxValueBytes int
-	MaxMutations  int
+	MaxValueBytes       int
+	MaxMutations        int
+	MaxTransactionBytes int64
 }
 
-// DefaultLimits caps values at 16 MiB and 100k mutations per batch.
-func DefaultLimits() Limits { return Limits{MaxValueBytes: 16 << 20, MaxMutations: 100_000} }
+// DefaultLimits caps values at 16 MiB, 100k mutations per batch, and 64 MiB total transaction size.
+func DefaultLimits() Limits {
+	return Limits{
+		MaxValueBytes:       16 << 20,
+		MaxMutations:        100_000,
+		MaxTransactionBytes: 64 << 20,
+	}
+}
+
+// BatchHeaderSize is the constant header size for a MutationBatch encoding (94 bytes).
+const BatchHeaderSize = 2 + 16 + 16 + 8 + 8 + 8 + 32 + 4
+
+// MutationHeaderSize is the per-mutation fixed header size (28 bytes).
+const MutationHeaderSize = 4 + 16 + 4 + 4
+
+// EncodedMutationsSize returns the total encoded byte size of a slice of mutations,
+// including the batch header.
+func EncodedMutationsSize(mutations []Mutation) int {
+	sz := BatchHeaderSize
+	for i := range mutations {
+		sz += MutationHeaderSize + mutations[i].Value.EncodedSize()
+	}
+	return sz
+}
+
+// EncodedBatchSize returns the total encoded byte size of b.
+func EncodedBatchSize(b *MutationBatch) int {
+	return EncodedMutationsSize(b.Mutations)
+}
 
 // EncodeBatch appends the binary encoding of b to dst.
 func EncodeBatch(dst []byte, b *MutationBatch) []byte {
@@ -71,6 +104,7 @@ func EncodeBatch(dst []byte, b *MutationBatch) []byte {
 	dst = binary.BigEndian.AppendUint64(dst, b.Sequence)
 	dst = binary.BigEndian.AppendUint64(dst, b.HLC)
 	dst = binary.BigEndian.AppendUint64(dst, b.SchemaEpoch)
+	dst = append(dst, b.SchemaHash[:]...)
 	dst = binary.BigEndian.AppendUint32(dst, uint32(len(b.Mutations)))
 	for i := range b.Mutations {
 		m := &b.Mutations[i]
@@ -85,7 +119,7 @@ func EncodeBatch(dst []byte, b *MutationBatch) []byte {
 
 // DecodeBatch decodes one batch from the front of src.
 func DecodeBatch(src []byte, lim Limits) (*MutationBatch, []byte, error) {
-	const hdrLen = 2 + 16 + 16 + 8 + 8 + 8 + 4
+	const hdrLen = 2 + 16 + 16 + 8 + 8 + 8 + 32 + 4
 	if len(src) < hdrLen {
 		return nil, nil, fmt.Errorf("codec: truncated batch header")
 	}
@@ -96,7 +130,8 @@ func DecodeBatch(src []byte, lim Limits) (*MutationBatch, []byte, error) {
 	b.Sequence = binary.BigEndian.Uint64(src[34:42])
 	b.HLC = binary.BigEndian.Uint64(src[42:50])
 	b.SchemaEpoch = binary.BigEndian.Uint64(src[50:58])
-	n := binary.BigEndian.Uint32(src[58:62])
+	copy(b.SchemaHash[:], src[58:90])
+	n := binary.BigEndian.Uint32(src[90:94])
 	if n > uint32(lim.MaxMutations) {
 		return nil, nil, fmt.Errorf("codec: batch of %d mutations exceeds limit %d", n, lim.MaxMutations)
 	}
@@ -123,6 +158,10 @@ func DecodeBatch(src []byte, lim Limits) (*MutationBatch, []byte, error) {
 			return nil, nil, fmt.Errorf("codec: mutation %d: tombstone with bad column id", i)
 		}
 		b.Mutations = append(b.Mutations, m)
+	}
+	consumed := len(src) - len(rest)
+	if lim.MaxTransactionBytes > 0 && int64(consumed) > lim.MaxTransactionBytes {
+		return nil, nil, fmt.Errorf("codec: batch of %d bytes exceeds MaxTransactionBytes %d", consumed, lim.MaxTransactionBytes)
 	}
 	return b, rest, nil
 }
@@ -178,12 +217,17 @@ func DecodeTombstone(src []byte) (crdt.Version, error) {
 
 // SnapshotManifest describes a logical current-state snapshot.
 type SnapshotManifest struct {
-	SnapshotID  ids.TxID
-	DBID        ids.DBID
-	SchemaEpoch uint64
-	SchemaHash  [32]byte
-	CreatedHLC  uint64
-	Watermarks  []OriginWatermark
+	FormatVersion   uint16
+	SnapshotID      ids.TxID
+	DBID            ids.DBID
+	SchemaEpoch     uint64
+	SchemaHash      [32]byte
+	CreatedHLC      uint64
+	StateGeneration uint64
+	ChunkCount      uint64
+	EncodedBytes    uint64
+	ContentHash     [32]byte
+	Watermarks      []OriginWatermark
 }
 
 // OriginWatermark is the highest contiguous sequence held for one origin.
@@ -194,11 +238,16 @@ type OriginWatermark struct {
 
 // EncodeManifest appends the manifest encoding.
 func EncodeManifest(dst []byte, m *SnapshotManifest) []byte {
+	dst = binary.BigEndian.AppendUint16(dst, m.FormatVersion)
 	dst = append(dst, m.SnapshotID[:]...)
 	dst = append(dst, m.DBID[:]...)
 	dst = binary.BigEndian.AppendUint64(dst, m.SchemaEpoch)
 	dst = append(dst, m.SchemaHash[:]...)
 	dst = binary.BigEndian.AppendUint64(dst, m.CreatedHLC)
+	dst = binary.BigEndian.AppendUint64(dst, m.StateGeneration)
+	dst = binary.BigEndian.AppendUint64(dst, m.ChunkCount)
+	dst = binary.BigEndian.AppendUint64(dst, m.EncodedBytes)
+	dst = append(dst, m.ContentHash[:]...)
 	dst = binary.BigEndian.AppendUint32(dst, uint32(len(m.Watermarks)))
 	for _, w := range m.Watermarks {
 		dst = append(dst, w.Origin[:]...)
@@ -209,17 +258,22 @@ func EncodeManifest(dst []byte, m *SnapshotManifest) []byte {
 
 // DecodeManifest decodes one manifest.
 func DecodeManifest(src []byte) (*SnapshotManifest, []byte, error) {
-	const hdr = 16 + 16 + 8 + 32 + 8 + 4
+	const hdr = 2 + 16 + 16 + 8 + 32 + 8 + 8 + 8 + 8 + 32 + 4
 	if len(src) < hdr {
 		return nil, nil, fmt.Errorf("codec: truncated snapshot manifest")
 	}
 	m := &SnapshotManifest{}
-	copy(m.SnapshotID[:], src[0:16])
-	copy(m.DBID[:], src[16:32])
-	m.SchemaEpoch = binary.BigEndian.Uint64(src[32:40])
-	copy(m.SchemaHash[:], src[40:72])
-	m.CreatedHLC = binary.BigEndian.Uint64(src[72:80])
-	n := binary.BigEndian.Uint32(src[80:84])
+	m.FormatVersion = binary.BigEndian.Uint16(src[0:2])
+	copy(m.SnapshotID[:], src[2:18])
+	copy(m.DBID[:], src[18:34])
+	m.SchemaEpoch = binary.BigEndian.Uint64(src[34:42])
+	copy(m.SchemaHash[:], src[42:74])
+	m.CreatedHLC = binary.BigEndian.Uint64(src[74:82])
+	m.StateGeneration = binary.BigEndian.Uint64(src[82:90])
+	m.ChunkCount = binary.BigEndian.Uint64(src[90:98])
+	m.EncodedBytes = binary.BigEndian.Uint64(src[98:106])
+	copy(m.ContentHash[:], src[106:138])
+	n := binary.BigEndian.Uint32(src[138:142])
 	if n > 4096 {
 		return nil, nil, fmt.Errorf("codec: absurd watermark count %d", n)
 	}

@@ -1020,6 +1020,38 @@ func (r *Registry) SetDefaultAlgorithm(ctx context.Context, alg AlgorithmID) err
 	return nil
 }
 
+// RebindDBID moves the registry to a new database identity for coordinated
+// reseed: the KEK re-derives under the new DBID and the sealed payload is
+// re-written with the new DBID, atomically installed. Key material is
+// preserved (re-wrapped, not rotated). The caller must have opened the
+// registry under the source DBID; files must already be rebound (registry
+// persists last) so a crash always retries to convergence.
+func (r *Registry) RebindDBID(ctx context.Context, newDBID [16]byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.dbID == newDBID {
+		return nil
+	}
+	mat, err := r.provider.Current(ctx)
+	if err != nil {
+		return fmt.Errorf("crypto: storage key: %w", err)
+	}
+	defer Zero(mat.Key)
+	r.storageKeyID = mat.ID
+	material, err := r.loadMaterialLocked(ctx)
+	if err != nil {
+		return err
+	}
+	defer zeroMaterial(material)
+	prev := r.dbID
+	r.dbID = newDBID
+	if err := r.persistLocked(mat.Key, material); err != nil {
+		r.dbID = prev
+		return err
+	}
+	return nil
+}
+
 // StorageKeyID returns the storage key id the registry is wrapped under.
 func (r *Registry) StorageKeyID() string {
 	r.mu.Lock()
