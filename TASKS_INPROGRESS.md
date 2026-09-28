@@ -15,3 +15,11 @@ This document tracks tasks currently being actively worked on by AI agents.
 
 
 
+- [ ] 23. `snapshot-resync` — New live suite: stale node rejoins via snapshot after log retention expiry. — Agent: Muse Code (Muse Spark), Started: 2026-09-28 00:20:00 UTC
+- [ ] 24. `backup-restore` — New live suite: backup, fresh-identity restore, rejoin, reseed rejection. — Agent: Muse Code (Muse Spark), Started: 2026-09-28 00:20:00 UTC
+- [ ] 25. `swim-discovery` — New live suite: cluster forms from partial seeds without static full mesh. — Agent: Muse Code (Muse Spark), Started: 2026-09-28 00:20:00 UTC
+- [ ] 26. `schema-evolution` — New live suite: rolling additive migration across a live mesh. — Agent: Muse Code (Muse Spark), Started: 2026-09-28 00:20:00 UTC
+- [ ] 27. `overload-budgets` — New live suite: app-level staging caps and overload rejection. — Agent: Muse Code (Muse Spark), Started: 2026-09-28 00:20:00 UTC
+- [ ] 28. `churn-retirement` — New live suite: suspect/dead/refutation plus retirement vs GC gating. — Agent: Muse Code (Muse Spark), Started: 2026-09-28 00:20:00 UTC
+- [ ] 29. `plumtree-live` — New live suite: dissemination mode over a real multi-process mesh. — Agent: Muse Code (Muse Spark), Started: 2026-09-28 00:20:00 UTC
+- [ ] 30. `bridge-two-streams` — New live suite: bridge two-streams live suite (see task 30). — Agent: Muse Code (Muse Spark), Started: 2026-09-28 00:20:00 UTC

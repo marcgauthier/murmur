@@ -56,11 +56,4 @@ No pending items remain in the areas below; design links are kept for reference.
 19. `highlow-faults` — DONE (covered by tests-live/highlow forgery test, see TASKS_COMPLETED.md).
 20. `highlow-schema` — DONE (covered by tests-live/highlow schema-hold test, see TASKS_COMPLETED.md).
 22. `write-priority` — DONE (multi-process redo, see TASKS_COMPLETED.md).
-23. `snapshot-resync` — New live suite: stale node rejoins via snapshot after log retention expiry.
-24. `backup-restore` — New live suite: backup, fresh-identity restore, rejoin, reseed rejection.
-25. `swim-discovery` — New live suite: cluster forms from partial seeds without static full mesh.
-26. `schema-evolution` — New live suite: rolling additive migration across a live mesh.
-27. `overload-budgets` — New live suite: app-level staging caps and overload rejection.
-28. `churn-retirement` — New live suite: suspect/dead/refutation plus retirement vs GC gating.
-29. `plumtree-live` — New live suite: dissemination mode over a real multi-process mesh.
-30. `bridge-two-streams` — New live suite: two Low domains importing into one High.
+23.–30. (Claimed by Muse Code (Muse Spark) for the new-suite campaign; see TASKS_INPROGRESS.md.)

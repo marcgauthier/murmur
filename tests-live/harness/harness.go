@@ -73,6 +73,18 @@ type ClusterOptions struct {
 	// ManualPeers omits the automatic full-mesh peer list so the test can
 	// establish peering later via AddPeer (delayed-mesh scenarios).
 	ManualPeers bool
+	// Replication carries optional retention overrides for scenarios
+	// that must force log expiry (snapshot resync, GC gating). Nil
+	// selects production defaults.
+	Replication *ReplicationOptions
+}
+
+// ReplicationOptions mirrors the daemon's replication config section.
+// Zero values select production defaults; positive values override.
+type ReplicationOptions struct {
+	MinLogRetentionMs        int64
+	MaxOfflineLogRetentionMs int64
+	MinRetainedBatches       uint64
 }
 
 var liveHTTPClient = &http.Client{Timeout: 15 * time.Second}
@@ -94,8 +106,15 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 		opts.BaseAPIPort = 18080
 	}
 
-	// Locate spedsql binary, build if not found
-	binPath := findOrBuildSpedSQL(t)
+	// Locate spedsql binary, build if not found. SPEDSQL_BIN overrides
+	// the shared binary so experimental daemon builds can be exercised
+	// without disturbing parallel suites.
+	var binPath string
+	if override := os.Getenv("SPEDSQL_BIN"); override != "" {
+		binPath = override
+	} else {
+		binPath = findOrBuildSpedSQL(t)
+	}
 
 	// Runtime root: the override env names a root shared by concurrent
 	// runs, so each cluster still nests under its own name (as does the
@@ -242,6 +261,13 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 		}
 		if opts.Schema != nil {
 			cfgJSON["schema"] = opts.Schema
+		}
+		if opts.Replication != nil {
+			cfgJSON["replication"] = map[string]any{
+				"min_log_retention_ms":         opts.Replication.MinLogRetentionMs,
+				"max_offline_log_retention_ms": opts.Replication.MaxOfflineLogRetentionMs,
+				"min_retained_batches":         opts.Replication.MinRetainedBatches,
+			}
 		}
 		if opts.Files != nil {
 			var fetchPeers []map[string]any

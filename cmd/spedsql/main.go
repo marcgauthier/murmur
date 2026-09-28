@@ -30,28 +30,38 @@ import (
 
 // NodeConfigFile represents the JSON configuration file for a node instance.
 type NodeConfigFile struct {
-	NodeID          string            `json:"node_id"`
-	DBID            string            `json:"db_id,omitempty"`
-	DataDir         string            `json:"data_dir"`
-	ListenAddr      string            `json:"listen_addr"`
-	APIAddr         string            `json:"api_addr"`
-	MetricsAddr     string            `json:"metrics_addr,omitempty"`
-	Bootstrap       []string          `json:"bootstrap,omitempty"`
-	Peers           []PeerConfig      `json:"peers,omitempty"`
-	AllowedPeers    []string          `json:"allowed_peers,omitempty"`
-	AllowedNetworks []string          `json:"allowed_networks,omitempty"`
-	AwaitUnlock     bool              `json:"await_unlock"`
-	KeyHex          string            `json:"key_hex,omitempty"`
-	KeyID           string            `json:"key_id,omitempty"`
-	AdminToken      string            `json:"admin_token,omitempty"`
-	ServiceToken    string            `json:"service_token,omitempty"`
-	SchemaPath      string            `json:"schema_path,omitempty"`
-	TLSCACertFile   string            `json:"tls_ca_cert_file,omitempty"`
-	TLSNodeCertFile string            `json:"tls_node_cert_file,omitempty"`
-	TLSNodeKeyFile  string            `json:"tls_node_key_file,omitempty"`
-	Schema          *db.SchemaConfig  `json:"schema,omitempty"`
-	Files           *FilesConfigFile  `json:"files,omitempty"`
-	Bridge          *BridgeConfigFile `json:"bridge,omitempty"`
+	NodeID          string                 `json:"node_id"`
+	DBID            string                 `json:"db_id,omitempty"`
+	DataDir         string                 `json:"data_dir"`
+	ListenAddr      string                 `json:"listen_addr"`
+	APIAddr         string                 `json:"api_addr"`
+	MetricsAddr     string                 `json:"metrics_addr,omitempty"`
+	Bootstrap       []string               `json:"bootstrap,omitempty"`
+	Peers           []PeerConfig           `json:"peers,omitempty"`
+	AllowedPeers    []string               `json:"allowed_peers,omitempty"`
+	AllowedNetworks []string               `json:"allowed_networks,omitempty"`
+	AwaitUnlock     bool                   `json:"await_unlock"`
+	KeyHex          string                 `json:"key_hex,omitempty"`
+	KeyID           string                 `json:"key_id,omitempty"`
+	AdminToken      string                 `json:"admin_token,omitempty"`
+	ServiceToken    string                 `json:"service_token,omitempty"`
+	SchemaPath      string                 `json:"schema_path,omitempty"`
+	TLSCACertFile   string                 `json:"tls_ca_cert_file,omitempty"`
+	TLSNodeCertFile string                 `json:"tls_node_cert_file,omitempty"`
+	TLSNodeKeyFile  string                 `json:"tls_node_key_file,omitempty"`
+	Schema          *db.SchemaConfig       `json:"schema,omitempty"`
+	Files           *FilesConfigFile       `json:"files,omitempty"`
+	Bridge          *BridgeConfigFile      `json:"bridge,omitempty"`
+	Replication     *ReplicationConfigFile `json:"replication,omitempty"`
+}
+
+// ReplicationConfigFile carries optional retention overrides. Zero values
+// select production defaults; positive values override them (used by live
+// scenarios that must force log expiry and snapshot resync).
+type ReplicationConfigFile struct {
+	MinLogRetentionMs        int64  `json:"min_log_retention_ms,omitempty"`
+	MaxOfflineLogRetentionMs int64  `json:"max_offline_log_retention_ms,omitempty"`
+	MinRetainedBatches       uint64 `json:"min_retained_batches,omitempty"`
 }
 
 type PeerConfig struct {
@@ -440,6 +450,17 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 	dbCfg.Replication.SendInterval = 15 * time.Millisecond
 	dbCfg.Replication.DialInterval = 50 * time.Millisecond
 	dbCfg.Replication.AckInterval = 50 * time.Millisecond
+	if rc := d.cfg.Replication; rc != nil {
+		if rc.MinLogRetentionMs > 0 {
+			dbCfg.Replication.MinLogRetention = time.Duration(rc.MinLogRetentionMs) * time.Millisecond
+		}
+		if rc.MaxOfflineLogRetentionMs > 0 {
+			dbCfg.Replication.MaxOfflineLogRetention = time.Duration(rc.MaxOfflineLogRetentionMs) * time.Millisecond
+		}
+		if rc.MinRetainedBatches > 0 {
+			dbCfg.Replication.MinRetainedBatches = rc.MinRetainedBatches
+		}
+	}
 
 	// Configure initial peers
 	for _, p := range d.cfg.Peers {
