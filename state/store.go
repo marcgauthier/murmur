@@ -1184,15 +1184,17 @@ func (s *Store) AsyncDurability() bool {
 	return s.writeOpts == pebble.NoSync
 }
 
-// Sync forces pending writes to disk, ensuring durability of all previously committed transactions.
+// Sync appends a WAL-only record and syncs it, ensuring durability of all
+// previously committed transactions. Pebble skips an empty batch entirely.
 func (s *Store) Sync() error {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	b := s.db.NewBatch()
-	defer b.Close()
-	return s.commitBatch(b, pebble.Sync)
+	if err := s.db.LogData(nil, pebble.Sync); err != nil {
+		return err
+	}
+	return s.failedErr()
 }
 
 // Size returns the database's total disk usage in bytes.

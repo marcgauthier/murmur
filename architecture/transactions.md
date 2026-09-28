@@ -250,6 +250,9 @@ When `DurabilityAsync` is explicitly configured:
 - Transactions commit at RAM speed via `pebble.NoSync` without blocking on disk sync.
 - Acknowledgements explicitly carry a weaker durability contract: in an ungraceful crash or power-loss scenario, transactions acknowledged since the last sync may not have reached disk.
 - Applications can invoke `db.Sync(ctx)` at any time to establish an explicit durable sync point to disk.
+- Sync uses a WAL-only Pebble record with `pebble.Sync`; an empty Pebble batch would be skipped and would not establish a durability barrier.
+- Set `Durability.SyncInterval = time.Second` to schedule a Pebble sync about once per second. The interval is opt-in, valid only with `DurabilityAsync`, and zero leaves synchronization manual. A slow or failed sync can extend the loss window; a failed scheduled sync makes the database fail closed. Graceful close performs a final sync and reports an error if it fails.
+- `pebble.NoSync` still appends each commit to the WAL. The interval reduces fsync frequency; it does not guarantee exactly one physical disk write per second.
 - Replica convergence and CRDT invariants remain intact: query engine rebuilds and version ordering remain authoritative from the persisted Pebble state.
 
 ---

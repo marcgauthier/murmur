@@ -912,8 +912,12 @@ func TestAsyncDurabilityMode(t *testing.T) {
 	}
 
 	// Test explicit sync.
+	walBytesBefore := s.db.Metrics().WAL.BytesWritten
 	if err := s.Sync(); err != nil {
 		t.Fatalf("Sync failed: %v", err)
+	}
+	if walBytesAfter := s.db.Metrics().WAL.BytesWritten; walBytesAfter <= walBytesBefore {
+		t.Fatalf("Sync wrote no WAL barrier: before=%d after=%d", walBytesBefore, walBytesAfter)
 	}
 
 	if err := s.Close(); err != nil {

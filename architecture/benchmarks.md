@@ -154,7 +154,52 @@ go test ./benchmark/ -bench 'BenchmarkCipherMatrix' -short
 
 # Five-node / backlog / throughput replication scenarios only
 go test ./benchmark/ -bench 'BenchmarkReplicationThroughput|BenchmarkFiveNodeSync|BenchmarkReconnectBacklog' -short
+
+# Direct Go API, one encrypted database, one and four concurrent writers
+SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./benchmark/ -run '^TestLocalWriterThroughput$' -v -count=1 -timeout=90s
+
+# Same local workload, async commits with a Pebble sync about once per second
+SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./benchmark/ -run '^TestLocalPeriodicSyncThroughput$' -v -count=1 -timeout=90s
+
+# Live daemon, one and four concurrent HTTP SQL writers (10s each)
+SPEDSQL_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-live/benchmark/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s
 ```
+
+The direct local writer benchmark opens one encrypted database with no peers
+and sends individual SQL `INSERT` statements from one or four goroutines
+through the Go API. It measures acknowledged inserts per wall-clock second,
+then closes and reopens the database and checks the durable row count. It has
+no daemon, HTTP, or QUIC traffic. Each writer-count run uses a fresh store.
+
+On 2026-09-28, a 10-second run on the four-core Intel i5-6500 measured
+3,205 inserts (320.4/sec) with one writer and 3,276 inserts (327.3/sec)
+with four writers. Both reopened row-count checks passed.
+
+The default synchronous durability mode waits for a Pebble WAL sync on each
+single-row transaction, and local writes pass through one serialized write
+coordinator. In-memory SQLite avoids a second durable SQL write but does not
+remove the Pebble sync cost. Batch transactions amortize that cost across rows.
+
+The periodic-sync variant uses the same one-row transactions, checks that
+scheduled syncs occurred, and verifies all acknowledged rows after a graceful
+close and reopen. Its higher rate trades away per-write crash durability.
+
+On 2026-09-28, a 10-second run on the same four-core Intel i5-6500 measured
+52,454 inserts (5,245.3/sec) with one writer and 51,908 inserts (5,186.6/sec)
+with four writers. The runs recorded 9 and 10 scheduled syncs respectively,
+and both reopened row-count checks passed. The result measures one WAL fsync
+about every second; individual commits still append to the WAL.
+
+The live writer benchmark starts a fresh encrypted single-node daemon per
+writer count and measures acknowledged single-row `INSERT` statements per
+wall-clock second. It checks the final SQL row count against the number of
+acknowledged inserts. Its rate includes the application HTTP and SQL paths;
+it is separate from the in-process write microbenchmarks and QUIC replication
+measurements. See [the live benchmark scenario](../tests-live/benchmark/README.md).
+
+The 2026-09-28 10-second run on the four-core Intel i5-6500 measured
+294.3 inserts/sec with one writer and 328.2 inserts/sec with four writers;
+both count checks passed.
 
 Benchmark names map to matrix sections: `BenchmarkPKLookup`,
 `BenchmarkIndexedEquality`, `BenchmarkIndexedRange`, `BenchmarkOrderLimit`,

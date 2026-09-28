@@ -112,6 +112,14 @@ are easier to prove there first.
 
 `PebbleConfig` is required; use `DefaultPebbleConfig()` for standard settings. `Config.Path` is the database directory. Expose cache size, memtable size/count, maximum open files, compaction concurrency, and compression; keep storage caches out of `CacheConfig`. Validate settings before opening Pebble. Encryption keys come from `Encryption.Key` or `Encryption.Provider`; never weaken the replication acknowledgement or durability contract through storage options.
 
+`DurabilityConfig{Mode: DurabilityAsync, SyncInterval: time.Second}` enables
+opt-in scheduled Pebble syncs for applications accepting approximately one
+second of unsynced acknowledged writes. `SyncInterval` must be non-negative
+and is valid only with `DurabilityAsync`; zero keeps manual `DB.Sync` behavior.
+`Metrics().PeriodicSyncs` and `PeriodicSyncFailures` report scheduled sync
+results. See [Section 17](transactions.md#17-alternative-write-optimization)
+for the durability contract.
+
 ```go
 type PebbleConfig struct {
     CacheBytes              int64

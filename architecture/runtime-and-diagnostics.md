@@ -177,7 +177,7 @@ Implementation status: `DB.Status` carries the node snapshot above plus
 per-peer records (`PeerDiagnostics`: session state, schema agreement,
 watermarks, per-origin lag, traffic totals, queue depths, SWIM membership state,
 selection state, and retention deadlines), `DB.Metrics` carries node-local writer/apply/GC/schema
-counters, `Status.Pool` and `Status.Membership` expose shared connection pool and SWIM
+counters plus scheduled durability sync successes and failures, `Status.Pool` and `Status.Membership` expose shared connection pool and SWIM
 diagnostics, and the `metrics` subpackage provides Prometheus collectors over a caller-owned
 registry with no HTTP listener. Counters cover implemented subsystems (SWIM membership and datagram transport,
 shared connection pool and admission/eviction, QUIC sessions, origin-log repair, snapshots, schema sync).

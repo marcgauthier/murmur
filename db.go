@@ -326,6 +326,10 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	if db.repl != nil {
 		db.startReplication(db.repl)
 	}
+	if cfg.Durability.SyncInterval > 0 {
+		db.wg.Add(1)
+		go db.periodicSyncLoop()
+	}
 	db.wg.Add(1)
 	go db.gcLoop()
 	db.wg.Add(1)
@@ -1404,6 +1408,27 @@ func (db *DB) DBID() DBID {
 
 // --- maintenance workers ---
 
+func (db *DB) periodicSyncLoop() {
+	defer db.wg.Done()
+	ticker := time.NewTicker(db.cfg.Durability.SyncInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-db.ctx.Done():
+			return
+		case <-ticker.C:
+			if err := db.store.Sync(); err != nil {
+				db.metrics.periodicSyncFailures.Add(1)
+				db.log.Error("replicateddb: periodic durability sync failed", "err", err.Error())
+				db.setState(StateFailed)
+				db.cancel()
+				return
+			}
+			db.metrics.periodicSyncs.Add(1)
+		}
+	}
+}
+
 func (db *DB) gcLoop() {
 	defer db.wg.Done()
 	t := time.NewTicker(30 * time.Second)
@@ -1775,6 +1800,11 @@ func (db *DB) Close() error {
 	}
 	db.wg.Wait()
 	var first error
+	if db.cfg.Durability.SyncInterval > 0 && db.store != nil {
+		if err := db.store.Sync(); err != nil {
+			first = fmt.Errorf("replicateddb: final durability sync: %w", err)
+		}
+	}
 	if db.subMgr != nil {
 		db.subMgr.close()
 		db.subMgr = nil

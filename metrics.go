@@ -19,6 +19,8 @@ type dbMetrics struct {
 	localCommits            atomic.Uint64
 	localCommitMutations    atomic.Uint64
 	localCommitLatencyNanos atomic.Uint64
+	periodicSyncs           atomic.Uint64
+	periodicSyncFailures    atomic.Uint64
 	writeAcquisitions       atomic.Uint64
 	writeQueueWaitNanos     atomic.Uint64
 
@@ -69,6 +71,8 @@ type MetricsSnapshot struct {
 	LocalCommits            uint64
 	LocalCommitMutations    uint64
 	LocalCommitLatencyNanos uint64
+	PeriodicSyncs           uint64
+	PeriodicSyncFailures    uint64
 	WriteAcquisitions       uint64
 	WriteQueueWaitNanos     uint64
 
@@ -115,6 +119,8 @@ func (m *dbMetrics) snapshot() MetricsSnapshot {
 		LocalCommits:            m.localCommits.Load(),
 		LocalCommitMutations:    m.localCommitMutations.Load(),
 		LocalCommitLatencyNanos: m.localCommitLatencyNanos.Load(),
+		PeriodicSyncs:           m.periodicSyncs.Load(),
+		PeriodicSyncFailures:    m.periodicSyncFailures.Load(),
 		WriteAcquisitions:       m.writeAcquisitions.Load(),
 		WriteQueueWaitNanos:     m.writeQueueWaitNanos.Load(),
 

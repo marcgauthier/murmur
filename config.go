@@ -47,6 +47,11 @@ const (
 // DurabilityConfig configures the durability contract.
 type DurabilityConfig struct {
 	Mode DurabilityMode
+	// SyncInterval periodically makes asynchronous commits durable. It is only
+	// valid with DurabilityAsync. Zero leaves synchronization to db.Sync.
+	// One second limits the usual unsynced window to about one second;
+	// a blocked or failed sync can extend it.
+	SyncInterval time.Duration
 }
 
 // BackupScheduleConfig configures the automated online backup worker.
@@ -488,6 +493,9 @@ func (c *Config) validate() error {
 	}
 	if c.Durability.Mode != DurabilitySynchronous && c.Durability.Mode != DurabilityAsync {
 		return fmt.Errorf("replicateddb: unsupported durability mode %d: %w", c.Durability.Mode, ErrUnsupportedSchema)
+	}
+	if c.Durability.SyncInterval < 0 || (c.Durability.SyncInterval > 0 && c.Durability.Mode != DurabilityAsync) {
+		return fmt.Errorf("replicateddb: durability SyncInterval requires DurabilityAsync and must be non-negative: %w", ErrUnsupportedSchema)
 	}
 	if c.MaxTransactionBytes <= 0 {
 		return fmt.Errorf("replicateddb: MaxTransactionBytes must be positive: %w", ErrUnsupportedSchema)
