@@ -1,7 +1,7 @@
 # SPeD-SQL
 
 <p align="center">
-  <img src="spedsql.png" alt="SPeD-SQL Logo" width="280"/>
+  <img src="spedsql.png" alt="SPeD-SQL Logo" width="600"/>
 </p>
 
 Fast In Memory Secure Peer-Distributed SQL with persistance.
