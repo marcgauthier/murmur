@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/transport"
+	"github.com/marcgauthier/spedsql/transport"
 )
 
 // testClusterCA issues node credentials for tests.

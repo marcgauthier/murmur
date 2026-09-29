@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/backup"
-	"github.com/nomadsql/replicateddb/crypto"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/schema"
+	"github.com/marcgauthier/spedsql/backup"
+	"github.com/marcgauthier/spedsql/crypto"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/schema"
 )
 
 func testEncryptionProvider(key []byte) crypto.KeyProvider {

@@ -4,8 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/nomadsql/replicateddb/crdt"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/crdt"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // CodecVersion versions the mutation/snapshot binary encoding.

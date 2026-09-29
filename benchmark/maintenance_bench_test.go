@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
-	"github.com/nomadsql/replicateddb/crypto"
+	"github.com/marcgauthier/spedsql/crypto"
 )
 
 // BenchmarkCheckpoint times online checkpoint creation on a template

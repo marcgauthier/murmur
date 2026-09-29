@@ -35,6 +35,16 @@ Membership callbacks only enqueue work to the scheduler; never perform SQL, Pebb
 
 Bootstrap from an overlapping partial seed list, resolving DNS to reachable endpoints. Retry failures with capped exponential backoff and jitter; unsuccessful bootstrap does not prevent local reads/writes after normal startup. Retain the distinction between a standalone node and an isolated member. A node joining an existing cluster must use its shared configured or persisted DBID; never silently adopt a seed's DBID. A fresh standalone node may still create its own DBID.
 
+Current runtime wiring: `db.go` starts `replication.NewMembershipService` when
+`Replication.Membership.Bootstrap` is nonempty, falling back to
+`Replication.Bootstrap`. It attaches the service to the replication manager;
+`replication/membership.go` calls `memberlist.Create`. With no seeds this startup
+path does not create the service. Transport/service initialization errors are
+currently not propagated from this block, so a successful database open alone
+does not prove discovery started. The seed-only live discovery acceptance gap
+is recorded in [release status](release-status.md#1-verified-feature-matrix).
+File-object fetch sources remain separately configured static peers.
+
 ### 26.2 Memberlist transport over QUIC
 
 Implement `memberlist.NodeAwareTransport`, including its underlying `Transport` interface, on the shared QUIC endpoint:
@@ -127,10 +137,9 @@ AllowedPeers []NodeID
 
 and optionally an address allow-list.
 
-The standalone daemon accepts `allowed_peers` as a JSON array of NodeID strings
-and applies it as `ReplicationConfig.AllowedPeers`. Entries are parsed before
-database open; malformed IDs fail startup. Use `tests-live/allow-nodes/` to
-exercise admission across independent daemon processes.
+`ReplicationConfig.AllowedPeers` sets allowed peer NodeIDs. Entries are validated before
+database open; malformed IDs fail startup. The live suite exercises
+admission in `tests-live/allow-nodes/`.
 
 Apply the same CA trust and `AllowedPeers` policy to membership and replication. For address-only bootstrap, verify the certificate chain, extract its NodeID SAN, enforce the allow-list, and then validate DBID in the authenticated protocol. Subsequent connections with a known identity must match that expected NodeID. Advertised metadata is not authorization.
 
@@ -149,9 +158,7 @@ listener opens. An absent address filter preserves the certificate/NodeID-only
 policy. A configured filter must match in addition to CA, NodeID, and DBID
 authorization; network location never substitutes for identity.
 
-The standalone daemon JSON config exposes the same policy as
-`allowed_networks`; each node process can therefore apply an independent
-address policy. The multi-process acceptance topology is documented in
+The multi-process acceptance topology is documented in
 [`architecture/testing.md`](testing.md) and exercised by
 `tests-live/addrpolicy/`.
 

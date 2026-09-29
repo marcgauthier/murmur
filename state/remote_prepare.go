@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/nomadsql/replicateddb/codec"
+	"github.com/marcgauthier/spedsql/codec"
 )
 
 // recoverPreparedRemote finishes the one remote transaction whose durable

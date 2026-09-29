@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/tests-live/harness"
-	"github.com/nomadsql/replicateddb/transport"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/tests-live/harness"
+	"github.com/marcgauthier/spedsql/transport"
 )
 
 func TestDaemonAPIRequiresMTLSExceptHealth(t *testing.T) {

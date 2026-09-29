@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/codec"
+	"github.com/marcgauthier/spedsql/codec"
 )
 
 // TestSnapshotLargeChunkedMergeEndToEnd imports a real multi-chunk

@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/overload"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/overload"
 )
 
 // TestQueueDropCounters proves overload drops are counted. Drops are safe

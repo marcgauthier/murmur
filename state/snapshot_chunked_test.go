@@ -7,9 +7,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
-	"github.com/nomadsql/replicateddb/codec"
-	spedsqlcrypto "github.com/nomadsql/replicateddb/crypto"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	spedsqlcrypto "github.com/marcgauthier/spedsql/crypto"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // openChunkedStore opens a store that forces the chunked snapshot merge

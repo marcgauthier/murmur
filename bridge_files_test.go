@@ -6,8 +6,8 @@ import (
 	"io"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/objectstore"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/objectstore"
 )
 
 func TestBridgeFileResolver(t *testing.T) {

@@ -17,10 +17,10 @@ import (
 	"sync"
 	"time"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/bridge"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/schema"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/bridge"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/schema"
 )
 
 // FilesConfigFile mirrors db.FilesConfig in node JSON configuration.

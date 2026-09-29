@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	replicateddb "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/transport"
+	replicateddb "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/transport"
 )
 
 // BenchmarkRebuild times Open (Pebble open + full SQL rebuild from current

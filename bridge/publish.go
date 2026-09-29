@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/nomadsql/replicateddb/backup"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/backup"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // DestinationPublisher adapts a backup.Destination blob store (local

@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // SessionPurpose classifies the intent of a connection or session for admission.

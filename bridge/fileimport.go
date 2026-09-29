@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/objectstore"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/objectstore"
 )
 
 // High-side file object installation.

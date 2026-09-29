@@ -5,8 +5,8 @@ import (
 	"io"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // FuzzFrame feeds arbitrary bytes to the frame reader: must never panic and

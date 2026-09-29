@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/codec"
+	"github.com/marcgauthier/spedsql/codec"
 )
 
 // holdWorker admits repeatedly, holding each ticket for service time, until
@@ -167,6 +167,79 @@ func TestSchedulerIdleBorrowing(t *testing.T) {
 	}
 	if snap.Local.Acquisitions != 0 {
 		t.Fatalf("local acquisitions = %d", snap.Local.Acquisitions)
+	}
+}
+
+// TestSchedulerMaintenanceReserve proves the anti-starvation floor: with
+// local saturated, a waiting maintenance ticket is granted after exactly
+// maintenanceReserveEvery interactive grants, not deferred forever.
+func TestSchedulerMaintenanceReserve(t *testing.T) {
+	s := newWriterScheduler(DefaultWriterSchedulingConfig())
+	ctx := context.Background()
+	admitAsync := func(class WriterClass) <-chan *Ticket {
+		ch := make(chan *Ticket, 1)
+		go func() {
+			tk, err := s.Admit(ctx, class)
+			if err != nil {
+				return
+			}
+			ch <- tk
+		}()
+		return ch
+	}
+	waitLocal := func() {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if s.Snapshot().Local.Waiters >= 1 {
+				return
+			}
+			if time.Now().After(deadline) {
+				s.Close()
+				t.Fatal("local waiter never queued")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	holder, err := s.Admit(ctx, WriterLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mch := admitAsync(WriterMaintenance)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if s.Snapshot().Maintenance.Waiters >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			holder.Release()
+			s.Close()
+			t.Fatal("maintenance waiter never queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// The initial grant counts, so 99 chained local grants bring the
+	// reserve counter to exactly 100 with local still saturated.
+	for i := 0; i < maintenanceReserveEvery-1; i++ {
+		next := admitAsync(WriterLocal)
+		waitLocal()
+		holder.Release()
+		select {
+		case holder = <-next:
+		case <-time.After(5 * time.Second):
+			s.Close()
+			t.Fatal("chained local grant lost")
+		}
+	}
+	// Local still holds and maintenance still waits: the next decision
+	// must divert to maintenance by the reserve.
+	holder.Release()
+	select {
+	case tk := <-mch:
+		tk.Release()
+	case <-time.After(5 * time.Second):
+		s.Close()
+		t.Fatal("maintenance never granted after 100 saturated interactive grants")
 	}
 }
 

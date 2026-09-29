@@ -8,9 +8,9 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/crdt"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/crdt"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // Row is the assembled current state of one replicated row.

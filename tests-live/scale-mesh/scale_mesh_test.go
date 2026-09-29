@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/schema"
-	"github.com/nomadsql/replicateddb/tests-live/harness"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/spedsql/tests-live/harness"
 )
 
 // Ten-node mesh with continuous writes: every node must converge, and the

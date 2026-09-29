@@ -8,7 +8,7 @@ package state
 import (
 	"encoding/binary"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // Key prefixes (PLAN section 14).

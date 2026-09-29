@@ -3,7 +3,7 @@ package replication
 import (
 	"testing"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func TestProgressRequestAndPageCodec(t *testing.T) {

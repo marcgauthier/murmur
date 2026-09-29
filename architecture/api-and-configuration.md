@@ -132,7 +132,7 @@ type PebbleConfig struct {
 
 type CompressionConfig struct {
     Mode      CompressionMode // default, none, snappy, or zstd
-    ZstdLevel int             // default 3; v1 supports only level 3
+    ZstdLevel int             // default 3; supported levels are 3, 9, and 12
 }
 
 type CompressionMode string
@@ -287,9 +287,7 @@ or `QueryStore.RemoteApplyMaxTransactions` (default 1,000) is reached. Zero
 selects the default for each; negative values are invalid. A local SQL write
 flushes pending remote rows first.
 
-The SQL materialization is always in memory. Older `QueryStore.Mode`,
-`QueryStore.TempDir`, and `QueryStore.MMapBytes` settings have been removed;
-remove those fields from Go config literals.
+The query view is always in-memory; see [query store](sqlite-backends.md#query-store-and-security).
 Pebble data and replication formats are unchanged.
 
 ### Transport

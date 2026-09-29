@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/schema"
+	"github.com/marcgauthier/spedsql/schema"
 )
 
 // waitForRowsSync polls like waitForRows but tolerates the materializer

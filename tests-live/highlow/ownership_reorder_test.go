@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/tests-live/harness"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/tests-live/harness"
 )
 
 func TestHighLowOwnershipReorderAcrossPeersLive(t *testing.T) {

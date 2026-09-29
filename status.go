@@ -4,8 +4,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/nomadsql/replicateddb/replication"
-	"github.com/nomadsql/replicateddb/transport"
+	"github.com/marcgauthier/spedsql/replication"
+	"github.com/marcgauthier/spedsql/transport"
 )
 
 // Attr is a structured log attribute.

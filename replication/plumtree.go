@@ -6,8 +6,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 const plumtreeGraftDelay = 75 * time.Millisecond

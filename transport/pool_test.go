@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func TestPoolValidation(t *testing.T) {

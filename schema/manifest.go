@@ -15,7 +15,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // Manifest is one immutable schema revision.

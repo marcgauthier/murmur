@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 type stubDB struct{ id ids.DBID }

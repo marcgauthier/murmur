@@ -8,8 +8,8 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/pebble/v2"
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 const MaxStagedTransactionBytes int64 = 256 << 20

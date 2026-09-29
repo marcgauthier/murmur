@@ -1,9 +1,14 @@
-When schema is declare:
-  Primary Keys: Every replicated table requires an explicit BLOB(16) primary key (e.g. replicateddb.NewRowID()). SQLite rowid /         
-  autoincrement is not replicated.
-  - this should be done automatically the user must flag a column name:
-        if no column is selected the Primary Keys is a UUIDv4 column name id
-        if column is selected the Primary Keys is a UUIDv5 (tablename + colunmn name value)
-        
-        
+build a gorm client for SPEDSQL?
 
+
+
+
+Version 2.0
+
+### 2. Custom conflict resolution callbacks                                                                                                    
+                                  
+  Per-cell LWW is clean and deterministic, but it's also lossy. If two nodes increment a counter, one write disappears. If you allowed           
+  registering per-column or per-table merge functions (e.g., MergeMax, MergeSum, MergeAppendSet, or arbitrary func(local, remote Cell) Cell),    
+  applications could model CRDTs beyond LWW — counters, grow-only sets, merge-friendly JSON — without leaving the replication framework. The     
+  Pebble merge operator could potentially be leveraged here.                                                                                     
+ 

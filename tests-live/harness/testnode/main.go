@@ -22,10 +22,10 @@ import (
 	"syscall"
 	"time"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/metrics"
-	"github.com/nomadsql/replicateddb/schema"
-	"github.com/nomadsql/replicateddb/service"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/metrics"
+	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/spedsql/service"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -38,8 +38,9 @@ type NodeConfigFile struct {
 	ListenAddr      string                 `json:"listen_addr"`
 	APIAddr         string                 `json:"api_addr"`
 	MetricsAddr     string                 `json:"metrics_addr,omitempty"`
-	Bootstrap       []string               `json:"bootstrap,omitempty"`
-	Peers           []PeerConfig           `json:"peers,omitempty"`
+	Bootstrap         []string               `json:"bootstrap,omitempty"`
+	MembershipEnabled bool                   `json:"membership_enabled,omitempty"`
+	Peers             []PeerConfig           `json:"peers,omitempty"`
 	AllowedPeers    []string               `json:"allowed_peers,omitempty"`
 	AllowedNetworks []string               `json:"allowed_networks,omitempty"`
 	AwaitUnlock     bool                   `json:"await_unlock"`
@@ -424,6 +425,7 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 			AllowedNetworks: append([]string(nil), d.cfg.AllowedNetworks...),
 			Bootstrap:       append([]string(nil), d.cfg.Bootstrap...),
 			Membership: db.MembershipConfig{
+				Enabled:       d.cfg.MembershipEnabled || len(d.cfg.Bootstrap) > 0,
 				Bootstrap:     append([]string(nil), d.cfg.Bootstrap...),
 				AdvertiseAddr: d.cfg.ListenAddr,
 			},
@@ -993,16 +995,17 @@ func (d *NodeDaemon) handleServiceSubscribe(w http.ResponseWriter, r *http.Reque
 }
 
 func (d *NodeDaemon) Close() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = d.httpServer.Shutdown(ctx)
 		cancel()
 	}
-	if d.database != nil {
-		_ = d.database.Close()
-		d.database = nil
+	d.mu.Lock()
+	database := d.database
+	d.database = nil
+	d.mu.Unlock()
+	if database != nil {
+		_ = database.Close()
 	}
 }
 

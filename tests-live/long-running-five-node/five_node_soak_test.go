@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/schema"
-	"github.com/nomadsql/replicateddb/tests-live/harness"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/spedsql/tests-live/harness"
 )
 
 var statusClient = &http.Client{Timeout: 3 * time.Second}
@@ -184,6 +184,7 @@ func envMillis(t *testing.T, key string, fallback int) time.Duration {
 
 func restartAndCheckPersistence(t *testing.T, cluster *harness.Cluster, node int) {
 	t.Helper()
+	started := time.Now()
 	before, err := rowCount(cluster, node)
 	if err != nil {
 		t.Fatalf("%s pre-restart count: %v", cluster.Nodes[node].Label, err)
@@ -196,7 +197,7 @@ func restartAndCheckPersistence(t *testing.T, cluster *harness.Cluster, node int
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if got, err := rowCount(cluster, node); err == nil && got >= before {
-			t.Logf("%s reopened with %d rows (had %d before restart)", cluster.Nodes[node].Label, got, before)
+		t.Logf("%s restarted and rejoined in %s with %d rows (had %d before restart)", cluster.Nodes[node].Label, time.Since(started), got, before)
 			return
 		}
 		time.Sleep(100 * time.Millisecond)

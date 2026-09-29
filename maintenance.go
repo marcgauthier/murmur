@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/nomadsql/replicateddb/crypto"
-	"github.com/nomadsql/replicateddb/replication"
+	"github.com/marcgauthier/spedsql/crypto"
+	"github.com/marcgauthier/spedsql/replication"
 )
 
 // --- key rotation ---

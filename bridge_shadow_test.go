@@ -4,10 +4,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/replication"
-	"github.com/nomadsql/replicateddb/schema"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/replication"
+	"github.com/marcgauthier/spedsql/schema"
 )
 
 // shadowTestContacts resolves the contacts table IDs of a test DB.

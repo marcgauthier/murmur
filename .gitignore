@@ -19,5 +19,7 @@ coverage.txt
 # Local build and live test runtime artifacts
 /bin/
 /spedsql
+/testnode
+tests-live/bin/
 tests-live/runtime/
 tests-live/failures/

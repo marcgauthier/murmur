@@ -3,8 +3,8 @@ package sqlengine
 import (
 	"fmt"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // CellKey identifies one replicated cell.

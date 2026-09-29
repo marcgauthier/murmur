@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/codec"
+	"github.com/marcgauthier/spedsql/codec"
 )
 
 func TestRemoteMaterializationFlushesAtTransactionCount(t *testing.T) {

@@ -19,13 +19,13 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/quic-go/quic-go"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/overload"
-	"github.com/nomadsql/replicateddb/plumtree"
-	"github.com/nomadsql/replicateddb/schema"
-	"github.com/nomadsql/replicateddb/state"
-	"github.com/nomadsql/replicateddb/transport"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/overload"
+	"github.com/marcgauthier/spedsql/plumtree"
+	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/spedsql/transport"
 )
 
 var (
@@ -1393,10 +1393,12 @@ func (m *Manager) PeerStatus() []PeerStatus {
 		p.mu.Lock()
 		var snapRecv, snapTotal uint64
 		if p.snapRecv != nil {
+			p.snapRecv.mu.Lock()
 			snapRecv = p.snapRecv.chunksReceived
 			if p.snapRecv.manifest != nil {
 				snapTotal = p.snapRecv.manifest.ChunkCount
 			}
+			p.snapRecv.mu.Unlock()
 		}
 		st := PeerStatus{
 			NodeID:                 p.id,
@@ -1652,7 +1654,26 @@ func (m *Manager) attach(p *peerState, ps *peerSession, h *Hello) {
 	agreed := p.agreed
 	p.mu.Unlock()
 
-	m.wg.Add(2)
+	// Account the loops under m.mu: a naked Add races Run's Wait when
+	// a session attaches during shutdown (Add concurrent with Wait is
+	// both a data race and a WaitGroup misuse). Bailing here uninstalls
+	// the just-installed session; session close is idempotent, so a
+	// racing closeSessions cannot double-free.
+	m.mu.Lock()
+	shutdown := m.closed || m.ctx.Err() != nil
+	if !shutdown {
+		m.wg.Add(2)
+	}
+	m.mu.Unlock()
+	if shutdown {
+		p.mu.Lock()
+		if p.session == ps {
+			p.session = nil
+		}
+		p.mu.Unlock()
+		go ps.close()
+		return
+	}
 	go m.readControlLoop(p, ps)
 	go m.streamAcceptLoop(p, ps)
 	if m.membership != nil && m.membership.Transport() != nil {
@@ -1745,6 +1766,7 @@ func (m *Manager) serveInbound(sess *transport.Session) {
 		var memErr *ErrMembershipStream
 		if errors.As(err, &memErr) {
 			if m.membership != nil && m.membership.Transport() != nil {
+				m.membership.Transport().RegisterSession(sess)
 				m.membership.Transport().HandleStream(sess, stream, memErr.Prefix)
 				return
 			}
@@ -2068,12 +2090,18 @@ func (m *Manager) streamAcceptLoop(p *peerState, ps *peerSession) {
 
 func (m *Manager) handleIncomingStream(p *peerState, ps *peerSession, stream *quic.Stream) {
 	defer m.wg.Done()
-	defer stream.Close()
+	keepOpen := false
+	defer func() {
+		if !keepOpen {
+			_ = stream.Close()
+		}
+	}()
 	frame, err := ReadFrame(stream)
 	if err != nil {
 		var memErr *ErrMembershipStream
 		if errors.As(err, &memErr) {
 			if m.membership != nil && m.membership.Transport() != nil {
+				keepOpen = true
 				m.membership.Transport().HandleStream(ps.sess, stream, memErr.Prefix)
 			}
 		}
@@ -3438,6 +3466,11 @@ func (m *Manager) snapRecvFor(p *peerState) *snapRecvState {
 }
 
 type snapRecvState struct {
+	// mu guards the fields below: a peer serves manifest, chunk,
+	// and done frames on concurrent streams, so unguarded access
+	// races. Never hold mu across ApplySnapshotChunk or p.mu (lock
+	// order is p.mu -> mu, taken only in PeerStatus).
+	mu             sync.Mutex
 	manifest       *codec.SnapshotManifest
 	chunksReceived uint64
 }
@@ -3463,8 +3496,10 @@ func (m *Manager) onSnapshotManifest(p *peerState, _ *peerSession, payload []byt
 		return fmt.Errorf("snapshot schema mismatch")
 	}
 	st := m.snapRecvFor(p)
+	st.mu.Lock()
 	st.manifest = manifest
 	st.chunksReceived = 0
+	st.mu.Unlock()
 	m.markSnapshotProgress(p)
 	return nil
 }
@@ -3491,13 +3526,16 @@ func (m *Manager) onSnapshotChunk(p *peerState, _ *peerSession, f *Frame) error 
 	m.st.snapshotChunksReceived.Add(1)
 	m.st.snapshotBytesReceived.Add(uint64(len(payload)))
 	st := m.snapRecvFor(p)
-	if st.manifest == nil {
+	st.mu.Lock()
+	manifest := st.manifest
+	st.mu.Unlock()
+	if manifest == nil {
 		return fmt.Errorf("snapshot chunk without manifest")
 	}
 	var aerr error
 	complete := false
 	for i := 0; i < 5; i++ {
-		complete, aerr = m.cfg.Applier.ApplySnapshotChunk(m.ctx, st.manifest, chunk.Index, chunk.Cells, chunk.Last)
+		complete, aerr = m.cfg.Applier.ApplySnapshotChunk(m.ctx, manifest, chunk.Index, chunk.Cells, chunk.Last)
 		if aerr == nil || !state.IsConflict(aerr) {
 			break
 		}
@@ -3506,11 +3544,15 @@ func (m *Manager) onSnapshotChunk(p *peerState, _ *peerSession, f *Frame) error 
 	if aerr != nil {
 		return aerr
 	}
+	st.mu.Lock()
 	st.chunksReceived++
-	m.markSnapshotProgress(p)
 	if complete {
 		st.manifest = nil
 		st.chunksReceived = 0
+	}
+	st.mu.Unlock()
+	m.markSnapshotProgress(p)
+	if complete {
 		m.st.snapshotsReceived.Add(1)
 		p.mu.Lock()
 		p.awaiting = false
@@ -3525,7 +3567,10 @@ func (m *Manager) onSnapshotChunk(p *peerState, _ *peerSession, f *Frame) error 
 
 func (m *Manager) onSnapshotDone(p *peerState, _ *peerSession) error {
 	st := m.snapRecvFor(p)
-	if st.manifest != nil {
+	st.mu.Lock()
+	pending := st.manifest != nil
+	st.mu.Unlock()
+	if pending {
 		// The sender closed a transfer before all indexed chunks validated.
 		// Request a fresh cut; do not advertise the manifest watermarks.
 		m.queueCtrl(p, MsgSnapshotRequest, 0, nil)

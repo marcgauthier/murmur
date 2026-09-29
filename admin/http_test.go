@@ -9,9 +9,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/admin"
-	"github.com/nomadsql/replicateddb/schema"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/admin"
+	"github.com/marcgauthier/spedsql/schema"
 )
 
 func TestAuthenticatedTLSUnlockLifecycle(t *testing.T) {

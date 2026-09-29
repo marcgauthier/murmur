@@ -19,10 +19,10 @@ import (
 	"io"
 	"strings"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/objectstore"
-	"github.com/nomadsql/replicateddb/replication"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/objectstore"
+	"github.com/marcgauthier/spedsql/replication"
 )
 
 // Bridge file record contract: table and column names as they appear in

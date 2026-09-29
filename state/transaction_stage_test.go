@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func stagedBatch(t *testing.T, origin ids.NodeID) (*codec.MutationBatch, [][]byte) {

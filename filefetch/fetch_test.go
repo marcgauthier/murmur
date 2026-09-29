@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/objectstore"
-	"github.com/nomadsql/replicateddb/transport"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/objectstore"
+	"github.com/marcgauthier/spedsql/transport"
 )
 
 func fetchTestPair(t *testing.T) (srvCreds, cliCreds *transport.Credentials, nodeA, nodeB ids.NodeID, dbid ids.DBID) {

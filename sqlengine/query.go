@@ -3,51 +3,54 @@ package sqlengine
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"sync"
 )
 
 // Rows is a standalone read result. Close must be called promptly: an open
-// Rows holds a read lock that stalls writers. Exhausting the rows also closes
-// the cursor and releases the lock. Close is idempotent.
+// Rows holds a read lock that stalls writers. Exhausting the rows or canceling
+// the query context also closes the cursor and releases the lock. Close is idempotent.
 type Rows struct {
-	rows    *sql.Rows
-	release func()
-	cols    []string
-	once    sync.Once
-	cerr    error
+	rows     *sql.Rows
+	release  func()
+	cols     []string
+	once     sync.Once
+	cerr     error
+	stopHook func() bool
 }
 
 // Query runs a standalone read on the read connection. The caller must
 // Close the Rows.
 func (e *Engine) Query(ctx context.Context, query string, args ...any) (*Rows, error) {
-	e.rw.RLock()
-	if e.closed {
-		e.rw.RUnlock()
-		return nil, fmt.Errorf("sqlengine: closed")
+	if err := e.lock.RLock(ctx); err != nil {
+		return nil, err
 	}
 	stmt, err := e.readStmts.prepare(ctx, e.db, query)
 	if err != nil {
-		e.rw.RUnlock()
+		e.lock.RUnlock()
 		return nil, err
 	}
 	rows, err := stmt.QueryContext(ctx, args...)
 	if err != nil {
-		e.rw.RUnlock()
+		e.lock.RUnlock()
 		return nil, err
 	}
-	return &Rows{rows: rows, release: e.rw.RUnlock}, nil
+	r := &Rows{rows: rows, release: e.lock.RUnlock}
+	if ctx.Done() != nil {
+		r.stopHook = context.AfterFunc(ctx, func() {
+			_ = r.Close()
+		})
+	}
+	return r, nil
 }
 
 // QueryRowContext runs a single-row standalone read. Unlike Query it does not
 // hold the read lock after returning: the row is scanned immediately, so fn
 // receives the *sql.Row while the lock is held and must Scan synchronously.
 func (e *Engine) QueryRowContext(ctx context.Context, query string, args []any, fn func(*sql.Row) error) error {
-	e.rw.RLock()
-	defer e.rw.RUnlock()
-	if e.closed {
-		return fmt.Errorf("sqlengine: closed")
+	if err := e.lock.RLock(ctx); err != nil {
+		return err
 	}
+	defer e.lock.RUnlock()
 	stmt, err := e.readStmts.prepare(ctx, e.db, query)
 	if err != nil {
 		return err
@@ -71,9 +74,7 @@ func (r *Rows) Next() bool {
 	if r.rows.Next() {
 		return true
 	}
-	if r.release != nil {
-		_ = r.Close()
-	}
+	_ = r.Close()
 	return false
 }
 
@@ -86,8 +87,16 @@ func (r *Rows) Err() error { return r.rows.Err() }
 // Close releases the read lock.
 func (r *Rows) Close() error {
 	r.once.Do(func() {
-		r.cerr = r.rows.Close()
-		r.release()
+		if r.stopHook != nil {
+			r.stopHook()
+			r.stopHook = nil
+		}
+		if r.rows != nil {
+			r.cerr = r.rows.Close()
+		}
+		if r.release != nil {
+			r.release()
+		}
 	})
 	return r.cerr
 }

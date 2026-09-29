@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/schema"
-	"github.com/nomadsql/replicateddb/tests-live/harness"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/spedsql/tests-live/harness"
 )
 
 // Log GC must keep up with a sustained update stream: with aggressive
@@ -93,13 +93,51 @@ func TestLogGCKeepsUpWithChurn(t *testing.T) {
 	// the window appends an origin-log batch, so (commits - collected)
 	// is the retained set's growth over the window. GC keeps up iff it
 	// collects >= 90% of what the window produced; a dead GC scores 0%.
+	// The window is 40s on a quiet box and stretches (to a 150s cap)
+	// under parallel-suite load until the commit floor is met, so the
+	// ratio proof stays meaningful at any production rate.
 	time.Sleep(20 * time.Second)
 	before := gcCounters(t, cluster.Nodes[0].APIAddr)
 	time.Sleep(40 * time.Second)
 	after := gcCounters(t, cluster.Nodes[0].APIAddr)
+	for elapsed := 40 * time.Second; after.commits-before.commits < 2000 && elapsed < 150*time.Second; {
+		time.Sleep(5 * time.Second)
+		elapsed += 5 * time.Second
+		after = gcCounters(t, cluster.Nodes[0].APIAddr)
+	}
+	t.Logf("window commits=%d over the measurement period", after.commits-before.commits)
 
 	stopped.Store(true)
 	<-done
+
+	// Drain: the window's tail stays uncollected until a GC pass runs
+	// after the updaters stop, so first wait for a post-stop pass and
+	// then settle on a stable collected count before sampling `after`.
+	// Stability alone is not enough: on a starved ticker no pass may
+	// run for a minute, and a prematurely stable sample measures
+	// ticker alignment instead of balance. A dead GC exhausts the
+	// run wait and still fails via the runs/ratio checks below.
+	runDeadline := time.Now().Add(180 * time.Second)
+	windowEndRuns := after.runs
+	for {
+		next := gcCounters(t, cluster.Nodes[0].APIAddr)
+		after = next
+		if next.runs > windowEndRuns || time.Now().After(runDeadline) {
+			break
+		}
+		time.Sleep(5 * time.Second)
+	}
+	drainDeadline := time.Now().Add(120 * time.Second)
+	for stable := 0; stable < 2 && time.Now().Before(drainDeadline); {
+		time.Sleep(5 * time.Second)
+		next := gcCounters(t, cluster.Nodes[0].APIAddr)
+		if next.collected == after.collected {
+			stable++
+		} else {
+			stable = 0
+		}
+		after = next
+	}
 
 	if got := updateErrs.Load(); got != 0 {
 		t.Fatalf("%d update errors during churn", got)
@@ -116,14 +154,18 @@ func TestLogGCKeepsUpWithChurn(t *testing.T) {
 	collected := after.collected - before.collected
 	runs := after.runs - before.runs
 	failures := after.failures - before.failures
-	t.Logf("churn: %d updater sweeps, %d commits produced, %d log batches collected, %d gc runs, %d gc failures",
-		totalSweeps, commits, collected, runs, failures)
+	maintAcq := after.maintAcq - before.maintAcq
+	t.Logf("churn: %d updater sweeps, %d commits produced, %d log batches collected, %d gc runs, %d gc failures, %d maintenance acquisitions",
+		totalSweeps, commits, collected, runs, failures, maintAcq)
 
 	// The balance assertion is vacuous without proven sustained churn
 	// (the retained set scales with the production rate, so the 90%
 	// bound stays meaningful at any rate above the floor).
 	if commits < 2000 {
 		t.Fatalf("only %d commits in the window, want >= 2000 for GC pressure", commits)
+	}
+	if maintAcq == 0 {
+		t.Fatalf("no maintenance acquisitions during %d commits; scheduler starves GC", commits)
 	}
 	if runs == 0 {
 		t.Fatalf("no GC runs during the window; test cannot observe GC")
@@ -237,6 +279,10 @@ type gcSnapshot struct {
 	collected int64
 	runs      int64
 	failures  int64
+	// maintAcq proves the maintenance reserve grants tickets under
+	// churn; without it (zero with nonzero commits) gcOnce starves in
+	// its first Admit and runs stays flat.
+	maintAcq int64
 }
 
 func gcCounters(t *testing.T, apiAddr string) (out gcSnapshot) {
@@ -270,6 +316,11 @@ func gcCounters(t *testing.T, apiAddr string) (out gcSnapshot) {
 			out.runs = v
 		case "spedsql_gc_failures_total":
 			out.failures = v
+		}
+		// Labeled series carry the metric name plus labels in field 0.
+		if strings.HasPrefix(fields[0], "spedsql_sched_acquisitions_total{") &&
+			strings.Contains(fields[0], `class="maintenance"`) {
+			out.maintAcq = v
 		}
 	}
 	return out

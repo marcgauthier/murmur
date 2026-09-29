@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/codec"
+	"github.com/marcgauthier/spedsql/codec"
 )
 
 func TestConfigMaxTransactionBytesValidation(t *testing.T) {

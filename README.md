@@ -4,25 +4,17 @@
   <img src="spedsql.png" alt="SPeD-SQL Logo" width="600"/>
 </p>
 
-Fast In Memory Secure Peer-Distributed SQL with persistance.
+SPeD-SQL (Secure Peer-Distributed SQL) is a Golang Embedded Package that provide an in memory SQLite database with masterless/offline distributed cluster with persistance on disk via Pebble saving only change deltas.
 
-An embedded, replicated SQL package for Go. Applications can link it directly;
-`cmd/spedsql` also provides a standalone node daemon for multi-process deployments.
-
-- **SQL queries** through an embedded SQLite engine held in memory and rebuilt
+- **SQL queries** through an embedded SQLite engine held in memory by default and rebuilt
   from Pebble on startup
 - **Durable state** in Pebble (authoritative; the SQL database is rebuildable)
 - **Masterless multi-writer replication** over QUIC with mutual TLS
 - **Offline writes** on every node, per-column last-writer-wins via hybrid
   logical clock (CR-SQLite-style cell model, engine-independent)
-- **Encrypted storage** (AES-256), storage-key rotation, snapshots for new or
-  stale nodes, replication-log garbage collection
+- **Encrypted storage** multiple cipher option, storage-key rotation, snapshots for new or stale nodes, replication-log garbage collection
 
-The architecture and implementation documentation has moved to the
-[architecture/](architecture/README.md) folder, split into smaller topic documents.
-Start with the [architecture overview](architecture/overview.md).
-Outstanding work is tracked in
-[TASKS_PENDING.md](TASKS_PENDING.md).
+The architecture and implementation documentation is in [architecture/](architecture/README.md) folder, split into smaller topic documents.  Start with the [architecture overview](architecture/overview.md).
 
 ## Reused packages
 
@@ -44,7 +36,7 @@ The default build uses mattn SQLite. The optional pure-Go `modernc.org/sqlite`
 driver can replace it under the `modernc` build tag without changing replication,
 durability, or conflict resolution.
 
-The SQL materialization is memory resident, non-authoritative, and rebuilt from
+The default SQL materialization is memory resident, non-authoritative, and rebuilt from
 Pebble on open. Reads hold the engine read lock until their rows are closed or
 exhausted; writes wait for active reads. See the [SQLite backend guide](architecture/sqlite-backends.md).
 
@@ -131,6 +123,35 @@ or strict refusal). Secondary `UNIQUE` constraints, virtual tables, and
 non-additive DDL are out of scope for v1. Foreign keys are
 application-level (not enforced during remote apply/rebuild).
 
+### Local-only tables, indexes, views, and FTS
+
+Not every table needs to be replicated. `SchemaConfig.LocalDDL` holds SQL
+statements for objects that live only on the local node — secondary indexes,
+views, FTS5 virtual tables, or entire tables that are never captured or sent
+over the wire. `LocalDDL` is re-applied after every open and rebuild, so
+these objects are always consistent with the current replicated state but
+carry zero replication overhead:
+
+```go
+Schema: replicateddb.SchemaConfig{
+    Version: 1,
+    Tables: []schema.TableSchema{{
+        Name: "contacts",
+        Columns: []schema.ColumnSchema{
+            {Name: "id", Type: schema.ColBlob},
+            {Name: "name", Type: schema.ColText, Nullable: true},
+        },
+    }},
+    LocalDDL: []string{
+        `CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(name)`,
+        `CREATE VIRTUAL TABLE IF NOT EXISTS contacts_fts USING fts5(name, content=contacts, content_rowid=rowid)`,
+        `CREATE TABLE IF NOT EXISTS local_cache (key TEXT PRIMARY KEY, value BLOB)`,
+    },
+},
+```
+
+Only `Tables` entries are replicated. Everything in `LocalDDL` stays local.
+
 ## Repository layout
 
 ```text
@@ -140,7 +161,7 @@ SPeD-SQL/                public API (db.go, transaction.go, config.go, ...)
   codec/                 binary value / mutation-batch / snapshot encodings
   schema/                stable table/column registry + validation
   state/                 Pebble-backed authoritative store (commit, log, GC, snapshot)
-  sqlengine/             in-memory SQL: pre-update capture, delta, apply, rebuild
+  sqlengine/             SQL materialization: capture, delta, apply, rebuild
   replication/           framed QUIC protocol + peer manager (batches, acks, snapshot)
   plumtree/              bounded eager/lazy dissemination state machine
   overload/              bounded global/per-peer accounting and token-bucket primitives
@@ -151,7 +172,7 @@ SPeD-SQL/                public API (db.go, transaction.go, config.go, ...)
   service/               optional authenticated HTTP adapter + remote SDK (status, SQL, subscriptions)
   bridge/                one-way Low-to-High logical replication roles and transfer types
   example/               runnable single-node example
-  tests-live/             standalone live integration scenarios ported from GALVANIZE
+  tests-live/             live multi-process integration test scenarios
 ```
 
 `objectstore/` stores immutable file payloads in authenticated encrypted
@@ -190,7 +211,7 @@ digests, and records latency SLOs. Run a short pass with
 
 The `tests-live/files-bridge` scenario checks encrypted file transfer from a
 two-node Low mesh through a recipient-sealed bridge into a two-node High mesh,
-with four `spedsql` daemon processes driven over HTTP (upload, peer fetch,
+with four isolated nodes driven over TLS (upload, peer fetch,
 sealed staging with a no-plaintext check, High re-encryption, search, and a
 delete cascade). Run it with `go test -count=1 ./tests-live/files-bridge`.
 The `tests-live/soak-slo` scenario measures continuous writes and convergence
@@ -263,13 +284,11 @@ REPLICATEDDB_BENCH_ROWS=1000000 go test ./benchmark/ -bench .  # 1M rows
 SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./benchmark/ -run '^TestLocalWriterThroughput$' -v -count=1 -timeout=90s  # direct local API, 1 vs 4 writers
 SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./benchmark/ -run '^TestLocalPeriodicSyncThroughput$' -v -count=1 -timeout=90s  # one-second disk sync, 1 vs 4 writers
 SPEDSQL_LOCAL_BATCH_BENCH_SECONDS=5 go test ./benchmark/ -run '^TestLocalTransactionBatchThroughput$' -v -count=1 -timeout=300s  # 1/10/100/1000 inserts per transaction
-SPEDSQL_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-live/benchmark/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s  # HTTP daemon, 1 vs 4 writers
+SPEDSQL_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-live/benchmark/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s  # live multi-process cluster, 1 vs 4 writers
 ```
 
 The direct local writer benchmark reports acknowledged SQL inserts per second
-for one and four goroutines on one encrypted database, with no HTTP or peers.
-It reopens the store and checks the durable row count. The separate live
-writer benchmark measures the standalone daemon's HTTP application path.
+for one and four goroutines on one encrypted database. It reopens the store and checks the durable row count. The separate live writer benchmark measures multi-node cluster throughput.
 `TestLocalPeriodicSyncThroughput` runs the same workload with opt-in
 one-second synchronization. On the Intel i5-6500, it measured about 5.2K
 single-row writes/sec for both one and four writers, versus about 320/sec
@@ -292,16 +311,14 @@ go test ./replication/ -run XXX -fuzz FuzzFrame -fuzztime 30s
 
 ## Status
 
-The [verified release status](architecture/release-status.md) is the single
-source of truth for implemented, partial, and pending work, with evidence
-for each claim. Residual pending items: snapshot source tail-history
-retention lease, SWIM discovery runtime wiring (static peers only; the QUIC
-transport adapter is unit-tested), multi-hour/impaired-network soak
-acceptance, and the TODO.md automatic-PK request. The daemon HTTP API requires
-HTTPS with a CA-signed client certificate for every route except public
-`GET /healthz`.
-No release commit exists yet; see the release-commit record before citing
-any hash in production claims.
+The [release inventory and verification record](architecture/release-status.md)
+separates implementation, available tests, and historical execution results.
+Snapshot source retention leases and bootstrap-configured SWIM runtime wiring
+exist. Remaining acceptance includes source-lease safety through receiver tail
+catch-up, actual seed-only discovery, and multi-hour/impaired-network soaks.
+Automatic primary-key derivation is not implemented; applications supply keys.
+No verified release revision is recorded; the static inventory does not certify
+the latest commit or working tree.
 
  Working: local durable engine, pre-update capture, transaction coalescing,
  per-cell LWW + row tombstones, encrypted Pebble, startup rebuild, two-node
@@ -315,8 +332,7 @@ any hash in production claims.
  with replicated schema-manifest sync (ancestry/merge exchange,
  `AcceptRemoteSchema` policy), `database/sql` driver wrapper
  (`sql.Open("replicateddb", ...)` / `NewConnector`), optional IP/CIDR peer
-admission (`Replication.AllowedNetworks`), daemon JSON identity/network filters
-(`allowed_peers` / `allowed_networks`), reactive query subscriptions
+admission (`Replication.AllowedNetworks` / `Replication.AllowedPeers`), reactive query subscriptions
 (`DB.Subscribe` / `DB.SubscribeWithOptions` with cursor resumption and reset notifications),
 canonical `MaxTransactionBytes` pre-commit validation with rollback, handshake receive limit advertising, and bounded decode/reassembly,
  fresh-writer-identity backup restore/clone with a durable restore marker (same-identity rollback rejected),
@@ -389,11 +405,10 @@ admission for all state writers.
  until restart, and restart recovers the last durable state), and a
  two-node randomized soak test with convergence assertion.
 
- Deferred to later milestones: large-BLOB chunking, long-duration impaired-network soak measurements,
- and long (multi-hour) soak runs (short soaks pass; multi-hour runs not yet
- accepted). The SWIM QUIC transport adapter and
- the shared bounded QUIC connection pool have implementations; SWIM runtime
- discovery wiring remains pending.
+ Transaction chunking and SWIM runtime wiring over the shared bounded QUIC
+ pool are implemented. Long-duration impaired-network measurements, multi-hour
+ soak acceptance, and seed-only live discovery verification remain outstanding;
+ short historical runs do not establish those guarantees.
 
  The [capability inventory](architecture/capability-gaps.md) distinguishes existing
  code from target requirements, including remaining bounded dissemination,
@@ -403,8 +418,9 @@ admission for all state writers.
  watermarks. Encrypted staging survives restart. Large snapshots merge CRDT
  winners through encrypted-VFS SSTable ingestion with durable progress and
  atomic watermark publication. `Replication.MaxSnapshotBytes` defaults to
- 512 MiB, with a 10-minute source transfer timeout; source tail-history
- retention remains pending.
+ 512 MiB, with a 10-minute source transfer timeout. Source tail-history leases
+ exist and release when export returns or expires; end-to-end protection through
+ receiver publication and tail catch-up remains an acceptance requirement.
 
 Implemented High/Low replication includes replicated row/field provenance,
 High-owned field protection, durable Low-delete holds, identity-collision

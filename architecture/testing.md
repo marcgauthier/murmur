@@ -4,6 +4,15 @@ Crash/convergence/network/encryption tests and alpha acceptance criteria.
 
 [Architecture index](README.md) · [Project README](../README.md)
 
+CI runs a live acceptance smoke with both the Go test process and the separately
+built `tests-live/harness/testnode` instrumented using `-race`. Enable the same
+path locally with `SPEDSQL_RACE=1 bash tests-live/run.sh <scenario>`; this is
+necessary because a race-instrumented test binary does not instrument a child
+node built separately. Weekly scheduled CI fuzzes every target in `codec` and
+`replication` with bounded runs and runs `govulncheck` across Go packages. These
+scheduled checks complement, but do not replace, the deployment rehearsals in
+[Operational rehearsals](operational-rehearsals.md).
+
 ## Contents
 
 - [55. Crash-Recovery Tests](#55-crash-recovery-tests)
@@ -119,11 +128,13 @@ The managed-view integration port at `tests-live/views/` checks view results on
 three replicas and after one replica reopens and rebuilds. Run it with
 `go test -count=1 ./tests-live/views`.
 
-The large-payload port at `tests-live/large-payload/` sends a 1.5 MiB value in
-the same transaction as 250 rows across two encrypted QUIC nodes, then checks
+The large-payload port at `tests-live/large-payload/` sends 250 separate row
+inserts and a separate 1.5 MiB value insert across two encrypted QUIC nodes, then checks
 the exact value digest and row count. Run it with
 `go test -count=1 ./tests-live/large-payload`. It covers the direct mesh data
-path; High/Low bundle transport is covered separately by
+path and eventual fidelity, not atomicity of a single 251-row transaction,
+interrupted-transaction restart, or cross-peer chunk repair. High/Low bundle
+transport is covered separately by
 `tests-live/highlow/` and `tests-live/files-bridge/`.
 
 The allow-nodes port at `tests-live/allow-nodes/` uses valid NodeID-bound
@@ -281,6 +292,20 @@ GC must collect at least 90% of the origin-log batches a 40s window
 produces (commits vs `spedsql_gc_log_collected_total`), proving the
 retained set does not grow, with exact row counts and identical digests
 at the end. Run it with `go test -count=1 ./tests-live/gc-balance`.
+
+The `tests-live/release-upgrade/` scenario checks out the pinned
+previous release into a scratch worktree, builds its daemon, and proves
+three upgrade paths against the current build: a rolling upgrade of a
+three-daemon mesh under continuous writes (zero failed writes outside
+upgrade windows, mixed old-write/new-read replication mid-roll,
+identical digests at the end), a current-binary open of a
+previous-release store with a byte-identical digest, and a
+fresh-identity restore by the current library of a backup taken by the
+previous release's writer. Run it with
+`bash tests-live/run.sh release-upgrade` (or
+`go test -count=1 ./tests-live/release-upgrade` after building the
+current test-node binary); it needs a git checkout containing the
+previous ref, so CI checks out full history (`fetch-depth: 0`).
 
 The `tests-live/soak-slo/` scenario writes through three encrypted daemon
 processes and their HTTP SQL endpoints, then gates logical digest convergence,
@@ -453,12 +478,7 @@ A first serious alpha should not be called successful until all of the following
 - encryption-manager data-key rotation configured/tested.
 - Startup rebuild recreates identical query-visible state.
 - Per-column LWW convergence tested.
-- Delete/resurrection semantics tested.
-- Two nodes replicate over quic-go with mTLS.
-- Every daemon API route requires HTTPS and a valid CA-signed client
-  certificate, except public HTTPS `GET /healthz`; verify absent, expired,
-  and untrusted client certificates are rejected and the CLI uses mTLS.
-- Three nodes forward multi-origin changes.
+- Mutual TLS authenticates all peer-to-peer QUIC replication connections with valid CA-signed certificates and URI NodeID verification.
 - Partial seed lists discover members through SWIM over authenticated QUIC without native UDP/TCP membership listeners.
 - QUIC membership/datagram/stream adapters handle identity, DBID, size limits, deadlines, and graceful shutdown.
 - Configured fanout/session/connection bounds (3/8/32 in the scaling test; production defaults 4/32/64) hold at 10/100/1,000 simulated members.

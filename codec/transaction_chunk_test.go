@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func chunkTestBatch(payloadBytes int) *MutationBatch {

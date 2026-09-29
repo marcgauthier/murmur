@@ -11,8 +11,8 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func openTestStore(t *testing.T, node ids.NodeID) *Store {

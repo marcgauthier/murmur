@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	replicateddb "github.com/nomadsql/replicateddb"
+	replicateddb "github.com/marcgauthier/spedsql"
 	_ "modernc.org/sqlite"
 )
 

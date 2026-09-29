@@ -17,9 +17,9 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/schema"
-	"github.com/nomadsql/replicateddb/tests-live/harness"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/spedsql/tests-live/harness"
 )
 
 func TestChainPeersConvergeViaForwarding(t *testing.T) {
@@ -152,10 +152,11 @@ func TestDynamicBootstrapDiscovery(t *testing.T) {
 	// Node 1 acts as bootstrap seed. Node 2 and 3 point to Node 1's repl address.
 	// No static peers are configured; dynamic discovery must form cluster sessions.
 	baseCluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "swim-discovery",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		ManualPeers: true,
+		Name:           "swim-discovery",
+		NumNodes:       3,
+		AwaitUnlock:    true,
+		ManualPeers:    true,
+		BootstrapSeeds: []int{0},
 		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
 			Name: "pm_rows",
 			Columns: []schema.ColumnSchema{
@@ -165,18 +166,57 @@ func TestDynamicBootstrapDiscovery(t *testing.T) {
 		}}},
 	})
 
-	// Add seed to Node 2 and Node 3 bootstrap via admin add peer
-	for i := 1; i < 3; i++ {
-		if err := baseCluster.AddPeer(i, 0); err != nil {
-			t.Fatalf("node %d add seed: %v", i, err)
-		}
-	}
+	// Wait for SWIM dynamic discovery to find all cluster members without any explicit AddPeer calls
+	waitForMembership(t, baseCluster, 3, 30*time.Second)
 
+	// Write 10 rows on Node 0 (seed)
 	for i := 0; i < 10; i++ {
 		id := fmt.Sprintf("%032x", 8000+i)
-		if err := baseCluster.ExecSQL(0, "INSERT INTO pm_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("dyn-%d", i)); err != nil {
+		if err := baseCluster.ExecSQL(0, "INSERT INTO pm_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("dyn-seed-%d", i)); err != nil {
 			t.Fatalf("seed write: %v", err)
 		}
 	}
-	waitConverged(t, baseCluster, 10, 60*time.Second)
+
+	// Write 5 rows on Node 1 (discovered peer)
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("%032x", 8100+i)
+		if err := baseCluster.ExecSQL(1, "INSERT INTO pm_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("dyn-node1-%d", i)); err != nil {
+			t.Fatalf("node 1 write: %v", err)
+		}
+	}
+
+	// Write 5 rows on Node 2 (discovered peer)
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("%032x", 8200+i)
+		if err := baseCluster.ExecSQL(2, "INSERT INTO pm_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("dyn-node2-%d", i)); err != nil {
+			t.Fatalf("node 2 write: %v", err)
+		}
+	}
+
+	// All 20 rows must converge across all 3 nodes. 150s, not 60s:
+	// under a full parallel `go test ./...` the box runs ~10x slow
+	// and exact convergence legitimately takes over a minute; the
+	// proof (exact 20-row convergence) is unchanged.
+	waitConverged(t, baseCluster, 20, 150*time.Second)
 }
+
+func waitForMembership(t *testing.T, c *harness.Cluster, wantMembers int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		allDiscovered := true
+		for _, node := range c.Nodes {
+			count := metricValue(t, node.APIAddr, "spedsql_membership_count")
+			if int(count) < wantMembers {
+				allDiscovered = false
+				break
+			}
+		}
+		if allDiscovered {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("nodes did not discover %d members via SWIM within %v", wantMembers, timeout)
+}
+

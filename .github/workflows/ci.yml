@@ -23,6 +23,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # Full history: release-upgrade checks out the previous release.
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -61,12 +64,15 @@ jobs:
         run: go test -tags "sqlite_preupdate_hook sqlite_fts5" -run '^TestMattnSQLitePreUpdatePreservesTextAndBlobTypes|TestPreUpdateCaptureInsertUpdateDelete$' ./sqlengine
 
   live-gate:
-    name: Live acceptance gate (release daemon binary)
+    name: Live acceptance gate
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # Full history: release-upgrade checks out the previous release.
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -76,29 +82,26 @@ jobs:
       - name: Verify dependencies
         run: go mod verify
 
-      - name: Build release daemon binary
+      - name: Build package
         env:
           CGO_ENABLED: 1
-        run: |
-          mkdir -p bin
-          go build -tags "sqlite_preupdate_hook sqlite_fts5" -o bin/spedsql ./cmd/spedsql
+        run: go build -tags "sqlite_preupdate_hook sqlite_fts5" ./...
 
       - name: Run live release-gate scenarios
         env:
           CGO_ENABLED: 1
         run: bash tests-live/run.sh gate
 
-      - name: Upload release daemon binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: spedsql-linux-amd64
-          path: bin/spedsql
-          retention-days: 5
-
       - name: Run pure-Go live smoke
         env:
           CGO_ENABLED: 0
           SPEDSQL_TAGS: modernc
+        run: bash tests-live/run.sh three-node-sync
+
+      - name: Run race-instrumented live node smoke
+        env:
+          CGO_ENABLED: 1
+          SPEDSQL_RACE: '1'
         run: bash tests-live/run.sh three-node-sync
 
       - name: Upload live failure artifacts
@@ -139,6 +142,50 @@ jobs:
           path: tests-live/failures/
           retention-days: 14
 
+  scheduled-fuzz:
+    name: Scheduled fuzzing and vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+
+      - name: Fuzz codec decoders
+        env:
+          CGO_ENABLED: 1
+        run: |
+          for target in FuzzValue FuzzBatch FuzzSnapshotCells FuzzCellState; do
+            go test ./codec -run '^$' -fuzz "^${target}$" -fuzztime=45s -parallel=2
+          done
+
+      - name: Fuzz replication protocol
+        env:
+          CGO_ENABLED: 1
+        run: |
+          for target in FuzzFrame FuzzHello FuzzBatchesMessage FuzzSnapshotChunkMessage; do
+            go test ./replication -run '^$' -fuzz "^${target}$" -fuzztime=45s -parallel=2
+          done
+
+      - name: Scan Go dependencies for known vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      - name: Upload fuzz corpus on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: |
+            codec/testdata/fuzz/
+            replication/testdata/fuzz/
+          if-no-files-found: ignore
+          retention-days: 14
+
   test-windows:
     name: Test Windows amd64 (Go ${{ matrix.go-version }})
     runs-on: windows-latest
@@ -149,6 +196,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # Full history: release-upgrade checks out the previous release.
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5

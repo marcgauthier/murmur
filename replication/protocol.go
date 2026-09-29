@@ -12,9 +12,9 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/schema"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/schema"
 )
 
 // Protocol version 3 adds validated, indexed snapshot transfers.

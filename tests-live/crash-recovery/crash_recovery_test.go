@@ -9,12 +9,13 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/tests-live/harness"
+	"github.com/marcgauthier/spedsql/tests-live/harness"
 )
 
 func TestAbruptProcessDeathRecoversCommittedRows(t *testing.T) {
@@ -91,14 +92,18 @@ func TestAbruptProcessDeathRecoversCommittedRows(t *testing.T) {
 	killDuringWrites(t, cluster, 1, &active)
 	time.Sleep(writeBurst)
 	restartNode(t, cluster, 1)
-	waitForPeers(t, cluster, []int{2, 2, 2}, 30*time.Second)
+	// 90s, not 30s: under a full parallel `go test ./...` the box runs
+	// ~10x slow and a rejoined node legitimately needs over half a
+	// minute to redial and resync; the proof (rejoin, no lost writes)
+	// is unchanged.
+	waitForPeers(t, cluster, []int{2, 2, 2}, 90*time.Second)
 	t.Log("node2 rejoined under continuing application load")
 
 	time.Sleep(writeBurst)
 	killDuringWrites(t, cluster, 2, &active)
 	time.Sleep(writeBurst)
 	restartNode(t, cluster, 2)
-	waitForPeers(t, cluster, []int{2, 2, 2}, 30*time.Second)
+	waitForPeers(t, cluster, []int{2, 2, 2}, 90*time.Second)
 
 	stopWriters()
 	waitForConvergence(t, cluster, time.Duration(envSeconds("SPEDSQL_CRASH_SETTLE_SECONDS", 60))*time.Second)
@@ -152,9 +157,11 @@ func waitForPeers(t *testing.T, cluster *harness.Cluster, want []int, timeout ti
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	var states []string
 	for i, node := range cluster.Nodes {
-		t.Fatalf("%s connected peers=%d, want %d", node.Label, connectedPeers(node.APIAddr), want[i])
+		states = append(states, fmt.Sprintf("%s=%d(want %d)", node.Label, connectedPeers(node.APIAddr), want[i]))
 	}
+	t.Fatalf("peers did not reach %v within %v: %s", want, timeout, strings.Join(states, " "))
 }
 
 func connectedPeers(apiAddr string) int {

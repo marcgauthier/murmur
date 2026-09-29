@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/state"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/state"
 )
 
 func TestStateStorePeerExclusion(t *testing.T) {

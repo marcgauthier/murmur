@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // EventState tracks publication of one outbox event.

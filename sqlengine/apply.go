@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/crdt"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/schema"
-	"github.com/nomadsql/replicateddb/state"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/crdt"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/spedsql/state"
 )
 
 // StateReader is the durable state needed for rebuild and apply.

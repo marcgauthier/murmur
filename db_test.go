@@ -6,14 +6,13 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/crypto"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/schema"
+	"github.com/marcgauthier/spedsql/crypto"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/schema"
 )
 
 func testSchema() []schema.TableSchema {
@@ -586,72 +585,3 @@ func TestPebbleCacheSettings(t *testing.T) {
 	_ = db.Close()
 }
 
-func TestQueryStoreMMapSecureLifecycle(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	cfg := testConfig(filepath.Join(dir, "mmap_node"))
-	cfg.QueryStore.Mode = QueryStoreMMap
-	cfg.withDefaults()
-
-	db, err := Open(ctx, cfg)
-	if err != nil {
-		t.Fatalf("Open with QueryStoreMMap failed: %v", err)
-	}
-
-	mmapBase := filepath.Join(cfg.Path, "query_mmap")
-	if info, err := os.Stat(mmapBase); err != nil {
-		t.Fatalf("expected query_mmap directory to exist: %v", err)
-	} else if info.Mode().Perm() != 0700 {
-		t.Fatalf("query_mmap directory permissions = %04o, want 0700", info.Mode().Perm())
-	}
-
-	// Insert row
-	id := ids.NewRowID()
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "MMap Alice"); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-
-	// Query row back
-	var name string
-	if err := db.QueryRowContext(ctx, `SELECT name FROM contacts WHERE id = ?`, id[:]).Scan(&name); err != nil {
-		t.Fatal(err)
-	}
-	if name != "MMap Alice" {
-		t.Fatalf("read name = %q, want 'MMap Alice'", name)
-	}
-
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-
-	// Verify disposable directory is securely wiped and removed
-	entries, err := os.ReadDir(mmapBase)
-	if err != nil && !os.IsNotExist(err) {
-		t.Fatalf("reading mmap base: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("disposable query directories still exist after DB Close: %d entries", len(entries))
-	}
-
-	// Re-open DB with QueryStoreMMap: verifies clean rebuild from encrypted Pebble store
-	db2, err := Open(ctx, cfg)
-	if err != nil {
-		t.Fatalf("re-Open with QueryStoreMMap failed: %v", err)
-	}
-	defer db2.Close()
-
-	var name2 string
-	if err := db2.QueryRowContext(ctx, `SELECT name FROM contacts WHERE id = ?`, id[:]).Scan(&name2); err != nil {
-		t.Fatalf("querying rebuilt mmap view: %v", err)
-	}
-	if name2 != "MMap Alice" {
-		t.Fatalf("rebuilt read name = %q, want 'MMap Alice'", name2)
-	}
-}

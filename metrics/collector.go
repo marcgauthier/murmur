@@ -18,7 +18,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	replicateddb "github.com/nomadsql/replicateddb"
+	replicateddb "github.com/marcgauthier/spedsql"
 )
 
 // SnapshotFunc returns the current diagnostic snapshot. DB.Status satisfies it.

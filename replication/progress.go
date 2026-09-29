@@ -3,7 +3,7 @@ package replication
 import (
 	"fmt"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func (m *Manager) requestProgress(p *peerState, after ids.NodeID) {

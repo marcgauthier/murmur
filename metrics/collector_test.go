@@ -8,8 +8,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	replicateddb "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/replication"
+	replicateddb "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/replication"
 )
 
 // TestCollectorSeries proves node, counter, and per-peer series expose the

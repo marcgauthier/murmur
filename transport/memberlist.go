@@ -15,7 +15,7 @@ import (
 	"github.com/hashicorp/memberlist"
 	"github.com/quic-go/quic-go"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 const (

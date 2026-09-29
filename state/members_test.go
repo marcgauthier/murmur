@@ -3,8 +3,8 @@ package state
 import (
 	"testing"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func TestMemberAdmissionLifecycle(t *testing.T) {

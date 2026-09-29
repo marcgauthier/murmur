@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func manifestTestTables() []TableSchema {

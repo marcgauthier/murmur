@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
-	"github.com/nomadsql/replicateddb/state"
+	"github.com/marcgauthier/spedsql/state"
 )
 
 // failFS wraps a vfs.FS and fails all file data writes once armed,

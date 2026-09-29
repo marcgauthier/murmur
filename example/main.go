@@ -8,8 +8,8 @@ import (
 	"log"
 	"os"
 
-	replicateddb "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/schema"
+	replicateddb "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/schema"
 )
 
 func main() {

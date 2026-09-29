@@ -6,9 +6,9 @@ import (
 	"io"
 	"os"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/objectstore"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/objectstore"
 )
 
 // FilePublisher emits recipient-sealed object chunks for file metadata

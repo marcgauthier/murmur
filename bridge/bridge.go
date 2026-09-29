@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // Role selects the bridge behavior of a node. The zero value disables the

@@ -167,8 +167,11 @@ SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./benchmark/ -run '^TestLocalPeriod
 # Local transaction-size matrix: 1/10/100/1000 rows, 1/4 writers, both durability modes
 SPEDSQL_LOCAL_BATCH_BENCH_SECONDS=5 go test ./benchmark/ -run '^TestLocalTransactionBatchThroughput$' -v -count=1 -timeout=300s
 
-# Live daemon, one and four concurrent HTTP SQL writers (10s each)
+# Live multi-process cluster, one and four concurrent SQL writers (10s each)
 SPEDSQL_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-live/benchmark/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s
+
+# Pebble folder-size matrix across compression modes and traffic shapes
+go test ./tests-live/compression/ -run '^TestPebbleCompressionSizes$' -v -count=1 -timeout=15m
 
 # Concurrent-reader query benchmarks (CGO tags required for default backend)
 go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./benchmark/ -bench 'BenchmarkConcurrent' -short -benchtime 1s
@@ -238,11 +241,10 @@ the cost of the transaction's Pebble sync. These are inserts into a growing
 table; the earlier `BenchmarkTxn1000Rows` updates existing rows in a template
 with a different schema and is a separate workload.
 
-The live writer benchmark starts a fresh encrypted single-node daemon per
+The live writer benchmark starts a fresh encrypted single-node process per
 writer count and measures acknowledged single-row `INSERT` statements per
 wall-clock second. It checks the final SQL row count against the number of
-acknowledged inserts. Its rate includes the application HTTP and SQL paths;
-it is separate from the in-process write microbenchmarks and QUIC replication
+acknowledged inserts. It is separate from the in-process write microbenchmarks and QUIC replication
 measurements. See [the live benchmark scenario](../tests-live/benchmark/README.md).
 
 The 2026-09-28 10-second run on the four-core Intel i5-6500 measured
@@ -287,9 +289,9 @@ measured 17,882 mixed queries/sec with one reader, 61,780 with four,
 41,061 with eight, and 55,661 with 32.
 
 The recorded backend comparison results below were collected before the
-SQLite-only refactor, when the query store had memory and mmap modes. They
-are historical data and do not describe the current implementation. New
-SQLite-only results should replace them after rerunning the matrix.
+backend refactors. They are historical data, not measurements of the latest
+revision. The current code is in-memory only; rerun the
+matrix against an identified revision before making performance claims.
 
 Benchmark names map to matrix sections: `BenchmarkPKLookup`,
 `BenchmarkIndexedEquality`, `BenchmarkIndexedRange`, `BenchmarkOrderLimit`,
@@ -327,8 +329,8 @@ Coverage notes and manual procedures:
   build) have no phase hooks; the suite reports rebuild as one derived
   component. Compaction is Pebble-automatic with no public trigger, so it
   is not benchmarked separately. Substring/trigram search is not enabled.
-- File-backed query-store comparisons are no longer applicable; SQLite
-  materialization is always in memory.
+- Query materialization comparisons use the in-memory query view; historical
+  results below require a fresh run before making performance claims.
 
 ## 63. Recorded Results (10K, 2026-09-27)
 
@@ -366,7 +368,7 @@ Search, 10K rows (ops/sec / p50 / p95):
 | FTSPrefix | 33,173 | 25µs | 52µs |
 
 Backend comparison, mixed point+range workload: memory 15,486 ops/sec,
-mmap 14,751 ops/sec, stock SQLite baseline 13,527 ops/sec.
+stock SQLite baseline 13,527 ops/sec.
 
 Writes, 10K rows:
 
@@ -402,7 +404,7 @@ lookups hold steady (PK 121K ops/sec); full-scan GroupBy drops to
 20 ops/sec; single-cell writes hold at 313 ops/sec; 10K-row
 transactions drop to 11K rows/sec (index maintenance grows with data);
 full open takes 4.0s (25K rows/sec); reconnect backlog catches up at
-1,162 rows/sec. Backends stay ordered: memory 12.8K, mmap 12.3K,
+1,162 rows/sec. Order is unchanged: memory 12.8K,
 SQLite baseline 9.9K ops/sec on the mixed workload.
 
 ---

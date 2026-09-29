@@ -8,10 +8,10 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/vfs"
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/crdt"
-	spedsqlcrypto "github.com/nomadsql/replicateddb/crypto"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/crdt"
+	spedsqlcrypto "github.com/marcgauthier/spedsql/crypto"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func BenchmarkSnapshotChunkMergeEncrypted(batch *testing.B) {

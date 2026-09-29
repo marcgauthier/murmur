@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/nomadsql/replicateddb/crypto"
+	"github.com/marcgauthier/spedsql/crypto"
 )
 
 // EncryptionAlgorithm names an at-rest AEAD. Canonical values double as the

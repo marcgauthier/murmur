@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/tests-live/harness"
+	"github.com/marcgauthier/spedsql/tests-live/harness"
 )
 
 const soakObjectKey = "5151515151515151515151515151515151515151515151515151515151515151"

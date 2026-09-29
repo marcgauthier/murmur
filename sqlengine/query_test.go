@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func TestQueryRowsCloseIsIdempotentAndUnblocksWriter(t *testing.T) {

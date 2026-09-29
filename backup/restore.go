@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // Restore unpacks a backup bundle from cfg.Source into cfg.TargetPath and cfg.KeysPath,

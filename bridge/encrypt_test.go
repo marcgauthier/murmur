@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func testOutboxKey(id string, seed byte) OutboxKey {

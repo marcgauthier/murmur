@@ -16,9 +16,9 @@ import (
 	"strconv"
 	"testing"
 
-	replicateddb "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/crypto"
-	"github.com/nomadsql/replicateddb/schema"
+	replicateddb "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/crypto"
+	"github.com/marcgauthier/spedsql/schema"
 )
 
 // randNew is math/rand.New exposed for the sync benchmarks (which seed

@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	replicateddb "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/schema"
+	replicateddb "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/schema"
 )
 
 // TestLocalWriterThroughput measures direct Go API writes to one encrypted

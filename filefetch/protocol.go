@@ -18,8 +18,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/objectstore"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/objectstore"
 )
 
 // Protocol version 1: request/response object fetch with byte offsets.

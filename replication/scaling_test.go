@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/state"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/state"
 )
 
 func TestPeerScalingCapsAcrossChurn(t *testing.T) {

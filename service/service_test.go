@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/schema"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/schema"
 )
 
 var testToken = bytes.Repeat([]byte{0x5a}, 32)

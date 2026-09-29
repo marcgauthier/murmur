@@ -10,9 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/objectstore"
-	"github.com/nomadsql/replicateddb/transport"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/objectstore"
+	"github.com/marcgauthier/spedsql/transport"
 )
 
 // Server serves container byte ranges to cluster peers over a dedicated

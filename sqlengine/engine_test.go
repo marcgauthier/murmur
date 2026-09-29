@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/schema"
-	"github.com/nomadsql/replicateddb/state"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/spedsql/state"
 )
 
 func testRegistry(t *testing.T) *schema.Registry {

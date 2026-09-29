@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	replicateddb "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/transport"
+	replicateddb "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/transport"
 )
 
 const benchPortA = "127.0.0.1:17443"

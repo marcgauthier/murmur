@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/state"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/state"
 )
 
 type committingChunkApplier struct{ store *state.Store }

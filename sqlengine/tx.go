@@ -20,56 +20,84 @@ type Tx struct {
 // The engine write lock is held until Commit or Rollback. Standalone reads
 // drain before the transaction starts.
 func (e *Engine) Begin(ctx context.Context) (*Tx, error) {
-	e.wmu.Lock()
-	e.rw.Lock() // drain in-flight reads; block new ones
-	if e.closed {
-		e.rw.Unlock()
-		e.wmu.Unlock()
-		return nil, fmt.Errorf("sqlengine: closed")
+	if err := e.lock.Lock(ctx); err != nil {
+		return nil, fmt.Errorf("sqlengine: begin: %w", err)
 	}
 	if _, err := e.write.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		e.rw.Unlock()
-		e.wmu.Unlock()
+		e.lock.Unlock()
 		return nil, fmt.Errorf("sqlengine: begin: %w", err)
 	}
 	e.beginCapture()
 	return &Tx{e: e, ctx: ctx, failCommit: e.failCommit}, nil
 }
 
-// Exec runs a statement inside the transaction.
+// Exec runs a statement inside the transaction using the transaction context.
 func (tx *Tx) Exec(query string, args ...any) (sql.Result, error) {
+	return tx.ExecContext(tx.ctx, query, args...)
+}
+
+// ExecContext runs a statement inside the transaction respecting ctx.
+func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	if tx.done {
 		return nil, fmt.Errorf("sqlengine: tx done")
 	}
-	stmt, err := tx.e.writeStmts.prepare(tx.ctx, tx.e.write, query)
+	if err := tx.ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stmt, err := tx.e.writeStmts.prepare(ctx, tx.e.write, query)
 	if err != nil {
 		return nil, err
 	}
-	return stmt.ExecContext(tx.ctx, args...)
+	return stmt.ExecContext(ctx, args...)
 }
 
-// Query runs a query inside the transaction on the write connection.
+// Query runs a query inside the transaction on the write connection using the transaction context.
 func (tx *Tx) Query(query string, args ...any) (*sql.Rows, error) {
-	if tx.done {
-		return nil, fmt.Errorf("sqlengine: tx done")
-	}
-	stmt, err := tx.e.writeStmts.prepare(tx.ctx, tx.e.write, query)
-	if err != nil {
-		return nil, err
-	}
-	return stmt.QueryContext(tx.ctx, args...)
+	return tx.QueryContext(tx.ctx, query, args...)
 }
 
-// QueryRow runs a single-row query inside the transaction.
-func (tx *Tx) QueryRow(query string, args ...any) (*sql.Row, error) {
+// QueryContext runs a query inside the transaction on the write connection respecting ctx.
+func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	if tx.done {
 		return nil, fmt.Errorf("sqlengine: tx done")
 	}
-	stmt, err := tx.e.writeStmts.prepare(tx.ctx, tx.e.write, query)
+	if err := tx.ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stmt, err := tx.e.writeStmts.prepare(ctx, tx.e.write, query)
 	if err != nil {
 		return nil, err
 	}
-	return stmt.QueryRowContext(tx.ctx, args...), nil
+	return stmt.QueryContext(ctx, args...)
+}
+
+// QueryRow runs a single-row query inside the transaction using the transaction context.
+func (tx *Tx) QueryRow(query string, args ...any) (*sql.Row, error) {
+	return tx.QueryRowContext(tx.ctx, query, args...)
+}
+
+// QueryRowContext runs a single-row query inside the transaction respecting ctx.
+func (tx *Tx) QueryRowContext(ctx context.Context, query string, args ...any) (*sql.Row, error) {
+	if tx.done {
+		return nil, fmt.Errorf("sqlengine: tx done")
+	}
+	if err := tx.ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stmt, err := tx.e.writeStmts.prepare(ctx, tx.e.write, query)
+	if err != nil {
+		return nil, err
+	}
+	return stmt.QueryRowContext(ctx, args...), nil
 }
 
 // Pending returns a copy of the changes captured so far. It allows the
@@ -89,7 +117,7 @@ func (tx *Tx) Commit() ([]RawChange, error) {
 		return nil, fmt.Errorf("sqlengine: tx done")
 	}
 	tx.done = true
-	defer tx.e.unlockWriter()
+	defer tx.e.lock.Unlock()
 	if tx.failCommit != nil {
 		if err := tx.failCommit(); err != nil {
 			tx.e.resetCapture()
@@ -111,28 +139,25 @@ func (tx *Tx) Rollback() error {
 		return nil
 	}
 	tx.done = true
-	defer tx.e.unlockWriter()
+	defer tx.e.lock.Unlock()
 	tx.e.resetCapture()
-	if _, err := tx.e.write.ExecContext(tx.ctx, "ROLLBACK"); err != nil {
+	if _, err := tx.e.write.ExecContext(context.Background(), "ROLLBACK"); err != nil {
 		return fmt.Errorf("sqlengine: rollback: %w", err)
 	}
 	return nil
 }
 
-func (e *Engine) unlockWriter() {
-	e.rw.Unlock()
-	e.wmu.Unlock()
-}
-
 // WriteSection runs fn with the writer + reader locks held (for apply and
 // rebuild, which manage their own SQL transactions).
 func (e *Engine) WriteSection(fn func(ctx context.Context) error) error {
-	e.wmu.Lock()
-	defer e.wmu.Unlock()
-	e.rw.Lock()
-	defer e.rw.Unlock()
-	if e.closed {
-		return fmt.Errorf("sqlengine: closed")
+	return e.WriteSectionContext(context.Background(), fn)
+}
+
+// WriteSectionContext runs fn with the writer + reader locks held respecting ctx.
+func (e *Engine) WriteSectionContext(ctx context.Context, fn func(ctx context.Context) error) error {
+	if err := e.lock.Lock(ctx); err != nil {
+		return err
 	}
-	return fn(context.Background())
+	defer e.lock.Unlock()
+	return fn(ctx)
 }

@@ -1,4 +1,4 @@
-module github.com/nomadsql/replicateddb
+module github.com/marcgauthier/spedsql
 
 go 1.26.0
 

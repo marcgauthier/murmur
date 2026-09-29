@@ -7,8 +7,8 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func openStoreAt(t *testing.T, path string, node ids.NodeID, db ids.DBID, restore *RestoreAdoption) *Store {

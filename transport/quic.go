@@ -10,7 +10,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // Credentials carries this node's TLS identity and trust policy.

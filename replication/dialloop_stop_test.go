@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/state"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/state"
 )
 
 // Removing a peer must stop its detached dialLoop state so a later re-add

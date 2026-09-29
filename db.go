@@ -18,15 +18,15 @@ import (
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/cockroachdb/pebble/v2/sstable/block"
 	"github.com/cockroachdb/pebble/v2/vfs"
-	"github.com/nomadsql/replicateddb/backup"
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/crypto"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/replication"
-	"github.com/nomadsql/replicateddb/schema"
-	"github.com/nomadsql/replicateddb/sqlengine"
-	"github.com/nomadsql/replicateddb/state"
-	"github.com/nomadsql/replicateddb/transport"
+	"github.com/marcgauthier/spedsql/backup"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/crypto"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/replication"
+	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/spedsql/sqlengine"
+	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/spedsql/transport"
 )
 
 // DB is an embedded replicated database. All methods are safe for concurrent
@@ -85,6 +85,23 @@ type DB struct {
 	openedAt time.Time
 
 	crash *crashHooks // failure injection; nil in production
+}
+
+// zstdProfileForLevel returns the Pebble block compression profile for a
+// validated Zstd level. Level 3 uses Pebble's built-in profile; other
+// supported levels copy it and override the per-block level. The shared
+// built-in profile is never mutated.
+func zstdProfileForLevel(level int) *sstable.CompressionProfile {
+	base := block.CompressionProfileByName("zstd")
+	if level == 3 {
+		return base
+	}
+	prof := *base
+	prof.Name = fmt.Sprintf("zstd-%d", level)
+	prof.DataBlocks.Level = uint8(level)
+	prof.ValueBlocks.Level = uint8(level)
+	prof.OtherBlocks.Level = uint8(level)
+	return &prof
 }
 
 // Open opens or creates the database, rebuilds the in-memory query database
@@ -193,7 +210,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	case CompressionSnappy:
 		compProfile = block.CompressionProfileByName("snappy")
 	case CompressionZstd:
-		compProfile = block.CompressionProfileByName("zstd")
+		compProfile = zstdProfileForLevel(cfg.Pebble.Compression.ZstdLevel)
 	}
 
 	pebbleFS := vfs.FS(efs)
@@ -249,11 +266,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		TimeCreated: manifest.TimeCreated,
 	}
 	var engine *sqlengine.Engine
-	if cfg.QueryStore.Mode == QueryStoreMMap {
-		engine, err = sqlengine.OpenMMap(reg, cfg.Schema.DDL, cfg.Schema.LocalDDL, cfg.Cache.StatementCacheEntries, cfg.QueryStore.TempDir, cfg.QueryStore.MMapBytes)
-	} else {
-		engine, err = sqlengine.Open(reg, cfg.Schema.DDL, cfg.Schema.LocalDDL, cfg.Cache.StatementCacheEntries)
-	}
+	engine, err = sqlengine.Open(reg, cfg.Schema.DDL, cfg.Schema.LocalDDL, cfg.Cache.StatementCacheEntries)
 	if err != nil {
 		db.closeStore()
 		db.cancel()
@@ -645,13 +658,38 @@ func (db *DB) BeginTxWithID(ctx context.Context, txID ids.TxID, _ *TxOptions) (*
 		ticket.Release()
 		return nil, flushErr
 	}
-	stx, err := db.engine.Begin(context.Background())
+	stx, err := db.engine.Begin(ctx)
 	if err != nil {
 		db.writeMu.Unlock()
 		ticket.Release()
 		return nil, err
 	}
-	return &Tx{db: db, stx: stx, txID: txID, ticket: ticket}, nil
+	tx := &Tx{db: db, stx: stx, txID: txID, ticket: ticket}
+	var stopUser, stopDB func() bool
+	if ctx.Done() != nil {
+		stopUser = context.AfterFunc(ctx, func() {
+			_ = tx.Rollback()
+		})
+	}
+	if db.ctx.Done() != nil {
+		stopDB = context.AfterFunc(db.ctx, func() {
+			_ = tx.Rollback()
+		})
+	}
+	if stopUser != nil || stopDB != nil {
+		tx.stopHook = func() bool {
+			ok1 := true
+			if stopUser != nil {
+				ok1 = stopUser()
+			}
+			ok2 := true
+			if stopDB != nil {
+				ok2 = stopDB()
+			}
+			return ok1 && ok2
+		}
+	}
+	return tx, nil
 }
 
 // HasTransactionReceipt reports whether a transaction ID already has a durable
@@ -1482,7 +1520,7 @@ func (db *DB) gcOnce(withReceipts bool) {
 		// until a short return proves the origin drained: one unit per
 		// 30s pass caps collection at ~137 batches/s, which any
 		// sustained workload outruns (unbounded retained growth).
-		for {
+		for unit := 0; ; unit++ {
 			ticket, err := db.sched.Admit(db.ctx, WriterMaintenance)
 			if err != nil {
 				return
@@ -1627,7 +1665,7 @@ func (db *DB) newReplicationManager(extraPeers []replication.PeerInfo) (*replica
 	if len(bootstrap) == 0 && len(db.cfg.Replication.Bootstrap) > 0 {
 		bootstrap = append(bootstrap, db.cfg.Replication.Bootstrap...)
 	}
-	if len(bootstrap) > 0 {
+	if memCfg.Enabled || len(bootstrap) > 0 {
 		advAddr := memCfg.AdvertiseAddr
 		if advAddr == "" {
 			advAddr = db.cfg.Replication.ListenAddr

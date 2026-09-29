@@ -26,10 +26,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/nomadsql/replicateddb/filefetch"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/objectstore"
-	"github.com/nomadsql/replicateddb/state"
+	"github.com/marcgauthier/spedsql/filefetch"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/objectstore"
+	"github.com/marcgauthier/spedsql/state"
 )
 
 // fetchState is the worker-side fetch subsystem state.

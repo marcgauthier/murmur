@@ -15,8 +15,8 @@ import (
 
 	"github.com/hashicorp/memberlist"
 
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/transport"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/transport"
 )
 
 const (
@@ -117,6 +117,8 @@ type MembershipEvent struct {
 
 // MembershipConfig configures HashiCorp memberlist SWIM discovery and failure detection.
 type MembershipConfig struct {
+	// Enabled explicitly starts the SWIM membership service even if Bootstrap is empty (e.g. for seed nodes).
+	Enabled        bool
 	Bootstrap      []string
 	AdvertiseAddr  string
 	ProbeInterval  time.Duration

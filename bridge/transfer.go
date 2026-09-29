@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // RecordOp distinguishes row upserts from row deletes.

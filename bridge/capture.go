@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // Capturer drains Low origin logs into the outbox, one transaction-linked

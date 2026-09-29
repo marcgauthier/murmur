@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/state"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/state"
 )
 
 func openPairForMembership(t *testing.T, mutate func(*Config)) (nodeA, nodeB NodeID, dbA, dbB *DB) {
@@ -56,6 +56,35 @@ func pollMember(t *testing.T, db *DB, peer NodeID, timeout time.Duration, want f
 	return rec
 }
 
+// pollMemberAdmissions waits until the manager has counted at least want
+// admissions. The counter trails the durable record (the attach
+// goroutine increments after the commit), so tests must poll it.
+func pollMemberAdmissions(t *testing.T, db *DB, want uint64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if got := db.Status().Replication.MemberAdmissions; got >= want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("admissions did not reach %d within %v (last %d)", want, timeout, db.Status().Replication.MemberAdmissions)
+}
+
+// pollMemberAdmissionsExact waits until the admission count equals want.
+// A duplicate admission fails the wait instead of passing silently.
+func pollMemberAdmissionsExact(t *testing.T, db *DB, want uint64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if got := db.Status().Replication.MemberAdmissions; got == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("admissions did not equal %d within %v (last %d)", want, timeout, db.Status().Replication.MemberAdmissions)
+}
+
 // TestMemberAdmissionOnHandshake proves the first successful authenticated
 // handshake persists an active admission with a retention deadline.
 func TestMemberAdmissionOnHandshake(t *testing.T) {
@@ -78,8 +107,13 @@ func TestMemberAdmissionOnHandshake(t *testing.T) {
 		return r.Status == state.MemberActive
 	})
 
+	// The admission counter is incremented by the attach goroutine
+	// after the record commit lands, so a Status sampled between the
+	// two observes the record without the count. Poll the counter;
+	// only the record itself is synchronous with the poll above.
+	pollMemberAdmissions(t, dbA, 1, 10*time.Second)
 	st := dbA.Status()
-	if st.Replication.MemberAdmissions < 1 || st.Replication.GatingMembers != 1 {
+	if st.Replication.GatingMembers != 1 {
 		t.Fatalf("admissions=%d gating=%d", st.Replication.MemberAdmissions, st.Replication.GatingMembers)
 	}
 	if len(st.Peers) != 1 || st.Peers[0].Retired || st.Peers[0].Excluded {
@@ -288,7 +322,7 @@ func TestRemovePeerRetiresAcrossRestart(t *testing.T) {
 	if dbA2.IsPeerExcluded(nodeB) {
 		t.Fatalf("exclusion not cleared: %+v", rec)
 	}
-	if got := dbA2.Status().Replication.MemberAdmissions; got != 1 {
-		t.Fatalf("MemberAdmissions after readmit = %d, want 1", got)
-	}
+	// As above, the counter lags the record commit across goroutines;
+	// poll for exactly one admission rather than asserting immediately.
+	pollMemberAdmissionsExact(t, dbA2, 1, 10*time.Second)
 }

@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/nomadsql/replicateddb/bridge"
+	"github.com/marcgauthier/spedsql/bridge"
 )
 
 func generateBridgeKeys(dir string) (BridgeKeyFiles, error) {

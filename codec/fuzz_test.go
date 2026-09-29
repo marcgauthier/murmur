@@ -3,7 +3,7 @@ package codec
 import (
 	"testing"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // FuzzValue decodes arbitrary bytes as a Value: must never panic.

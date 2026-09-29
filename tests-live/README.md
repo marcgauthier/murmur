@@ -25,10 +25,13 @@ go test -tags "sqlite_preupdate_hook sqlite_fts5" -v ./tests-live/...
 `run.sh` and the test harness build the `spedsql` daemon with
 `SPEDSQL_TAGS` (default `"sqlite_preupdate_hook sqlite_fts5"`; use
 `SPEDSQL_TAGS=modernc` with `CGO_ENABLED=0` for the pure-Go backend).
-`run.sh` rebuilds `bin/spedsql` on every invocation; bare `go test`
-reuses the existing `bin/spedsql` as-is, so rebuild it (or delete it
-and let the harness rebuild) after changing product code, or a stale
-daemon will silently test old behavior.
+`run.sh` rebuilds `tests-live/bin/testnode` on every invocation; bare
+`go test` reuses the existing `tests-live/bin/testnode` as-is, so
+rebuild it (or delete it and let the harness rebuild) after changing
+product code, or a stale daemon will silently test old behavior.
+Set `SPEDSQL_RACE=1` with `run.sh` to build the child node with `go build -race`
+and run scenario tests with `go test -race`; instrumenting only the test process
+does not instrument the separately built node.
 
 CI runs `bash tests-live/run.sh gate` (release acceptance: API mTLS, smoke,
 encryption, backup/restore, partitions, High/Low, files, upgrades,
@@ -45,6 +48,6 @@ invocation is active, isolate the runtime root with a private
 the harness coordinates them across processes (and checkouts) with
 claim files under `${TMPDIR:-/tmp}/spedsql-portclaims` (4h TTL).
 
-Each scenario spins up discrete node instances (e.g. `./node1`, `./node2`, `./node3`, `./node4`) running the standalone daemon binary (`cmd/spedsql`) with isolated Pebble storage, certificates, log files (`node.log`), and HTTPS service/admin endpoints. API requests use a CA-signed client certificate; only `GET /healthz` permits a client without a certificate. Encrypted nodes start with `await-unlock = true` and receive their encryption key through the HTTPS Remote Unlock API (`/v1/admin/unlock`).
+Each scenario spins up discrete node instances (e.g. `./node1`, `./node2`, `./node3`, `./node4`) running the internal test fixture binary (`tests-live/harness/testnode`) with isolated Pebble storage, certificates, log files (`node.log`), and HTTPS service/admin endpoints. API requests use a CA-signed client certificate; only `GET /healthz` permits a client without a certificate. Encrypted nodes start with `await-unlock = true` and receive their encryption key through the HTTPS Remote Unlock API (`/v1/admin/unlock`).
 
 Successful runtime directories under `tests-live/runtime/` are automatically removed. Failures are preserved under `tests-live/failures/<timestamp>-<scenario>/` with full node directories and log files for inspection.

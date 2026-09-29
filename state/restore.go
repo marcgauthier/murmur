@@ -8,7 +8,7 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 // Restore errors returned during fresh-identity adoption.

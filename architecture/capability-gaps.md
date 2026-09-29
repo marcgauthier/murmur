@@ -1,8 +1,8 @@
 # Capability gaps and implementation status
 
 Source comparison with the sibling GALVANIZE checkout on 2026-09-27. This is an
-implementation inventory and a set of target additions, not a claim that these
-features are available. Update this inventory as code and acceptance tests change.
+implementation inventory with remaining acceptance work, reconciled with code on
+2026-09-28. Implementation labels do not claim a fresh passing test run.
 
 The pending checklist in [TASKS_PENDING.md](../TASKS_PENDING.md#pending-tasks) is the live list
 of remaining work. This document provides comparison context and design priorities;
@@ -18,23 +18,22 @@ QUIC replication, memberlist SWIM discovery over QUIC, a bounded shared connecti
 pool, separate control/data/snapshot streams, log GC, snapshot merging,
 key rotation, FTS, and checkpoint backup transports. The default SQL engine uses
 bundled SQLite through `mattn/go-sqlite3`; an optional `modernc` build tag
-provides a pure-Go SQLite backend (`modernc.org/sqlite`). Both use an in-memory
-query materialization rebuilt from Pebble.
+provides a pure-Go SQLite backend (`modernc.org/sqlite`). Both use an in-memory query materialization rebuilt from Pebble.
 
 Existing fuzz, crash, adversarial-peer, and two-node convergence/soak tests are
 useful foundations. Their presence does not establish acceptance for the additions
 below; this comparison did not execute either repository's tests.
 
-## Existing requirements still awaiting implementation
+## Implemented requirements and remaining acceptance
 
 | Capability | Current gap | Target document |
 | --- | --- | --- |
-| Membership and bounded dissemination | Peer selection/rotation, anti-entropy, the shared bounded QUIC pool, Plumtree integration, and scaling acceptance are implemented; only runtime SWIM discovery wiring remains pending (static peers; the QUIC transport adapter is unit-tested) | [Membership](membership-and-transport.md), [dissemination](replication-and-dissemination.md) |
+| Membership and bounded dissemination | Peer selection/rotation, anti-entropy, the shared bounded QUIC pool, Plumtree integration, and scaling acceptance are implemented; runtime SWIM wiring starts with configured bootstrap seeds. Seed-only live discovery acceptance remains pending; the named discovery test currently uses explicit `AddPeer` calls | [Membership](membership-and-transport.md), [dissemination](replication-and-dissemination.md) |
 | Detailed synchronization | Separate streams, the transaction-chunk codec, durable chunk staging, paginated progress, and cross-peer partial-range repair are implemented | [Synchronization](synchronization-and-overload.md) |
 | Overload controls | Aggregate/per-peer queue byte/entry budgets, staging caps, token buckets, and retryable overload responses are implemented | [Overload](synchronization-and-overload.md#32-mutation-batching) |
-| Safe snapshot publication | Consistent read cuts, digest-validated durable staging, atomic cell/watermark publication, and chunked merge with durable resume plus atomic publication are implemented up to 512 MiB; only the bounded source tail-history lease remains pending | [Snapshot safety](snapshots-backup-and-restore.md#current-implementation-and-remaining-gap) |
+| Safe snapshot publication | Consistent read cuts, digest-validated durable staging, atomic cell/watermark publication, chunked merge with durable resume plus atomic publication up to 512 MiB, bounded source tail-history leases, and live acceptance covering slow transfer, sustained writes, aggressive GC, restarts, and tail catch-up are fully verified | [Snapshot safety](snapshots-backup-and-restore.md#current-implementation-and-remaining-gap) |
 | Restore identity safety | Fresh writer identity, rollback rejection, inherited-membership-policy clearing, and crash-safe ciphertext rebinding for new-DBID reseed are implemented | [Backup and restore](snapshots-backup-and-restore.md#38-pebble-online-zero-downtime-backup-and-restore) |
-| Metrics integration | Status, membership/pool diagnostics, replication/writer counters, and Prometheus collectors exist; metrics for still-pending subsystems (SWIM runtime, tail lease) remain outstanding | [Diagnostics](runtime-and-diagnostics.md#52-metrics-and-diagnostics) |
+| Metrics integration | Status, membership/pool diagnostics, replication/writer counters, and Prometheus collectors exist; dedicated retention-lease metrics and complete SWIM runtime metric coverage remain follow-ups; those subsystems themselves have implementations | [Diagnostics](runtime-and-diagnostics.md#52-metrics-and-diagnostics) |
 
 ## Additional GALVANIZE capabilities
 
@@ -50,7 +49,7 @@ are tracked separately. Their acceptance criteria live with each subsystem.
 | [Encrypted file replication](file-replication.md) | Local authenticated immutable objects plus replicated metadata with streaming upload/read, search/list, delete tombstones, availability status, grace-based collection, bounded mesh fetch from static peers, recipient-sealed High/Low file artifacts with High-local re-encryption, object key rotation with generations, and object-inclusive versus metadata-only backup/restore exist; SWIM fetch discovery remains pending |
 | [Address policy](membership-and-transport.md#ip-and-cidr-admission-policy) | Implemented IP/CIDR filtering alongside certificate/NodeID authorization |
 | [Query subscriptions](query-and-search.md#reactive-query-subscriptions) | Implemented bounded subscriptions to committed SQL-visible changes with explicit resume/reset behavior |
-| [Optional service adapters](runtime-and-diagnostics.md#optional-service-and-administration-adapters) | Implemented optional authenticated SQL/status/subscription HTTP handler and SDK plus separate admin unlock controls; file operations await file replication |
+| [Optional service adapters](runtime-and-diagnostics.md#optional-service-and-administration-adapters) | Implemented optional authenticated SQL/status/subscription HTTP handler and SDK plus separate admin unlock controls; file routes remain absent from the reusable service handler/SDK despite core file replication and internal test-node file routes |
 
 High/Low identifies security domains and permitted data direction. It is distinct
 from local/replication writer priority, and neither implies a network bandwidth
@@ -75,12 +74,12 @@ encrypted file-object transfer with High-local re-encryption (proven by
 ## Delivery order
 
 The delivery order below is complete except for the noted residuals; see the
-[verified release status](release-status.md#1-verified-feature-matrix) for
+[release inventory and verification record](release-status.md#1-verified-feature-matrix) for
 current evidence.
 
 1. Snapshot generation publication, restore policy cleanup/reseed, bounded
-   dissemination, detailed synchronization, and overload are implemented;
-   residual: source tail-history retention lease.
+   dissemination, detailed synchronization, overload, and live source-lease safety
+   acceptance through receiver tail catch-up under sustained writes/GC are fully verified.
 2. Writer scheduling/address admission, sustained-load acceptance, and
    membership/pool diagnostics are implemented.
 3. High/Low atomic delivery, encrypted outbox storage, capacity and schema
@@ -89,10 +88,10 @@ current evidence.
    sealed High/Low artifacts with High-local re-encryption, object key
    rotation, object-inclusive backup/restore, file service operations);
    residual: SWIM fetch discovery.
-5. Residual runtime work: SWIM discovery wiring (static peers only),
-   multi-hour/impaired-network soak acceptance and the TODO.md
-   automatic-PK request. The daemon API requires HTTPS with verified client
-   certificates except for public `GET /healthz`.
+5. Remaining work: seed-only SWIM discovery acceptance,
+   service-adapter file routes, and multi-hour/impaired-network
+   soak acceptance. Automatic primary-key derivation is not implemented; callers
+   still supply explicit `BLOB(16)` keys.
 
 Update [pending tasks](../TASKS_PENDING.md) and project status only when the
 corresponding implementation and acceptance checks exist.

@@ -13,7 +13,7 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 
-	"github.com/nomadsql/replicateddb/schema"
+	"github.com/marcgauthier/spedsql/schema"
 )
 
 // Schema storage key names under prefix 0x06.

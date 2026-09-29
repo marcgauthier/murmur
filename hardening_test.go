@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/crypto"
+	"github.com/marcgauthier/spedsql/crypto"
 )
 
 // TestOpenBadPathFailsCleanly proves Open surfaces storage errors instead of

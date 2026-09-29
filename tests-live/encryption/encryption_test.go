@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/schema"
-	"github.com/nomadsql/replicateddb/tests-live/harness"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/spedsql/tests-live/harness"
 )
 
 func TestEncryptedStoreRejectsWrongKeyAndReopens(t *testing.T) {

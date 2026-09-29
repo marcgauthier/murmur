@@ -1,16 +1,19 @@
-# Release status (verified)
+# Release status and verification record
 
-Single verified source for what SPeD-SQL implements, which platforms it
-supports, how to deploy it, and which exact commit those claims attach to.
-When this document disagrees with an older status paragraph elsewhere, this
-document wins; the older paragraph is stale and should be fixed.
+Implementation inventory, configured platform checks, deployment guidance, and
+historical verification results. Code presence, test coverage, and successful
+execution against a release revision are separate claims. Keep related topic
+documents consistent with this inventory.
 
 [Architecture index](README.md) · [Project README](../README.md) ·
 [Versioning and release](versioning-and-release.md)
 
-Last verified: 2026-09-28 against the current uncommitted tree
-listed in [§5](#5-release-commit). Re-verify (builds, vet, unit suites,
-live suites) before moving these claims to a new commit.
+Documentation reconciled by static inspection on 2026-09-28, using HEAD
+`4bdd2974766786865c6222bb4843cab79e41e5c5` and the working-tree move of the
+standalone daemon into `tests-live/harness/testnode/`. No build, vet, unit,
+or live suite was rerun for this reconciliation. Historical results in
+[§4](#4-verification-record) do not certify this revision or subsequent edits.
+No verified release revision is recorded in [§5](#5-release-commit).
 
 > Build-tag contract: the default CGO build does **not** compile without
 > tags. Every `go build` / `go vet` / `go test` command in this document
@@ -30,40 +33,42 @@ live suites) before moving these claims to a new commit.
 
 ## 1. Verified feature matrix
 
-State is one of **Implemented** (code plus passing tests exist),
+State is one of **Implemented** (a production code path exists),
 **Partial** (some of the capability is missing), or **Pending**.
-Evidence names the code path and command for each capability. Refactor-specific
-verification is recorded in [§4](#4-verification-record).
+The evidence column identifies code and available tests or commands; it is not
+a fresh pass result. The historical heading is retained for existing links.
+Release-specific execution evidence belongs in [§4](#4-verification-record).
 
 | # | Capability | State | Evidence |
 |---|---|---|---|
 | 1 | Embedded Go API, schema v1 (explicit `BLOB(16)` PK, additive `DB.Migrate`, replicated manifest, `AcceptRemoteSchema`) | Implemented | `db.go`, `schema/`, `schema_sync.go`; `go test -tags ... ./tests-live/schema-evolution` |
 | 2 | Durable encrypted Pebble store (AES-256-GCM default, key registry, storage/data-key rotation, maintenance rewrite) | Implemented | `crypto/`, `state/`; `go test -tags ... ./tests-live/encryption ./tests-live/rekey` |
-| 3 | In-memory SQLite materialization rebuilt from Pebble (default mattn/go-sqlite3; optional `modernc` pure-Go driver) | Implemented | `sqlengine/`; both backend SQL engine suites |
+| 3 | In-memory SQLite materialization rebuilt from Pebble (default mattn/go-sqlite3; optional `modernc` driver) | Implemented | `sqlengine/`; both backend SQL engine suites. |
 | 4 | Pre-update capture, transaction coalescing, per-cell LWW + row tombstones, offline writes, deterministic convergence | Implemented | `sqlengine/capture_*.go`, `crdt/`; `go test -tags ... ./tests-live/three-node-sync ./tests-live/crdt-contention` |
-| 5 | QUIC + mTLS replication over a static mesh: multi-origin forwarding, rotation, anti-entropy, partition healing | Implemented | `replication/`, `transport/`; `go test -tags ... ./tests-live/partial-mesh ./tests-live/partition ./tests-live/chaos-load ./tests-live/crash-recovery` |
-| 6 | Bounded fanout/selection: selected targets, peer rotation, anti-entropy, shared pool caps (defaults: fanout 4, 32 sessions, 64 connections, 2 repairs) | Implemented | `replication/manager.go` (`reconcileSelectedLocked`), `transport/pool.go`, `config.go`; `go test -tags ... ./replication -run 'TestPeerScalingCapsAcrossChurn|TestPeerSelectionBoundedByFanout|TestPeerRotation'` |
+| 5 | QUIC + mTLS replication with configured or discovered peers: multi-origin forwarding, rotation, anti-entropy, partition healing | Implemented | `replication/`, `transport/`; `go test -tags ... ./tests-live/partial-mesh ./tests-live/partition ./tests-live/chaos-load ./tests-live/crash-recovery` |
+| 6 | Bounded fanout/selection: selected targets, peer rotation, anti-entropy, shared pool caps (defaults: fanout 4, 32 sessions, 64 connections, 2 repairs) | Implemented | `replication/manager.go` (`reconcileSelectedLocked`), `transport/pool.go`, `config.go`; `go test -tags ... ./replication -run 'TestPeerScalingCapsAcrossChurn\|TestPeerSelectionBoundedByFanout\|TestPeerRotation'` |
 | 7 | Optional Plumtree dissemination with required-capability negotiation (mixed modes refuse) | Implemented | `replication/plumtree.go`, `plumtree/`; `go test -tags ... ./tests-live/plumtree-live` |
-| 8 | Transaction chunks (64 KiB, durable encrypted staging, restart resume, cross-peer repair) and paginated applied/observed progress | Implemented | `replication/transaction_chunks.go`, `replication/progress.go`, `replication/chunk_availability.go`, `state/transaction_stage.go`; `go test -tags ... ./tests-live/large-payload` |
+| 8 | Transaction chunks (64 KiB, durable encrypted staging, restart resume, cross-peer repair) and paginated applied/observed progress | Implemented | `replication/transaction_chunks.go`, `replication/progress.go`, `replication/chunk_availability.go`, `state/transaction_stage.go`; `state/transaction_stage_test.go` covers restart/complete-batch staging; `replication/transaction_chunks_test.go` covers complete-only apply. `tests-live/large-payload` covers separate writes and large-value fidelity, not single bulk-transaction atomicity or interrupted cross-peer repair. |
 | 9 | Overload budgets: global/per-peer queue byte/entry caps, 256 MiB durable staging cap, token buckets, retryable overload responses | Implemented | `overload/`, replication queue accounting; `go test -tags ... ./tests-live/overload-budgets` |
 | 10 | Snapshot resync: consistent Pebble read cut, manifest v1, canonical digest, encrypted restart-safe staging, atomic (≤8 MiB) and chunked SSTable-ingest merge (≤512 MiB), atomic watermark publication, stall watchdog with bounded re-request, explicit busy deferral, per-peer transfer progress | Implemented | `state/snapshot*.go`, `replication/manager.go` (watchdog/deferral), `replication/snapshot_progress_test.go`; `go test -tags ... ./tests-live/snapshot-resync` (single + dual requester) |
-| 11 | Snapshot source tail-history retention lease | Pending | Transfer timeout (10 min read-cut hold) is implemented (`config.go`, `replication/manager.go`); no retention-lease code exists, so a source under log-GC pressure can still age out tail history mid-transfer. |
+| 11 | Snapshot source tail-history retention lease | Implemented | `state/snapshot.go`, `state/store.go`, `state/scan.go`; `TestSnapshotTailRetentionLease*` covers concurrent writes/GC, cancellation/retry, and expiry. In-memory lease releases when export returns or expires; protection through receiver publication and tail catch-up still needs live acceptance. |
 | 12 | Log GC gated by persisted member admission/ack-progress retention deadlines; `RemovePeer` retirement persists across restart, `AddPeer` readmits | Implemented | `state/members.go`, `db.go`; `go test -tags ... ./tests-live/churn-retirement` |
 | 13 | Backup/restore with fresh-writer identity, durable restore marker (same-identity rollback rejected), new-DBID reseed | Implemented | `backup/`, `state/restore.go`; `go test -tags ... ./tests-live/backup-restore` |
-| 14 | SWIM/memberlist over QUIC | Partial | Transport adapter implemented and unit-tested (`transport/memberlist.go`, `transport/memberlist_test.go`), but no runtime discovery wiring exists (`memberlist.Create` appears only in tests); clusters use static `Replication.Peers`. |
+| 14 | SWIM/memberlist over QUIC | Implemented | `db.go` starts `replication.NewMembershipService` with configured bootstrap seeds; `replication/membership.go` calls `memberlist.Create`. Membership/transport tests exist. `TestDynamicBootstrapDiscovery` (partial-mesh) starts 3 nodes with no static peers and seed addresses only, requires SWIM membership of 3 on all nodes plus exact 20-row convergence with zero `AddPeer` calls (verified passing live; see §4 format for recording a candidate run). |
 | 15 | High/Low bridge: domain roles, recipient-sealed bundles, durable outbox (encrypted payloads) / inbox journals, aggregate capacity with backpressure, atomic imports with stable source receipts + contiguous stream progress, waiting-schema holds, status/replay diagnostics, ownership/provenance with reorder convergence, sealed file-object transfer | Implemented | `bridge/`; `go test ./bridge/`; `go test -tags ... ./tests-live/highlow ./tests-live/files-bridge ./tests-live/bridge-two-streams` |
-| 16 | Encrypted file objects: replicated metadata, streaming upload/read, search/list, delete tombstones, availability, grace collection, bounded mesh fetch from static peers, per-file key generations, object-inclusive vs metadata-only backup | Implemented | `objectstore/`, `files*.go`; `go test ./objectstore`; `go test -tags ... ./tests-live/files-soak`; SWIM fetch discovery is pending (see #14). |
-| 17 | Writer scheduling (90/10 shares, idle borrowing, bounded debt, cancellation-aware admission), reactive subscriptions, IP/CIDR admission, `database/sql` driver, optional service/admin HTTP adapters, daemon HTTPS API with mTLS, `DB.Status`/`DB.Metrics`/Prometheus collectors | Implemented | `scheduler.go`, `subscriptions.go`, `transport/addrs.go`, `driver.go`, `service/`, `admin/`, daemon TLS middleware; `go test -tags ... ./tests-live/api-mtls ./tests-live/loadshare ./tests-live/subscribe ./tests-live/addrpolicy`; `go test -tags ... ./service/ ./admin/ ./metrics/` |
+| 16 | Encrypted file objects: replicated metadata, streaming upload/read, search/list, delete tombstones, availability, grace collection, bounded mesh fetch from static peers, per-file key generations, object-inclusive vs metadata-only backup | Implemented | `objectstore/`, `files*.go`; `go test ./objectstore`; `go test -tags ... ./tests-live/files-soak`; File-fetch SWIM discovery remains pending independently of SQL membership (#14). |
+| 17 | Writer scheduling (90/10 shares, idle borrowing, bounded debt, cancellation-aware admission), reactive subscriptions, IP/CIDR admission, `database/sql` driver, optional service/admin HTTP adapters, internal test-node HTTPS API with client-certificate authorization, `DB.Status`/`DB.Metrics`/Prometheus collectors | Implemented | `scheduler.go`, `subscriptions.go`, `transport/addrs.go`, `driver.go`, `service/`, `admin/`, `tests-live/harness/testnode/` TLS middleware (HTTPS health is exempt from client-certificate authorization); `go test -tags ... ./tests-live/api-mtls ./tests-live/loadshare ./tests-live/subscribe ./tests-live/addrpolicy`; `go test -tags ... ./service/ ./admin/ ./metrics/` |
 | 18 | Hardening: decoder fuzz targets, crash-injection suite, adversarial-peer tests, cert-expiry rejection, disk-full fail-closed, short multi-process soaks | Implemented | `codec/`, `replication/fuzz_test.go`, `crash_test.go`, `diskfull_test.go`, `soak_test.go`; `go test -tags ... ./tests-live/soak-slo ./tests-live/long-running-five-node` (smoke durations; multi-hour/impaired-network acceptance remains pending) |
 | 19 | Benchmark matrix (§59–§61) with recorded 10K/100K results, cipher/compression matrix, local/live writer throughput, transaction-size matrix, concurrent-reader suite | Implemented | `benchmark/`; [Benchmarks](benchmarks.md#62-running-the-matrix) |
-| 20 | Automatic primary-key derivation (default `id` UUIDv4 / UUIDv5 from a flagged column) | Pending | Requested in [TODO.md](../TODO.md); v1 still requires the application to supply an explicit `BLOB(16)` PK. Not release-blocking. |
+| 20 | Automatic primary-key derivation (default `id` UUIDv4 / UUIDv5 from a flagged column) | Pending | Not implemented; v1 still requires the application to supply an explicit `BLOB(16)` PK. Not release-blocking. |
 
 ## 2. Supported platforms
 
-Pinned by [CI](../.github/workflows/ci.yml) and re-verified locally on
-2026-09-28 (builds, both vets, unit suites, nine live suites).
+The table separates configured [CI](../.github/workflows/ci.yml) checks from
+historical local results. No current CI run was inspected for this reconciliation;
+configuration alone is not evidence of a passing run.
 
-| OS / arch | Backend (build tags) | CGO | Proven by |
+| OS / arch | Backend (build tags) | CGO | Configured checks / historical local evidence |
 |---|---|---|---|
 | Linux amd64 | Default mattn/go-sqlite3, `-tags "sqlite_preupdate_hook sqlite_fts5"` | yes (gcc) | CI race suite; local `go build`, `go vet`, `-short` suites, live suites |
 | Linux amd64 | Pure Go (`modernc.org/sqlite`), `-tags modernc` | no | CI suite; local `go build`, `go vet` |
@@ -80,8 +85,7 @@ pass one of the two tag sets above.
 
 ## 3. Deployment
 
-Two deployment shapes are supported: link the module into a Go
-application, or run the `spedsql` daemon.
+SPeD-SQL is an embedded Go library. Applications link the package directly into their process:
 
 ### 3.1 Embedded library
 
@@ -92,96 +96,15 @@ go get github.com/nomadsql/replicateddb
 Open a node as in the [project README quick start](../README.md#quick-start):
 `Config{Path, NodeID, Schema, Pebble, Encryption, Replication}` with a
 cluster-shared `DBID`, one CA, and per-node certificates carrying the
-`replicateddb://node/<uuid>` URI SAN (see §3.3). Every replicated table
+`replicateddb://node/<uuid>` URI SAN (see §3.2). Every replicated table
 needs an explicit `BLOB(16)` primary key; see
 [Schema rules](../README.md#schema-rules-v1).
 
-### 3.2 Daemon build and layout
-
-```sh
-go build -tags "sqlite_preupdate_hook sqlite_fts5" -o bin/spedsql ./cmd/spedsql
-```
-
-Give each node its own directory (`node1/`, `node2`, …) containing a JSON
-config, a `pebble/` store (created on first start), TLS files, and logs.
-The live harness uses exactly this layout; see
-[`tests-live/harness/harness.go`](../tests-live/harness/harness.go) and any
-`tests-live/*/README.md`.
-
-Minimal two-node config (`node1/config.json`; node2 mirrors it with
-swapped ports and peer entries):
-
-```json
-{
-  "node_id": "<uuid>",
-  "db_id": "<shared cluster uuid>",
-  "data_dir": "node1",
-  "listen_addr": "127.0.0.1:17443",
-  "api_addr": "127.0.0.1:18080",
-  "await_unlock": true,
-  "key_id": "app-key-1",
-  "tls_ca_cert_file": "node1/tls/ca.crt",
-  "tls_node_cert_file": "node1/tls/node.crt",
-  "tls_node_key_file": "node1/tls/node.key",
-  "peers": [{"node_id": "<node2 uuid>", "addrs": ["127.0.0.1:17444"]}],
-  "schema": {"version": 1, "tables": [
-    {"name": "items", "columns": [
-      {"name": "id", "type": 4},
-      {"name": "name", "type": 3, "nullable": true}
-    ]}
-  ]}
-}
-```
-
-Column `type` is numeric (`schema.ColumnType`: 1=INTEGER, 2=REAL,
-3=TEXT, 4=BLOB); string names are not accepted in JSON configs.
-
-Optional sections: `allowed_peers` / `allowed_networks` (admission),
-`replication` (`dissemination: "plumtree"` must match on every member;
-retention overrides are test-only), `limits` (commit budgets; defaults
-are 16 MiB values / 64 MiB transactions), `files` (object replication),
-`bridge` (High/Low role). Full key list:
-[`cmd/spedsql/main.go`](../cmd/spedsql/main.go) (`NodeConfigFile`);
-files/bridge key shapes follow the harness writers (`cfgJSON`,
-`bridgeJSON` in `harness.go`).
-
-Start, unlock, and check:
-
-```sh
-./bin/spedsql agent --config node1/config.json
-./bin/spedsql unlock --api https://127.0.0.1:18080 --ca-cert ca.crt --client-cert client.crt --client-key client.key --key-hex <64 hex chars>
-./bin/spedsql status --api https://127.0.0.1:18080 --ca-cert ca.crt --client-cert client.crt --client-key client.key
-./bin/spedsql exec --api https://127.0.0.1:18080 --ca-cert ca.crt --client-cert client.crt --client-key client.key \
-  "INSERT INTO items (id, name) VALUES (x'00112233445566778899aabbccddeeff', 'hello')"
-./bin/spedsql query --api https://127.0.0.1:18080 --ca-cert ca.crt --client-cert client.crt --client-key client.key 'SELECT id, name FROM items'
-```
-
-(`unlock` posts the storage key to `/v1/admin/unlock`; without
-`await_unlock` the daemon uses `key_hex` from the config. The CLI sends
-the SQL statement as one positional argument; `/v1/exec` and `/v1/query`
-also accept an `args` JSON array. File operations live
-under `/v1/files/*`, bridge controls under `/v1/admin/bridge/*`, peer
-churn under `/v1/admin/add_peer` / `/v1/admin/remove_peer`, schema
-migration under `/v1/admin/migrate`. Every route, including `/metrics`,
-requires HTTPS and a valid client certificate signed by the configured CA.
-`GET /healthz` is the only route that permits clients without a certificate,
-and it is still HTTPS-only.)
-
-The API listener has no plaintext mode. It uses `tls_ca_cert_file` to verify
-client certificates and `tls_node_cert_file` / `tls_node_key_file` as its
-HTTPS server identity. Client certificates must be valid for client
-authentication and chain to the configured CA. The server certificate must
-also contain a DNS or IP SAN matching the hostname used by clients. The CLI
-requires `--ca-cert`, `--client-cert`, and `--client-key` on each API command.
-
-### 3.3 Certificates
+### 3.2 Certificates & mTLS
 
 Replication is mTLS-only. Each node certificate must carry its NodeID as
-a URI SAN `replicateddb://node/<uuid>`; the daemon loads
-`tls_ca_cert_file` / `tls_node_cert_file` / `tls_node_key_file` and
-rejects mismatched identities. There is no `spedsql` cert subcommand
-yet; provision with the `transport` package (the same calls the live
-harness uses):
+a URI SAN `replicateddb://node/<uuid>`; the engine loads certificates and
+rejects mismatched identities. Provision with the `transport` package:
 
 ```go
 ca, _ := transport.GenerateCA(365 * 24 * time.Hour)
@@ -189,36 +112,37 @@ certPEM, keyPEM, _ := ca.IssueNodeForHosts(nodeID, 90*24*time.Hour,
     []string{"db.example.com"}, nil)
 ```
 
-Persist `ca.CertPEM` once per cluster and one cert/key pair per node. Node
-certificates can also be API client credentials. Ensure each API server
-certificate contains the DNS/IP SAN clients use to reach it. Rotate before
+Persist `ca.CertPEM` once per cluster and one cert/key pair per node. Rotate before
 `NotAfter`; expired certificates are rejected.
 
-### 3.4 Operations
+### 3.3 Operations
 
-- Health: `/healthz` (process), `/v1/status` (state, peers, watermarks,
-  lag, queue depths), `/metrics` (Prometheus). `DBState` must be
-  `ready` before writes are accepted.
+- Health & Metrics: `DB.Status` (state, peers, watermarks, lag, queue depths), `DB.Metrics` (counters), and optional Prometheus collectors (`metrics` package). `DBState` must be `ready` before writes are accepted.
 - Backup: stop the node (or checkpoint online via `backup/`), copy the
   data directory. Restore/clone requires a **fresh** NodeID and
   certificate; opening restored data under the old identity is rejected
   (proven by `tests-live/backup-restore`).
-- Peer churn: `remove_peer` retires and persists exclusion (survives
-  restart, releases GC retention); `add_peer` readmits.
+- Peer churn: `DB.RemovePeer` retires and persists exclusion (survives
+  restart, releases GC retention); `DB.AddPeer` readmits with fresh obligations.
   Proven by `tests-live/churn-retirement`.
-- Rolling schema change: additive migrations only, one node at a time;
+- Rolling schema change: additive migrations only (`DB.Migrate`), one node at a time;
   mixed-version meshes keep replicating. Proven by
   `tests-live/schema-evolution`.
 - Upgrades: on-disk format is versioned (`format_version` = 2 with
   minimum reader/writer enforcement); replication handshakes negotiate
   capabilities and refuse unknown required bits, so mixed-version
-  clusters fail closed instead of diverging.
+  clusters fail closed instead of diverging. The compatible upgrade
+  paths (rolling previous-to-current binaries, current binary opening
+  a previous-release store, current restore of a previous-release
+  backup) are proven by `tests-live/release-upgrade`.
 - Loss window: default durability syncs Pebble before every write
   acknowledgement. `DurabilityAsync` returns without a disk sync and
   syncs about once per second plus on graceful close; use it only when
   the application accepts losing roughly the last second after a crash.
 
-### 3.5 Verifying a deployment
+### 3.4 Verifying live multi-process scenarios
+
+The live test suite validates multi-node cluster behavior across isolated processes using internal test fixtures:
 
 ```sh
 bash tests-live/run.sh three-node-sync    # convergence smoke
@@ -229,6 +153,11 @@ SPEDSQL_TAGS=modernc bash tests-live/run.sh three-node-sync  # pure-Go backend
 ```
 
 ## 4. Verification record
+
+The entries below preserve previously recorded results. Their source snapshots
+were not fully identified by immutable commits, and their suite counts describe
+the runner at the time. Use `tests-live/run.sh` for the current suite selection.
+They must not be relabeled as successful runs against the current checkout.
 
 SQLite backend refactor verification, 2026-09-28, linux/amd64:
 
@@ -241,7 +170,7 @@ SQLite backend refactor verification, 2026-09-28, linux/amd64:
 - The live `three-node-sync` convergence scenario passed under both drivers.
 
 2026-09-28, host linux/amd64 (Intel i5-6500), Go 1.26.x, HEAD
-`b81e5c1` plus the §5 tree:
+`b81e5c1` plus then-uncommitted changes (exact patch not recorded):
 
 - `go build -tags "sqlite_preupdate_hook sqlite_fts5" ./...` — pass.
 - `go build -tags "modernc" ./...` — pass.
@@ -268,12 +197,15 @@ SQLite backend refactor verification, 2026-09-28, linux/amd64:
   `schema-evolution`, `snapshot-resync`, `soak-slo` (smoke),
   `subscribe`, `three-node-sync`, `views`, `write-priority` — all pass.
 
-Not run for this release: full `-race` suites, multi-hour and
+Not run in that recorded verification: full `-race` suites, multi-hour and
 impaired-network soaks (pending acceptance, matrix #18; the 10-minute,
 2-hour, and 1-hour soaks now run on a weekly CI schedule plus manual
 dispatch via `bash tests-live/run.sh soak`; no scheduled run has completed
-yet at the time of writing), the three-minute default
-`allow-nodes` run, and the Windows/arm64 native test suites (CI-owned).
+yet according to that historical entry), the three-minute default
+`allow-nodes` run, and native Windows tests (configured in CI). Linux arm64
+has cross-build coverage only; no native arm64 test job is configured.
+A `go test -race` parent process does not instrument the separately built live
+node: the current runner builds that executable without `-race`.
 
 2026-09-28 follow-up (snapshot progress + live gate): `live-gate` CI job
 runs `bash tests-live/run.sh gate` (smoke, encryption, backup/restore,
@@ -289,25 +221,31 @@ runner invocations against one checkout concurrently; isolate with
 verifies optional client certificates during the handshake against the
 configured CA, and rejects missing certificates at every route except
 `GET /healthz`. The full live release gate passed, including the new
-`api-mtls` scenario; see TASKS_COMPLETED.md API-MTLS-001. This verification
-applies to the current working tree and is not a release commit.
+`api-mtls` scenario; see the 2026-09-28 20:58:47 UTC entry titled
+“Require HTTPS with client-certificate verification for the daemon API” in
+[TASKS_COMPLETED.md](../TASKS_COMPLETED.md). This is a historical report for
+the then-working tree, not verification of a recorded release commit. The
+listener now lives in the internal test-node fixture; the embedded package
+starts no HTTP listener.
 
 ## 5. Release commit
 
-No release commit exists yet: the tree is dirty. Review `git status --short`
-and include the intended changes when preparing a release; the shared
-workspace may contain unrelated in-progress work.
+No verified release commit is recorded here. This does not assert that the
+checkout is dirty or that no source commits exist. The static inspection
+baseline above is not a tested release candidate.
 
-To cut it:
+Before publishing:
 
-```sh
-git status --short          # confirm the tree above (plus nothing unexpected)
-git add -A
-git commit -m "Release: reconciled status, verified matrix, deployment docs"
-git rev-parse HEAD          # record this hash below and in the release notes
-```
+1. Review and commit the intended release changes; exclude unrelated work.
+2. Record the full candidate hash and verify an isolated checkout of that hash.
+3. Run the required builds, vet, both backend suites, live gate/full matrix,
+   and production-duration/platform acceptance. Record exclusions explicitly.
+4. Attach results to the candidate using this evidence format:
 
-Then replace this paragraph with the recorded hash and re-run §4
-against the clean checkout before publishing binaries.
+| Candidate commit | Command / suite and duration | Backend / build tags | OS / arch / Go | Result / log artifact |
+|---|---|---|---|---|
+| Not recorded | Not rerun for this documentation reconciliation | — | — | No release verification claim |
 
-Recorded release commit: _none yet_.
+Record the resulting release tag and candidate hash in the release notes.
+Documentation-only updates may reference the tested candidate; any runtime
+change requires verification of the new candidate.

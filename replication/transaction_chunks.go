@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/overload"
-	"github.com/nomadsql/replicateddb/state"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/overload"
+	"github.com/marcgauthier/spedsql/state"
 )
 
 func (m *Manager) onTransactionChunk(p *peerState, raw []byte) error {

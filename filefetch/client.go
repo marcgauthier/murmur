@@ -7,9 +7,9 @@ import (
 	"io"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/objectstore"
-	"github.com/nomadsql/replicateddb/transport"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/objectstore"
+	"github.com/marcgauthier/spedsql/transport"
 )
 
 // Client errors. ErrNotFound and ErrBadOffset select the next source;

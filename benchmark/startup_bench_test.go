@@ -7,10 +7,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
-	replicateddb "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/crypto"
-	"github.com/nomadsql/replicateddb/state"
+	replicateddb "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/crypto"
+	"github.com/marcgauthier/spedsql/state"
 )
 
 // BenchmarkStartupComponents breaks Open into externally measurable

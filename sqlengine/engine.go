@@ -20,9 +20,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/schema"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/schema"
 )
 
 // CaptureMode controls whether the pre-update hook records mutations.
@@ -74,8 +74,8 @@ type Engine struct {
 
 	tables map[string]*schema.TableSchema // lowercase name -> table
 
-	wmu sync.Mutex   // serializes writers (held across explicit Tx)
-	rw  sync.RWMutex // readers vs writers
+	lock    *engineLock
+	closeMu sync.Mutex
 
 	capMu   sync.Mutex
 	mode    CaptureMode
@@ -90,8 +90,7 @@ type Engine struct {
 	// failCommit injects COMMIT failures (tests only).
 	failCommit func() error
 
-	closed     bool
-	cleanupDir string
+	closed bool
 }
 
 // Open creates the in-memory query database, registers change capture, and
@@ -130,6 +129,7 @@ func open(reg *schema.Registry, ddl, localDDL []string, stmtCacheEntries int) (*
 		db:         db,
 		write:      write,
 		tables:     make(map[string]*schema.TableSchema, len(reg.Tables)),
+		lock:       newEngineLock(),
 		writeStmts: newStmtCache(stmtCacheEntries),
 		readStmts:  newStmtCache(stmtCacheEntries),
 		ddl:        ddl,
@@ -180,10 +180,9 @@ func (e *Engine) StmtCacheStats() (hits, misses uint64) {
 
 // Close releases all resources.
 func (e *Engine) Close() error {
-	e.wmu.Lock()
-	defer e.wmu.Unlock()
-	e.rw.Lock()
-	defer e.rw.Unlock()
+	e.lock.Close()
+	e.closeMu.Lock()
+	defer e.closeMu.Unlock()
 	if e.closed {
 		return nil
 	}
@@ -196,11 +195,6 @@ func (e *Engine) Close() error {
 	var first error
 	if e.db != nil {
 		first = e.db.Close()
-	}
-	if e.cleanupDir != "" {
-		if err := secureWipeAndRemoveDir(e.cleanupDir); err != nil && first == nil {
-			first = err
-		}
 	}
 	return first
 }

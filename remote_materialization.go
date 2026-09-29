@@ -5,8 +5,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/nomadsql/replicateddb/sqlengine"
-	"github.com/nomadsql/replicateddb/state"
+	"github.com/marcgauthier/spedsql/sqlengine"
+	"github.com/marcgauthier/spedsql/state"
 )
 
 // queueRemoteLocked records final row identities, not copies of values. Later

@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"sync"
 
-	"github.com/nomadsql/replicateddb/sqlengine"
+	"github.com/marcgauthier/spedsql/sqlengine"
 )
 
 // TxOptions configures an explicit transaction. Reserved for future
@@ -19,33 +19,44 @@ type Tx struct {
 	stx          *sqlengine.Tx
 	txID         TxID
 	done         bool
+	mu           sync.Mutex
 	ticket       *Ticket
 	bridgeImport *bridgeImportInfo
+	stopHook     func() bool
 }
 
 // ExecContext executes a statement inside the transaction.
-func (tx *Tx) ExecContext(_ context.Context, query string, args ...any) (sql.Result, error) {
-	if tx.done {
+func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	tx.mu.Lock()
+	done := tx.done
+	tx.mu.Unlock()
+	if done {
 		return nil, ErrTxDone
 	}
-	return tx.stx.Exec(query, args...)
+	return tx.stx.ExecContext(ctx, query, args...)
 }
 
 // QueryContext runs a query inside the transaction. Rows must be closed
 // before Commit.
-func (tx *Tx) QueryContext(_ context.Context, query string, args ...any) (*sql.Rows, error) {
-	if tx.done {
+func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	tx.mu.Lock()
+	done := tx.done
+	tx.mu.Unlock()
+	if done {
 		return nil, ErrTxDone
 	}
-	return tx.stx.Query(query, args...)
+	return tx.stx.QueryContext(ctx, query, args...)
 }
 
 // QueryRowContext runs a single-row query inside the transaction.
-func (tx *Tx) QueryRowContext(_ context.Context, query string, args ...any) *TxRow {
-	if tx.done {
+func (tx *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *TxRow {
+	tx.mu.Lock()
+	done := tx.done
+	tx.mu.Unlock()
+	if done {
 		return &TxRow{err: ErrTxDone}
 	}
-	row, err := tx.stx.QueryRow(query, args...)
+	row, err := tx.stx.QueryRowContext(ctx, query, args...)
 	return &TxRow{row: row, err: err}
 }
 
@@ -55,10 +66,17 @@ func (tx *Tx) TxID() TxID { return tx.txID }
 // Commit commits: SQL COMMIT then one atomic Pebble commit. Success is
 // reported only after Pebble durability.
 func (tx *Tx) Commit() error {
+	tx.mu.Lock()
 	if tx.done {
+		tx.mu.Unlock()
 		return ErrTxDone
 	}
 	tx.done = true
+	if tx.stopHook != nil {
+		tx.stopHook()
+		tx.stopHook = nil
+	}
+	tx.mu.Unlock()
 	defer tx.db.writeMu.Unlock()
 	defer tx.ticket.Release()
 	return tx.db.commitTx(tx)
@@ -66,10 +84,17 @@ func (tx *Tx) Commit() error {
 
 // Rollback aborts the transaction.
 func (tx *Tx) Rollback() error {
+	tx.mu.Lock()
 	if tx.done {
+		tx.mu.Unlock()
 		return ErrTxDone
 	}
 	tx.done = true
+	if tx.stopHook != nil {
+		tx.stopHook()
+		tx.stopHook = nil
+	}
+	tx.mu.Unlock()
 	defer tx.db.writeMu.Unlock()
 	defer tx.ticket.Release()
 	return tx.stx.Rollback()

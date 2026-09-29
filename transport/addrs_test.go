@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func TestParseAddressPolicy(t *testing.T) {

@@ -2,35 +2,17 @@ package replicateddb
 
 import (
 	"fmt"
-	"path/filepath"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
-	"github.com/nomadsql/replicateddb/backup"
-	"github.com/nomadsql/replicateddb/replication"
-	"github.com/nomadsql/replicateddb/schema"
-	"github.com/nomadsql/replicateddb/transport"
-)
-
-// QueryStoreMode selects between in-memory and disposable file-backed SQL materialization.
-type QueryStoreMode int
-
-const (
-	// QueryStoreMemory uses an in-memory SQL database (default). Zero disk footprint.
-	QueryStoreMemory QueryStoreMode = iota
-	// QueryStoreMMap uses a secure, disposable file-backed SQLite database with mmap enabled.
-	QueryStoreMMap
+	"github.com/marcgauthier/spedsql/backup"
+	"github.com/marcgauthier/spedsql/replication"
+	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/spedsql/transport"
 )
 
 // QueryStoreConfig configures the SQL materialization.
 type QueryStoreConfig struct {
-	// Mode selects in-memory or disposable file-backed storage (default QueryStoreMemory).
-	Mode QueryStoreMode
-	// TempDir sets the parent directory for disposable mmap storage.
-	// When empty, defaults to filepath.Join(Path, "query_mmap").
-	TempDir string
-	// MMapBytes configures the mmap size for QueryStoreMMap (default 256 MiB).
-	MMapBytes int64
 	// RemoteApplyInterval batches durable remote changes into one SQLite
 	// transaction. Zero selects one second. A negative value is invalid.
 	RemoteApplyInterval time.Duration
@@ -168,7 +150,8 @@ const (
 type CompressionConfig struct {
 	// Algorithm selects the codec. Default zstd.
 	Algorithm CompressionAlgorithm
-	// ZstdLevel selects the Zstd level. Default 3; Pebble supports only 3.
+	// ZstdLevel selects the Zstd level. Default 3; supported levels are
+	// 3 (default), 9, and 12.
 	ZstdLevel int
 }
 
@@ -385,14 +368,6 @@ func (c *Config) withDefaults() {
 	}
 	if c.QueryStore.RemoteApplyMaxTransactions == 0 {
 		c.QueryStore.RemoteApplyMaxTransactions = 1_000
-	}
-	if c.QueryStore.Mode == QueryStoreMMap {
-		if c.QueryStore.MMapBytes <= 0 {
-			c.QueryStore.MMapBytes = 256 << 20
-		}
-		if c.QueryStore.TempDir == "" && c.Path != "" {
-			c.QueryStore.TempDir = filepath.Join(c.Path, "query_mmap")
-		}
 	}
 	if c.Cache.StatementCacheEntries == 0 {
 		c.Cache.StatementCacheEntries = 256
@@ -655,8 +630,12 @@ func (p PebbleConfig) validate() error {
 	default:
 		return fmt.Errorf("replicateddb: unknown Pebble compression %q", p.Compression.Algorithm)
 	}
-	if p.Compression.Algorithm == CompressionZstd && p.Compression.ZstdLevel != 3 {
-		return fmt.Errorf("replicateddb: Pebble Zstd supports only level 3")
+	if p.Compression.Algorithm == CompressionZstd {
+		switch p.Compression.ZstdLevel {
+		case 3, 9, 12:
+		default:
+			return fmt.Errorf("replicateddb: Pebble Zstd supports only levels 3, 9, and 12 (got %d)", p.Compression.ZstdLevel)
+		}
 	}
 	return nil
 }

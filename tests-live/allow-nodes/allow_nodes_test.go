@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/tests-live/harness"
+	"github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/tests-live/harness"
 )
 
 // TestAllowedNodeIDsAcrossProcesses checks that certificate validity alone

@@ -7,11 +7,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
-	replicateddb "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/crypto"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/state"
+	replicateddb "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/crypto"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/state"
 )
 
 // openTemplateStore opens a copy of the n-row template directly at the

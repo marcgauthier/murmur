@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func TestBridgeOwnershipPolicyReplicatesWithHighMutations(t *testing.T) {

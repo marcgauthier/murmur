@@ -7,7 +7,7 @@ Fast In Memory Secure Peer-Distributed SQL with persistance.
 **Primary components:** SQLite + Pebble + HashiCorp memberlist + quic-go
 **Replication model:** Masterless, offline-capable, per-column last-writer-wins using HLC  
 **Durable source of truth:** Pebble  
-**Query/search engine:** in-memory SQLite materialization, rebuilt from Pebble
+**Query/search engine:** SQLite materialization (memory by default), rebuilt from Pebble
 **Prepared:** 2026-09-26  
 **Storage revision:** Pebble v2.1.6 with authenticated encrypted VFS; new databases only
 **Membership revision:** 2026-09-27; SWIM discovery and bounded replication, with all inter-node traffic over QUIC
@@ -135,19 +135,22 @@ CR-SQLite can still be studied as a reference for conflict semantics and testing
 ## 3. SQLite Role
 
 SQLite is the embedded SQL engine and holds the query-visible materialization
-in memory. Pebble stores the durable current state and replication history.
+in memory by default. Pebble stores the durable current state and replication history.
 SQLite is rebuilt from Pebble during open and can be discarded at any time.
 
 The default build uses `mattn/go-sqlite3` with bundled SQLite. It requires
 `sqlite_preupdate_hook` and `sqlite_fts5` build tags. The optional `modernc`
 build tag selects the pure-Go `modernc.org/sqlite` driver and builds with
-`CGO_ENABLED=0`. Both drivers use SQLite locking: active queries hold a shared
+`CGO_ENABLED=0`. Both drivers use a context-aware reader/writer lock: active queries hold a shared
 engine read lock, while writes, rebuilds, migrations, and remote apply take the
-exclusive engine lock. An open result set therefore delays writes until it is
-closed or exhausted.
+exclusive engine lock. An open result set delays writes until it is closed, exhausted,
+or its query context is canceled. Transaction startup and write admissions respect
+context deadlines, aborting without deadlock if reads remain blocked. Abandoned
+transactions automatically rollback when their context is canceled.
 
-The SQL materialization always stays in memory. Pebble remains the only durable
-database and remains responsible for the successful-write durability contract.
+The query materialization is always in-memory with zero disk footprint.
+Pebble remains the authoritative database and is responsible for the
+successful-write durability contract.
 See [SQLite backends](sqlite-backends.md) for build and validation commands.
 
 ---

@@ -13,9 +13,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/nomadsql/replicateddb/replication"
-	"github.com/nomadsql/replicateddb/schema"
-	"github.com/nomadsql/replicateddb/state"
+	"github.com/marcgauthier/spedsql/replication"
+	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/spedsql/state"
 )
 
 // schemaRegistry returns the live registry. The pointer is swapped on

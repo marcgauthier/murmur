@@ -314,8 +314,8 @@ Increase concurrency only after profiling.
 
 ## 64. SQLite Connection and Locking Model
 
-Both supported drivers use one named shared-cache in-memory SQLite database,
-with a reserved write connection and a pool of read connections. The engine
+Both supported drivers use one named shared-cache in-memory SQLite
+database with a reserved write connection and a pool of read connections. The engine
 read/write lock permits overlapping queries while a materialization is stable.
 A write takes the exclusive lock, waits for active result sets to close or
 exhaust, and prevents new reads until commit or rollback. Callers should close
@@ -365,8 +365,9 @@ core library starts no listener and the handler never closes the caller's DB.
 Results are bounded (10,000 rows and 1 MiB request bodies by default) with
 explicit too-large failures, and values use a typed JSON codec that preserves
 int64 precision and base64 blobs. `service.Client` is the remote SDK (status,
-query, exec, streaming subscribe over TLS-only https URLs). File operations
-are absent until encrypted file replication exists; unlock stays in `admin`.
+query, exec, streaming subscribe over TLS-only https URLs). File routes
+are absent from `service.Handler`/`service.Client`, although core encrypted file
+replication and the internal test-node file routes exist. Unlock stays in `admin`.
 
 Remote unlock is a separate lifecycle extension. A locked service may expose only
 its authenticated control surface; it must not initialize/open encrypted state or
@@ -381,15 +382,6 @@ return a generic response and do not publish an unlocked runtime. `GET
 /v1/status` reports only locked/unlocked state, and `POST /v1/lock` closes the
 active DB. Applications mount the handler on their own TLS listener; the core
 library starts no HTTP listener and existing `db.Open` behavior is unchanged.
-
-The standalone daemon API uses a different deployment boundary: its listener
-is HTTPS-only and verifies client certificates against `tls_ca_cert_file`.
-It uses the configured node certificate/key as the HTTPS server identity;
-server certificates need DNS/IP SANs matching client connection names. Every
-route, including `/metrics`, requires a trusted client certificate except
-public `GET /healthz`, which remains HTTPS-only. The `spedsql` CLI requires
-server CA and client certificate/key files for API commands. Bearer tokens are
-not daemon API credentials; mTLS is the API access control.
 
 Acceptance for an adapter includes authorization separation, failed unlock,
 worker startup only after successful unlock, streaming cancellation, shutdown,

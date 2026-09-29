@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	replicateddb "github.com/nomadsql/replicateddb"
+	replicateddb "github.com/marcgauthier/spedsql"
 )
 
 // BenchmarkCipherMatrix measures single-cell update throughput across

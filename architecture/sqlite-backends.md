@@ -1,15 +1,17 @@
 # SQLite backends
 
-The query materialization uses SQLite in memory and is rebuilt from authoritative
-Pebble state whenever a node opens. Choose one of two Go drivers at build time:
+The query materialization uses an in-memory SQLite database with zero disk
+footprint and is rebuilt from authoritative Pebble state whenever a node
+opens. Choose one of two Go drivers at build time:
 
 - Default CGO build: `github.com/mattn/go-sqlite3`, using its bundled SQLite.
 - Pure-Go build: `modernc.org/sqlite`, selected with `-tags modernc` and
   `CGO_ENABLED=0`.
 
-Both backends use SQLite's reader/writer locking. A query holds the engine read
-lock until its rows are closed or exhausted; a write waits for active queries,
-and new queries wait while a write is running. Pebble remains the sole durable
+Both backends use a context-aware reader/writer engine lock. A query holds the engine read
+lock until its rows are closed, exhausted, or its context is canceled; a write waits for active queries,
+and new queries wait while a write is running. Transaction startup and write admissions respect
+context cancellation and deadlines, unblocking without deadlocks. Pebble remains the sole durable
 source of truth.
 
 ## Build and test
@@ -44,8 +46,8 @@ The mattn build enables `RegisterPreUpdateHook` with the
 hook API. Both implementations capture insert, update, and delete values and
 pass them through the same transaction coalescing and Pebble commit path.
 
-The query database uses a named shared-cache in-memory SQLite database with a
-reserved write connection and a pool of read connections. The engine-level
+The query database uses a named shared-cache in-memory SQLite database with
+a reserved write connection and a pool of read connections. The engine-level
 read/write lock ensures readers see a stable materialization while writes,
 rebuilds, migrations, and remote bulk apply run. This model does not provide
 MVCC readers that continue while a write is in progress. The pool is capped at
@@ -55,10 +57,24 @@ MVCC readers that continue while a write is in progress. The pool is capped at
 
 | Build | Driver | Requirements | SQL materialization |
 |---|---|---|---|
-| Default | mattn/go-sqlite3 | CGO, `sqlite_preupdate_hook sqlite_fts5` tags | In-memory SQLite |
-| Optional | modernc.org/sqlite | `modernc` tag, `CGO_ENABLED=0` | In-memory SQLite |
+| Default | mattn/go-sqlite3 | CGO, `sqlite_preupdate_hook sqlite_fts5` tags | In-memory |
+| Optional | modernc.org/sqlite | `modernc` tag, `CGO_ENABLED=0` | In-memory |
 
 The optional modernc build is the supported cross-platform path for targets
 where a CGO compiler is unavailable. The default CGO backend is validated on
 Linux amd64; other targets require separate validation before being claimed as
 supported.
+
+## Query store and security
+
+`Config.QueryStore` configures remote-apply batching into the in-memory
+materialization; the driver selection is independent:
+
+| Field | Behavior / default |
+|---|---|
+| `RemoteApplyInterval` | Batches durable remote changes into one SQLite transaction; zero selects 1s. |
+| `RemoteApplyMaxTransactions` | Flushes when this many received transactions are queued; zero selects 1,000. |
+
+The query view is always an in-memory SQLite database: it leaves no
+query files on disk, creates no temporary query directories, and is
+rebuilt from authoritative encrypted Pebble state on every open.

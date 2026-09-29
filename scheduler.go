@@ -74,6 +74,16 @@ func DefaultWriterSchedulingConfig() WriterSchedulingConfig {
 	return WriterSchedulingConfig{LocalShare: 90, RemoteShare: 10, MaxDebt: time.Second}
 }
 
+// maintenanceReserveEvery reserves one grant in this many for a waiting
+// maintenance ticket. Without it, sustained interactive load starves
+// maintenance (log GC, receipts, bridge capture) forever: the fair
+// comparison only covers the interactive classes, so a never-empty
+// local/remote queue would defer maintenance indefinitely. One percent
+// keeps background work progressing while leaving the 90/10 interactive
+// ratio (and its dual-contention measurement, which excludes
+// maintenance service) effectively unchanged.
+const maintenanceReserveEvery = 100
+
 func (c *WriterSchedulingConfig) withDefaults() {
 	if c.LocalShare == 0 && c.RemoteShare == 0 {
 		c.LocalShare, c.RemoteShare = 90, 10
@@ -137,6 +147,10 @@ type writerScheduler struct {
 
 	active *schedWaiter
 	queues map[WriterClass][]*schedWaiter
+
+	// sinceMaintenance counts interactive grants since the last
+	// maintenance grant; it drives the anti-starvation reserve.
+	sinceMaintenance uint64
 
 	// Diagnostics (all guarded by mu).
 	acquisitions [3]uint64
@@ -257,31 +271,41 @@ func (s *writerScheduler) grantNextLocked() {
 	}
 	localQ := len(s.queues[WriterLocal]) > 0
 	remoteQ := len(s.queues[WriterRemote]) > 0
+	maintenanceQ := len(s.queues[WriterMaintenance]) > 0
 	var class WriterClass
-	switch {
-	case localQ && remoteQ:
-		// Compare S_local/w_local <= S_remote/w_remote without floats.
-		if s.service[0]*s.remoteW <= s.service[1]*s.localW {
-			class = WriterLocal
-		} else {
-			class = WriterRemote
-		}
-	case localQ:
-		class = WriterLocal
-	case remoteQ:
-		class = WriterRemote
-	default:
-		if len(s.queues[WriterMaintenance]) == 0 {
-			return
-		}
+	if maintenanceQ && s.sinceMaintenance >= maintenanceReserveEvery {
 		class = WriterMaintenance
+	} else {
+		switch {
+		case localQ && remoteQ:
+			// Compare S_local/w_local <= S_remote/w_remote without floats.
+			if s.service[0]*s.remoteW <= s.service[1]*s.localW {
+				class = WriterLocal
+			} else {
+				class = WriterRemote
+			}
+		case localQ:
+			class = WriterLocal
+		case remoteQ:
+			class = WriterRemote
+		default:
+			if !maintenanceQ {
+				return
+			}
+			class = WriterMaintenance
+		}
+	}
+	if class == WriterMaintenance {
+		s.sinceMaintenance = 0
+	} else {
+		s.sinceMaintenance++
 	}
 	w := s.queues[class][0]
 	s.queues[class] = s.queues[class][1:]
 	w.granted = true
 	// Dual contention: the grant chose between backlogged interactive
-	// classes, so the share policy bound the decision. Maintenance is
-	// granted only with no interactive waiters, hence never dual.
+	// classes, so the share policy bound the decision. Maintenance
+	// grants (idle or reserve) are never dual-marked.
 	w.dual = (class == WriterLocal && remoteQ) || (class == WriterRemote && localQ)
 	s.active = w
 	s.acquisitions[class]++

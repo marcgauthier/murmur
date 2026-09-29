@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	db "github.com/nomadsql/replicateddb"
+	db "github.com/marcgauthier/spedsql"
 )
 
 const (

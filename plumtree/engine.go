@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 var (

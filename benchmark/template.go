@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	replicateddb "github.com/nomadsql/replicateddb"
+	replicateddb "github.com/marcgauthier/spedsql"
 )
 
 // benchTemplate is one populated, closed store per dataset size, built

@@ -9,7 +9,7 @@ architecture work. Completed tasks are archived in [TASKS_COMPLETED.md](../TASKS
 
 Start with the [overview](overview.md), then read the topics relevant to your change. Original section numbers are preserved so existing section references remain identifiable; prose references link directly to their new locations.
 
-For the verified implementation inventory, supported platforms, and deployment
+For the implementation inventory, configured platform checks, and deployment
 instructions, read [Release status](release-status.md); it is the single
 source of truth when older status paragraphs disagree. For the original
 code-versus-design comparison with GALVANIZE, read
@@ -18,7 +18,9 @@ High/Low implements roles, sealed bundles, encrypted journals, capacity
 enforcement, atomic delivery with receipts and stream progress, schema holds,
 status/replay controls, and ownership policy. Replicated file metadata with
 bounded mesh fetch and cross-domain sealed payload transfer is implemented;
-only SWIM-based discovery remains pending.
+SWIM-based file-fetch discovery remains pending. SQL membership runtime wiring
+exists when bootstrap seeds are configured; seed-only live acceptance remains
+outstanding. The query materialization is in-memory only.
 
 | Document | Topics | Original sections |
 | --- | --- | --- |
@@ -41,10 +43,11 @@ only SWIM-based discovery remains pending.
 | [SQLite backends](sqlite-backends.md) | Default mattn SQLite build, optional pure-Go modernc build, capture hooks, and reader/writer locking. | 3, 4, 64 |
 | [Query and search](query-and-search.md) | Indexes, FTS, prepared statements, and reactive query subscriptions. | 23, 24, 65 |
 | [Testing and acceptance](testing.md) | Crash/convergence/network/encryption tests and alpha acceptance criteria. | 55, 56, 57, 58, 89 |
+| [Operational rehearsals](operational-rehearsals.md) | Backup restore, lost-key, certificate-renewal, disk-full, and recovery-time drills. | New topic |
 | [Benchmarks](benchmarks.md) | Search, write/replication, and startup performance scenarios. | 59, 60, 61 |
 | [Implementation roadmap and pending tasks](../TASKS_PENDING.md) | Implementation phases, prototype files, MVP boundaries, active and future tasks. | 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 87, 91 |
 | [Invariants, risks, and security](invariants-and-risks.md) | Design risks, non-negotiable architecture invariants, and security review requirements. | 78, 79, 85 |
 | [Versioning, release, and references](versioning-and-release.md) | Compatibility/versioning, packaging, platform support, and architecture sources. | 84, 86, 90 |
-| [Release status](release-status.md) | Verified feature matrix, supported platforms, deployment instructions, and release commit. | New topic |
+| [Release status](release-status.md) | Implementation inventory, historical test results, configured platform checks, and release evidence requirements. | New topic |
 
 Keep these documents, their links, and the project README current when behavior, APIs, configuration, storage formats, or implementation status change. Repository guidance is in [AGENTS.md](../AGENTS.md).

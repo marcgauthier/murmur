@@ -2,14 +2,16 @@ package rollingrestart
 
 import (
 	"fmt"
+	"io"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/schema"
-	"github.com/nomadsql/replicateddb/tests-live/harness"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/spedsql/tests-live/harness"
 )
 
 // Rolling restart with continuous writes: each node stops and rejoins in
@@ -90,7 +92,10 @@ func TestRollingRestartLosesNoWrites(t *testing.T) {
 		// writers: exact-count agreement is unobservable while 80+
 		// inserts/s keep landing.
 		time.Sleep(3 * time.Second)
-		quiesce(t, cluster, "rr_rows", &paused, 60*time.Second)
+		// 150s, not 60s: under a full parallel `go test ./...` the box
+		// runs ~10x slow and exact agreement legitimately takes over a
+		// minute; the proof (exact agreement) is unchanged.
+		quiesce(t, cluster, "rr_rows", &paused, 150*time.Second)
 	}
 
 	stopWriters()
@@ -98,7 +103,7 @@ func TestRollingRestartLosesNoWrites(t *testing.T) {
 	if got := failed.Load(); got != 0 {
 		t.Fatalf("%d writes failed outside restart windows, want zero-downtime", got)
 	}
-	waitConvergedCounts(t, cluster, "rr_rows", 60*time.Second)
+	waitConvergedCounts(t, cluster, "rr_rows", 150*time.Second)
 	want, err := cluster.ComputeTableDigest(0, "rr_rows", "id")
 	if err != nil {
 		t.Fatal(err)
@@ -156,6 +161,28 @@ func dumpIDDiff(t *testing.T, c *harness.Cluster, table string) {
 			break
 		}
 	}
+	// Session state for heal-stall forensics: a frozen row gap with
+	// writers paused means sessions (not slowness) are wedged, and the
+	// per-peer connection/need/ack state shows which link is stuck.
+	for idx, node := range c.Nodes {
+		t.Logf("divergence: node%d status: %s", idx+1, fetchStatus(t, node.APIAddr))
+	}
+}
+
+// fetchStatus returns the node's /v1/status body, truncated for logs.
+// Plain http.Get works: the harness routes it through the mTLS client.
+func fetchStatus(t *testing.T, apiAddr string) string {
+	t.Helper()
+	resp, err := http.Get("https://" + apiAddr + "/v1/status")
+	if err != nil {
+		return "unreachable: " + err.Error()
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	if err != nil {
+		return "read error: " + err.Error()
+	}
+	return string(raw)
 }
 
 func firstN(s []string, n int) []string {

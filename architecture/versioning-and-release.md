@@ -45,9 +45,9 @@ capabilities
 
 This makes rolling upgrades possible later.
 
-Require a new replication transport protocol version for shared membership/replication stream dispatch and DATAGRAM capability negotiation. Reject legacy peers explicitly; do not silently fall back to native memberlist UDP/TCP or full-mesh replication. This network revision does not change mutation identities or conflict semantics. Persist new peer-retirement/retention metadata under versioned package-owned keys without inventing a data migration or marking it implemented in the current code.
+Require a new replication transport protocol version for shared membership/replication stream dispatch and DATAGRAM capability negotiation. Reject legacy peers explicitly; do not silently fall back to native memberlist UDP/TCP or full-mesh replication. This network revision does not change mutation identities or conflict semantics. Peer admission/retention and retirement metadata are implemented under package-owned keys; see [retention](snapshots-backup-and-restore.md).
 
-Version the new range/chunk and Plumtree message formats, schema ancestry, snapshot manifest/generation publication, and restore identity metadata. Negotiate required capabilities before starting transfers; an old peer must not interpret observed heads or staging receipts as applied watermarks. Preserve transaction identities across chunking and existing HLC/LWW semantics. These additions describe target architecture rather than claiming the current implementation already supports the new persistent metadata or APIs.
+Version the new range/chunk and Plumtree message formats, schema ancestry, snapshot manifest/generation publication, and restore identity metadata. Negotiate required capabilities before starting transfers; an old peer must not interpret observed heads or staging receipts as applied watermarks. Preserve transaction identities across chunking and existing HLC/LWW semantics. Range/chunk transfer, Plumtree, snapshot publication, and restore metadata have implementations; their evidence and acceptance limits are recorded in [release status](release-status.md#1-verified-feature-matrix).
 
 Implementation status: fresh Pebble stores record `format_version`,
 `minimum_reader_version`, and `minimum_writer_version` (all 2); open fails
@@ -59,7 +59,7 @@ session before any peer state exists, and sessions pin the negotiated usable
 set. Capability bits 1..31 are reserved for the target subsystems above and
 are defined alongside their features. Snapshot manifests already enforce
 `FormatVersion == 1` on both sides; range/chunk, Plumtree, generation
-publication, and restore-marker versioning land with those formats.
+publication, and restore-marker formats are implemented alongside their feature code.
 
 ---
 
@@ -81,7 +81,8 @@ go get github.com/nomadsql/replicateddb
 
 ### Supported Platform and Build Matrix
 
-Continuous integration (GitHub Actions `.github/workflows/ci.yml`) validates the following platform and build configurations:
+Continuous integration (GitHub Actions `.github/workflows/ci.yml`) is configured
+for the following checks. These are not observed results for the latest revision:
 
 | Platform / Architecture | Build Mode / Driver | Compiler & Toolchain | CI Checks |
 |---|---|---|---|
@@ -93,7 +94,7 @@ Continuous integration (GitHub Actions `.github/workflows/ci.yml`) validates the
 ### Build Tags and Driver Selection
 
 The default backend is bundled SQLite through `mattn/go-sqlite3`; the SQL
-materialization is in memory and uses SQLite reader/writer locking.
+materialization is in-memory and uses SQLite reader/writer locking.
 
 When building with specialized tags or zero-CGO fallbacks:
 - **Default (`!modernc`)**: mattn CGO driver (`mattn/go-sqlite3`) with bundled SQLite.
@@ -107,14 +108,16 @@ The default CGO configuration requires tags
 (`sqlengine/capture_mattn.go` needs the pre-update-hook API). Every build,
 vet, and test invocation must pass `-tags "sqlite_preupdate_hook sqlite_fts5"`
 or `-tags modernc`; `tests-live/run.sh` applies `SPEDSQL_TAGS` (defaulting to
-the CGO set) to both the daemon build and the test run.
+the CGO set) to both the internal test-node build and the test run. The
+separately built test node is not race-instrumented by `go test -race` alone.
 
 ### Release status and release commit
 
-The [verified release status](release-status.md) is the single source for the
-feature matrix, supported platforms, deployment instructions, verification
-record, and the exact release commit. No release commit exists yet; do not
-cite a hash in production claims until the §5 procedure there is complete.
+The [release inventory and verification record](release-status.md) separates
+code presence, test coverage, and historical results. No verified release
+revision is recorded there. Record the exact candidate, commands, backend,
+platform, and results using its §5 procedure before making release claims;
+checkout cleanliness is a transient observation, not a release identifier.
 
 ### Pinned Dependencies and Toolchains
 
@@ -122,7 +125,7 @@ The codebase maintains explicit pins in `go.mod`:
 
 | Component | Pinned Version / Source | Rationale / Capability |
 |---|---|---|
-| **Go Toolchain** | `1.26.0+` (minimum `1.25.x`) | Primary runtime, compiler, and standard library |
+| **Go Toolchain** | `1.26.0` (`go.mod` directive) | Primary runtime, compiler, and standard library |
 | **mattn SQLite** | `github.com/mattn/go-sqlite3 v1.14.32` | Default CGO SQLite driver with pre-update hook and FTS5 build features |
 | **Pebble** | `github.com/cockroachdb/pebble/v2 v2.1.6` | Authoritative LSM KV, Zstd level 3, VFS encryption, reader/writer version checks |
 | **Memberlist** | `github.com/hashicorp/memberlist v0.7.0` | SWIM cluster membership and gossip |

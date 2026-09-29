@@ -10,10 +10,10 @@ import (
 	"strings"
 	"testing"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/schema"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/schema"
 )
 
 // fileBridgeHarness wires a real Low/High pair with the full bridge pipeline.

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/transport"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/transport"
 )
 
 type mockMembershipHandler struct {

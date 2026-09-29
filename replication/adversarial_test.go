@@ -9,10 +9,10 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
-	"github.com/nomadsql/replicateddb/state"
-	"github.com/nomadsql/replicateddb/transport"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/spedsql/transport"
 )
 
 // fakeApplier records applied batches.

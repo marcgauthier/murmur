@@ -130,12 +130,23 @@ published) or the complete merged state; a preempting newer transfer can
 never publish the older partial merge. SQL stays gated on the pre-snapshot
 materialization until publication completes, then rebuilds once from the
 committed state. The source holds its consistent Pebble read cut for at most
-`Replication.SnapshotTransferTimeout` (10 minutes by default). A bounded
-source log-retention lease covering the snapshot's watermarks — so concurrent
-source writes and log GC preserve tail repair history until transfer
-completion or expiry — remains pending; no lease code exists yet. Explicit
-progress diagnostics and fault injection at every publication boundary also
-remain outstanding.
+`Replication.SnapshotTransferTimeout` (10 minutes by default).
+`state.ExportSnapshotContext` acquires an in-memory source log-retention lease
+at the manifest watermarks; log GC honors its floor. Expiry uses the context
+deadline, or ten minutes when no deadline is supplied. The lease is released
+when export returns, including cancellation/error, and is not persisted across
+source restart. It does not explicitly wait for receiver publication or tail
+catch-up before release.
+
+`TestSnapshotTailRetentionLease*` covers concurrent writes/GC, cancellation and
+retry, and expiry. Full live acceptance covering slow transfer with sustained
+writes/aggressive GC through receiver publication, tail catch-up, and source/receiver
+restarts is verified by `snapshot_recovery_test.go` (`TestSnapshotSlowTransferSustainedWritesAndAggressiveGC`,
+`TestSnapshotTransferInterruptedBySourceAndReceiverRestarts`, `TestSnapshotRestartServesPublishedRows`)
+and multi-process scenario `tests-live/snapshot-resync`. Progress diagnostics, busy deferral,
+and the stall watchdog are implemented (`replication/snapshot_progress_test.go`). Publication tests cover
+interrupted merge/restart, crash before publication, and SSTable ingestion before
+progress persistence (`state/snapshot_chunked_test.go`).
 
 Snapshot manifest:
 

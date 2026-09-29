@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/nomadsql/replicateddb/backup"
-	"github.com/nomadsql/replicateddb/schema"
+	"github.com/marcgauthier/spedsql/backup"
+	"github.com/marcgauthier/spedsql/schema"
 )
 
 var testObjectKey = bytes.Repeat([]byte{0x71}, 32)

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func (m *Manager) onChunkAvailabilityRequest(p *peerState, payload []byte) error {

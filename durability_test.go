@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func TestDurabilityConfigValidation(t *testing.T) {

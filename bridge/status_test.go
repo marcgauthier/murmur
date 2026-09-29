@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/codec"
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func appendBatch(t *testing.T, o *Outbox, origin ids.NodeID, originSeq uint64) uint64 {

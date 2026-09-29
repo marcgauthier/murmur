@@ -291,8 +291,19 @@ func TestFileFetchWorker(t *testing.T) {
 	if !bytes.Equal(got, data) {
 		t.Fatal("worker-fetched bytes differ from upload")
 	}
-	if n := dbB.FileFetchStats().Completed; n < 1 {
-		t.Fatalf("worker completed %d fetches", n)
+	// The worker increments Completed after the fetched bytes land,
+	// so a snapshot sampled between the two observes bytes with a
+	// zero count. Poll the counter; the byte comparison above already
+	// proved the fetch itself.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if n := dbB.FileFetchStats().Completed; n >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("worker completed %d fetches", dbB.FileFetchStats().Completed)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

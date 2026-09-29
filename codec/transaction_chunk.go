@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 const (

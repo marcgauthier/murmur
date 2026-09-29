@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	replicateddb "github.com/nomadsql/replicateddb"
+	replicateddb "github.com/marcgauthier/spedsql"
 )
 
 // Concurrent-reader query benchmarks against the in-memory SQLite materialization.

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nomadsql/replicateddb/ids"
+	"github.com/marcgauthier/spedsql/ids"
 )
 
 func testCreds(t *testing.T, ca *CA, id ids.NodeID, allowed []ids.NodeID) *Credentials {

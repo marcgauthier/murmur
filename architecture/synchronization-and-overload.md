@@ -166,7 +166,7 @@ Do not use JSON on the replication hot path.
 
 ### Pebble storage compression
 
-Default to enabled Zstd level 3 on every LSM level. After initializing all level options, apply `pebble.UniformDBCompressionSettings(block.ZstdCompression)` with `Options.ApplyCompressionSettings`. Use the v2.1.6 `sstable/block` profile, whose Zstd setting is level 3. Explicit none/snappy map to their uniform built-in profiles. Reject unsupported modes and any nonzero Zstd level other than 3; a nonzero Zstd level with none/snappy is invalid.
+Default to enabled Zstd level 3 on every LSM level. After initializing all level options, apply `pebble.UniformDBCompressionSettings(block.ZstdCompression)` with `Options.ApplyCompressionSettings`. Use the v2.1.6 `sstable/block` profile, whose Zstd setting is level 3. Explicit none/snappy map to their uniform built-in profiles. Supported Zstd levels are 3 (default), 9, and 12; level 3 uses Pebble's shared built-in profile, while 9 and 12 copy it and override the per-block level without mutating the shared profile. Reject unsupported modes and any other Zstd level.
 
 ```go
 opts.EnsureDefaults()
@@ -294,7 +294,9 @@ bound; all-zero resolves to defaults, otherwise positive shares totaling
 100). Local transactions hold a local ticket end to end, remote
 apply/snapshot/schema adoption hold remote tickets, and migrations, file
 rewrites, and per-unit log/receipt GC hold maintenance tickets (granted
-only with no interactive waiters); admission precedes all conflicting locks
+with no interactive waiters, plus a 1-in-100 reserve for a waiting
+maintenance ticket so sustained interactive load cannot starve background
+work forever); admission precedes all conflicting locks
 and honors context cancellation and shutdown. Open-time rebuild and Close
 drains predate/follow service and bypass the coordinator. Diagnostics ride
 `MetricsSnapshot.Scheduler` and the `metrics` collectors (per-class

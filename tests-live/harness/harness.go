@@ -22,15 +22,19 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/transport"
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/transport"
 )
 
 // Node represents a running spedsql daemon instance in the test cluster.
 type Node struct {
-	Index         int
-	Label         string
-	NodeID        db.NodeID
+	Index  int
+	Label  string
+	NodeID db.NodeID
+	// BinaryPath is the daemon executable this node starts. It
+	// defaults to the cluster binary; SetNodeBinary switches it
+	// while the node is stopped (rolling-upgrade tests).
+	BinaryPath    string
 	Dir           string
 	PebbleDir     string
 	LogsDir       string
@@ -101,6 +105,14 @@ type ClusterOptions struct {
 	Bootstrap []string
 	// BootstrapByNode overrides the bootstrap seed addresses per node.
 	BootstrapByNode map[int][]string
+	// BootstrapSeeds specifies node indices (e.g. []int{0}) that act as bootstrap seeds.
+	// All cluster nodes have membership enabled, and non-seed nodes automatically
+	// receive the seed nodes' replication addresses in their bootstrap configuration.
+	BootstrapSeeds []int
+	// BinaryByNode overrides the daemon executable per node
+	// (mixed-version clusters: old binaries alongside the
+	// current build). Empty entries inherit the cluster binary.
+	BinaryByNode map[int]string
 }
 
 // ReplicationOptions mirrors the daemon's replication config section.
@@ -252,10 +264,18 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 
 		keyHex := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
+		nodeBin := binPath
+		if override, ok := opts.BinaryByNode[i]; ok && override != "" {
+			if _, err := os.Stat(override); err != nil {
+				t.Fatalf("node %s binary %q: %v", label, override, err)
+			}
+			nodeBin = override
+		}
 		node := &Node{
 			Index:      i,
 			Label:      label,
 			NodeID:     nodeID,
+			BinaryPath: nodeBin,
 			Dir:        nodeDir,
 			PebbleDir:  pebbleDir,
 			LogsDir:    logsDir,
@@ -331,10 +351,30 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 			"allowed_networks":   allowedNetworks,
 			"allowed_peers":      allowedPeers,
 		}
-		if boot, ok := opts.BootstrapByNode[i]; ok {
+		if len(opts.BootstrapSeeds) > 0 {
+			cfgJSON["membership_enabled"] = true
+			isSeed := false
+			for _, sIdx := range opts.BootstrapSeeds {
+				if sIdx == i {
+					isSeed = true
+					break
+				}
+			}
+			if !isSeed {
+				var seedAddrs []string
+				for _, sIdx := range opts.BootstrapSeeds {
+					if sIdx >= 0 && sIdx < len(cluster.Nodes) {
+						seedAddrs = append(seedAddrs, cluster.Nodes[sIdx].ReplAddr)
+					}
+				}
+				cfgJSON["bootstrap"] = seedAddrs
+			}
+		} else if boot, ok := opts.BootstrapByNode[i]; ok {
 			cfgJSON["bootstrap"] = boot
+			cfgJSON["membership_enabled"] = true
 		} else if len(opts.Bootstrap) > 0 {
 			cfgJSON["bootstrap"] = opts.Bootstrap
+			cfgJSON["membership_enabled"] = true
 		}
 		if opts.Schema != nil {
 			cfgJSON["schema"] = opts.Schema
@@ -430,6 +470,21 @@ func bridgeJSON(node *Node, b *BridgeOptions) map[string]any {
 	}
 }
 
+// SetNodeBinary switches the daemon executable a node starts next.
+// The node must be stopped; the switch takes effect on StartNode.
+// Rolling-upgrade tests flip nodes from the previous release to the
+// current build one at a time.
+func (c *Cluster) SetNodeBinary(idx int, path string) {
+	c.T.Helper()
+	if path == "" {
+		c.T.Fatalf("node %s: empty binary path", c.Nodes[idx].Label)
+	}
+	if _, err := os.Stat(path); err != nil {
+		c.T.Fatalf("node %s binary %q: %v", c.Nodes[idx].Label, path, err)
+	}
+	c.Nodes[idx].BinaryPath = path
+}
+
 func (c *Cluster) StartNode(idx int) {
 	c.T.Helper()
 	node := c.Nodes[idx]
@@ -440,7 +495,11 @@ func (c *Cluster) StartNode(idx int) {
 	}
 	node.LogFileWriter = logFile
 
-	cmd := exec.Command(c.BinaryPath, "agent", "--config", node.ConfigFile)
+	bin := node.BinaryPath
+	if bin == "" {
+		bin = c.BinaryPath
+	}
+	cmd := exec.Command(bin, "agent", "--config", node.ConfigFile)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
@@ -676,7 +735,7 @@ func (c *Cluster) Cleanup() {
 func findOrBuildSpedSQL(t *testing.T) string {
 	t.Helper()
 	root := repoRoot(t)
-	bin := filepath.Join(root, "bin", "spedsql")
+	bin := filepath.Join(root, "tests-live", "bin", "testnode")
 	if _, err := os.Stat(bin); err == nil {
 		return bin
 	}
@@ -686,11 +745,14 @@ func findOrBuildSpedSQL(t *testing.T) string {
 	if tags == "" {
 		tags = "sqlite_preupdate_hook sqlite_fts5"
 	}
-	cmd := exec.Command("go", "build", "-tags", tags, "-o", bin, "./cmd/spedsql")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatalf("create test bin dir: %v", err)
+	}
+	cmd := exec.Command("go", "build", "-tags", tags, "-o", bin, "./tests-live/harness/testnode")
 	cmd.Dir = root
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("build spedsql binary: %v, output: %s", err, string(out))
+		t.Fatalf("build testnode binary: %v, output: %s", err, string(out))
 	}
 	return bin
 }
