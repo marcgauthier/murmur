@@ -308,7 +308,11 @@ type peerSession struct {
 	ctrlStream  *quic.Stream
 	ctrlWriteMu sync.Mutex
 
-	dataStream  *quic.Stream
+	// dataStream is atomic so close can reclaim it without taking
+	// dataWriteMu: senders hold dataWriteMu while taking peer.mu for
+	// accounting, while close runs under peer.mu (attach replacement,
+	// shutdown drain) — taking the mutex here deadlocks both.
+	dataStream  atomic.Pointer[quic.Stream]
 	dataWriteMu sync.Mutex
 
 	outbound  bool // true when we dialed
@@ -336,12 +340,13 @@ func (s *peerSession) close() {
 		if s.ctrlStream != nil {
 			_ = s.ctrlStream.Close()
 		}
-		s.dataWriteMu.Lock()
-		if s.dataStream != nil {
-			_ = s.dataStream.Close()
-			s.dataStream = nil
+		// Never take dataWriteMu here: close runs under peer.mu while
+		// senders hold dataWriteMu across peer.mu accounting. Swap the
+		// stream out atomically; a racing sender either fails its write
+		// (session closed) or owns a stream the conn close reaps.
+		if ds := s.dataStream.Swap(nil); ds != nil {
+			_ = ds.Close()
 		}
-		s.dataWriteMu.Unlock()
 		_ = s.sess.Close()
 	})
 }
@@ -391,7 +396,8 @@ func (s *peerSession) sendDataType(typ uint16, flags uint16, payload []byte) err
 		return fmt.Errorf("replication: session closed")
 	default:
 	}
-	if s.dataStream == nil {
+	ds := s.dataStream.Load()
+	if ds == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 		stream, err := s.sess.OpenStream(ctx)
 		cancel()
@@ -401,14 +407,18 @@ func (s *peerSession) sendDataType(typ uint16, flags uint16, payload []byte) err
 		if s.st != nil {
 			s.st.dataStreamsOpened.Add(1)
 		}
-		s.dataStream = stream
+		s.dataStream.Store(stream)
+		ds = stream
 	}
 	if s.timeout > 0 {
-		_ = s.dataStream.SetWriteDeadline(time.Now().Add(s.timeout))
+		_ = ds.SetWriteDeadline(time.Now().Add(s.timeout))
 	}
-	if err := WriteFrame(s.dataStream, typ, flags, payload); err != nil {
-		_ = s.dataStream.Close()
-		s.dataStream = nil
+	if err := WriteFrame(ds, typ, flags, payload); err != nil {
+		_ = ds.Close()
+		// Drop only our stream: close may have concurrently swapped in
+		// nil already, and Store(nil) here could orphan nothing else
+		// since senders are serialized by dataWriteMu.
+		s.dataStream.CompareAndSwap(ds, nil)
 		return &sendError{err: err}
 	}
 	if n := uint64(len(payload) + frameHdrLen); n > 0 {
@@ -1674,11 +1684,17 @@ func (m *Manager) attach(p *peerState, ps *peerSession, h *Hello) {
 		go ps.close()
 		return
 	}
-	go m.readControlLoop(p, ps)
-	go m.streamAcceptLoop(p, ps)
+	// Adopt the connection for replication BEFORE starting our accept
+	// loop: adoption yields any membership AcceptStream consumer
+	// synchronously, so exactly one consumer ever accepts on it.
+	// Streams arriving in the gap queue losslessly in QUIC; starting
+	// our loop first would race the old one and either side could
+	// steal (and drop) the other's streams.
 	if m.membership != nil && m.membership.Transport() != nil {
 		m.membership.Transport().RegisterSession(ps.sess)
 	}
+	go m.readControlLoop(p, ps)
+	go m.streamAcceptLoop(p, ps)
 	if !agreed {
 		// Schema mismatch accepted for synchronization: request the
 		// peer's manifest once attached; data stays gated until agreed.
@@ -1766,7 +1782,9 @@ func (m *Manager) serveInbound(sess *transport.Session) {
 		var memErr *ErrMembershipStream
 		if errors.As(err, &memErr) {
 			if m.membership != nil && m.membership.Transport() != nil {
-				m.membership.Transport().RegisterSession(sess)
+				// Memberlist-only connection: replication never
+				// attaches it, so the membership accept loop stays.
+				m.membership.Transport().RegisterMemberlistSession(sess)
 				m.membership.Transport().HandleStream(sess, stream, memErr.Prefix)
 				return
 			}
@@ -3330,6 +3348,21 @@ func (m *Manager) sendAckAndPull(p *peerState) error {
 	for _, w := range wms {
 		_ = ps.send(MsgNeed, 0, EncodeNeed(nil, Need{Origin: w.Origin, FromSeq: w.Sequence + 1}))
 	}
+	// Pull origins the peer advertises but our store has never seen.
+	// ReceiveWatermarks omits unknown origins, so without an explicit
+	// Need a first-delivery loss stalls the origin permanently: the
+	// sender's sent-cursor suppresses resends within a session while
+	// the watermark pull above never asks for the missing range.
+	p.mu.Lock()
+	advertised := make(map[ids.NodeID]uint64, len(p.have))
+	for origin, seq := range p.have {
+		advertised[origin] = seq
+	}
+	p.mu.Unlock()
+	for _, need := range unknownAdvertisedNeeds(advertised, wms) {
+		_ = ps.send(MsgNeed, 0, EncodeNeed(nil, need))
+		m.st.needsSent.Add(1)
+	}
 	if progress {
 		_ = ps.send(MsgProgressRequest, 0, EncodeProgressRequest(nil, ids.NodeID{}))
 	}
@@ -3349,6 +3382,23 @@ func (m *Manager) sendAckAndPull(p *peerState) error {
 	_ = ps.send(MsgPing, 0, binaryBigEndianPutUint64(nonce))
 	m.st.pingsSent.Add(1)
 	return nil
+}
+
+// unknownAdvertisedNeeds returns a Need from sequence 1 for every origin
+// the peer advertises (have) that is absent from our durable watermarks.
+// Known origins are excluded: the watermark pull already covers them.
+func unknownAdvertisedNeeds(advertised map[ids.NodeID]uint64, wms []codec.OriginWatermark) []Need {
+	known := make(map[ids.NodeID]struct{}, len(wms))
+	for _, w := range wms {
+		known[w.Origin] = struct{}{}
+	}
+	var out []Need
+	for origin, seq := range advertised {
+		if _, ok := known[origin]; !ok && seq > 0 {
+			out = append(out, Need{Origin: origin, FromSeq: 1})
+		}
+	}
+	return out
 }
 
 // --- snapshots ---

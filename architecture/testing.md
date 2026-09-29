@@ -8,9 +8,17 @@ CI runs a live acceptance smoke with both the Go test process and the separately
 built `tests-live/harness/testnode` instrumented using `-race`. Enable the same
 path locally with `SPEDSQL_RACE=1 bash tests-live/run.sh <scenario>`; this is
 necessary because a race-instrumented test binary does not instrument a child
-node built separately. Weekly scheduled CI fuzzes every target in `codec` and
-`replication` with bounded runs and runs `govulncheck` across Go packages. These
-scheduled checks complement, but do not replace, the deployment rehearsals in
+node built separately. The per-PR live gate (`run.sh gate`) covers smoke,
+encryption, backup/restore, partitions, version skew, schema and release
+upgrades, High/Low, files, scale mesh, snapshot resync, GC balance, rolling
+restart, crash recovery, discovery mesh, migration crash, and pause/resume,
+with pure-Go (`modernc`) and `-race` matrices over `three-node-sync`,
+`rolling-restart`, and `partition`. A scheduled repetition lane
+(`run.sh stress`) reruns the concurrency-sensitive suites to catch
+flakes that pass once and fail under repetition. Weekly scheduled CI
+fuzzes every target in `codec` and `replication` with bounded runs and
+runs `govulncheck` across Go packages. These scheduled checks
+complement, but do not replace, the deployment rehearsals in
 [Operational rehearsals](operational-rehearsals.md).
 
 ## Contents

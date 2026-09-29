@@ -95,7 +95,7 @@ Do not replicate FTS internal mutations.
 
 ## Reactive query subscriptions
 
-SPeD-SQL provides an embedded reactive query subscription interface (`DB.Subscribe` and `DB.SubscribeWithOptions`) returning an initial query result and subsequent notifications whenever committed, SQL-visible state changes. Local writes, remote apply, accepted High/Low imports, and snapshot publication notify through the materialization boundary. Uncommitted, staged, or partially materialized states never emit query updates.
+Murmur-SQL provides an embedded reactive query subscription interface (`DB.Subscribe` and `DB.SubscribeWithOptions`) returning an initial query result and subsequent notifications whenever committed, SQL-visible state changes. Local writes, remote apply, accepted High/Low imports, and snapshot publication notify through the materialization boundary. Uncommitted, staged, or partially materialized states never emit query updates.
 
 ### Cursor and Resumption Model
 

@@ -285,14 +285,20 @@ func (s *Store) initMeta(nodeID ids.NodeID, dbID ids.DBID) error {
 	b := s.db.NewBatch()
 	defer b.Close()
 	set := func(k, v []byte) error { return b.Set(k, v, nil) }
-	// Format version.
+	// Format version: this binary opens [MinFormatVersion, FormatVersion].
+	// Older binaries required strict equality with their own version, so
+	// they refuse stores first written here (downgrade guard), while this
+	// binary keeps opening previous-release stores read-write.
 	raw, err := s.getDirect(SysKey(sysFormat))
+	var storedFormat uint64
 	if err == nil {
 		v, ok := decodeU64(raw)
-		if !ok || v != FormatVersion {
-			return fmt.Errorf("state: unsupported format version %d (want %d)", v, FormatVersion)
+		if !ok || v < MinFormatVersion || v > FormatVersion {
+			return fmt.Errorf("state: unsupported format version %d (want %d..%d)", v, MinFormatVersion, FormatVersion)
 		}
+		storedFormat = v
 	} else if isNotFound(err) {
+		storedFormat = FormatVersion
 		if err := set(SysKey(sysFormat), encodeU64(FormatVersion)); err != nil {
 			return err
 		}
@@ -300,8 +306,8 @@ func (s *Store) initMeta(nodeID ids.NodeID, dbID ids.DBID) error {
 		return err
 	}
 	// Minimum reader/writer compatibility. A store demanding a newer
-	// reader or writer fails closed. Markers absent on pre-marker v2
-	// stores default to the format version (this binary).
+	// reader or writer fails closed. Markers absent on pre-marker stores
+	// default to the store's own format version.
 	for _, mk := range []struct {
 		name string
 		max  uint64
@@ -320,7 +326,7 @@ func (s *Store) initMeta(nodeID ids.NodeID, dbID ids.DBID) error {
 				return fmt.Errorf("state: store requires minimum %s version %d (this binary supports %d)", mk.role, v, mk.max)
 			}
 		} else if isNotFound(err) {
-			if err := set(SysKey(mk.name), encodeU64(FormatVersion)); err != nil {
+			if err := set(SysKey(mk.name), encodeU64(storedFormat)); err != nil {
 				return err
 			}
 		} else {

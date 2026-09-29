@@ -6,7 +6,7 @@ Atomic delivery, encrypted outbox storage, aggregate capacity enforcement,
 definition-level schema validation, and local provenance/ownership policy are
 implemented. Convergence when High policy and Low value mutations arrive in a
 different order across High peers remains pending. Remaining work is tracked in
-[TASKS_PENDING.md](../TASKS_PENDING.md#pending-tasks).
+[TODO.md](../TODO.md).
 
 [Architecture index](README.md) · [Capability gaps](capability-gaps.md)
 

@@ -1,6 +1,6 @@
-# SPeD-SQL — Architecture and Implementation Plan
+# MURMUR-SQL — Architecture and Implementation Plan
 
-Fast In Memory Secure Peer-Distributed SQL with persistance.
+Coordinated starling flock flight.
 
 **Status:** Architecture and implementation plan  
 **Target language:** Go  
@@ -168,7 +168,7 @@ with `CGO_ENABLED=0` on systems without a C toolchain.
 Recommended repository layout:
 
 ```text
-SPeD-SQL/
+MURMUR-SQL/
     db.go
     config.go
     errors.go

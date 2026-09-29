@@ -319,6 +319,9 @@ func formatBytes(n int64) string {
 }
 
 func TestPebbleCompressionSizes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping compression benchmark suite in short mode (-short or -race); run without -short for full matrix")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
 	scale := envScale(t)

@@ -2,7 +2,7 @@
 
 Run with `go test -count=1 ./tests-live/plumtree-live`.
 
-`TestPlumtreeMeshConverges` meshes three `spedsql` daemons in Plumtree
+`TestPlumtreeMeshConverges` meshes three Murmur-SQL daemons in Plumtree
 dissemination mode (see the harness `Replication.Dissemination` /
 `DisseminationByNode` options and the daemon `replication.dissemination`
 setting) and requires end-to-end write convergence with equal digests.

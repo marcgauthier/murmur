@@ -237,7 +237,7 @@ committed local delta
 Pebble commit (pebble.Sync or pebble.NoSync)
 ```
 
-Acknowledging before Pebble durability changes the durability contract. SPeD-SQL provides an explicit configuration:
+Acknowledging before Pebble durability changes the durability contract. Murmur-SQL provides an explicit configuration:
 
 ```go
 DurabilitySynchronous // Default: fsync before acknowledging commit (pebble.Sync)

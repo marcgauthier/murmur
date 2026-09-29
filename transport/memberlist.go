@@ -106,6 +106,20 @@ type MemberlistTransport struct {
 
 	sessions    map[ids.NodeID]*Session
 	activeConns map[*Session]struct{}
+	// streamLoops tracks one membership AcceptStream consumer per
+	// memberlist-owned connection. Replication-owned connections must
+	// never run one: two AcceptStream consumers on one connection
+	// split incoming streams at random, so a data stream the
+	// membership loop wins is dropped as a header mismatch while the
+	// sender's writes keep succeeding into the half-closed stream
+	// (silent permanent stall). replOwned marks connections whose
+	// stream consumer is replication (which forwards membership
+	// streams back via HandleStream).
+	streamLoops map[*Session]*streamLoopState
+	replOwned   map[*Session]bool
+	// datagramLoops guards the datagram consumer exactly once per
+	// connection across both registration paths.
+	datagramLoops map[*Session]bool
 
 	packetsSent            atomic.Uint64
 	packetsReceived        atomic.Uint64
@@ -124,7 +138,18 @@ type MemberlistTransport struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	// streamLoopsRunning counts live membership AcceptStream loops;
+	// the adoption test asserts it to prove single-acceptance.
+	streamLoopsRunning atomic.Int64
+
 	closed bool
+}
+
+// streamLoopState controls one membership AcceptStream consumer so
+// replication adoption can yield it synchronously.
+type streamLoopState struct {
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 // Ensure MemberlistTransport satisfies memberlist.NodeAwareTransport and memberlist.Transport.
@@ -184,6 +209,9 @@ func NewMemberlistTransport(cfg MemberlistTransportConfig) (*MemberlistTransport
 		streamCh:      make(chan net.Conn, streamBuf),
 		sessions:      make(map[ids.NodeID]*Session),
 		activeConns:   make(map[*Session]struct{}),
+		streamLoops:   make(map[*Session]*streamLoopState),
+		replOwned:     make(map[*Session]bool),
+		datagramLoops: make(map[*Session]bool),
 		ctx:           ctx,
 		cancel:        cancel,
 	}
@@ -408,11 +436,57 @@ func (t *MemberlistTransport) DialAddressTimeout(addr memberlist.Address, timeou
 	return &StreamConn{stream: stream, sess: sess}, nil
 }
 
-// RegisterSession attaches an externally established QUIC session to this transport.
+// RegisterSession adopts an externally established QUIC session (a
+// replication connection) for datagrams only. It marks the connection
+// replication-owned and yields any running membership AcceptStream
+// consumer synchronously, so from return on exactly one consumer
+// accepts streams on it: replication, which forwards membership
+// streams back via HandleStream. Idempotent.
 func (t *MemberlistTransport) RegisterSession(sess *Session) {
+	if sess == nil {
+		return
+	}
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.sessions[sess.Peer] = sess
+	t.activeConns[sess] = struct{}{}
+	t.replOwned[sess] = true
+	st, ok := t.streamLoops[sess]
+	if ok {
+		delete(t.streamLoops, sess)
+	}
+	wantDatagram := !t.datagramLoops[sess]
+	if wantDatagram {
+		t.datagramLoops[sess] = true
+		t.wg.Add(1)
+	}
+	t.mu.Unlock()
+	// Yield outside the lock: the exiting loop takes none, and the wait
+	// is prompt (its AcceptStream fails on cancel).
+	if ok {
+		st.cancel()
+		<-st.done
+	}
+	if wantDatagram {
+		go t.receiveDatagramLoop(sess)
+	}
+}
+
+// RegisterMemberlistSession tracks a connection that carries only
+// membership traffic (accepted on a listener replication never
+// attaches), ensuring a membership AcceptStream consumer runs for it.
+// Unlike RegisterSession it never yields: there is no replication
+// consumer to hand over to.
+func (t *MemberlistTransport) RegisterMemberlistSession(sess *Session) {
+	if sess == nil {
+		return
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.closed || sess == nil {
+	if t.closed {
 		return
 	}
 	t.registerSessionLocked(sess)
@@ -424,9 +498,22 @@ func (t *MemberlistTransport) registerSessionLocked(sess *Session) {
 	}
 	t.sessions[sess.Peer] = sess
 	t.activeConns[sess] = struct{}{}
-	t.wg.Add(2)
-	go t.receiveDatagramLoop(sess)
-	go t.acceptStreamLoop(sess)
+	if !t.datagramLoops[sess] {
+		t.datagramLoops[sess] = true
+		t.wg.Add(1)
+		go t.receiveDatagramLoop(sess)
+	}
+	// Memberlist-owned connections run the membership accept loop;
+	// replication-owned ones never do: RegisterSession yields it and
+	// replication forwards membership streams back instead.
+	if !t.replOwned[sess] {
+		ctx, cancel := context.WithCancel(t.ctx)
+		st := &streamLoopState{cancel: cancel, done: make(chan struct{})}
+		t.streamLoops[sess] = st
+		t.streamLoopsRunning.Add(1)
+		t.wg.Add(1)
+		go t.acceptStreamLoop(sess, ctx, st)
+	}
 }
 
 func (t *MemberlistTransport) getOrDialSession(ctx context.Context, addr memberlist.Address) (*Session, error) {
@@ -538,10 +625,21 @@ func (t *MemberlistTransport) receiveDatagramLoop(sess *Session) {
 	}
 }
 
-func (t *MemberlistTransport) acceptStreamLoop(sess *Session) {
+func (t *MemberlistTransport) acceptStreamLoop(sess *Session, ctx context.Context, st *streamLoopState) {
+	// Deferred LIFO: counter first so a yielded waiter observing done
+	// already sees zero; then done; then map cleanup; then wg.
 	defer t.wg.Done()
+	defer func() {
+		t.mu.Lock()
+		if cur, ok := t.streamLoops[sess]; ok && cur == st {
+			delete(t.streamLoops, sess)
+		}
+		t.mu.Unlock()
+	}()
+	defer close(st.done)
+	defer t.streamLoopsRunning.Add(-1)
 	for {
-		stream, err := sess.AcceptStream(t.ctx)
+		stream, err := sess.AcceptStream(ctx)
 		if err != nil {
 			return
 		}

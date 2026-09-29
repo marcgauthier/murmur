@@ -2,8 +2,6 @@ package rollingrestart
 
 import (
 	"fmt"
-	"io"
-	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -164,25 +162,7 @@ func dumpIDDiff(t *testing.T, c *harness.Cluster, table string) {
 	// Session state for heal-stall forensics: a frozen row gap with
 	// writers paused means sessions (not slowness) are wedged, and the
 	// per-peer connection/need/ack state shows which link is stuck.
-	for idx, node := range c.Nodes {
-		t.Logf("divergence: node%d status: %s", idx+1, fetchStatus(t, node.APIAddr))
-	}
-}
-
-// fetchStatus returns the node's /v1/status body, truncated for logs.
-// Plain http.Get works: the harness routes it through the mTLS client.
-func fetchStatus(t *testing.T, apiAddr string) string {
-	t.Helper()
-	resp, err := http.Get("https://" + apiAddr + "/v1/status")
-	if err != nil {
-		return "unreachable: " + err.Error()
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2048))
-	if err != nil {
-		return "read error: " + err.Error()
-	}
-	return string(raw)
+	c.DumpForensics("divergence")
 }
 
 func firstN(s []string, n int) []string {

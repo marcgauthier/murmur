@@ -24,7 +24,7 @@ func NewLocalDestination(dir string) (*LocalDestination, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("backup: local destination dir cannot be empty")
 	}
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("backup: create local destination dir %s: %w", dir, err)
 	}
 	return &LocalDestination{Dir: dir}, nil
@@ -34,7 +34,7 @@ func (d *LocalDestination) Type() string { return "local" }
 
 // WriteBackup streams the backup archive to a temporary file, fsyncs, and atomically renames.
 func (d *LocalDestination) WriteBackup(ctx context.Context, name string, r io.Reader, _ int64) error {
-	if err := os.MkdirAll(d.Dir, 0o750); err != nil {
+	if err := os.MkdirAll(d.Dir, 0o700); err != nil {
 		return fmt.Errorf("backup: ensure dir %s: %w", d.Dir, err)
 	}
 	finalPath := filepath.Join(d.Dir, name)

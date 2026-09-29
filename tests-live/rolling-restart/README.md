@@ -1,7 +1,7 @@
 # Rolling restart (multi-process)
 
 Run with `go test -count=1 ./tests-live/rolling-restart` (tags required;
-or `bash tests-live/run.sh rolling-restart`). Three `spedsql` daemons mesh
+or `bash tests-live/run.sh rolling-restart`). Three Murmur-SQL daemons mesh
 while a writer hammers every node at 40 inserts/s. Each node stops and
 rejoins in turn (same durable directory, unlock, readiness), reconverging
 before the next restart.

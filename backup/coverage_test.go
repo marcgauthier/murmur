@@ -575,3 +575,18 @@ func TestWriteRestoreIntentErrors(t *testing.T) {
 		t.Fatal("intent into missing dir succeeded")
 	}
 }
+
+func TestLocalDestinationDirNoGroupOther(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "dest")
+	d, err := NewLocalDestination(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(d.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("destination dir mode=%04o, want no group/other bits", fi.Mode().Perm())
+	}
+}

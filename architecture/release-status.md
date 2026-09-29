@@ -10,10 +10,10 @@ documents consistent with this inventory.
 
 Documentation reconciled by static inspection on 2026-09-28, using HEAD
 `4bdd2974766786865c6222bb4843cab79e41e5c5` and the working-tree move of the
-standalone daemon into `tests-live/harness/testnode/`. No build, vet, unit,
-or live suite was rerun for this reconciliation. Historical results in
+standalone daemon into `tests-live/harness/testnode/`. Historical results in
 [§4](#4-verification-record) do not certify this revision or subsequent edits.
-No verified release revision is recorded in [§5](#5-release-commit).
+Execution evidence for candidate `31bf1b5` is recorded in the 2026-09-29
+§4 entry; no release tag has been cut ([§5](#5-release-commit)).
 
 > Build-tag contract: the default CGO build does **not** compile without
 > tags. Every `go build` / `go vet` / `go test` command in this document
@@ -85,12 +85,12 @@ pass one of the two tag sets above.
 
 ## 3. Deployment
 
-SPeD-SQL is an embedded Go library. Applications link the package directly into their process:
+Murmur-SQL is an embedded Go library. Applications link the package directly into their process:
 
 ### 3.1 Embedded library
 
 ```sh
-go get github.com/nomadsql/replicateddb
+go get github.com/marcgauthier/spedsql
 ```
 
 Open a node as in the [project README quick start](../README.md#quick-start):
@@ -212,8 +212,9 @@ runs `bash tests-live/run.sh gate` (smoke, encryption, backup/restore,
 partitions, version skew, High/Low, files, scale mesh, upgrades,
 snapshot resync, GC balance, rolling restart, crash recovery) against
 the freshly built daemon on every push/PR, plus a pure-Go live smoke;
-all gate suites pass locally (see TASKS_COMPLETED.md
-SNAPSHOT-PROGRESS-001, LIVE-GATE-001, LIVE-GROUP-A-001). Do not run two
+all gate suites pass locally (completion notes were in TASKS_COMPLETED.md
+under SNAPSHOT-PROGRESS-001, LIVE-GATE-001, LIVE-GROUP-A-001; the file was
+removed since, content survives in git history). Do not run two
 runner invocations against one checkout concurrently; isolate with
 `SPEDSQL_LIVE_RUNTIME`.
 
@@ -223,16 +224,109 @@ configured CA, and rejects missing certificates at every route except
 `GET /healthz`. The full live release gate passed, including the new
 `api-mtls` scenario; see the 2026-09-28 20:58:47 UTC entry titled
 “Require HTTPS with client-certificate verification for the daemon API” in
-[TASKS_COMPLETED.md](../TASKS_COMPLETED.md). This is a historical report for
-the then-working tree, not verification of a recorded release commit. The
-listener now lives in the internal test-node fixture; the embedded package
-starts no HTTP listener.
+TASKS_COMPLETED.md (removed since; content survives in git history). This
+is a historical report for the then-working tree, not verification of a
+recorded release commit. The listener now lives in the internal test-node
+fixture; the embedded package starts no HTTP listener.
+
+2026-09-29 release and upgrade verification of candidate
+`31bf1b582fd21b50b049d0c0b9a47d5d4589a3ac` (“Rename module to
+github.com/marcgauthier/spedsql”), linux/amd64, Go 1.26.x, executed in
+an isolated worktree checkout of that commit (clean tree, no patch):
+
+- `go build` with both tag sets and `go vet` with both tag sets — pass.
+- Cross-compiles: linux/arm64 and windows/amd64 (`modernc`) — pass.
+  The previous release `4bdd297` also cross-builds for both targets.
+- `go test -tags "sqlite_preupdate_hook sqlite_fts5" -count=1 ./...`
+  — 54 ok; sole failure `tests-live/partial-mesh`
+  TestDynamicBootstrapDiscovery (SWIM discovery flake, peer-owned WIP:
+  fails intermittently, passes other runs).
+- `go test -tags "modernc" -count=1 ./...` — 55 ok, fully green.
+- `go test -race -tags "sqlite_preupdate_hook sqlite_fts5" -count=1
+  ./...` — 54 ok with no data-race reports; sole failure
+  `tests-live/compression` (peer's new suite, not wired into run.sh;
+  exceeds the 10-minute package timeout under `-race`, passes
+  non-race). Two genuine data races found during this cycle were fixed
+  in this candidate: snapshot receive state shared across concurrent
+  streams (now mutex-guarded) and WaitGroup Add racing Wait on attach
+  during shutdown (now gated on closed under m.mu); both verified with
+  targeted `-race` stress plus full root/replication `-race` runs.
+- `bash tests-live/run.sh gate` — exit 0, 41 `RESULT: PASS`, zero FAIL,
+  including the new `release-upgrade` scenario (3/3): rolling upgrade
+  of previous-release binaries to the current build under continuous
+  writes with a mixed-version replication proof mid-roll, current-binary
+  open of a previous-release store (byte-identical digest), and current
+  restore of a previous-release backup. Previous release for all three:
+  `4bdd297` (old module path), so the suite also proves binary
+  compatibility across the module rename. The suite additionally passes
+  with `SPEDSQL_TAGS=modernc`.
+- Load-flake hardening in this candidate: admission/fetch-completed
+  counters polled instead of asserted immediately (an event counter
+  trails its durable record across goroutines), gc-balance adaptive
+  window plus post-stop drain, plumtree at-least-once delivery,
+  crash-recovery/rolling-restart/partial-mesh convergence waits
+  extended, crash waitForPeers diagnostics fixed, rolling-restart
+  divergence forensics (per-node `/v1/status` dumps).
+
+Exclusions and follow-ups (clear before production claims): the
+compression suite under `-race` (not in any gate), scheduled
+multi-hour soaks (never run), native Windows/arm64 execution
+(CI-owned), and `gofmt` on 5 peer-owned files. TASKS_*.md trackers
+were removed in this cycle, so older entries' pointers to
+TASKS_COMPLETED.md are historical. No release tag has been cut; see
+[§5](#5-release-commit).
+
+The post-restart heal stall listed here in earlier revisions is FIXED
+(uncommitted at this writing): root cause was a `peerSession`
+close/send ABBA deadlock — `close` took `dataWriteMu` while running
+under `peer.mu` (attach tie-break replacement, shutdown drain,
+`RemovePeer`), while data senders held `dataWriteMu` across `peer.mu`
+traffic accounting. After a restart the losing session's close met an
+in-flight send and both wedged forever: frozen row gap, dead link, and
+a hung `/v1/status`. Fix: the data stream handle is now atomic, so
+`close` never takes `dataWriteMu` (replication/manager.go). Proof:
+new in-process `TestRestartChurnHealsInProcess` hung 1/15 runs
+pre-fix (stacks show the exact cycle) and passes 55/55 post-fix
+(40 plain + 15 `-race`, zero race reports); new live
+`TestRollingRestartChurn` plus the rolling-restart suite pass under
+contention; full live gate green on the fixed build. Any release
+candidate containing this fix needs re-verification per §5 step 3.
+
+The SWIM discovery flake is likewise FIXED (uncommitted): every
+replication session ran two AcceptStream consumers on one QUIC
+connection (replication's plus membership's), which split incoming
+streams at random — a data stream the membership loop won was dropped
+as a header mismatch while the sender's writes kept succeeding into
+the half-closed stream (captured live: 1210 batches sent, 0 streams
+accepted, heal only on 30s+ recycle; ~30% of runs took 37-100s).
+Fix: replication adoption yields the membership consumer
+synchronously before starting its own loops, so exactly one consumer
+accepts per connection (transport/memberlist.go,
+replication/manager.go attach order). Proof: new
+`TestReplAdoptionYieldsMembershipAcceptLoop` (fails without the
+yield); `TestDynamicBootstrapDiscovery` 16/16 at ~1.1s post-fix;
+peer's swim-discovery suite 3/3; full live gate green. Per user
+decision 2026-09-29, discovery stays a v1.0 feature (stabilize, not
+experimental); needs re-verification per §5 step 3 like the above.
+
+Test-harness changes in the same uncommitted set: the live gate now
+also runs `partial-mesh` (discovery), `migration-crash`, and
+`pause-resume`; `graceful-shutdown` stays unwired (mid-snapshot
+SIGTERM intercept and snapshot-vs-log forcing flaked 1/4 under
+contention); new scheduled `run.sh stress` repetition lane plus
+`live-stress` CI job; shared `Cluster.DumpForensics` helper (used by
+rolling-restart and partial-mesh); daemon straggler reaping in
+harness cleanup plus a `run.sh` exit trap; CI `modernc`/`-race` live
+lanes widened to three suites each.
 
 ## 5. Release commit
 
-No verified release commit is recorded here. This does not assert that the
-checkout is dirty or that no source commits exist. The static inspection
-baseline above is not a tested release candidate.
+No release tag has been cut, so no verified release commit is recorded
+here. Candidate `31bf1b582fd21b50b049d0c0b9a47d5d4589a3ac` was verified
+in an isolated checkout per the procedure below; results and explicit
+exclusions are attached in [§4](#4-verification-record) (2026-09-29
+entry). Cutting a release from this candidate still requires clearing
+those exclusions, re-verifying, and recording the tag.
 
 Before publishing:
 
@@ -244,7 +338,7 @@ Before publishing:
 
 | Candidate commit | Command / suite and duration | Backend / build tags | OS / arch / Go | Result / log artifact |
 |---|---|---|---|---|
-| Not recorded | Not rerun for this documentation reconciliation | — | — | No release verification claim |
+| `31bf1b5` (full hash above) | builds, vet, CGO + modernc + race `./...`, live gate; see §4 2026-09-29 entry | CGO `sqlite_preupdate_hook sqlite_fts5` + `modernc` | linux/amd64, Go 1.26.x | Pass with exclusions (compression under race, soaks, native win/arm64, gofmt); heal stall + discovery flake fixed after this candidate, need re-verification; no release claim |
 
 Record the resulting release tag and candidate hash in the release notes.
 Documentation-only updates may reference the tested candidate; any runtime

@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -115,10 +116,10 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, `Usage: spedsql <command> [arguments]
+	fmt.Fprintf(os.Stderr, `Usage: testnode <command> [arguments]
 
 Commands:
-  agent   Run a SPeD-SQL node agent daemon
+  agent   Run a Murmur-SQL node agent daemon
   unlock  Send encryption key to unlock an await-unlock node
   exec    Execute a SQL DDL/DML statement against an HTTP service API
   query   Run a SQL query against an HTTP service API
@@ -349,6 +350,8 @@ func (d *NodeDaemon) Start() error {
 	mux.HandleFunc("/v1/admin/migrate", d.handleAdminMigrate)
 	mux.HandleFunc("/v1/admin/rotate-key", d.handleAdminRotateKey)
 	mux.HandleFunc("/v1/admin/encryption-status", d.handleAdminEncryptionStatus)
+	mux.HandleFunc("/v1/debug/peers", d.handleDebugPeers)
+	mux.HandleFunc("/v1/debug/stacks", d.handleDebugStacks)
 
 	// Fallback health check
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -800,6 +803,26 @@ func (d *NodeDaemon) handleServiceStatus(w http.ResponseWriter, r *http.Request)
 		"selected_peers":  st.SelectedPeers,
 		"uptime_millis":   st.Uptime.Milliseconds(),
 	})
+}
+
+func (d *NodeDaemon) handleDebugPeers(w http.ResponseWriter, r *http.Request) {
+	d.mu.Lock()
+	database := d.database
+	d.mu.Unlock()
+	if database == nil {
+		http.Error(w, "node is locked", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(database.Peers())
+}
+
+// handleDebugStacks dumps all goroutine stacks. It takes no database or
+// replication locks, so it responds even when the node is deadlocked;
+// forensics fetch it on divergence to capture wedged mutex holders.
+func (d *NodeDaemon) handleDebugStacks(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	_ = pprof.Lookup("goroutine").WriteTo(w, 2)
 }
 
 func (d *NodeDaemon) handleServiceQuery(w http.ResponseWriter, r *http.Request) {

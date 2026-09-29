@@ -1,7 +1,7 @@
 # Ten-node mesh (multi-process)
 
 Run with `go test -count=1 ./tests-live/scale-mesh` (tags required; or
-`bash tests-live/run.sh scale-mesh`). Ten `spedsql` daemons mesh with the
+`bash tests-live/run.sh scale-mesh`). Ten Murmur-SQL daemons mesh with the
 default fanout of 4 while two origins write 400 rows.
 
 Smaller suites never exceed the fanout, so this is the only live proof

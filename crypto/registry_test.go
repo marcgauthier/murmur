@@ -436,3 +436,26 @@ func TestRegistryPins(t *testing.T) {
 		t.Fatalf("pins %+v", pins)
 	}
 }
+
+func TestRegistryDirNoGroupOther(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "keys")
+	r, err := OpenRegistry(dir, testProvider(), testDBID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Close()
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("registry dir mode=%04o, want no group/other bits", fi.Mode().Perm())
+	}
+	fi, err = os.Stat(filepath.Join(dir, RegistryFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("registry file mode=%04o, want no group/other bits", fi.Mode().Perm())
+	}
+}

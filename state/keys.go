@@ -48,18 +48,26 @@ const (
 	sysRestoreMarker = "restore_marker"
 )
 
-// FormatVersion is the persistent Pebble format version. It is incompatible
-// with the old Badger store (which used 1); old directories are rejected.
-const FormatVersion uint64 = 2
+// FormatVersion is the persistent Pebble format version written by this
+// binary. It exceeds the previous release's format (2), whose opener
+// requires strict equality, so older binaries refuse stores first
+// written here: the downgrade guard.
+const FormatVersion uint64 = 3
 
-// MinReaderVersion and MinWriterVersion are the oldest store versions this
-// binary can read and write. Both equal FormatVersion: v1 (Badger) stores
-// are unreadable, and anything newer needs a newer binary. Fresh stores
-// record all three markers; pre-marker v2 stores default the minima to
-// their format version on open.
+// MinFormatVersion is the oldest persistent format this binary still
+// opens (downgrade-guard floor): v2 stores from the previous release
+// open read-write with their markers left untouched, while v1 (Badger)
+// and anything newer than FormatVersion fail closed.
+const MinFormatVersion uint64 = 2
+
+// MinReaderVersion and MinWriterVersion are the newest store minimum
+// versions this binary satisfies (its own version): a store demanding
+// a newer reader or writer needs a newer binary. Fresh stores record
+// all three markers at FormatVersion; pre-marker stores default
+// missing minima to their own stored format version on open.
 const (
-	MinReaderVersion uint64 = 2
-	MinWriterVersion uint64 = 2
+	MinReaderVersion uint64 = 3
+	MinWriterVersion uint64 = 3
 )
 
 // CellKey builds 01 | tableID:u32 | rowUUID:16 | columnID:u32.

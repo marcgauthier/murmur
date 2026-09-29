@@ -1,7 +1,7 @@
 # Log-GC balance (multi-process)
 
 Run with `go test -count=1 ./tests-live/gc-balance` (tags required; or
-`bash tests-live/run.sh gc-balance`). Three `spedsql` daemons mesh with
+`bash tests-live/run.sh gc-balance`). Three Murmur-SQL daemons mesh with
 aggressive log retention (1s log, 20s offline pin, 10 batches) while one
 node updates a fixed 200-key set with eight parallel updaters over
 disjoint ranges.

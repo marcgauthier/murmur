@@ -1,11 +1,14 @@
-# SPeD-SQL Architecture
+# MURMUR-SQL Architecture
+
+*Coordinated starling flock flight.*
 
 The architecture and implementation documentation has moved from the root `ARCHITECTURE.md` into these topic documents.
 
 These documents describe the target design and implementation plan, including planned capabilities. See the [project README](../README.md#status) for current implementation status.
 
-Use [TASKS_PENDING.md](../TASKS_PENDING.md) as the live checklist of outstanding
-architecture work. Completed tasks are archived in [TASKS_COMPLETED.md](../TASKS_COMPLETED.md).
+Use [TODO.md](../TODO.md) as the live checklist of outstanding work.
+[Release status](release-status.md) records the implementation inventory and
+verification history.
 
 Start with the [overview](overview.md), then read the topics relevant to your change. Original section numbers are preserved so existing section references remain identifiable; prose references link directly to their new locations.
 
@@ -24,7 +27,7 @@ outstanding. The query materialization is in-memory only.
 
 | Document | Topics | Original sections |
 | --- | --- | --- |
-| [Pending tasks](../TASKS_PENDING.md#pending-tasks) | Maintained checklist of remaining core work, optional extensions, and acceptance requirements. | New topic |
+| [TODO list](../TODO.md) | Live checklist of remaining work, release blockers, and future items. | New topic |
 | [Capability gaps and implementation status](capability-gaps.md) | Implemented foundations, pending core requirements, GALVANIZE comparison, and delivery priorities. | New topic |
 | [High/Low replication and provenance](high-low-replication.md) | One-way domain bridge, sealed bundles, durable delivery, schema holds, High ownership, and replay. | New topic |
 | [Encrypted file replication](file-replication.md) | Separate encrypted objects, metadata, peer fetching, cross-domain artifacts, and retention. | New topic |
@@ -45,7 +48,7 @@ outstanding. The query materialization is in-memory only.
 | [Testing and acceptance](testing.md) | Crash/convergence/network/encryption tests and alpha acceptance criteria. | 55, 56, 57, 58, 89 |
 | [Operational rehearsals](operational-rehearsals.md) | Backup restore, lost-key, certificate-renewal, disk-full, and recovery-time drills. | New topic |
 | [Benchmarks](benchmarks.md) | Search, write/replication, and startup performance scenarios. | 59, 60, 61 |
-| [Implementation roadmap and pending tasks](../TASKS_PENDING.md) | Implementation phases, prototype files, MVP boundaries, active and future tasks. | 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 87, 91 |
+| Implementation roadmap (removed; content now in [TODO list](../TODO.md) and [Release status](release-status.md)) | Implementation phases, MVP boundaries, active and future tasks. | 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 87, 91 |
 | [Invariants, risks, and security](invariants-and-risks.md) | Design risks, non-negotiable architecture invariants, and security review requirements. | 78, 79, 85 |
 | [Versioning, release, and references](versioning-and-release.md) | Compatibility/versioning, packaging, platform support, and architecture sources. | 84, 86, 90 |
 | [Release status](release-status.md) | Implementation inventory, historical test results, configured platform checks, and release evidence requirements. | New topic |

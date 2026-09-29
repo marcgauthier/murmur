@@ -1,7 +1,7 @@
 # High/Low bridge live scenarios
 
 Run with `go test -count=1 ./tests-live/highlow`. Real Low and High
-`spedsql` daemon processes (distinct DBIDs, no mesh between them) move
+Murmur-SQL daemon processes (distinct DBIDs, no mesh between them) move
 logical writes across a directory drop, driven only through HTTP: disconnected
 transfer with one-way role gating, gap delivery with duplicate/reordered
 recovery, two-receiver convergence, forgery/corruption/misnaming rejection

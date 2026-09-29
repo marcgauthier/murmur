@@ -183,7 +183,7 @@ diagnostics, and the `metrics` subpackage provides Prometheus collectors over a 
 registry with no HTTP listener. Counters cover implemented subsystems (SWIM membership and datagram transport,
 shared connection pool and admission/eviction, QUIC sessions, origin-log repair, snapshots, schema sync).
 Metrics for Plumtree and overload integration land with those subsystems; remaining observability work is tracked
-in [TASKS_PENDING.md](../TASKS_PENDING.md#pending-tasks).
+in [TODO.md](../TODO.md).
 
 ---
 

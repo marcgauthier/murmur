@@ -2,7 +2,7 @@
 
 Run with `go test -count=1 ./tests-live/backup-restore`.
 
-`TestBackupRestoreRejoinMesh` meshes three `spedsql` daemons, stops
+`TestBackupRestoreRejoinMesh` meshes three Murmur-SQL daemons, stops
 node3, takes an offline backup of its durable directory through the
 library, wipes the directory to simulate total loss, restores the backup
 under a fresh writer identity (TLS certificate reissued for the new

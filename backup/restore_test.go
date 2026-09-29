@@ -249,3 +249,56 @@ func TestRestoreIntentRoundTrip(t *testing.T) {
 		t.Fatalf("version-skewed intent err = %v", err)
 	}
 }
+
+// TestRestoreVerifiesTrailingChecksum proves corruption that still parses
+// as tar cannot restore silently: the tar reader stops at the archive's
+// trailing zero blocks without consuming the gzip footer, so Restore must
+// drain the stream to force CRC verification. Flipping a footer byte
+// leaves every entry intact but must fail the restore with
+// ErrCorruptBackup and publish no intent.
+func TestRestoreVerifiesTrailingChecksum(t *testing.T) {
+	ctx := context.Background()
+	db := setupMockDB(t)
+	backupDir := filepath.Join(t.TempDir(), "backups")
+	localDest, err := NewLocalDestination(backupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateBackup(ctx, db, Config{Destination: localDest, Compression: "gzip"}); err != nil {
+		t.Fatal(err)
+	}
+	backups, err := localDest.ListBackups(ctx, db.dbID)
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("list = %v, %v", backups, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(backupDir, backups[0].Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) < 32 {
+		t.Fatalf("archive too small (%d bytes) to flip the footer", len(raw))
+	}
+	// The gzip footer is the last 8 bytes (CRC32 + ISIZE); flipping inside
+	// the CRC keeps the deflate stream — and every tar entry — intact.
+	raw[len(raw)-5] ^= 0xFF
+	tamperDir := filepath.Join(t.TempDir(), "tampered")
+	tamperDest, err := NewLocalDestination(tamperDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tamperDir, backups[0].Name), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	targetDir := filepath.Join(t.TempDir(), "restored")
+	if _, err := Restore(ctx, RestoreConfig{
+		Source:      tamperDest,
+		BackupName:  backups[0].Name,
+		TargetPath:  targetDir,
+		FreshNodeID: testFreshNodeID,
+	}); !errors.Is(err, ErrCorruptBackup) {
+		t.Fatalf("footer-tampered restore err = %v, want %v", err, ErrCorruptBackup)
+	}
+	if _, err := os.Stat(filepath.Join(targetDir, RestoreIntentFileName)); !os.IsNotExist(err) {
+		t.Fatalf("restore intent present after failed restore (err=%v)", err)
+	}
+}

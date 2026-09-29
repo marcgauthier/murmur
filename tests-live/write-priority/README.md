@@ -1,6 +1,6 @@
 # Local-write priority live scenario
 
-Two `spedsql` daemons take continuous writes on both nodes (sixteen writers
+Two Murmur-SQL daemons take continuous writes on both nodes (sixteen writers
 per node, disjoint 16-byte row-ID ranges) while serving reads, under
 full-mesh replication. The test gates on:
 

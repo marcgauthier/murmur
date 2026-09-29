@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	// MetadataMagic is the 4-byte header identifying SPeD-SQL memberlist node metadata ("SPED").
+	// MetadataMagic is the 4-byte header identifying Murmur-SQL memberlist node metadata ("SPED").
 	MetadataMagic uint32 = 0x53504544
 	// MetadataVersion is the current version of the node metadata format.
 	MetadataVersion uint8 = 1

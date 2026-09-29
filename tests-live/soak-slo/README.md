@@ -1,7 +1,7 @@
 # Three-node sustained-write SLO soak
 
 Run the five-second smoke form with `go test -count=1 ./tests-live/soak-slo`.
-Three encrypted `spedsql` daemon processes run in separate node directories
+Three encrypted Murmur-SQL daemon processes run in separate node directories
 and accept continuous independent SQL writes through the HTTP service. They
 must converge to an identical logical-state SHA-256 digest. The test reports
 write p95 and maximum latency, and checks service readiness, materialized

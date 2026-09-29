@@ -1,7 +1,7 @@
 # Encrypted file transfer soak
 
 Run the smoke version with `go test -count=1 ./tests-live/files-soak`. Two
-`spedsql` daemon processes in discrete `node1`/`node2` directories form an
+Murmur-SQL daemon processes in discrete `node1`/`node2` directories form an
 encrypted mesh; the test drives them over HTTP, uploading 64 KiB files
 repeatedly to one node, waiting for replicated metadata, fetching the
 payloads from the peer, checking each SHA-256 digest, and searching the

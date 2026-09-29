@@ -1,4 +1,4 @@
-// Package metrics exposes SPeD-SQL diagnostics to Prometheus.
+// Package metrics exposes Murmur-SQL diagnostics to Prometheus.
 //
 // The Collector scrapes a replicateddb.Status snapshot on each collection;
 // it registers nothing globally and starts no HTTP listener. Applications

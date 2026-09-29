@@ -91,6 +91,65 @@ func (tca *testCertAuthority) issueNodeCreds(t *testing.T, nodeID ids.NodeID) *C
 	return creds
 }
 
+// TestReplAdoptionYieldsMembershipAcceptLoop proves exactly-once stream
+// acceptance per connection: a memberlist-tracked connection runs one
+// membership AcceptStream consumer, and replication adoption yields it
+// synchronously (replication forwards membership streams back instead).
+// Two consumers split streams at random; a data stream the membership
+// loop won was dropped as a header mismatch while the sender's writes
+// kept succeeding into the half-closed stream — a silent permanent
+// replication stall after SWIM discovery.
+func TestReplAdoptionYieldsMembershipAcceptLoop(t *testing.T) {
+	ca := newTestCA(t)
+	dbid := ids.NewDBID()
+	nodeA, nodeB := ids.NewNodeID(), ids.NewNodeID()
+	trA, err := NewMemberlistTransport(MemberlistTransportConfig{
+		LocalNodeID: nodeA, DBID: dbid, Creds: ca.issueNodeCreds(t, nodeA),
+		BindAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer trA.Shutdown()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sessB, err := Dial(ctx, trA.listener.Addr(), ca.issueNodeCreds(t, nodeB), nodeA)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer sessB.Close()
+
+	// The accept loop must have registered the connection with a
+	// running membership consumer; without this the yield below would
+	// pass vacuously.
+	deadline := time.Now().Add(5 * time.Second)
+	for trA.streamLoopsRunning.Load() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("membership accept loop never started for dialed connection")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	trA.mu.Lock()
+	serverSess := trA.sessions[nodeB]
+	trA.mu.Unlock()
+	if serverSess == nil {
+		t.Fatal("accepted connection not tracked")
+	}
+
+	// Adoption (as replication attach performs) yields synchronously:
+	// at return no membership consumer accepts on the connection.
+	trA.RegisterSession(serverSess)
+	if got := trA.streamLoopsRunning.Load(); got != 0 {
+		t.Fatalf("stream loops running after adoption = %d, want 0", got)
+	}
+	// Idempotent: repeat adoption changes nothing.
+	trA.RegisterSession(serverSess)
+	if got := trA.streamLoopsRunning.Load(); got != 0 {
+		t.Fatalf("stream loops running after re-adoption = %d, want 0", got)
+	}
+}
+
 func TestMemberlistTransportFinalAdvertiseAddr(t *testing.T) {
 	ca := newTestCA(t)
 	nodeID := ids.NewNodeID()

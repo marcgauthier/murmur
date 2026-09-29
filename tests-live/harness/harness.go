@@ -49,6 +49,10 @@ type Node struct {
 	KeyID         string
 	Process       *exec.Cmd
 	LogFileWriter *os.File
+	// Pids records every daemon PID started for this node so Cleanup
+	// can reap stragglers a normal stop missed.
+	pidMu sync.Mutex
+	Pids  []int
 }
 
 // Cluster manages multiple discrete node instances in their own directories.
@@ -489,6 +493,11 @@ func (c *Cluster) StartNode(idx int) {
 	c.T.Helper()
 	node := c.Nodes[idx]
 
+	// Defensive: never orphan a live process by starting over it.
+	if node.Process != nil && node.Process.Process != nil {
+		c.StopNode(idx)
+	}
+
 	logFile, err := os.OpenFile(node.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		c.T.Fatalf("open log file %s: %v", node.LogFile, err)
@@ -507,6 +516,9 @@ func (c *Cluster) StartNode(idx int) {
 		c.T.Fatalf("start node %s: %v", node.Label, err)
 	}
 	node.Process = cmd
+	node.pidMu.Lock()
+	node.Pids = append(node.Pids, cmd.Process.Pid)
+	node.pidMu.Unlock()
 }
 
 func (c *Cluster) StopNode(idx int) {
@@ -720,6 +732,10 @@ func (c *Cluster) Cleanup() {
 	for i := range c.Nodes {
 		c.StopNode(i)
 	}
+	// A wedged shutdown or a test bug can strand a daemon past the
+	// normal stop loop; sweep recorded PIDs so no testnode outlives
+	// its suite to collide with the next run.
+	c.reapStragglers()
 	if c.T.Failed() || c.failed {
 		failuresDir := filepath.Join(repoRoot(c.T), "tests-live", "failures")
 		_ = os.MkdirAll(failuresDir, 0755)

@@ -1,6 +1,6 @@
 # Stale-node snapshot resync (multi-process)
 
-Run with `go test -count=1 ./tests-live/snapshot-resync`. Three `spedsql`
+Run with `go test -count=1 ./tests-live/snapshot-resync`. Three Murmur-SQL
 daemon processes mesh with aggressive log retention (1s log retention, 20s
 offline pin, 10 retained batches). Node3 writes acknowledged rows and the
 mesh converges; node3 stops; the survivors write 60 rows; the test waits

@@ -1,6 +1,6 @@
 # Two-Low/two-High encrypted file bridge (multi-process)
 
-Run with `go test -count=1 ./tests-live/files-bridge`. Four `spedsql`
+Run with `go test -count=1 ./tests-live/files-bridge`. Four Murmur-SQL
 daemon processes (two Low mesh peers, two High mesh peers) run in discrete
 `node1`/`node2` directories per domain; the test drives them only through
 their HTTPS APIs with client certificates, replicating how the application works.

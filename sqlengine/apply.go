@@ -358,6 +358,12 @@ func (e *Engine) RepairRows(src StateReader, rows []RowKey) error {
 // generated definitions after any failure, and the rebuild needs the new
 // registry installed to recreate every table.
 func (e *Engine) MigrateTo(newReg *schema.Registry, ddl []string) error {
+	return e.MigrateToWithLocalDDL(newReg, ddl, nil)
+}
+
+// MigrateToWithLocalDDL applies additive or rename DDL, swaps the registry,
+// and replaces local-only objects used by subsequent materializer rebuilds.
+func (e *Engine) MigrateToWithLocalDDL(newReg *schema.Registry, ddl, localDDL []string) error {
 	return e.WriteSection(func(ctx context.Context) error {
 		e.SetCaptureMode(CaptureSuppressed)
 		defer e.SetCaptureMode(CaptureLocal)
@@ -371,6 +377,9 @@ func (e *Engine) MigrateTo(newReg *schema.Registry, ddl []string) error {
 			}
 		}
 		e.reg = newReg
+		if localDDL != nil {
+			e.localDDL = append([]string(nil), localDDL...)
+		}
 		e.tables = make(map[string]*schema.TableSchema, len(newReg.Tables))
 		for _, t := range newReg.Tables {
 			e.tables[strings.ToLower(t.Name)] = t

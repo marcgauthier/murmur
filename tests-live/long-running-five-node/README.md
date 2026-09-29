@@ -2,7 +2,7 @@
 
 Run the 30-second smoke form with
 `go test -count=1 ./tests-live/long-running-five-node`. Five encrypted
-`spedsql` daemon processes run in isolated node directories and accept
+Murmur-SQL daemon processes run in isolated node directories and accept
 continuous application writes across the full mesh. The scenario restarts
 node2 and node4 in place during active writes, checks that their persisted rows
 remain available after reopening, and requires all five nodes to converge to

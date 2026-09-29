@@ -103,6 +103,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+	c.DumpForensics("converge-timeout")
 	t.Fatalf("nodes did not converge on %d rows within %v", want, timeout)
 }
 
@@ -217,6 +218,7 @@ func waitForMembership(t *testing.T, c *harness.Cluster, wantMembers int, timeou
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
+	c.DumpForensics("membership-timeout")
 	t.Fatalf("nodes did not discover %d members via SWIM within %v", wantMembers, timeout)
 }
 

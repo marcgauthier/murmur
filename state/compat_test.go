@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -83,5 +84,79 @@ func TestMinReaderWriterGateOpen(t *testing.T) {
 	}
 	if format != FormatVersion || minR != FormatVersion || minW != FormatVersion {
 		t.Fatalf("reopened FormatInfo = %d/%d/%d", format, minR, minW)
+	}
+}
+
+// prevReleaseFormat is the persistent format the pinned previous release
+// writes and requires with strict equality. Fresh stores must record a
+// different version so older binaries refuse them (downgrade guard).
+const prevReleaseFormat uint64 = 2
+
+// TestFreshStoreExceedsPreviousRelease pins the downgrade guard: a store
+// first written by this binary carries a format the previous release
+// rejects, so a downgraded binary fails closed instead of misreading it.
+func TestFreshStoreExceedsPreviousRelease(t *testing.T) {
+	s := openTestStore(t, ids.NewNodeID())
+	format, _, _, err := s.FormatInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if format == prevReleaseFormat {
+		t.Fatalf("fresh format = %d, want != previous release %d", format, prevReleaseFormat)
+	}
+	if format != FormatVersion {
+		t.Fatalf("fresh format = %d, want FormatVersion %d", format, FormatVersion)
+	}
+}
+
+// TestPreviousReleaseV2StoreOpens proves backward compatibility: a store
+// carrying previous-release v2 markers opens read-write on this binary
+// with its markers left at v2 (no eager upgrade).
+func TestPreviousReleaseV2StoreOpens(t *testing.T) {
+	dir := t.TempDir()
+	node := ids.NewNodeID()
+	pdb, err := pebble.Open(dir, &pebble.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mk := range []struct {
+		name string
+		val  uint64
+	}{
+		{sysFormat, prevReleaseFormat},
+		{sysMinReader, prevReleaseFormat},
+		{sysMinWriter, prevReleaseFormat},
+	} {
+		if err := pdb.Set(SysKey(mk.name), encodeU64(mk.val), pebble.Sync); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := pdb.Set(SysKey(sysLocalNode), node[:], pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	if err := pdb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(dir, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
+	if err != nil {
+		t.Fatalf("v2 store failed to open: %v", err)
+	}
+	defer s.Close()
+	format, minR, minW, err := s.FormatInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if format != prevReleaseFormat || minR != prevReleaseFormat || minW != prevReleaseFormat {
+		t.Fatalf("v2 FormatInfo = %d/%d/%d, want markers left at 2", format, minR, minW)
+	}
+	ctx := context.Background()
+	row := ids.NewRowID()
+	if _, err := s.CommitLocal(ctx, localBatch(s, s.ClockNow(),
+		codec.Mutation{TableID: 7, RowID: row, ColumnID: 2, Value: codec.Text("v2-write")})); err != nil {
+		t.Fatalf("write to v2 store: %v", err)
+	}
+	st, ok, err := s.GetCell(7, row, 2)
+	if err != nil || !ok || st.Value.S != "v2-write" {
+		t.Fatalf("v2 store readback: %v %v", st, err)
 	}
 }

@@ -1,6 +1,6 @@
 # Benchmark live scenario
 
-Multi-process two-node replication throughput benchmark. One `spedsql`
+Multi-process two-node replication throughput benchmark. One Murmur-SQL
 daemon writes continuously (one insert plus one hot-row update per round)
 while its peer converges; the report covers statement/mutation rates,
 convergence time, and logical protocol byte rates.

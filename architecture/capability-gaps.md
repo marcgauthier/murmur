@@ -4,8 +4,8 @@ Source comparison with the sibling GALVANIZE checkout on 2026-09-27. This is an
 implementation inventory with remaining acceptance work, reconciled with code on
 2026-09-28. Implementation labels do not claim a fresh passing test run.
 
-The pending checklist in [TASKS_PENDING.md](../TASKS_PENDING.md#pending-tasks) is the live list
-of remaining work. This document provides comparison context and design priorities;
+The [TODO list](../TODO.md) is the live list of remaining work.
+This document provides comparison context and design priorities;
 keep its status summaries consistent when checklist items are completed or changed.
 
 [Architecture index](README.md) · [Project README](../README.md)
@@ -66,7 +66,7 @@ protocol. Wire compatibility with GALVANIZE is not currently promised.
 
 GALVANIZE's High/Low directory, HTTP(S), and FTP(S) transports have implementations.
 Its SFTP entry points currently return configuration errors; listing a transport
-in a reference configuration does not establish support. The SPeD-SQL bridge has
+in a reference configuration does not establish support. The Murmur-SQL bridge has
 directory, HTTP(S), and FTP(S) publication adapters plus recipient-sealed
 encrypted file-object transfer with High-local re-encryption (proven by
 `tests-live/files-bridge`).
@@ -93,5 +93,5 @@ current evidence.
    soak acceptance. Automatic primary-key derivation is not implemented; callers
    still supply explicit `BLOB(16)` keys.
 
-Update [pending tasks](../TASKS_PENDING.md) and project status only when the
+Update the [TODO list](../TODO.md) and project status only when the
 corresponding implementation and acceptance checks exist.

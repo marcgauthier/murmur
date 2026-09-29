@@ -223,6 +223,14 @@ func Restore(ctx context.Context, cfg RestoreConfig) (*Metadata, error) {
 		return nil, fmt.Errorf("%w: backup-metadata.json missing from archive", ErrInvalidMetadata)
 	}
 
+	// Force gzip CRC verification. The tar reader stops at the archive's
+	// trailing zero blocks without consuming the gzip footer, so
+	// mid-stream corruption that still parses as tar would otherwise
+	// restore silently; only a full read surfaces the checksum failure.
+	if _, err := io.Copy(io.Discard, gr); err != nil {
+		return nil, fmt.Errorf("%w: trailing checksum: %v", ErrCorruptBackup, err)
+	}
+
 	// 6. Verify restored essentials
 	regFile := filepath.Join(cfg.KeysPath, "KEYREGISTRY")
 	if _, err := os.Stat(regFile); err != nil {

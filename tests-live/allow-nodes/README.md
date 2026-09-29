@@ -6,7 +6,7 @@ Run from the repository root with:
 go test -count=1 ./tests-live/allow-nodes
 ```
 
-Three standalone `spedsql` processes use separate node directories, encrypted
+Three standalone Murmur-SQL processes use separate node directories, encrypted
 Pebble stores, and certificates issued by one cluster CA. Node1 and node3 accept
 all identities; node2 allows only node1. All nodes produce application writes
 concurrently for three minutes by default. The test requires the unauthorized

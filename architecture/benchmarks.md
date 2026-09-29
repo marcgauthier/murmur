@@ -42,7 +42,7 @@ mixed read/write
 Compare:
 
 ```text
-SPeD-SQL in-memory SQLite materialization
+Murmur-SQL in-memory SQLite materialization
 ordinary SQLite baseline
 ```
 

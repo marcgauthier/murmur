@@ -92,17 +92,23 @@ jobs:
           CGO_ENABLED: 1
         run: bash tests-live/run.sh gate
 
-      - name: Run pure-Go live smoke
+      - name: Run pure-Go live matrix
         env:
           CGO_ENABLED: 0
           SPEDSQL_TAGS: modernc
-        run: bash tests-live/run.sh three-node-sync
+        run: |
+          bash tests-live/run.sh three-node-sync
+          bash tests-live/run.sh rolling-restart
+          bash tests-live/run.sh partition
 
-      - name: Run race-instrumented live node smoke
+      - name: Run race-instrumented live matrix
         env:
           CGO_ENABLED: 1
           SPEDSQL_RACE: '1'
-        run: bash tests-live/run.sh three-node-sync
+        run: |
+          bash tests-live/run.sh three-node-sync
+          bash tests-live/run.sh rolling-restart
+          bash tests-live/run.sh partition
 
       - name: Upload live failure artifacts
         if: failure()
@@ -139,6 +145,36 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: live-soak-failures
+          path: tests-live/failures/
+          retention-days: 14
+
+  live-stress:
+    name: Live repetition stress (scheduled)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Run scheduled repetition stress
+        env:
+          CGO_ENABLED: 1
+        run: bash tests-live/run.sh stress
+
+      - name: Upload live failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-stress-failures
           path: tests-live/failures/
           retention-days: 14
 

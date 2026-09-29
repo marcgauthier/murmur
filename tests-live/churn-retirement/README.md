@@ -1,6 +1,6 @@
 # Peer exclusion, restart persistence, and retention release (multi-process)
 
-Run with `go test -count=1 ./tests-live/churn-retirement`. Three `spedsql`
+Run with `go test -count=1 ./tests-live/churn-retirement`. Three Murmur-SQL
 daemons mesh; node3 is excluded on the survivors via
 `POST /v1/admin/remove_peer`. Sessions to node3 must drop, its writes
 must stop arriving, and it must release its GC retention pin

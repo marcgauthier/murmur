@@ -1,6 +1,6 @@
 # Multi-process writes through partition and healing
 
-Run with `go test -count=1 ./tests-live/chaos-load`. Three encrypted `spedsql`
+Run with `go test -count=1 ./tests-live/chaos-load`. Three encrypted Murmur-SQL
 processes run in separate node directories. All processes write concurrently
 while node3 is cut off from the connected node1/node2 pair, and the test checks
 that the groups have divergent row counts and ordered SHA-256 digests. It then

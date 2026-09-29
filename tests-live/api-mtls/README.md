@@ -1,6 +1,6 @@
 # API mTLS
 
-Starts a real `spedsql` daemon and verifies that its API is HTTPS-only. A
+Starts a real Murmur-SQL daemon and verifies that its API is HTTPS-only. A
 trusted client certificate is required for every route except public
 `GET /healthz`; `/metrics` and `/v1/*` reject requests without a valid
 cluster-CA-issued client certificate. A certificate from another CA and

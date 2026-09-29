@@ -330,7 +330,14 @@ func AssignIDs(current, next []TableSchema) ([]TableSchema, error) {
 	out := cloneTables(next)
 	for i := range out {
 		t := &out[i]
-		if old, ok := byName[lowerName(t.Name)]; ok {
+		old, found := byName[lowerName(t.Name)]
+		if !found && t.ID != 0 {
+			old, found = byID[t.ID]
+			if found && old.Name == t.Name {
+				found = false
+			}
+		}
+		if found {
 			if t.ID == 0 {
 				t.ID = old.ID
 			} else if t.ID != old.ID {
@@ -449,12 +456,17 @@ func unionTable(at *TableSchema, bt *TableSchema) error {
 // Missing or altered declarations fail, identifying the object.
 func checkSuperset(base, next []TableSchema) error {
 	byName := make(map[string]*TableSchema, len(next))
+	byID := make(map[uint32]*TableSchema, len(next))
 	for i := range next {
 		t := &next[i]
 		byName[lowerName(t.Name)] = t
+		byID[t.ID] = t
 	}
 	for _, bt := range base {
 		nt, ok := byName[lowerName(bt.Name)]
+		if !ok {
+			nt, ok = byID[bt.ID]
+		}
 		if !ok {
 			return fmt.Errorf("schema: migration drops table %q (destructive changes need coordinated maintenance): %w",
 				bt.Name, ErrUnsupportedSchema)
@@ -686,15 +698,23 @@ func MigrationDDL(oldTables, nextTables []TableSchema) ([]string, error) {
 		return nil, err
 	}
 	oldByName := make(map[string]*TableSchema, len(oldTables))
+	oldByID := make(map[uint32]*TableSchema, len(oldTables))
 	for i := range oldTables {
 		t := &oldTables[i]
 		oldByName[lowerName(t.Name)] = t
+		oldByID[t.ID] = t
 	}
 	ordered := append([]TableSchema(nil), nextTables...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].ID < ordered[j].ID })
 	var out []string
 	for _, nt := range ordered {
 		ot, ok := oldByName[lowerName(nt.Name)]
+		if !ok {
+			ot, ok = oldByID[nt.ID]
+			if ok {
+				out = append(out, "ALTER TABLE \""+ot.Name+"\" RENAME TO \""+nt.Name+"\"")
+			}
+		}
 		if !ok {
 			out = append(out, nt.CreateTableDDL())
 			continue

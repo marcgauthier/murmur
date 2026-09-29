@@ -1,6 +1,6 @@
 # Repository guidance
 
-## Main goal of SPeD-SQL
+## Main goal of Murmur-SQL
 Create a very fast local sql database with encryption at rest on disk via KV store and that replicated quickly via QUIC with TLS, The code must work, it must be tested with live test not just test for code. 
 
 

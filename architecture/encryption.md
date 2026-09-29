@@ -44,7 +44,7 @@ Assign immutable random file identities; rename and hard links retain identity, 
 ### SQL materialization
 
 The SQLite query materialization is memory resident and rebuildable from
-Pebble. SPeD-SQL does not create a query database file. Operating systems may
+Pebble. Murmur-SQL does not create a query database file. Operating systems may
 page process memory to swap; deployments that require protection from that
 exposure must disable or encrypt swap at the host level. The encrypted Pebble
 VFS remains the at-rest protection for authoritative database files.

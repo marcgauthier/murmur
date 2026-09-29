@@ -6,7 +6,7 @@ Run from the repository root with:
 go test -count=1 ./tests-live/views
 ```
 
-Three `spedsql` daemon processes in discrete node directories form an
+Three Murmur-SQL daemon processes in discrete node directories form an
 encrypted mutual-TLS mesh with the same local view over the replicated
 `contacts` table. Each node inserts a row; the two qualifying
 rows must appear in the view on all replicas, while a non-qualifying row stays

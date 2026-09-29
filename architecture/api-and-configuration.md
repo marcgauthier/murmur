@@ -22,6 +22,7 @@ Initial concept:
 type Config struct {
     Path        string
     NodeID      NodeID
+    DBID        DBID
     QueryStore  QueryStoreConfig
     Encryption EncryptionConfig
     Replication ReplicationConfig
@@ -29,7 +30,14 @@ type Config struct {
     Schema      SchemaConfig
     Pebble      PebbleConfig
     Durability  DurabilityConfig
+    Backup      BackupScheduleConfig
+    Files       FilesConfig
     Scheduling  WriterSchedulingConfig
+    Subscription SubscriptionConfig
+    MaxReplicatedValueBytes int
+    MaxBatchMutations       int
+    MaxTransactionBytes     int64
+    Logger      Logger
 }
 
 func Open(ctx context.Context, cfg Config) (*DB, error)
@@ -108,7 +116,7 @@ handles never closes the underlying `*DB`. The explicit `DB`/`Tx` API remains
 the primary interface: transaction interception and connection-specific hooks
 are easier to prove there first.
 
-`Open` requires both `cfg.Schema` and `cfg.Pebble`. The schema must include its version and complete table, column, constraint, and index declarations; do not infer it from existing data. Validate it against [Section 6](schema.md#6-schema-rules-for-version-1) and persisted schema metadata before creating tables, rebuilding data, or starting replication. Errors must identify the offending table, column, or index.
+`Open` requires both `cfg.Schema` and `cfg.Pebble`. The schema must include its version and complete table and column declarations; do not infer it from existing data. Validate it against [Section 6](schema.md#6-schema-rules-for-version-1) and persisted schema metadata before creating tables, rebuilding data, or starting replication. Errors must identify the offending table, column, or index.
 
 `PebbleConfig` is required; use `DefaultPebbleConfig()` for standard settings. `Config.Path` is the database directory. Expose cache size, memtable size/count, maximum open files, compaction concurrency, and compression; keep storage caches out of `CacheConfig`. Validate settings before opening Pebble. Encryption keys come from `Encryption.Key` or `Encryption.Provider`; never weaken the replication acknowledgement or durability contract through storage options.
 
@@ -131,17 +139,16 @@ type PebbleConfig struct {
 }
 
 type CompressionConfig struct {
-    Mode      CompressionMode // default, none, snappy, or zstd
-    ZstdLevel int             // default 3; supported levels are 3, 9, and 12
+    Algorithm CompressionAlgorithm // default zstd (empty resolves to it)
+    ZstdLevel int                  // default 3; supported levels are 3, 9, and 12
 }
 
-type CompressionMode string
+type CompressionAlgorithm string
 
 const (
-    CompressionDefault CompressionMode = ""
-    CompressionNone    CompressionMode = "none"
-    CompressionSnappy  CompressionMode = "snappy"
-    CompressionZstd    CompressionMode = "zstd"
+    CompressionZstd   CompressionAlgorithm = "zstd"
+    CompressionSnappy CompressionAlgorithm = "snappy"
+    CompressionNone   CompressionAlgorithm = "none"
 )
 ```
 
@@ -189,10 +196,13 @@ db, err := replicateddb.Open(ctx, replicateddb.Config{
     },
 
     Schema: replicateddb.SchemaConfig{
-        Version:            7,
-        Tables:             schema,
-        AcceptRemoteSchema: true, // auto-adopt higher schema versions from peers
+        Version: 7,
+        Tables:  schema,
+        // AcceptRemoteSchema nil (default) auto-adopts higher schema versions
+        // from peers; set an explicit false pointer to refuse remote schemas.
     },
+
+    MaxTransactionBytes: 64 << 20, // default pre-commit cap (top-level Config field)
 
     Encryption: replicateddb.EncryptionConfig{
         Algorithm:       replicateddb.AES256GCM,
@@ -218,7 +228,6 @@ db, err := replicateddb.Open(ctx, replicateddb.Config{
         MaxReplicationSessions: 8,
         MaxQUICConnections:     32,
         Dissemination:          replicateddb.DisseminationGossip, // optional: DisseminationPlumtree
-        MaxTransactionBytes:    64 << 20,
         MaxSnapshotBytes:       512 << 20, // default staging/publication bound
         SnapshotTransferTimeout: 10 * time.Minute, // source read-cut lease
         // Overload's zero fields select the bounded defaults in Section 32.

@@ -70,13 +70,13 @@ Deliver the project as a Go module.
 Example:
 
 ```text
-github.com/nomadsql/replicateddb
+github.com/marcgauthier/spedsql
 ```
 
 Target:
 
 ```go
-go get github.com/nomadsql/replicateddb
+go get github.com/marcgauthier/spedsql
 ```
 
 ### Supported Platform and Build Matrix

@@ -41,6 +41,11 @@ type preparer interface {
 }
 
 func (c *stmtCache) prepare(ctx context.Context, p preparer, query string) (*sql.Stmt, error) {
+	// Single-statement gate: the backends disagree about stacked input, so
+	// reject it before any driver sees it (identical on every backend).
+	if err := checkSingleStatement(query); err != nil {
+		return nil, err
+	}
 	c.mu.Lock()
 	if s, ok := c.cache.Get(query); ok {
 		c.hits.Add(1)

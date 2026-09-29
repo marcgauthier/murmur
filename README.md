@@ -1,10 +1,12 @@
-# SPeD-SQL
+# MURMUR-SQL
 
 <p align="center">
-  <img src="spedsql.png" alt="SPeD-SQL Logo" width="600"/>
+  <img src="murmur-sql.png" alt="MURMUR-SQL logo" width="600"/>
 </p>
 
-SPeD-SQL (Secure Peer-Distributed SQL) is a Golang Embedded Package that provide an in memory SQLite database with masterless/offline distributed cluster with persistance on disk via Pebble saving only change deltas.
+*Coordinated starling flock flight.*
+
+Murmur-SQL is a Golang embedded package that provides an in-memory SQLite database with masterless/offline distributed cluster with persistence on disk via Pebble saving only change deltas.
 
 - **SQL queries** through an embedded SQLite engine held in memory by default and rebuilt
   from Pebble on startup
@@ -12,7 +14,7 @@ SPeD-SQL (Secure Peer-Distributed SQL) is a Golang Embedded Package that provide
 - **Masterless multi-writer replication** over QUIC with mutual TLS
 - **Offline writes** on every node, per-column last-writer-wins via hybrid
   logical clock (CR-SQLite-style cell model, engine-independent)
-- **Encrypted storage** multiple cipher option, storage-key rotation, snapshots for new or stale nodes, replication-log garbage collection
+- **Encrypted storage** with multiple cipher options, storage-key rotation, snapshots for new or stale nodes, replication-log garbage collection
 
 The architecture and implementation documentation is in [architecture/](architecture/README.md) folder, split into smaller topic documents.  Start with the [architecture overview](architecture/overview.md).
 
@@ -104,11 +106,15 @@ graceful close. The default remains a disk sync before each write acknowledgemen
 Pebble still appends to its WAL on each commit, so this setting controls sync
 frequency rather than the exact number of physical disk writes.
 
-Run the runnable example:
+Run the runnable example (the SQLite feature tags are required):
 
 ```sh
-go run ./example
+go run -tags "sqlite_preupdate_hook sqlite_fts5" ./example
 ```
+
+A graduated progression — single node, encrypted node with transactions and
+reopen recovery, then a 3-node replicated mesh — lives in `examples/`
+(see [examples/README.md](examples/README.md)).
 
 ## Schema rules (v1)
 
@@ -155,7 +161,7 @@ Only `Tables` entries are replicated. Everything in `LocalDDL` stays local.
 ## Repository layout
 
 ```text
-SPeD-SQL/                public API (db.go, transaction.go, config.go, ...)
+MURMUR-SQL/               public API (db.go, transaction.go, config.go, ...)
   architecture/          architecture, subsystem design, testing, and implementation roadmap
   crdt/                  HLC clock, version comparison, LWW merge
   codec/                 binary value / mutation-batch / snapshot encodings
@@ -170,8 +176,13 @@ SPeD-SQL/                public API (db.go, transaction.go, config.go, ...)
   objectstore/           local immutable encrypted file payload storage
   ids/                   128-bit identity types
   service/               optional authenticated HTTP adapter + remote SDK (status, SQL, subscriptions)
+  metrics/               Prometheus collectors over DB.Status (caller-owned registry)
+  admin/                 TLS-only unlock/status/lock HTTP handler (app-mounted, no listener)
   bridge/                one-way Low-to-High logical replication roles and transfer types
+  backup/                backup/restore with local/HTTPS/FTP destinations, file objects
+  filefetch/             bounded mesh fetch of file object bytes (client/server protocol)
   example/               runnable single-node example
+  examples/              graduated examples: single node → 3-node mesh
   tests-live/             live multi-process integration test scenarios
 ```
 
@@ -320,7 +331,7 @@ Automatic primary-key derivation is not implemented; applications supply keys.
 No verified release revision is recorded; the static inventory does not certify
 the latest commit or working tree.
 
- Working: local durable engine, pre-update capture, transaction coalescing,
+Working: local durable engine, pre-update capture, transaction coalescing,
  per-cell LWW + row tombstones, encrypted Pebble, startup rebuild, two-node
  QUIC replication with mTLS, conflicting-write convergence, log GC,
  snapshot resync, storage/data-key rotation, maintenance file rewrite, FTS5,

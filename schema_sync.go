@@ -12,6 +12,8 @@ package replicateddb
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/marcgauthier/spedsql/replication"
 	"github.com/marcgauthier/spedsql/schema"
@@ -107,6 +109,16 @@ func registryTables(reg *schema.Registry) []schema.TableSchema {
 // the configuration to match the published manifest exactly. The new
 // version is always current+1; read it back with SchemaInfo.
 func (db *DB) Migrate(ctx context.Context, newTables []schema.TableSchema) error {
+	return db.migrate(ctx, newTables, nil)
+}
+
+// MigrateWithLocalDDL migrates the replicated schema and replaces the
+// local-only indexes, views, and FTS objects used by materializer rebuilds.
+func (db *DB) MigrateWithLocalDDL(ctx context.Context, newTables []schema.TableSchema, localDDL []string) error {
+	return db.migrate(ctx, newTables, localDDL)
+}
+
+func (db *DB) migrate(ctx context.Context, newTables []schema.TableSchema, localDDL []string) error {
 	db.mu.Lock()
 	st := db.dbState
 	db.mu.Unlock()
@@ -154,7 +166,7 @@ func (db *DB) Migrate(ctx context.Context, newTables []schema.TableSchema) error
 		return err
 	}
 	_ = ctx
-	if err := db.publishSchemaRevision(cur, next); err != nil {
+	if err := db.publishSchemaRevisionWithLocalDDL(cur, next, localDDL); err != nil {
 		return err
 	}
 	db.metrics.schemaMigrations.Add(1)
@@ -218,6 +230,10 @@ func (db *DB) countVisibleRows(tableID uint32) (int, error) {
 // the materializer is dirty; a post-Pebble DDL failure rebuilds before
 // readiness, failing to StateFailed when unrecoverable.
 func (db *DB) publishSchemaRevision(cur, next *schema.Manifest) error {
+	return db.publishSchemaRevisionWithLocalDDL(cur, next, nil)
+}
+
+func (db *DB) publishSchemaRevisionWithLocalDDL(cur, next *schema.Manifest, localDDL []string) error {
 	ddl, err := schema.MigrationDDL(cur.Tables, next.Tables)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrUnsupportedSchema, err)
@@ -229,7 +245,13 @@ func (db *DB) publishSchemaRevision(cur, next *schema.Manifest) error {
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrSchemaMismatch, err)
 	}
-	if err := db.engine.MigrateTo(newReg, ddl); err != nil {
+	// Manifests received over the wire carry ID-sorted columns
+	// (EncodeManifest sorts), while locally authored ones keep
+	// declaration order. Order the new registry like the live one so
+	// the rebuild below preserves physical column order identically on
+	// the author and every adopter.
+	orderRegistryLikeLocal(db.schemaRegistry(), newReg)
+	if err := db.engine.MigrateToWithLocalDDL(newReg, ddl, localDDL); err != nil {
 		db.log.Warn("schema DDL failed; rebuilding materializer", "err", err.Error())
 	}
 	// Rebuild regardless: it validates the migrated state and recovers a
@@ -249,6 +271,46 @@ func (db *DB) publishSchemaRevision(cur, next *schema.Manifest) error {
 		repl.RefreshSchema(db.schemaIdentity())
 	}
 	return nil
+}
+
+// orderRegistryLikeLocal rewrites newReg's column order in place: columns
+// already present locally keep their current relative order and genuinely
+// new columns append sorted by stable ID (matching MigrationDDL's append
+// order). Tables unknown locally keep manifest order. IDs, names, types,
+// and the canonical hash are untouched; only the physical order the
+// materializer rebuilds takes from the registry changes.
+func orderRegistryLikeLocal(current, newReg *schema.Registry) {
+	if current == nil || newReg == nil {
+		return
+	}
+	for _, nt := range newReg.Tables {
+		var ct *schema.TableSchema
+		for _, t := range current.Tables {
+			if strings.EqualFold(t.Name, nt.Name) {
+				ct = t
+				break
+			}
+		}
+		if ct == nil {
+			continue
+		}
+		pos := make(map[uint32]int, len(ct.Columns))
+		for i, c := range ct.Columns {
+			pos[c.ID] = i
+		}
+		known := make([]schema.ColumnSchema, 0, len(nt.Columns))
+		added := make([]schema.ColumnSchema, 0, len(nt.Columns))
+		for _, c := range nt.Columns {
+			if _, ok := pos[c.ID]; ok {
+				known = append(known, c)
+			} else {
+				added = append(added, c)
+			}
+		}
+		sort.Slice(known, func(i, j int) bool { return pos[known[i].ID] < pos[known[j].ID] })
+		sort.Slice(added, func(i, j int) bool { return added[i].ID < added[j].ID })
+		nt.Columns = append(known, added...)
+	}
 }
 
 // --- replication.SchemaSyncer ---
