@@ -137,7 +137,7 @@ func waitForPeers(t *testing.T, cluster *harness.Cluster, want int, timeout time
 
 func connectedPeers(apiAddr string) int {
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://" + apiAddr + "/v1/status")
+	resp, err := client.Get("https://" + apiAddr + "/v1/status")
 	if err != nil {
 		return -1
 	}

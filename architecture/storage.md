@@ -10,7 +10,7 @@ Pebble layout, startup/rebuild, caching, compaction, and a log-GC example.
 - [14. Pebble Key Layout](#14-pebble-key-layout)
 - [20. Materialization Generation](#20-materialization-generation)
 - [21. Startup](#21-startup)
-- [22. Fast LumoSQL Rebuild](#22-fast-lumosql-rebuild)
+- [22. Fast SQLite Rebuild](#22-fast-sqlite-rebuild)
 - [25. Pebble Caching](#25-pebble-caching)
 - [47. Pebble Compaction and Encrypted-File Reclamation](#47-pebble-compaction-and-encrypted-file-reclamation)
 - [83. Example Log GC](#83-example-log-gc)
@@ -26,7 +26,7 @@ Pebble stores four distinct classes of information:
 3. Replication/node metadata.
 4. Schema/system metadata.
 
-The current state must be sufficient to rebuild LumoSQL without replaying historical mutations.
+The current state must be sufficient to rebuild SQLite without replaying historical mutations.
 
 ---
 
@@ -209,7 +209,7 @@ Startup sequence:
 4. Validate database format version.
 5. Load NodeID, sequence, HLC and schema metadata; enforce fresh-identity/reseed policy before writable networking.
 6. Validate application schema and compatibility with persisted metadata under Section 6.
-7. Start LumoSQL.
+7. Start SQLite.
 8. Create SQL schema.
 9. Bulk rebuild current state from Pebble.
 10. Build non-unique secondary indexes only.
@@ -227,7 +227,7 @@ Only scan current state plus row tombstones.
 
 ---
 
-## 22. Fast LumoSQL Rebuild
+## 22. Fast SQLite Rebuild
 
 Rebuild should operate table-by-table.
 
@@ -243,7 +243,7 @@ assemble rows
 prepared INSERT
       |
       v
-large LumoSQL transaction
+large SQLite transaction
 ```
 
 Avoid one SQL transaction per cell.
@@ -277,7 +277,7 @@ cells/sec
 time to query-ready
 peak RAM
 Pebble read throughput
-LumoSQL insertion throughput
+SQLite insertion throughput
 index-build time
 FTS-build time
 ```
@@ -294,9 +294,9 @@ type CacheConfig struct {
 }
 ```
 
-Default to a 16 MiB Pebble block cache because the SQL dataset also lives in LumoSQL memory. Benchmark cache sizing and include memtables, encrypted-VFS indexes and buffers, replication queues, and SQL indexes in the total memory budget.
+Default to a 256 MiB Pebble block cache. Note the SQL dataset also lives in SQLite memory, so size the block cache against the total memory budget: include memtables, encrypted-VFS indexes and buffers, replication queues, and SQL indexes, and benchmark cache sizing on the target dataset before raising it further.
 
-Expose cache usage/hit rate, memtable bytes, encryption buffer/index bytes, replication queues, and statement-cache usage. Close/unref owned Pebble cache resources during shutdown.
+Expose cache usage/hit rate, memtable bytes, encryption buffer/index bytes, replication queues, and statement-cache usage. Close/unref owned Pebble cache resources during shutdown. Statement-cache lookup hits/misses are counted in `DB.Metrics()` (`StmtCacheHits`/`StmtCacheMisses`) and exported as `spedsql_stmt_cache_hits_total` / `spedsql_stmt_cache_misses_total`; use the hit rate to size `Cache.StatementCacheEntries` (default 256 per read/write cache).
 
 ---
 

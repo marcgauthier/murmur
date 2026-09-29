@@ -21,20 +21,14 @@ type Tx struct {
 // drain before the transaction starts.
 func (e *Engine) Begin(ctx context.Context) (*Tx, error) {
 	e.wmu.Lock()
-	if !e.concurrentMVCC {
-		e.rw.Lock() // drain in-flight reads; block new ones
-	}
+	e.rw.Lock() // drain in-flight reads; block new ones
 	if e.closed {
-		if !e.concurrentMVCC {
-			e.rw.Unlock()
-		}
+		e.rw.Unlock()
 		e.wmu.Unlock()
 		return nil, fmt.Errorf("sqlengine: closed")
 	}
 	if _, err := e.write.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		if !e.concurrentMVCC {
-			e.rw.Unlock()
-		}
+		e.rw.Unlock()
 		e.wmu.Unlock()
 		return nil, fmt.Errorf("sqlengine: begin: %w", err)
 	}
@@ -126,9 +120,7 @@ func (tx *Tx) Rollback() error {
 }
 
 func (e *Engine) unlockWriter() {
-	if !e.concurrentMVCC {
-		e.rw.Unlock()
-	}
+	e.rw.Unlock()
 	e.wmu.Unlock()
 }
 
@@ -137,10 +129,8 @@ func (e *Engine) unlockWriter() {
 func (e *Engine) WriteSection(fn func(ctx context.Context) error) error {
 	e.wmu.Lock()
 	defer e.wmu.Unlock()
-	if !e.concurrentMVCC {
-		e.rw.Lock()
-		defer e.rw.Unlock()
-	}
+	e.rw.Lock()
+	defer e.rw.Unlock()
 	if e.closed {
 		return fmt.Errorf("sqlengine: closed")
 	}

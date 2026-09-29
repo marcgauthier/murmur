@@ -32,6 +32,20 @@ func (l *latency) percentile(p float64) time.Duration {
 	return sorted[idx]
 }
 
+// reportWall publishes p50/p95/p99 latency plus wall-clock throughput for
+// concurrent benchmarks, where dividing by summed per-op durations would
+// overcount elapsed time. unitPerOp scales the throughput metric (1 for
+// ops/sec; pass rows or bytes per op for rows/sec or MB/sec companions).
+func (l *latency) reportWall(b *testing.B, wall time.Duration, unitPerOp float64, unit string) {
+	b.Helper()
+	b.ReportMetric(float64(l.percentile(50).Nanoseconds()), "p50-ns")
+	b.ReportMetric(float64(l.percentile(95).Nanoseconds()), "p95-ns")
+	b.ReportMetric(float64(l.percentile(99).Nanoseconds()), "p99-ns")
+	if wall > 0 {
+		b.ReportMetric(float64(len(l.samples))*unitPerOp/wall.Seconds(), unit+"/sec")
+	}
+}
+
 // report publishes p50/p95/p99 latency plus throughput. unitPerOp scales
 // the throughput metric (1 for ops/sec; pass rows or bytes per op for
 // rows/sec or MB/sec companions).

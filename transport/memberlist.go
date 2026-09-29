@@ -600,6 +600,58 @@ func (t *MemberlistTransport) handleIncomingStream(sess *Session, stream *quic.S
 	}
 }
 
+// HandleStream dispatches an externally accepted stream with a known prefix to memberlist.
+func (t *MemberlistTransport) HandleStream(sess *Session, stream *quic.Stream, prefix []byte) {
+	var header [StreamHeaderLen]byte
+	copy(header[:], prefix)
+	n := len(prefix)
+	if n < StreamHeaderLen {
+		_ = stream.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.ReadFull(stream, header[n:]); err != nil {
+			_ = stream.Close()
+			return
+		}
+		_ = stream.SetReadDeadline(time.Time{})
+	}
+
+	magic := binary.BigEndian.Uint32(header[0:4])
+	version := header[4]
+	typ := header[5]
+	if magic != StreamMagic || version != StreamVersion || typ != StreamTypeMembership {
+		t.datagramEnvelopeErrors.Add(1)
+		_ = stream.Close()
+		return
+	}
+	var dbid ids.DBID
+	copy(dbid[:], header[6:22])
+	if dbid != t.dbid {
+		t.datagramDBIDMismatches.Add(1)
+		_ = stream.Close()
+		return
+	}
+	var senderID ids.NodeID
+	copy(senderID[:], header[22:38])
+	if senderID != sess.Peer {
+		t.datagramEnvelopeErrors.Add(1)
+		_ = stream.Close()
+		return
+	}
+
+	conn := &StreamConn{
+		stream: stream,
+		sess:   sess,
+	}
+
+	select {
+	case t.streamCh <- conn:
+	case <-t.ctx.Done():
+		_ = conn.Close()
+	default:
+		t.streamDrops.Add(1)
+		_ = conn.Close()
+	}
+}
+
 // Shutdown stops membership delivery and cleans up transport workers.
 func (t *MemberlistTransport) Shutdown() error {
 	t.mu.Lock()

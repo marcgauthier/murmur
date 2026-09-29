@@ -102,11 +102,18 @@ when a callback fails. Replication protocol tests cover watermark-list round
 trips and reject missing counts, truncated entries, and absurd entry counts.
 Run them with `go test ./state ./replication`.
 
+> Every `go test ./tests-live/...` command in this document requires the
+> build tags: use `go test -tags "sqlite_preupdate_hook sqlite_fts5"
+> -count=1 ./tests-live/<scenario>` (or `-tags modernc` for the pure-Go
+> backend), or run `bash tests-live/run.sh <scenario>`, which applies
+> `SPEDSQL_TAGS` (defaulting to the CGO set) automatically.
+
 The live integration port at `tests-live/crdt-contention/` runs three encrypted
 QUIC nodes and verifies that concurrent updates to disjoint columns all
 survive replication. Run it with `go test -count=1 ./tests-live/crdt-contention`.
 It covers the disjoint-column invariant from GALVANIZE's CRDT contention
-scenario; shared-cell contention and delete pruning remain unported.
+scenario; the multi-process daemon scenario below additionally covers
+shared-cell contention, while delete pruning remains unported.
 
 The managed-view integration port at `tests-live/views/` checks view results on
 three replicas and after one replica reopens and rebuilds. Run it with
@@ -116,7 +123,8 @@ The large-payload port at `tests-live/large-payload/` sends a 1.5 MiB value in
 the same transaction as 250 rows across two encrypted QUIC nodes, then checks
 the exact value digest and row count. Run it with
 `go test -count=1 ./tests-live/large-payload`. It covers the direct mesh data
-path; High/Low bundle transport remains unimplemented.
+path; High/Low bundle transport is covered separately by
+`tests-live/highlow/` and `tests-live/files-bridge/`.
 
 The allow-nodes port at `tests-live/allow-nodes/` uses valid NodeID-bound
 certificates while restricting one peer to a loopback `/32`; it verifies the
@@ -196,6 +204,83 @@ The `tests-live/files-bridge/` scenario covers two Low peers, a recipient-sealed
 Low-to-High file import, and two High peers. High-2 learns metadata through its
 mesh and fetches the verified object from High-1. Run it with
 `go test -count=1 ./tests-live/files-bridge`.
+
+The `tests-live/snapshot-resync/` scenario stops one of three meshed daemons
+running aggressive log retention, writes the survivors past retention and a
+log-GC pass, then restarts the stale node: its needed ranges are gone, so it
+must rejoin via snapshot without discarding its acknowledged pre-stop rows.
+The snapshot path is proven by the receiver's `spedsql_repl_snapshots_received_total`
+counter alongside digest convergence. A second test restarts two stale nodes
+at once against one survivor so their snapshot requests overlap: the source
+serves one transfer per peer with explicit busy deferrals, and both rejoins
+converge with snapshot counters and progress/deferral series present.
+Run them with `go test -count=1 ./tests-live/snapshot-resync`.
+
+The `tests-live/backup-restore/` scenarios stop a meshed daemon, back up
+its durable directory offline, wipe it, restore under a fresh writer
+identity with a reissued certificate, and restart into a reconverged mesh
+with no lost rows; a second test proves opening restored data under a
+stale identity is rejected. Run them with
+`go test -count=1 ./tests-live/backup-restore`.
+
+The `tests-live/partial-mesh/` scenario peers three daemons as a chain
+and requires writes to converge end to end via origin forwarding, with
+provably no direct session between the unlinked ends (SWIM discovery is
+not yet wired into the runtime). Run it with
+`go test -count=1 ./tests-live/partial-mesh`.
+
+The `tests-live/schema-evolution/` scenario rolls an additive migration
+(new nullable column) across three live daemons one at a time: the
+mixed-version mesh keeps replicating in both directions, and after the
+last migration all peers converge on the full state with equal digests.
+Run it with `go test -count=1 ./tests-live/schema-evolution`.
+
+The `tests-live/overload-budgets/` scenario runs two daemons with small
+commit budgets and requires clean rejection of an oversize HTTP body and
+an over-budget value (no partial rows, writer stays healthy), then
+converges a concurrent 400-insert blast with bounded tail latency. Run it
+with `go test -count=1 ./tests-live/overload-budgets`.
+
+The `tests-live/churn-retirement/` scenario excludes a meshed peer via
+the admin API and requires session drops, write isolation, GC retention
+release, restart persistence of the exclusion, and healing on explicit
+re-add. Run it with `go test -count=1 ./tests-live/churn-retirement`.
+
+The `tests-live/plumtree-live/` scenarios converge writes across an
+all-Plumtree three-daemon mesh, and prove required capability
+negotiation by isolating a gossip-mode node meshed with Plumtree peers
+(convergence on both sides plus recorded handshake refusals). Run them
+with `go test -count=1 ./tests-live/plumtree-live`.
+
+The `tests-live/bridge-two-streams/` scenarios import two independent
+Low domains into one High cluster (one stream per High node): rows from
+both domains converge with Low-owned provenance, a single-stream second
+round leaves the other stream's progress untouched, and a cross-domain
+row-identity collision fails closed with first-writer state intact. Run
+them with `go test -count=1 ./tests-live/bridge-two-streams`.
+
+The `tests-live/rolling-restart/` scenario restarts each node of a
+three-daemon mesh in turn while writers hammer every node: no write to
+a live node may fail, and the mesh converges to identical digests after
+each restart. Run it with `go test -count=1 ./tests-live/rolling-restart`.
+
+The `tests-live/version-skew/` scenario meshes two daemons with a third
+that advertises handshake protocol version 99: the skewed node never
+connects in either direction and exchanges no data, but stays alive and
+keeps serving local reads/writes while the compatible pair converges.
+Run it with `go test -count=1 ./tests-live/version-skew`.
+
+The `tests-live/scale-mesh/` scenario converges 400 rows from two
+origins across ten daemons at the default fanout of 4, with a 2s sampler
+asserting no node ever selects more than 4 replication targets. Run it
+with `go test -count=1 ./tests-live/scale-mesh`.
+
+The `tests-live/gc-balance/` scenario updates a fixed 200-key set with
+eight parallel updaters under aggressive retention: after a 20s warmup,
+GC must collect at least 90% of the origin-log batches a 40s window
+produces (commits vs `spedsql_gc_log_collected_total`), proving the
+retained set does not grow, with exact row counts and identical digests
+at the end. Run it with `go test -count=1 ./tests-live/gc-balance`.
 
 The `tests-live/soak-slo/` scenario writes through three encrypted daemon
 processes and their HTTP SQL endpoints, then gates logical digest convergence,
@@ -313,7 +398,7 @@ Also test full-mesh reachability and hub/spoke allow-list topologies while the r
 
 ### Scaling acceptance tests
 
-Use an instrumented transport and deterministic scheduler simulation for clusters of 10, 100, and 1,000 members, plus real QUIC integration coverage on smaller clusters. Under defaults, assert selected outbound replication targets never exceed three, total replication sessions never exceed eight, and total admitted connections plus handshakes never exceed 32. Include inbound bursts and transient repair work in peak accounting.
+Use an instrumented transport and deterministic scheduler simulation for clusters of 10, 100, and 1,000 members, plus real QUIC integration coverage on smaller clusters. Under the configured test bounds (fanout 3, 8 sessions, 32 connections), assert selected outbound replication targets never exceed three, total replication sessions never exceed eight, and total admitted connections plus handshakes never exceed 32. Production defaults are fanout 4, 32 sessions, and 64 connections (`config.go`). Include inbound bursts and transient repair work in peak accounting.
 
 Measure convergence latency, bytes sent, dial/handshake churn, evictions, queue pressure, and probe failures across cluster sizes. Verify eventual convergence under finite loss/partitions and repeated successful peer selection. Distinguish fixed fanout and connection bounds from O(N) membership/watermark metadata and membership-size-dependent gossip retransmission traffic.
 
@@ -360,7 +445,7 @@ Required:
 A first serious alpha should not be called successful until all of the following work:
 
 - Embedded Go API with no standalone service.
-- LumoSQL opens in memory.
+- Both the default mattn SQLite and optional modernc builds open the in-memory query materialization and pass the same capture and rebuild acceptance cases.
 - Base table writes captured through pre-update hook.
 - Multi-statement transactions coalesce correctly.
 - Pebble is authoritative.
@@ -370,10 +455,13 @@ A first serious alpha should not be called successful until all of the following
 - Per-column LWW convergence tested.
 - Delete/resurrection semantics tested.
 - Two nodes replicate over quic-go with mTLS.
+- Every daemon API route requires HTTPS and a valid CA-signed client
+  certificate, except public HTTPS `GET /healthz`; verify absent, expired,
+  and untrusted client certificates are rejected and the CLI uses mTLS.
 - Three nodes forward multi-origin changes.
 - Partial seed lists discover members through SWIM over authenticated QUIC without native UDP/TCP membership listeners.
 - QUIC membership/datagram/stream adapters handle identity, DBID, size limits, deadlines, and graceful shutdown.
-- Default fanout three, replication session cap eight, and total QUIC connection/handshake cap 32 hold at 10/100/1,000 simulated members.
+- Configured fanout/session/connection bounds (3/8/32 in the scaling test; production defaults 4/32/64) hold at 10/100/1,000 simulated members.
 - Peer rotation and anti-entropy converge after missed forwarding, membership churn, and partitions.
 - Offline conflicting writes converge.
 - Replication logs garbage-collect safely.

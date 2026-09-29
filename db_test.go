@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -486,15 +487,77 @@ func TestNodeIDHelpers(t *testing.T) {
 	_ = ids.NewDBID
 }
 
+// Reopening a database must preserve declaration column order. The stored
+// schema manifest sorts columns by hash-derived ID; rebuilding the live
+// registry from it (instead of the config declaration) used to permute
+// physical column order on every reopen whenever ID order differed from
+// declaration order (contacts.name sorts before contacts.id by ID).
+func TestRestartPreservesDeclarationColumnOrder(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	cfg := testConfig(dir)
+	db, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cols := queryColumns(t, db, `SELECT * FROM contacts`)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"id", "name", "phone", "score"}
+	if fmt.Sprint(cols) != fmt.Sprint(want) {
+		t.Fatalf("fresh open columns=%v, want %v", cols, want)
+	}
+
+	db2, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	cols2 := queryColumns(t, db2, `SELECT * FROM contacts`)
+	if fmt.Sprint(cols2) != fmt.Sprint(want) {
+		t.Fatalf("reopen columns=%v, want %v (declaration order)", cols2, want)
+	}
+}
+
+func queryColumns(t *testing.T, db *DB, q string) []string {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	return rows.Columns()
+}
+
+func TestMetricsStmtCacheCounters(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, testConfig(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	before := db.Metrics()
+	queryAll(t, db, `SELECT id, name FROM contacts`)
+	queryAll(t, db, `SELECT id, name FROM contacts`)
+	after := db.Metrics()
+	if after.StmtCacheMisses-before.StmtCacheMisses != 1 ||
+		after.StmtCacheHits-before.StmtCacheHits != 1 {
+		t.Fatalf("stmt cache delta hits=%d misses=%d, want 1/1",
+			after.StmtCacheHits-before.StmtCacheHits,
+			after.StmtCacheMisses-before.StmtCacheMisses)
+	}
+}
+
 func TestPebbleCacheSettings(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
-	// 1. Automatic default when zero: 16 MiB
+	// 1. Automatic default when zero: 256 MiB
 	cfgDefault := testConfig(filepath.Join(dir, "default"))
 	cfgDefault.withDefaults()
-	if cfgDefault.Pebble.CacheBytes != 16<<20 {
-		t.Fatalf("expected default 16MiB, got %d", cfgDefault.Pebble.CacheBytes)
+	if cfgDefault.Pebble.CacheBytes != 256<<20 {
+		t.Fatalf("expected default 256MiB, got %d", cfgDefault.Pebble.CacheBytes)
 	}
 
 	// 2. Setting via cfg.Cache.BlockCacheBytes alias
@@ -518,8 +581,77 @@ func TestPebbleCacheSettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open with custom cache failed: %v", err)
 	}
-	defer db.Close()
-
 	metrics := db.store.Metrics()
 	t.Logf("Pebble metrics with 128MiB cache setting: %+v", metrics)
+	_ = db.Close()
+}
+
+func TestQueryStoreMMapSecureLifecycle(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	cfg := testConfig(filepath.Join(dir, "mmap_node"))
+	cfg.QueryStore.Mode = QueryStoreMMap
+	cfg.withDefaults()
+
+	db, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Open with QueryStoreMMap failed: %v", err)
+	}
+
+	mmapBase := filepath.Join(cfg.Path, "query_mmap")
+	if info, err := os.Stat(mmapBase); err != nil {
+		t.Fatalf("expected query_mmap directory to exist: %v", err)
+	} else if info.Mode().Perm() != 0700 {
+		t.Fatalf("query_mmap directory permissions = %04o, want 0700", info.Mode().Perm())
+	}
+
+	// Insert row
+	id := ids.NewRowID()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "MMap Alice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Query row back
+	var name string
+	if err := db.QueryRowContext(ctx, `SELECT name FROM contacts WHERE id = ?`, id[:]).Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+	if name != "MMap Alice" {
+		t.Fatalf("read name = %q, want 'MMap Alice'", name)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Verify disposable directory is securely wiped and removed
+	entries, err := os.ReadDir(mmapBase)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("reading mmap base: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("disposable query directories still exist after DB Close: %d entries", len(entries))
+	}
+
+	// Re-open DB with QueryStoreMMap: verifies clean rebuild from encrypted Pebble store
+	db2, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatalf("re-Open with QueryStoreMMap failed: %v", err)
+	}
+	defer db2.Close()
+
+	var name2 string
+	if err := db2.QueryRowContext(ctx, `SELECT name FROM contacts WHERE id = ?`, id[:]).Scan(&name2); err != nil {
+		t.Fatalf("querying rebuilt mmap view: %v", err)
+	}
+	if name2 != "MMap Alice" {
+		t.Fatalf("rebuilt read name = %q, want 'MMap Alice'", name2)
+	}
 }

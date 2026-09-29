@@ -84,8 +84,8 @@ func (s DBState) WritesAllowed() bool { return s == StateReady }
 //
 // Membership fields describe the static mesh until SWIM discovery lands:
 // MembershipCount equals known peers (configured plus inbound-discovered)
-// and SelectedPeers equals connected sessions (every connected peer is a
-// replication target; bounded selection is pending).
+// and SelectedPeers equals the bounded selected replication targets
+// (see reconcileSelectedLocked; defaults: fanout 4).
 type Status struct {
 	State  DBState
 	NodeID NodeID
@@ -138,32 +138,36 @@ type Status struct {
 // depths, and persisted retirement/exclusion state. It never contains
 // secrets.
 type PeerDiagnostics struct {
-	NodeID             NodeID
-	Addrs              []string
-	Connected          bool
-	Dynamic            bool
-	SchemaAgreed       bool
-	SnapshotRequired   bool
-	AwaitingSnapshot   bool
-	Retired            bool
-	Excluded           bool
-	Selected           bool
-	MembershipState    string
-	RetirementDeadline time.Time
-	RTT                time.Duration
-	LastSeen           time.Time
-	LastHandshake      time.Time
-	LastSend           time.Time
-	LastRecv           time.Time
-	LastAntiEntropy    time.Time
-	RemoteSchemaEpoch  uint64
-	RemoteSchemaHash   [32]byte
-	BytesSent          uint64
-	BytesReceived      uint64
-	QueuedNeed         int
-	QueuedCtrl         int
-	QueuedSchema       int
-	Have               map[NodeID]uint64
-	Sent               map[NodeID]uint64
-	LagByOrigin        map[NodeID]uint64
+	NodeID           NodeID
+	Addrs            []string
+	Connected        bool
+	Dynamic          bool
+	SchemaAgreed     bool
+	SnapshotRequired bool
+	AwaitingSnapshot bool
+	// SnapshotChunksReceived/Total track the in-flight inbound snapshot
+	// transfer from this peer (zero when none is active).
+	SnapshotChunksReceived uint64
+	SnapshotChunksTotal    uint64
+	Retired                bool
+	Excluded               bool
+	Selected               bool
+	MembershipState        string
+	RetirementDeadline     time.Time
+	RTT                    time.Duration
+	LastSeen               time.Time
+	LastHandshake          time.Time
+	LastSend               time.Time
+	LastRecv               time.Time
+	LastAntiEntropy        time.Time
+	RemoteSchemaEpoch      uint64
+	RemoteSchemaHash       [32]byte
+	BytesSent              uint64
+	BytesReceived          uint64
+	QueuedNeed             int
+	QueuedCtrl             int
+	QueuedSchema           int
+	Have                   map[NodeID]uint64
+	Sent                   map[NodeID]uint64
+	LagByOrigin            map[NodeID]uint64
 }

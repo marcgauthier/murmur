@@ -38,6 +38,44 @@ func gcTestConfig(path string) Config {
 	return cfg
 }
 
+// TestGCDrainsPastUnitCap proves one gcOnce collects past the per-call
+// unit cap: with 6000 eligible batches and the 1000-batch minimum
+// retention (zero MinRetainedBatches defaults to 1000), a single pass
+// must collect 5000. Without the drain loop only the first 4096 collect
+// and the retained log grows without bound under any sustained workload.
+func TestGCDrainsPastUnitCap(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, gcTestConfig(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	const batches = 6000
+	for i := 0; i < batches; i++ {
+		id := NewRowID()
+		if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`,
+			id[:], fmt.Sprintf("d%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	past := time.Now().Add(-time.Hour).UnixMilli()
+	if _, err := db.store.EnsureMemberAdmitted(NewNodeID(), past, 60_000); err != nil {
+		t.Fatal(err)
+	}
+	db.gcOnce(false)
+	const want = batches - 1000 // minimum retention keeps the newest 1000
+	if got := db.metrics.gcLogCollected.Load(); got != want {
+		t.Fatalf("one gcOnce collected %d batches, want %d (drain loop)", got, want)
+	}
+	first, err := db.store.FirstRetainedSeq(db.cfg.NodeID)
+	if err != nil || first != want+1 {
+		t.Fatalf("first retained seq = %d, %v; want %d", first, err, want+1)
+	}
+	if got := queryAll(t, db, `SELECT id FROM contacts`); len(got) != batches {
+		t.Fatalf("rows after GC = %d, want %d", len(got), batches)
+	}
+}
+
 // TestGCExpiredObligationReleasesHistory proves retention deadlines gate
 // log collection: an expired member pins nothing (its history collects
 // while SQL keeps serving), and a live member without acks pins everything.

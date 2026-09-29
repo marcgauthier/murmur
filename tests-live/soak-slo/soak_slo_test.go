@@ -181,7 +181,7 @@ func waitForPeers(t *testing.T, cluster *harness.Cluster, want int, timeout time
 }
 
 func connectedPeers(apiAddr string) int {
-	resp, err := scenarioHTTP.Get("http://" + apiAddr + "/v1/status")
+	resp, err := scenarioHTTP.Get("https://" + apiAddr + "/v1/status")
 	if err != nil {
 		return -1
 	}
@@ -196,7 +196,7 @@ func connectedPeers(apiAddr string) int {
 }
 
 func serviceState(apiAddr string) (string, error) {
-	resp, err := scenarioHTTP.Get("http://" + apiAddr + "/v1/status")
+	resp, err := scenarioHTTP.Get("https://" + apiAddr + "/v1/status")
 	if err != nil {
 		return "", err
 	}
@@ -209,7 +209,7 @@ func serviceState(apiAddr string) (string, error) {
 }
 
 func scrapeMetrics(apiAddr string) (string, error) {
-	resp, err := scenarioHTTP.Get("http://" + apiAddr + "/metrics")
+	resp, err := scenarioHTTP.Get("https://" + apiAddr + "/metrics")
 	if err != nil {
 		return "", err
 	}

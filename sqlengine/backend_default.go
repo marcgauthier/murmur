@@ -1,10 +1,7 @@
-//go:build !lumosql
+//go:build !modernc
 
 package sqlengine
 
-import _ "modernc.org/sqlite"
+import _ "github.com/mattn/go-sqlite3"
 
-const (
-	sqlDriverName         = "sqlite"
-	backendConcurrentMVCC = false
-)
+const sqlDriverName = "sqlite3"

@@ -169,13 +169,23 @@ type ManagerConfig struct {
 	SnapshotChunkCells      int
 	MaxSnapshotBytes        uint64
 	SnapshotTransferTimeout time.Duration
-	Fanout                  int
-	PeerRotationInterval    time.Duration
-	AntiEntropyInterval     time.Duration
-	MaxConcurrentRepairs    int
-	MaxReplicationSessions  int
-	MaxQUICConnections      int
-	Pool                    *transport.Pool
+	// SnapshotRequestTimeout bounds how long a receiver waits for
+	// snapshot progress (manifest or chunks) before the stall watchdog
+	// re-requests. Default 30s.
+	SnapshotRequestTimeout time.Duration
+	// AdvertiseProtocolVersion/MinProtocolVersion override the
+	// handshake's advertised versions when nonzero, for
+	// interoperability testing (peers must refuse unknown versions).
+	// Zero selects the protocol constants. Never set in production.
+	AdvertiseProtocolVersion    uint16
+	AdvertiseMinProtocolVersion uint16
+	Fanout                      int
+	PeerRotationInterval        time.Duration
+	AntiEntropyInterval         time.Duration
+	MaxConcurrentRepairs        int
+	MaxReplicationSessions      int
+	MaxQUICConnections          int
+	Pool                        *transport.Pool
 	// EnablePlumtree advertises the optional eager/lazy dissemination mode.
 	// Anti-entropy and durable Need repair remain active in either mode.
 	EnablePlumtree bool
@@ -215,6 +225,9 @@ func (c *ManagerConfig) withDefaults() {
 	}
 	if c.SnapshotTransferTimeout == 0 {
 		c.SnapshotTransferTimeout = 10 * time.Minute
+	}
+	if c.SnapshotRequestTimeout == 0 {
+		c.SnapshotRequestTimeout = 30 * time.Second
 	}
 	if c.Fanout == 0 {
 		c.Fanout = 4
@@ -275,6 +288,10 @@ type PeerStatus struct {
 	// we are still waiting for.
 	SnapshotRequired bool
 	AwaitingSnapshot bool
+	// SnapshotChunksReceived/Total track the in-flight inbound transfer
+	// from this peer (zero when none is active).
+	SnapshotChunksReceived uint64
+	SnapshotChunksTotal    uint64
 	// BytesSent/BytesReceived count session frame bytes (payload plus
 	// frame header) in both directions.
 	BytesSent     uint64
@@ -469,10 +486,14 @@ func (e *sendError) Unwrap() error { return e.err }
 
 // peerState tracks one peer (configured or dynamic inbound).
 type peerState struct {
-	mu                sync.Mutex
-	id                ids.NodeID
-	addrs             []string
-	dynamic           bool
+	mu      sync.Mutex
+	id      ids.NodeID
+	addrs   []string
+	dynamic bool
+	// stopped marks a peerState detached by RemovePeer/OnPeerLeft. Its
+	// dialLoop must exit promptly so a later re-add does not run two
+	// dialers for the same ID and flap sessions after heal.
+	stopped           atomic.Bool
 	selected          bool
 	dialFailures      int
 	lastAntiEntropy   time.Time
@@ -490,8 +511,15 @@ type peerState struct {
 	sentErr           map[ids.NodeID]bool   // snapshot-required already signalled
 	caps              uint64
 	awaiting          bool // we requested a snapshot and wait for it
-	forceAck          bool // ForceSync requested an immediate ack+pull
-	wake              chan struct{}
+	// awaitingSince marks when the current wait began; lastSnapProgress
+	// marks the last snapshot manifest/chunk received. The stall watchdog
+	// re-requests when progress stalls past SnapshotRequestTimeout.
+	// snapRetryAfter is a source-requested backoff after a busy deferral.
+	awaitingSince    time.Time
+	lastSnapProgress time.Time
+	snapRetryAfter   time.Time
+	forceAck         bool // ForceSync requested an immediate ack+pull
+	wake             chan struct{}
 
 	pingNonce uint64
 	pingAt    time.Time
@@ -675,6 +703,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 			TimeCreated: cfg.SchemaTime,
 		},
 	}
+	m.ctx, m.cancel = context.WithCancel(context.Background())
 	if cfg.EnablePlumtree {
 		fanout := cfg.Fanout
 		if fanout < 2 {
@@ -767,7 +796,11 @@ func (m *Manager) Close() error {
 	m.running.Store(false)
 	m.mu.Lock()
 	cancel := m.cancel
+	mem := m.membership
 	m.mu.Unlock()
+	if mem != nil {
+		_ = mem.Shutdown()
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -910,6 +943,11 @@ func (m *Manager) RemovePeer(id ids.NodeID) {
 	m.reconcileSelectedLocked()
 	m.mu.Unlock()
 	if ok {
+		// Stop the detached dialLoop before closing the session: a
+		// later AddPeer creates a fresh peerState and dialer, and the
+		// stale loop must not dial or attach sessions for this ID.
+		p.stopped.Store(true)
+		p.pokeWake()
 		p.mu.Lock()
 		p.selected = false
 		if p.session != nil {
@@ -1116,6 +1154,15 @@ func (m *Manager) runPeriodicAntiEntropy() {
 		m.mu.Unlock()
 		return
 	}
+	// Stalled snapshot waits outrank routine anti-entropy: re-request
+	// before picking a sync target.
+	m.mu.Unlock()
+	m.retryStalledSnapshots()
+	m.mu.Lock()
+	if m.closed || m.ctx.Err() != nil {
+		m.mu.Unlock()
+		return
+	}
 	var candidates []ids.NodeID
 	var fallback []ids.NodeID
 	for id, p := range m.peers {
@@ -1147,6 +1194,47 @@ func (m *Manager) runPeriodicAntiEntropy() {
 
 	if targetP != nil {
 		m.performAntiEntropy(targetP)
+	}
+}
+
+// retryStalledSnapshots re-requests snapshots that made no progress
+// (manifest or chunks) within SnapshotRequestTimeout. The original request
+// may have been lost, deferred while the source was busy, or abandoned
+// when the source failed mid-transfer — all previously stalled the
+// receiver's one-shot wait forever. Transfers that keep moving are never
+// disturbed, and source-requested busy backoff is honored.
+func (m *Manager) retryStalledSnapshots() {
+	if m.ctx.Err() != nil {
+		return
+	}
+	now := time.Now()
+	m.mu.Lock()
+	peers := make([]*peerState, 0, len(m.peers))
+	for id, p := range m.peers {
+		if id == m.cfg.Local || m.excluded[id] {
+			continue
+		}
+		peers = append(peers, p)
+	}
+	timeout := m.cfg.SnapshotRequestTimeout
+	m.mu.Unlock()
+	for _, p := range peers {
+		p.mu.Lock()
+		sess := p.session
+		stalled := p.awaiting && sess != nil && !p.lastSnapProgress.IsZero() &&
+			now.Sub(p.lastSnapProgress) >= timeout &&
+			!now.Before(p.snapRetryAfter)
+		if stalled {
+			p.lastSnapProgress = now
+		}
+		p.mu.Unlock()
+		if !stalled || sess.isClosed() {
+			continue
+		}
+		m.log.Info("snapshot stalled; re-requesting", slog.String("peer", p.id.String()))
+		m.queueCtrl(p, MsgSnapshotRequest, 0, nil)
+		m.st.snapshotRequestsSent.Add(1)
+		m.st.snapshotReRequested.Add(1)
 	}
 }
 
@@ -1257,6 +1345,10 @@ func (m *Manager) OnPeerLeft(nodeID ids.NodeID) {
 	m.reconcileSelectedLocked()
 	m.mu.Unlock()
 	if ok {
+		// Same dialLoop lifecycle as RemovePeer: the detached state
+		// must stop dialing so a later re-add owns the only dialer.
+		p.stopped.Store(true)
+		p.pokeWake()
 		p.mu.Lock()
 		p.selected = false
 		ps := p.session
@@ -1299,30 +1391,39 @@ func (m *Manager) PeerStatus() []PeerStatus {
 	out := make([]PeerStatus, 0, len(m.peers))
 	for _, p := range m.peers {
 		p.mu.Lock()
+		var snapRecv, snapTotal uint64
+		if p.snapRecv != nil {
+			snapRecv = p.snapRecv.chunksReceived
+			if p.snapRecv.manifest != nil {
+				snapTotal = p.snapRecv.manifest.ChunkCount
+			}
+		}
 		st := PeerStatus{
-			NodeID:            p.id,
-			Addrs:             append([]string(nil), p.addrs...),
-			Connected:         p.session != nil,
-			Dynamic:           p.dynamic,
-			Selected:          p.selected,
-			LastSeen:          p.lastSeen,
-			RTT:               p.rtt,
-			Have:              copyMap(p.have),
-			Sent:              copyMap(p.sent),
-			LastHandshake:     p.lastHandshake,
-			LastSend:          p.lastSend,
-			LastRecv:          p.lastRecv,
-			LastAntiEntropy:   p.lastAntiEntropy,
-			SchemaAgreed:      p.agreed,
-			RemoteSchemaEpoch: p.remote.Epoch,
-			RemoteSchemaHash:  p.remote.Hash,
-			SnapshotRequired:  len(p.sentErr) > 0,
-			AwaitingSnapshot:  p.awaiting,
-			BytesSent:         p.bytesSent,
-			BytesReceived:     p.bytesReceived,
-			QueuedNeed:        len(p.needCh),
-			QueuedCtrl:        len(p.ctrlCh) + len(p.retryCh),
-			QueuedSchema:      len(p.schemaReqCh) + len(p.schemaRespCh),
+			NodeID:                 p.id,
+			Addrs:                  append([]string(nil), p.addrs...),
+			Connected:              p.session != nil,
+			Dynamic:                p.dynamic,
+			Selected:               p.selected,
+			LastSeen:               p.lastSeen,
+			RTT:                    p.rtt,
+			Have:                   copyMap(p.have),
+			Sent:                   copyMap(p.sent),
+			LastHandshake:          p.lastHandshake,
+			LastSend:               p.lastSend,
+			LastRecv:               p.lastRecv,
+			LastAntiEntropy:        p.lastAntiEntropy,
+			SchemaAgreed:           p.agreed,
+			RemoteSchemaEpoch:      p.remote.Epoch,
+			RemoteSchemaHash:       p.remote.Hash,
+			SnapshotRequired:       len(p.sentErr) > 0,
+			AwaitingSnapshot:       p.awaiting,
+			SnapshotChunksReceived: snapRecv,
+			SnapshotChunksTotal:    snapTotal,
+			BytesSent:              p.bytesSent,
+			BytesReceived:          p.bytesReceived,
+			QueuedNeed:             len(p.needCh),
+			QueuedCtrl:             len(p.ctrlCh) + len(p.retryCh),
+			QueuedSchema:           len(p.schemaReqCh) + len(p.schemaRespCh),
 		}
 		p.mu.Unlock()
 		out = append(out, st)
@@ -1404,9 +1505,10 @@ func (m *Manager) ourHello() (*Hello, error) {
 	if m.cfg.EnablePlumtree {
 		caps |= CapPlumtree | CapRequiredMask
 	}
+	ver, minVer := m.effectiveVersions()
 	return &Hello{
-		ProtocolVersion:     ProtocolVersion,
-		MinProtocolVersion:  MinProtocolVersion,
+		ProtocolVersion:     ver,
+		MinProtocolVersion:  minVer,
 		NodeID:              m.cfg.Local,
 		DBID:                m.cfg.DBID,
 		SchemaEpoch:         id.Epoch,
@@ -1419,6 +1521,21 @@ func (m *Manager) ourHello() (*Hello, error) {
 	}, nil
 }
 
+// effectiveVersions returns the protocol versions this node speaks: the
+// Advertise overrides when nonzero (interoperability testing only),
+// otherwise the compiled constants. Advertisement and enforcement share
+// this so a node never accepts a peer its own hello would refuse.
+func (m *Manager) effectiveVersions() (ver, minVer uint16) {
+	ver, minVer = ProtocolVersion, MinProtocolVersion
+	if m.cfg.AdvertiseProtocolVersion != 0 {
+		ver = m.cfg.AdvertiseProtocolVersion
+	}
+	if m.cfg.AdvertiseMinProtocolVersion != 0 {
+		minVer = m.cfg.AdvertiseMinProtocolVersion
+	}
+	return ver, minVer
+}
+
 // validateIdentity checks the fatal handshake fields: node, database, and
 // protocol overlap. Schema agreement is handled separately so mismatched
 // peers can synchronize instead of always refusing.
@@ -1429,7 +1546,8 @@ func (m *Manager) validateIdentity(h *Hello, sessPeer ids.NodeID) error {
 	if h.DBID != m.cfg.DBID {
 		return fmt.Errorf("db id mismatch")
 	}
-	if h.ProtocolVersion < MinProtocolVersion || h.MinProtocolVersion > ProtocolVersion {
+	ver, minVer := m.effectiveVersions()
+	if h.ProtocolVersion < minVer || h.MinProtocolVersion > ver {
 		return fmt.Errorf("protocol %d (min %d) incompatible", h.ProtocolVersion, h.MinProtocolVersion)
 	}
 	return nil
@@ -1537,6 +1655,9 @@ func (m *Manager) attach(p *peerState, ps *peerSession, h *Hello) {
 	m.wg.Add(2)
 	go m.readControlLoop(p, ps)
 	go m.streamAcceptLoop(p, ps)
+	if m.membership != nil && m.membership.Transport() != nil {
+		m.membership.Transport().RegisterSession(ps.sess)
+	}
 	if !agreed {
 		// Schema mismatch accepted for synchronization: request the
 		// peer's manifest once attached; data stays gated until agreed.
@@ -1620,7 +1741,23 @@ func (m *Manager) serveInbound(sess *transport.Session) {
 		return
 	}
 	frame, err := ReadFrame(stream)
-	if err != nil || frame.Type != MsgHello {
+	if err != nil {
+		var memErr *ErrMembershipStream
+		if errors.As(err, &memErr) {
+			if m.membership != nil && m.membership.Transport() != nil {
+				m.membership.Transport().HandleStream(sess, stream, memErr.Prefix)
+				return
+			}
+		}
+		m.st.handshakeFailures.Add(1)
+		_ = stream.Close()
+		_ = sess.Close()
+		if m.pool != nil {
+			m.pool.Release(sess.Peer, transport.PurposeInboundReplication)
+		}
+		return
+	}
+	if frame.Type != MsgHello {
 		m.st.handshakeFailures.Add(1)
 		_ = stream.Close()
 		_ = sess.Close()
@@ -1744,6 +1881,9 @@ func (m *Manager) peerFor(id ids.NodeID, addrs []string, dynamic bool) *peerStat
 
 func (m *Manager) dialLoop(p *peerState) {
 	defer m.wg.Done()
+	if p.stopped.Load() {
+		return
+	}
 	// Immediate first attempt if selected.
 	if m.isPeerSelected(p.id) {
 		m.tryDial(p)
@@ -1751,6 +1891,9 @@ func (m *Manager) dialLoop(p *peerState) {
 	t := time.NewTicker(m.cfg.DialInterval)
 	defer t.Stop()
 	for {
+		if p.stopped.Load() {
+			return
+		}
 		select {
 		case <-m.ctx.Done():
 			return
@@ -1928,6 +2071,12 @@ func (m *Manager) handleIncomingStream(p *peerState, ps *peerSession, stream *qu
 	defer stream.Close()
 	frame, err := ReadFrame(stream)
 	if err != nil {
+		var memErr *ErrMembershipStream
+		if errors.As(err, &memErr) {
+			if m.membership != nil && m.membership.Transport() != nil {
+				m.membership.Transport().HandleStream(ps.sess, stream, memErr.Prefix)
+			}
+		}
 		return
 	}
 	switch frame.Type {
@@ -2720,15 +2869,19 @@ func (m *Manager) onError(p *peerState, ps *peerSession, payload []byte) {
 		}
 	case ErrSnapshotRequired:
 		m.st.snapshotRequiredReceived.Add(1)
-		p.mu.Lock()
-		already := p.awaiting
-		p.awaiting = true
-		p.mu.Unlock()
-		if !already {
+		if !m.markSnapshotRequested(p) {
 			m.log.Info("peer requires snapshot", slog.String("peer", p.id.String()))
 			m.queueCtrl(p, MsgSnapshotRequest, 0, nil)
 			m.st.snapshotRequestsSent.Add(1)
 		}
+	case ErrSnapshotBusy:
+		// The source is already sending us a snapshot; back the stall
+		// watchdog off briefly instead of piling on requests.
+		m.st.snapshotBusyReceived.Add(1)
+		p.mu.Lock()
+		p.snapRetryAfter = time.Now().Add(5 * time.Second)
+		p.mu.Unlock()
+		m.log.Info("snapshot source busy; backing off", slog.String("peer", p.id.String()))
 	case ErrSchemaMismatch:
 		// Mid-session incompatibility: gate data and idle until either
 		// side migrates (migration recycles sessions and re-drives
@@ -2771,11 +2924,7 @@ func (m *Manager) onError(p *peerState, ps *peerSession, payload []byte) {
 					}
 				}
 				if len(missing) > 0 && m.requestChunkSources(p, repair, missing) == 0 {
-					p.mu.Lock()
-					already := p.awaiting
-					p.awaiting = true
-					p.mu.Unlock()
-					if !already {
+					if !m.markSnapshotRequested(p) {
 						m.queueCtrl(p, MsgSnapshotRequest, 0, nil)
 					}
 				}
@@ -3178,9 +3327,39 @@ func (m *Manager) sendAckAndPull(p *peerState) error {
 
 var errSnapshotInFlight = errors.New("snapshot already in flight")
 
+// markSnapshotRequested records a fresh snapshot wait and reports whether
+// one was already outstanding. Repeat requests never extend the stall
+// deadline. Callers must not hold p.mu.
+func (m *Manager) markSnapshotRequested(p *peerState) (already bool) {
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.awaiting {
+		return true
+	}
+	p.awaiting = true
+	p.awaitingSince = now
+	p.lastSnapProgress = now
+	return false
+}
+
+// markSnapshotProgress records received snapshot traffic so the stall
+// watchdog does not re-request a transfer that is moving. Callers must
+// not hold p.mu.
+func (m *Manager) markSnapshotProgress(p *peerState) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastSnapProgress = time.Now()
+}
+
 func (m *Manager) sendSnapshot(p *peerState, ps *peerSession) {
 	if !p.snapSend.CompareAndSwap(false, true) {
-		return // one outbound snapshot per peer at a time
+		// One outbound snapshot per peer at a time. Tell the requester
+		// to back off instead of dropping the request silently: a silent
+		// drop used to stall the receiver's one-shot wait forever.
+		m.st.snapshotsBusyDeferred.Add(1)
+		m.queueCtrl(p, MsgError, 0, EncodeError(nil, ErrSnapshotBusy, "snapshot already in flight"))
+		return
 	}
 	defer p.snapSend.Store(false)
 	ctx, cancel := context.WithTimeout(m.ctx, m.cfg.SnapshotTransferTimeout)
@@ -3259,7 +3438,8 @@ func (m *Manager) snapRecvFor(p *peerState) *snapRecvState {
 }
 
 type snapRecvState struct {
-	manifest *codec.SnapshotManifest
+	manifest       *codec.SnapshotManifest
+	chunksReceived uint64
 }
 
 func (m *Manager) onSnapshotManifest(p *peerState, _ *peerSession, payload []byte) error {
@@ -3284,6 +3464,8 @@ func (m *Manager) onSnapshotManifest(p *peerState, _ *peerSession, payload []byt
 	}
 	st := m.snapRecvFor(p)
 	st.manifest = manifest
+	st.chunksReceived = 0
+	m.markSnapshotProgress(p)
 	return nil
 }
 
@@ -3324,8 +3506,11 @@ func (m *Manager) onSnapshotChunk(p *peerState, _ *peerSession, f *Frame) error 
 	if aerr != nil {
 		return aerr
 	}
+	st.chunksReceived++
+	m.markSnapshotProgress(p)
 	if complete {
 		st.manifest = nil
+		st.chunksReceived = 0
 		m.st.snapshotsReceived.Add(1)
 		p.mu.Lock()
 		p.awaiting = false

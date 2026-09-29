@@ -36,13 +36,13 @@ const DefaultAlgorithm = AlgorithmAES256GCM
 
 // canonical names, also used by Config.SetEncryptionAlgorithm / status.
 var algorithmNames = map[AlgorithmID]string{
-	AlgorithmAES128GCM:        "AES-128-GCM",
-	AlgorithmAES192GCM:        "AES-192-GCM",
-	AlgorithmAES256GCM:        "AES-256-GCM",
-	AlgorithmChaCha20Poly1305: "ChaCha20-Poly1305",
+	AlgorithmAES128GCM:         "AES-128-GCM",
+	AlgorithmAES192GCM:         "AES-192-GCM",
+	AlgorithmAES256GCM:         "AES-256-GCM",
+	AlgorithmChaCha20Poly1305:  "ChaCha20-Poly1305",
 	AlgorithmXChaCha20Poly1305: "XChaCha20-Poly1305",
-	AlgorithmAEGIS128L:        "AEGIS-128L",
-	AlgorithmAEGIS256:         "AEGIS-256",
+	AlgorithmAEGIS128L:         "AEGIS-128L",
+	AlgorithmAEGIS256:          "AEGIS-256",
 }
 
 // String returns the canonical algorithm name.

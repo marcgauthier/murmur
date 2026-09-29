@@ -58,7 +58,7 @@ func newLowCluster(t *testing.T, name, staging string, keys liveKeys, tables []s
 		Schema:   liveSchemaConfig(tables),
 		Bridge: &harness.BridgeOptions{
 			Role: "low-exporter", Stream: liveStream, NodeIndex: 0,
-			StagingDir: staging,
+			StagingDir:    staging,
 			SignerKeyFile: keys.files.SignerKeyFile, RecipientPubFile: keys.files.RecipientPubFile,
 		},
 	})
@@ -72,7 +72,7 @@ func newHighCluster(t *testing.T, name, staging string, keys liveKeys, tables []
 		Schema:   liveSchemaConfig(tables),
 		Bridge: &harness.BridgeOptions{
 			Role: "high-importer", Stream: liveStream, NodeIndices: indices,
-			StagingDir: staging,
+			StagingDir:       staging,
 			RecipientKeyFile: keys.files.RecipientKeyFile, SignerPubFile: keys.files.SignerPubFile,
 		},
 	})
@@ -340,7 +340,7 @@ func TestHighLowForgeriesRejectedLive(t *testing.T) {
 		Schema:   liveSchemaConfig(liveContactsSchema()),
 		Bridge: &harness.BridgeOptions{
 			Role: "low-exporter", Stream: liveStream, NodeIndex: 0,
-			StagingDir: otherStaging,
+			StagingDir:    otherStaging,
 			SignerKeyFile: keys.files.SignerKeyFile, RecipientPubFile: otherKeys.files.RecipientPubFile,
 		},
 	})

@@ -103,9 +103,7 @@ func (m *Manager) onProgressPage(p *peerState, payload []byte) error {
 			}
 		}
 		m.mu.Unlock()
-		best.mu.Lock()
-		best.awaiting = true
-		best.mu.Unlock()
+		m.markSnapshotRequested(best)
 		m.queueCtrl(best, MsgSnapshotRequest, 0, nil)
 	}
 	if page.More && len(page.Items) != 0 {

@@ -83,7 +83,7 @@ func (c *Cluster) UploadFile(idx int, name string, data []byte) (FileStatus, err
 		"name":        name,
 		"data_base64": base64.StdEncoding.EncodeToString(data),
 	})
-	resp, err := http.Post(fmt.Sprintf("http://%s/v1/files/upload", node.APIAddr), "application/json", bytes.NewReader(payload))
+	resp, err := http.Post(fmt.Sprintf("https://%s/v1/files/upload", node.APIAddr), "application/json", bytes.NewReader(payload))
 	if err != nil {
 		return st, err
 	}
@@ -101,7 +101,7 @@ func (c *Cluster) UploadFile(idx int, name string, data []byte) (FileStatus, err
 // DownloadFile fetches verified file bytes from one node.
 func (c *Cluster) DownloadFile(idx int, name string) ([]byte, error) {
 	node := c.Nodes[idx]
-	resp, err := http.Get(fmt.Sprintf("http://%s/v1/files/download?name=%s", node.APIAddr, name))
+	resp, err := http.Get(fmt.Sprintf("https://%s/v1/files/download?name=%s", node.APIAddr, name))
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +117,7 @@ func (c *Cluster) DownloadFile(idx int, name string) ([]byte, error) {
 func (c *Cluster) StatFile(idx int, name string) (FileStatus, error) {
 	var st FileStatus
 	node := c.Nodes[idx]
-	resp, err := http.Get(fmt.Sprintf("http://%s/v1/files/status?name=%s", node.APIAddr, name))
+	resp, err := http.Get(fmt.Sprintf("https://%s/v1/files/status?name=%s", node.APIAddr, name))
 	if err != nil {
 		return st, err
 	}
@@ -135,7 +135,7 @@ func (c *Cluster) StatFile(idx int, name string) (FileStatus, error) {
 // SearchFiles lists files by prefix or substring.
 func (c *Cluster) SearchFiles(idx int, prefix, substr string) ([]FileStatus, error) {
 	node := c.Nodes[idx]
-	url := fmt.Sprintf("http://%s/v1/files/search?prefix=%s&substr=%s", node.APIAddr, prefix, substr)
+	url := fmt.Sprintf("https://%s/v1/files/search?prefix=%s&substr=%s", node.APIAddr, prefix, substr)
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, err
@@ -157,7 +157,7 @@ func (c *Cluster) SearchFiles(idx int, prefix, substr string) ([]FileStatus, err
 // DeleteFile replicates a file tombstone from one node.
 func (c *Cluster) DeleteFile(idx int, name string) error {
 	node := c.Nodes[idx]
-	req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("http://%s/v1/files/delete?name=%s", node.APIAddr, name), nil)
+	req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("https://%s/v1/files/delete?name=%s", node.APIAddr, name), nil)
 	if err != nil {
 		return err
 	}
@@ -178,7 +178,7 @@ func (c *Cluster) FetchFile(idx int, name string) (FileStatus, error) {
 	var st FileStatus
 	node := c.Nodes[idx]
 	payload, _ := json.Marshal(map[string]string{"name": name})
-	resp, err := http.Post(fmt.Sprintf("http://%s/v1/files/fetch", node.APIAddr), "application/json", bytes.NewReader(payload))
+	resp, err := http.Post(fmt.Sprintf("https://%s/v1/files/fetch", node.APIAddr), "application/json", bytes.NewReader(payload))
 	if err != nil {
 		return st, err
 	}
@@ -207,7 +207,7 @@ type FetchStats struct {
 func (c *Cluster) FetchStats(idx int) (FetchStats, error) {
 	var st FetchStats
 	node := c.Nodes[idx]
-	resp, err := http.Get(fmt.Sprintf("http://%s/v1/files/fetch-stats", node.APIAddr))
+	resp, err := http.Get(fmt.Sprintf("https://%s/v1/files/fetch-stats", node.APIAddr))
 	if err != nil {
 		return st, err
 	}
@@ -257,7 +257,7 @@ func (c *Cluster) WaitFileDeleted(idx int, name string, timeout time.Duration) e
 // BridgeExport captures and publishes pending Low bundles plus file chunks.
 func (c *Cluster) BridgeExport(idx int) (map[string]any, error) {
 	node := c.Nodes[idx]
-	resp, err := http.Post(fmt.Sprintf("http://%s/v1/admin/bridge/export", node.APIAddr), "application/json", bytes.NewReader([]byte("{}")))
+	resp, err := http.Post(fmt.Sprintf("https://%s/v1/admin/bridge/export", node.APIAddr), "application/json", bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return nil, err
 	}
@@ -276,7 +276,7 @@ func (c *Cluster) BridgeExport(idx int) (map[string]any, error) {
 // BridgeImport receives staged artifacts and drains them into High.
 func (c *Cluster) BridgeImport(idx int) (map[string]any, error) {
 	node := c.Nodes[idx]
-	resp, err := http.Post(fmt.Sprintf("http://%s/v1/admin/bridge/import", node.APIAddr), "application/json", bytes.NewReader([]byte("{}")))
+	resp, err := http.Post(fmt.Sprintf("https://%s/v1/admin/bridge/import", node.APIAddr), "application/json", bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return nil, err
 	}
@@ -301,7 +301,7 @@ type BridgeExportOptions struct {
 func (c *Cluster) BridgeExportWithOptions(idx int, opts BridgeExportOptions) (map[string]any, error) {
 	node := c.Nodes[idx]
 	payload, _ := json.Marshal(map[string]any{"capture_only": opts.CaptureOnly})
-	resp, err := http.Post(fmt.Sprintf("http://%s/v1/admin/bridge/export", node.APIAddr), "application/json", bytes.NewReader(payload))
+	resp, err := http.Post(fmt.Sprintf("https://%s/v1/admin/bridge/export", node.APIAddr), "application/json", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -320,7 +320,7 @@ func (c *Cluster) BridgeExportWithOptions(idx int, opts BridgeExportOptions) (ma
 // BridgeStatus returns the bridge outbox/inbox progress snapshot.
 func (c *Cluster) BridgeStatus(idx int) (map[string]any, error) {
 	node := c.Nodes[idx]
-	resp, err := http.Get(fmt.Sprintf("http://%s/v1/admin/bridge/status", node.APIAddr))
+	resp, err := http.Get(fmt.Sprintf("https://%s/v1/admin/bridge/status", node.APIAddr))
 	if err != nil {
 		return nil, err
 	}
@@ -339,7 +339,7 @@ func (c *Cluster) BridgeStatus(idx int) (map[string]any, error) {
 // Provenance returns field ownership (present, owner "low"/"high").
 func (c *Cluster) Provenance(idx int, table, rowHex, column string) (bool, string, error) {
 	node := c.Nodes[idx]
-	url := fmt.Sprintf("http://%s/v1/admin/bridge/provenance?table=%s&row=%s&column=%s", node.APIAddr, table, rowHex, column)
+	url := fmt.Sprintf("https://%s/v1/admin/bridge/provenance?table=%s&row=%s&column=%s", node.APIAddr, table, rowHex, column)
 	resp, err := http.Get(url)
 	if err != nil {
 		return false, "", err
@@ -363,7 +363,7 @@ func (c *Cluster) Provenance(idx int, table, rowHex, column string) (bool, strin
 func (c *Cluster) ReleaseOwnership(idx int, table, rowHex, column string) error {
 	node := c.Nodes[idx]
 	payload, _ := json.Marshal(map[string]string{"table": table, "column": column, "row_hex": rowHex})
-	resp, err := http.Post(fmt.Sprintf("http://%s/v1/admin/bridge/release", node.APIAddr), "application/json", bytes.NewReader(payload))
+	resp, err := http.Post(fmt.Sprintf("https://%s/v1/admin/bridge/release", node.APIAddr), "application/json", bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -379,7 +379,7 @@ func (c *Cluster) ReleaseOwnership(idx int, table, rowHex, column string) error 
 func (c *Cluster) Migrate(idx int, tables any) error {
 	node := c.Nodes[idx]
 	payload, _ := json.Marshal(map[string]any{"tables": tables})
-	resp, err := http.Post(fmt.Sprintf("http://%s/v1/admin/migrate", node.APIAddr), "application/json", bytes.NewReader(payload))
+	resp, err := http.Post(fmt.Sprintf("https://%s/v1/admin/migrate", node.APIAddr), "application/json", bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -395,7 +395,7 @@ func (c *Cluster) Migrate(idx int, tables any) error {
 func (c *Cluster) RotateKey(idx int, keyID, keyHex, algorithm string) error {
 	node := c.Nodes[idx]
 	payload, _ := json.Marshal(map[string]string{"key_id": keyID, "key_hex": keyHex, "algorithm": algorithm})
-	resp, err := http.Post(fmt.Sprintf("http://%s/v1/admin/rotate-key", node.APIAddr), "application/json", bytes.NewReader(payload))
+	resp, err := http.Post(fmt.Sprintf("https://%s/v1/admin/rotate-key", node.APIAddr), "application/json", bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -410,7 +410,7 @@ func (c *Cluster) RotateKey(idx int, keyID, keyHex, algorithm string) error {
 // EncryptionStatus returns the node's encryption status snapshot.
 func (c *Cluster) EncryptionStatus(idx int) (map[string]any, error) {
 	node := c.Nodes[idx]
-	resp, err := http.Get(fmt.Sprintf("http://%s/v1/admin/encryption-status", node.APIAddr))
+	resp, err := http.Get(fmt.Sprintf("https://%s/v1/admin/encryption-status", node.APIAddr))
 	if err != nil {
 		return nil, err
 	}

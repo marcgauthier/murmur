@@ -31,7 +31,7 @@ type mockDB struct {
 	schemaVer   uint64
 	schemaHash  string
 
-	pinnedPaths []string
+	pinnedPaths  []string
 	checkpointed bool
 }
 
@@ -76,9 +76,9 @@ func (m *mockDB) Unpin(_ context.Context, path string) error {
 	return nil
 }
 
-func (m *mockDB) KeysDir() string      { return m.keysDir }
-func (m *mockDB) ClusterID() string    { return m.dbID }
-func (m *mockDB) LocalNodeID() string  { return m.nodeID }
+func (m *mockDB) KeysDir() string     { return m.keysDir }
+func (m *mockDB) ClusterID() string   { return m.dbID }
+func (m *mockDB) LocalNodeID() string { return m.nodeID }
 func (m *mockDB) SchemaInfo() (uint64, uint64, string) {
 	return m.schemaEpoch, m.schemaVer, m.schemaHash
 }

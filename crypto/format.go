@@ -46,6 +46,7 @@ import (
 //	| sealed
 //
 // Checkpoint payload: entryCount u32 + entries of
+//
 //	chunkIndex u64 | newestSeq u64 | chunkLen u32 | baseSeq u64
 //
 // committedEnd bounds the committed record region (bytes past it are an
@@ -474,4 +475,3 @@ type extent struct {
 
 // recordSizes bounds record parsing.
 const maxSealedRecordLen = ChunkSize + 64
-

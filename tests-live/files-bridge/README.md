@@ -3,7 +3,7 @@
 Run with `go test -count=1 ./tests-live/files-bridge`. Four `spedsql`
 daemon processes (two Low mesh peers, two High mesh peers) run in discrete
 `node1`/`node2` directories per domain; the test drives them only through
-their HTTP APIs, replicating how the application works.
+their HTTPS APIs with client certificates, replicating how the application works.
 
 Flow:
 

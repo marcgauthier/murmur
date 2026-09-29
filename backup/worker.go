@@ -33,10 +33,10 @@ type Worker struct {
 	src SourceDB
 	log Logger
 
-	mu       sync.Mutex
-	running  bool
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
+	mu      sync.Mutex
+	running bool
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
 
 	lastBackup time.Time
 	lastErr    error

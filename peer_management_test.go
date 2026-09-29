@@ -10,7 +10,6 @@ import (
 	"github.com/nomadsql/replicateddb/state"
 )
 
-
 func TestStateStorePeerExclusion(t *testing.T) {
 	dir := t.TempDir()
 	store, err := state.Open(dir, ids.NewNodeID(), ids.NewDBID(), state.Options{})
@@ -18,7 +17,6 @@ func TestStateStorePeerExclusion(t *testing.T) {
 		t.Fatalf("state.Open: %v", err)
 	}
 	defer store.Close()
-
 
 	n1 := ids.NewNodeID()
 	n2 := ids.NewNodeID()
@@ -217,7 +215,6 @@ func TestPeerManagementValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = db2.Close()
-
 
 	otherNode := NewNodeID()
 	if err := db2.AddPeer(ctx, Peer{NodeID: otherNode}); !errors.Is(err, ErrClosed) {

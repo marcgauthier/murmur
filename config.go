@@ -2,40 +2,41 @@ package replicateddb
 
 import (
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/nomadsql/replicateddb/backup"
+	"github.com/nomadsql/replicateddb/replication"
 	"github.com/nomadsql/replicateddb/schema"
 	"github.com/nomadsql/replicateddb/transport"
 )
 
-// QueryStoreMode selects how the SQL materialization is stored.
+// QueryStoreMode selects between in-memory and disposable file-backed SQL materialization.
 type QueryStoreMode int
 
 const (
-	// QueryStoreMemory keeps the query database memory-resident (pure-Go fallback).
+	// QueryStoreMemory uses an in-memory SQL database (default). Zero disk footprint.
 	QueryStoreMemory QueryStoreMode = iota
-	// QueryStoreMMap uses a disposable file-backed SQLite materialization with mmap.
-	// It is rebuilt from Pebble and removed when the DB closes.
+	// QueryStoreMMap uses a secure, disposable file-backed SQLite database with mmap enabled.
 	QueryStoreMMap
 )
 
 // QueryStoreConfig configures the SQL materialization.
 type QueryStoreConfig struct {
+	// Mode selects in-memory or disposable file-backed storage (default QueryStoreMemory).
 	Mode QueryStoreMode
+	// TempDir sets the parent directory for disposable mmap storage.
+	// When empty, defaults to filepath.Join(Path, "query_mmap").
+	TempDir string
+	// MMapBytes configures the mmap size for QueryStoreMMap (default 256 MiB).
+	MMapBytes int64
 	// RemoteApplyInterval batches durable remote changes into one SQLite
 	// transaction. Zero selects one second. A negative value is invalid.
 	RemoteApplyInterval time.Duration
 	// RemoteApplyMaxTransactions flushes when this many received transactions
 	// are queued, even before RemoteApplyInterval. Zero selects 1,000.
 	RemoteApplyMaxTransactions int
-	// TempDir is the parent for the disposable mmap query directory. Empty uses
-	// the operating system temporary directory.
-	TempDir string
-	// MMapBytes is SQLite's mmap limit in the default backend. Zero selects
-	// 256 MiB. The LumoSQL/LMDB backend uses LUMO_LMDB_MAPSIZE instead.
-	MMapBytes int64
 }
 
 // DurabilityMode selects the acknowledgement contract for local writes.
@@ -150,7 +151,7 @@ type SubscriptionConfig struct {
 type CacheConfig struct {
 	StatementCacheEntries int
 	// BlockCacheBytes sizes Pebble's unified block cache (alias for Pebble.CacheBytes).
-	// Default 16 MiB.
+	// Default 256 MiB.
 	BlockCacheBytes int64
 }
 
@@ -193,11 +194,11 @@ type PebbleConfig struct {
 	BaseFS vfs.FS
 }
 
-// DefaultPebbleConfig returns standard Pebble settings (16MiB cache, 4MiB
+// DefaultPebbleConfig returns standard Pebble settings (256MiB cache, 4MiB
 // memtables x2, 1000 open files, 1 concurrent compaction, Zstd level 3).
 func DefaultPebbleConfig() PebbleConfig {
 	return PebbleConfig{
-		CacheBytes:               16 << 20,
+		CacheBytes:               256 << 20,
 		MemTableBytes:            4 << 20,
 		MemTableCount:            2,
 		MaxOpenFiles:             1000,
@@ -233,6 +234,9 @@ func (c SchemaConfig) acceptRemoteSchema() bool {
 	return c.AcceptRemoteSchema == nil || *c.AcceptRemoteSchema
 }
 
+// MembershipConfig configures SWIM dynamic discovery and failure detection over QUIC.
+type MembershipConfig = replication.MembershipConfig
+
 // ReplicationConfig configures QUIC replication. A zero ListenAddr disables
 // replication (single-node mode); peers may still be added later.
 type ReplicationConfig struct {
@@ -250,6 +254,10 @@ type ReplicationConfig struct {
 	// filtering. Invalid entries fail Open. See
 	// architecture/membership-and-transport.md ("IP and CIDR admission policy").
 	AllowedNetworks []string
+	// Membership configures SWIM dynamic discovery over QUIC.
+	Membership MembershipConfig
+	// Bootstrap is an optional list of QUIC seed addresses for dynamic discovery.
+	Bootstrap []string
 	// MaxBatchBytes caps one replication frame payload.
 	MaxBatchBytes int
 	// MaxBatchMutations caps mutations pulled per send round.
@@ -278,6 +286,9 @@ type ReplicationConfig struct {
 	// SnapshotTransferTimeout bounds how long the source holds its consistent read cut.
 	// Default 10 minutes.
 	SnapshotTransferTimeout time.Duration
+	// SnapshotRequestTimeout bounds how long a receiver waits for snapshot
+	// progress before re-requesting. Default 30 seconds.
+	SnapshotRequestTimeout time.Duration
 	// Fanout is the number of active replication targets selected per push round.
 	// Default 4.
 	Fanout int
@@ -300,6 +311,12 @@ type ReplicationConfig struct {
 	// Dissemination selects bounded gossip (the zero/default) or optional
 	// Plumtree eager/lazy routing. All peers in the cluster must agree.
 	Dissemination DisseminationMode
+	// ProtocolVersionOverride/MinProtocolVersionOverride replace the
+	// advertised handshake versions when nonzero, for interoperability
+	// testing (peers must refuse unknown versions). Zero selects the
+	// protocol constants. Never set in production.
+	ProtocolVersionOverride    uint16
+	MinProtocolVersionOverride uint16
 }
 
 // DisseminationMode selects how mutation batches are propagated.
@@ -369,6 +386,14 @@ func (c *Config) withDefaults() {
 	if c.QueryStore.RemoteApplyMaxTransactions == 0 {
 		c.QueryStore.RemoteApplyMaxTransactions = 1_000
 	}
+	if c.QueryStore.Mode == QueryStoreMMap {
+		if c.QueryStore.MMapBytes <= 0 {
+			c.QueryStore.MMapBytes = 256 << 20
+		}
+		if c.QueryStore.TempDir == "" && c.Path != "" {
+			c.QueryStore.TempDir = filepath.Join(c.Path, "query_mmap")
+		}
+	}
 	if c.Cache.StatementCacheEntries == 0 {
 		c.Cache.StatementCacheEntries = 256
 	}
@@ -376,7 +401,7 @@ func (c *Config) withDefaults() {
 	if c.Cache.BlockCacheBytes > 0 {
 		p.CacheBytes = c.Cache.BlockCacheBytes
 	} else if p.CacheBytes == 0 {
-		p.CacheBytes = 16 << 20
+		p.CacheBytes = 256 << 20
 	}
 	if c.Cache.BlockCacheBytes == 0 {
 		c.Cache.BlockCacheBytes = p.CacheBytes
@@ -445,6 +470,9 @@ func (c *Config) withDefaults() {
 	if r.SnapshotTransferTimeout == 0 {
 		r.SnapshotTransferTimeout = 10 * time.Minute
 	}
+	if r.SnapshotRequestTimeout == 0 {
+		r.SnapshotRequestTimeout = 30 * time.Second
+	}
 	if r.Fanout == 0 {
 		r.Fanout = 4
 	}
@@ -462,6 +490,9 @@ func (c *Config) withDefaults() {
 	}
 	if r.MaxQUICConnections == 0 {
 		r.MaxQUICConnections = 64
+	}
+	if len(r.Membership.Bootstrap) == 0 && len(r.Bootstrap) > 0 {
+		r.Membership.Bootstrap = append([]string(nil), r.Bootstrap...)
 	}
 	if c.Subscription.MaxSubscribers == 0 {
 		c.Subscription.MaxSubscribers = 1024
@@ -518,12 +549,6 @@ func (c *Config) validate() error {
 	if c.Subscription.MaxSubscribers < 0 || c.Subscription.EventBufferSize < 0 || c.Subscription.MaxRetainedEvents < 0 {
 		return fmt.Errorf("replicateddb: subscription limits must be non-negative: %w", ErrUnsupportedSchema)
 	}
-	if c.QueryStore.Mode != QueryStoreMemory && c.QueryStore.Mode != QueryStoreMMap {
-		return fmt.Errorf("replicateddb: unsupported query-store mode %d: %w", c.QueryStore.Mode, ErrUnsupportedSchema)
-	}
-	if c.QueryStore.MMapBytes < 0 {
-		return fmt.Errorf("replicateddb: query-store MMapBytes must be non-negative: %w", ErrUnsupportedSchema)
-	}
 	if c.QueryStore.RemoteApplyInterval <= 0 {
 		return fmt.Errorf("replicateddb: query-store RemoteApplyInterval must be positive: %w", ErrUnsupportedSchema)
 	}
@@ -548,6 +573,9 @@ func (c *Config) validate() error {
 	if c.Replication.SnapshotTransferTimeout <= 0 {
 		return fmt.Errorf("replicateddb: Replication.SnapshotTransferTimeout must be positive")
 	}
+	if c.Replication.SnapshotRequestTimeout <= 0 {
+		return fmt.Errorf("replicateddb: Replication.SnapshotRequestTimeout must be positive")
+	}
 	if c.Replication.Fanout <= 0 {
 		return fmt.Errorf("replicateddb: Replication.Fanout must be positive")
 	}
@@ -556,6 +584,9 @@ func (c *Config) validate() error {
 	}
 	if c.Replication.Dissemination == DisseminationPlumtree && c.Replication.Fanout < 2 {
 		return fmt.Errorf("replicateddb: Replication.Fanout must be at least 2 for Plumtree")
+	}
+	if v, m := c.Replication.ProtocolVersionOverride, c.Replication.MinProtocolVersionOverride; v != 0 && m > v {
+		return fmt.Errorf("replicateddb: Replication.MinProtocolVersionOverride must not exceed ProtocolVersionOverride")
 	}
 	if c.Replication.PeerRotationInterval <= 0 {
 		return fmt.Errorf("replicateddb: Replication.PeerRotationInterval must be positive")

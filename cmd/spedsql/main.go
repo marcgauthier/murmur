@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -10,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -20,7 +23,6 @@ import (
 	"time"
 
 	db "github.com/nomadsql/replicateddb"
-	"github.com/nomadsql/replicateddb/admin"
 	"github.com/nomadsql/replicateddb/metrics"
 	"github.com/nomadsql/replicateddb/schema"
 	"github.com/nomadsql/replicateddb/service"
@@ -43,8 +45,6 @@ type NodeConfigFile struct {
 	AwaitUnlock     bool                   `json:"await_unlock"`
 	KeyHex          string                 `json:"key_hex,omitempty"`
 	KeyID           string                 `json:"key_id,omitempty"`
-	AdminToken      string                 `json:"admin_token,omitempty"`
-	ServiceToken    string                 `json:"service_token,omitempty"`
 	SchemaPath      string                 `json:"schema_path,omitempty"`
 	TLSCACertFile   string                 `json:"tls_ca_cert_file,omitempty"`
 	TLSNodeCertFile string                 `json:"tls_node_cert_file,omitempty"`
@@ -53,6 +53,7 @@ type NodeConfigFile struct {
 	Files           *FilesConfigFile       `json:"files,omitempty"`
 	Bridge          *BridgeConfigFile      `json:"bridge,omitempty"`
 	Replication     *ReplicationConfigFile `json:"replication,omitempty"`
+	Limits          *LimitsConfigFile      `json:"limits,omitempty"`
 }
 
 // ReplicationConfigFile carries optional retention overrides. Zero values
@@ -62,6 +63,20 @@ type ReplicationConfigFile struct {
 	MinLogRetentionMs        int64  `json:"min_log_retention_ms,omitempty"`
 	MaxOfflineLogRetentionMs int64  `json:"max_offline_log_retention_ms,omitempty"`
 	MinRetainedBatches       uint64 `json:"min_retained_batches,omitempty"`
+	Dissemination            string `json:"dissemination,omitempty"`
+	// ProtocolVersionOverride/MinProtocolVersionOverride replace the
+	// advertised handshake versions (interoperability testing only).
+	ProtocolVersionOverride    uint16 `json:"protocol_version_override,omitempty"`
+	MinProtocolVersionOverride uint16 `json:"min_protocol_version_override,omitempty"`
+}
+
+// LimitsConfigFile carries optional commit-path budget overrides. Zero
+// values select production defaults; positive values override them (used
+// by live scenarios that must deterministically trip budget rejection).
+type LimitsConfigFile struct {
+	MaxValueBytes       int   `json:"max_value_bytes,omitempty"`
+	MaxTransactionBytes int64 `json:"max_transaction_bytes,omitempty"`
+	MaxBatchMutations   int   `json:"max_batch_mutations,omitempty"`
 }
 
 type PeerConfig struct {
@@ -116,29 +131,25 @@ func runAgent(args []string) {
 	nodeIDStr := fs.String("node-id", "", "Node UUID")
 	dataDir := fs.String("data-dir", "", "Data directory for Pebble store and logs")
 	listenAddr := fs.String("listen-addr", "127.0.0.1:7443", "Replication listen address")
-	apiAddr := fs.String("api-addr", "127.0.0.1:8080", "HTTP API listen address")
+	apiAddr := fs.String("api-addr", "127.0.0.1:8080", "HTTPS API listen address")
 	metricsAddr := fs.String("metrics-addr", "", "Prometheus metrics listen address (optional, defaults to api-addr)")
-	awaitUnlock := fs.Bool("await-unlock", false, "Wait for key via Remote Unlock HTTP API")
+	awaitUnlock := fs.Bool("await-unlock", false, "Wait for key via Remote Unlock HTTPS API")
 	keyHex := fs.String("key-hex", "", "Hex-encoded 32-byte encryption key")
 	keyID := fs.String("key-id", "default-key", "Encryption Key ID")
-	adminToken := fs.String("admin-token", "0123456789abcdef0123456789abcdef", "Bearer token for admin unlock API")
-	serviceToken := fs.String("service-token", "0123456789abcdef0123456789abcdef", "Bearer token for SQL service API")
 	schemaPath := fs.String("schema-path", "", "Directory containing *.sql schema files")
 	logFile := fs.String("log-file", "", "Log output file (optional)")
 	_ = fs.Parse(args)
 
 	cfg := NodeConfigFile{
-		NodeID:       *nodeIDStr,
-		DataDir:      *dataDir,
-		ListenAddr:   *listenAddr,
-		APIAddr:      *apiAddr,
-		MetricsAddr:  *metricsAddr,
-		AwaitUnlock:  *awaitUnlock,
-		KeyHex:       *keyHex,
-		KeyID:        *keyID,
-		AdminToken:   *adminToken,
-		ServiceToken: *serviceToken,
-		SchemaPath:   *schemaPath,
+		NodeID:      *nodeIDStr,
+		DataDir:     *dataDir,
+		ListenAddr:  *listenAddr,
+		APIAddr:     *apiAddr,
+		MetricsAddr: *metricsAddr,
+		AwaitUnlock: *awaitUnlock,
+		KeyHex:      *keyHex,
+		KeyID:       *keyID,
+		SchemaPath:  *schemaPath,
 	}
 
 	if *configPath != "" {
@@ -228,11 +239,77 @@ type NodeDaemon struct {
 	dbID       db.DBID
 	mu         sync.Mutex
 	database   *db.DB
-	adminH     *admin.Handler
-	serviceH   *service.Handler
 	httpServer *http.Server
 	promReg    *prometheus.Registry
 	bridge     *bridgeRuntime
+}
+
+func (d *NodeDaemon) apiTLSConfig() (*tls.Config, error) {
+	if d.cfg.TLSCACertFile == "" || d.cfg.TLSNodeCertFile == "" || d.cfg.TLSNodeKeyFile == "" {
+		return nil, fmt.Errorf("tls_ca_cert_file, tls_node_cert_file, and tls_node_key_file are required for the HTTPS API")
+	}
+	caPEM, err := os.ReadFile(d.cfg.TLSCACertFile)
+	if err != nil {
+		return nil, fmt.Errorf("read API client CA: %w", err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("API client CA file contains no valid certificate")
+	}
+	certPEM, err := os.ReadFile(d.cfg.TLSNodeCertFile)
+	if err != nil {
+		return nil, fmt.Errorf("read API server certificate: %w", err)
+	}
+	keyPEM, err := os.ReadFile(d.cfg.TLSNodeKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("read API server key: %w", err)
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("load API server key pair: %w", err)
+	}
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.RequestClientCert,
+		ClientCAs:    roots,
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return nil // /healthz may be called without a client certificate.
+			}
+			peerCerts := make([]*x509.Certificate, 0, len(rawCerts))
+			for _, raw := range rawCerts {
+				peer, err := x509.ParseCertificate(raw)
+				if err != nil {
+					return fmt.Errorf("parse client certificate: %w", err)
+				}
+				peerCerts = append(peerCerts, peer)
+			}
+			intermediates := x509.NewCertPool()
+			for _, peer := range peerCerts[1:] {
+				intermediates.AddCert(peer)
+			}
+			_, err := peerCerts[0].Verify(x509.VerifyOptions{
+				Roots: roots, Intermediates: intermediates,
+				KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+			})
+			return err
+		},
+	}, nil
+}
+
+func requireAPIClientCert(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" && r.Method == http.MethodGet {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+			http.Error(w, "valid client certificate required", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (d *NodeDaemon) Start() error {
@@ -243,26 +320,8 @@ func (d *NodeDaemon) Start() error {
 	// Metrics endpoint
 	mux.Handle("/metrics", promhttp.HandlerFor(d.promReg, promhttp.HandlerOpts{}))
 
-	// Open callback for admin unlock handler
-	openFn := func(ctx context.Context, km db.KeyMaterial) (*db.DB, error) {
-		return d.openDatabase(ctx, km.Key, km.ID)
-	}
-
-	token := []byte(d.cfg.AdminToken)
-	if len(token) < 32 {
-		token = append(token, make([]byte, 32-len(token))...)
-	}
-
-	adminH, err := admin.New(admin.Config{
-		BearerToken: token,
-		Open:        openFn,
-	})
-	if err != nil {
-		return fmt.Errorf("init admin handler: %w", err)
-	}
-	d.adminH = adminH
-
-	// Mount admin and service wrappers
+	// The daemon API is protected by the verified client certificate on this
+	// listener. /healthz is the sole HTTPS route that permits no client cert.
 	mux.HandleFunc("/v1/admin/unlock", d.handleAdminUnlock)
 	mux.HandleFunc("/v1/admin/status", d.handleAdminStatus)
 	mux.HandleFunc("/v1/admin/lock", d.handleAdminLock)
@@ -296,9 +355,14 @@ func (d *NodeDaemon) Start() error {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 
+	apiTLS, err := d.apiTLSConfig()
+	if err != nil {
+		return fmt.Errorf("configure API TLS: %w", err)
+	}
 	d.httpServer = &http.Server{
-		Addr:    d.cfg.APIAddr,
-		Handler: mux,
+		Addr:      d.cfg.APIAddr,
+		Handler:   requireAPIClientCert(mux),
+		TLSConfig: apiTLS,
 	}
 
 	ln, err := net.Listen("tcp", d.cfg.APIAddr)
@@ -307,8 +371,8 @@ func (d *NodeDaemon) Start() error {
 	}
 
 	go func() {
-		if err := d.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
-			log.Printf("[SPEDSQL] HTTP server error: %v", err)
+		if err := d.httpServer.ServeTLS(ln, "", ""); err != nil && err != http.ErrServerClosed {
+			log.Printf("[SPEDSQL] HTTPS API server error: %v", err)
 		}
 	}()
 
@@ -358,6 +422,11 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 		Replication: db.ReplicationConfig{
 			ListenAddr:      d.cfg.ListenAddr,
 			AllowedNetworks: append([]string(nil), d.cfg.AllowedNetworks...),
+			Bootstrap:       append([]string(nil), d.cfg.Bootstrap...),
+			Membership: db.MembershipConfig{
+				Bootstrap:     append([]string(nil), d.cfg.Bootstrap...),
+				AdvertiseAddr: d.cfg.ListenAddr,
+			},
 		},
 	}
 	for _, peerID := range d.cfg.AllowedPeers {
@@ -460,6 +529,26 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 		if rc.MinRetainedBatches > 0 {
 			dbCfg.Replication.MinRetainedBatches = rc.MinRetainedBatches
 		}
+		if rc.Dissemination != "" {
+			dbCfg.Replication.Dissemination = db.DisseminationMode(rc.Dissemination)
+		}
+		if rc.ProtocolVersionOverride != 0 {
+			dbCfg.Replication.ProtocolVersionOverride = rc.ProtocolVersionOverride
+		}
+		if rc.MinProtocolVersionOverride != 0 {
+			dbCfg.Replication.MinProtocolVersionOverride = rc.MinProtocolVersionOverride
+		}
+	}
+	if lc := d.cfg.Limits; lc != nil {
+		if lc.MaxValueBytes > 0 {
+			dbCfg.MaxReplicatedValueBytes = lc.MaxValueBytes
+		}
+		if lc.MaxTransactionBytes > 0 {
+			dbCfg.MaxTransactionBytes = lc.MaxTransactionBytes
+		}
+		if lc.MaxBatchMutations > 0 {
+			dbCfg.MaxBatchMutations = lc.MaxBatchMutations
+		}
 	}
 
 	// Configure initial peers
@@ -525,30 +614,24 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 		}
 	}
 
-	// Add configured peers
+	// Add configured peers, honoring persisted exclusions: an explicit
+	// RemovePeer survives restarts by design, and only an explicit
+	// AddPeer (which clears the exclusion) may re-admit the peer.
 	for _, p := range d.cfg.Peers {
 		peerNodeID, err := db.ParseNodeID(p.NodeID)
-		if err == nil {
-			_ = instance.AddPeer(ctx, db.Peer{NodeID: peerNodeID, Addrs: p.Addrs})
+		if err != nil {
+			continue
 		}
+		if instance.IsPeerExcluded(peerNodeID) {
+			continue
+		}
+		_ = instance.AddPeer(ctx, db.Peer{NodeID: peerNodeID, Addrs: p.Addrs})
 	}
 
 	// Register Prometheus metrics collector
 	collector := metrics.NewCollector(instance.Status)
 	_ = d.promReg.Register(collector)
 
-	// Setup service handler
-	svcToken := []byte(d.cfg.ServiceToken)
-	if len(svcToken) < 32 {
-		svcToken = append(svcToken, make([]byte, 32-len(svcToken))...)
-	}
-	svcH, err := service.New(instance, service.Config{
-		BearerToken: svcToken,
-	})
-	if err != nil {
-		log.Printf("[SPEDSQL] Warn: init service handler failed: %v", err)
-	}
-	d.serviceH = svcH
 	d.database = instance
 
 	if err := d.initBridge(instance); err != nil {
@@ -635,7 +718,6 @@ func (d *NodeDaemon) handleAdminLock(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = d.database.Close()
 	d.database = nil
-	d.serviceH = nil
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -713,6 +795,7 @@ func (d *NodeDaemon) handleServiceStatus(w http.ResponseWriter, r *http.Request)
 		"schema_epoch":    st.SchemaEpoch,
 		"peer_count":      st.PeerCount,
 		"connected_peers": st.ConnectedPeers,
+		"selected_peers":  st.SelectedPeers,
 		"uptime_millis":   st.Uptime.Milliseconds(),
 	})
 }
@@ -821,9 +904,8 @@ func (d *NodeDaemon) handleServiceSubscribe(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "node is locked", http.StatusServiceUnavailable)
 		return
 	}
-	// Native server-sent-events subscription over the daemon's loopback
-	// API (same wire format as the TLS-gated service handler, which would
-	// otherwise 403 every subscription on plain HTTP).
+	// Native server-sent-events subscription over the daemon API. The outer
+	// mTLS middleware authenticates this route like every other /v1 endpoint.
 	query := r.URL.Query().Get("query")
 	if query == "" {
 		http.Error(w, "query is required", http.StatusBadRequest)
@@ -925,12 +1007,60 @@ func (d *NodeDaemon) Close() {
 }
 
 // Client CLI helper subcommands
+type apiClientFlags struct {
+	apiURL   *string
+	caFile   *string
+	certFile *string
+	keyFile  *string
+}
+
+func addAPIClientFlags(fs *flag.FlagSet) apiClientFlags {
+	return apiClientFlags{
+		apiURL:   fs.String("api", "https://127.0.0.1:8080", "HTTPS API base URL"),
+		caFile:   fs.String("ca-cert", "", "CA certificate used to verify the API server"),
+		certFile: fs.String("client-cert", "", "Client certificate for API mTLS"),
+		keyFile:  fs.String("client-key", "", "Client private key for API mTLS"),
+	}
+}
+
+func (f apiClientFlags) client() (*http.Client, string, error) {
+	u, err := url.Parse(*f.apiURL)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return nil, "", fmt.Errorf("API URL must be an absolute https URL")
+	}
+	if *f.caFile == "" || *f.certFile == "" || *f.keyFile == "" {
+		return nil, "", fmt.Errorf("--ca-cert, --client-cert, and --client-key are required")
+	}
+	caPEM, err := os.ReadFile(*f.caFile)
+	if err != nil {
+		return nil, "", fmt.Errorf("read API CA: %w", err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caPEM) {
+		return nil, "", fmt.Errorf("API CA file contains no valid certificate")
+	}
+	cert, err := tls.LoadX509KeyPair(*f.certFile, *f.keyFile)
+	if err != nil {
+		return nil, "", fmt.Errorf("load API client certificate: %w", err)
+	}
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12, RootCAs: roots, Certificates: []tls.Certificate{cert},
+		}},
+	}, strings.TrimSuffix(*f.apiURL, "/"), nil
+}
+
 func runUnlock(args []string) {
 	fs := flag.NewFlagSet("unlock", flag.ExitOnError)
-	apiURL := fs.String("api", "http://127.0.0.1:8080", "Node HTTP API base URL")
+	apiFlags := addAPIClientFlags(fs)
 	keyHex := fs.String("key-hex", "", "Hex-encoded 32-byte encryption key")
 	keyStr := fs.String("key", "", "String 32-byte key")
 	_ = fs.Parse(args)
+	client, apiURL, err := apiFlags.client()
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	payload := map[string]string{}
 	if *keyHex != "" {
@@ -938,10 +1068,10 @@ func runUnlock(args []string) {
 	} else if *keyStr != "" {
 		payload["key"] = *keyStr
 	} else {
-		payload["key_hex"] = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		log.Fatal("--key-hex or --key is required")
 	}
 	body, _ := json.Marshal(payload)
-	resp, err := http.Post(strings.TrimSuffix(*apiURL, "/")+"/v1/admin/unlock", "application/json", strings.NewReader(string(body)))
+	resp, err := client.Post(apiURL+"/v1/admin/unlock", "application/json", strings.NewReader(string(body)))
 	if err != nil {
 		log.Fatalf("unlock request failed: %v", err)
 	}
@@ -955,14 +1085,18 @@ func runUnlock(args []string) {
 
 func runExec(args []string) {
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
-	apiURL := fs.String("api", "http://127.0.0.1:8080", "Node HTTP API base URL")
+	apiFlags := addAPIClientFlags(fs)
 	_ = fs.Parse(args)
+	client, apiURL, err := apiFlags.client()
+	if err != nil {
+		log.Fatal(err)
+	}
 	if fs.NArg() < 1 {
 		log.Fatal("SQL statement argument required")
 	}
 	sqlStmt := fs.Arg(0)
 	payload, _ := json.Marshal(map[string]any{"query": sqlStmt})
-	resp, err := http.Post(strings.TrimSuffix(*apiURL, "/")+"/v1/exec", "application/json", strings.NewReader(string(payload)))
+	resp, err := client.Post(apiURL+"/v1/exec", "application/json", strings.NewReader(string(payload)))
 	if err != nil {
 		log.Fatalf("exec request failed: %v", err)
 	}
@@ -976,14 +1110,18 @@ func runExec(args []string) {
 
 func runQuery(args []string) {
 	fs := flag.NewFlagSet("query", flag.ExitOnError)
-	apiURL := fs.String("api", "http://127.0.0.1:8080", "Node HTTP API base URL")
+	apiFlags := addAPIClientFlags(fs)
 	_ = fs.Parse(args)
+	client, apiURL, err := apiFlags.client()
+	if err != nil {
+		log.Fatal(err)
+	}
 	if fs.NArg() < 1 {
 		log.Fatal("SQL query argument required")
 	}
 	sqlQuery := fs.Arg(0)
 	payload, _ := json.Marshal(map[string]any{"query": sqlQuery})
-	resp, err := http.Post(strings.TrimSuffix(*apiURL, "/")+"/v1/query", "application/json", strings.NewReader(string(payload)))
+	resp, err := client.Post(apiURL+"/v1/query", "application/json", strings.NewReader(string(payload)))
 	if err != nil {
 		log.Fatalf("query request failed: %v", err)
 	}
@@ -997,9 +1135,13 @@ func runQuery(args []string) {
 
 func runStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	apiURL := fs.String("api", "http://127.0.0.1:8080", "Node HTTP API base URL")
+	apiFlags := addAPIClientFlags(fs)
 	_ = fs.Parse(args)
-	resp, err := http.Get(strings.TrimSuffix(*apiURL, "/") + "/v1/status")
+	client, apiURL, err := apiFlags.client()
+	if err != nil {
+		log.Fatal(err)
+	}
+	resp, err := client.Get(apiURL + "/v1/status")
 	if err != nil {
 		log.Fatalf("status request failed: %v", err)
 	}

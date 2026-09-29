@@ -427,6 +427,11 @@ func (s *Store) KnownOrigins() ([]ids.NodeID, error) {
 // HLC wall time is older than keepNewerThanMillis, except it always retains
 // the newest minRetain entries. Active unexpired retention leases and bridge
 // export resume points bound throughSeq.
+// CollectUnitCap bounds one CollectLog/CollectReceipts call so a single
+// collection keeps its write batch small. Callers that must drain fully
+// loop until a call returns fewer than the cap.
+const CollectUnitCap = 4096
+
 func (s *Store) CollectLog(origin ids.NodeID, throughSeq uint64, keepNewerThanMillis int64, minRetain uint64) (int, error) {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
@@ -476,7 +481,7 @@ func (s *Store) CollectLog(origin ids.NodeID, throughSeq uint64, keepNewerThanMi
 			}
 			keys = append(keys, LogKey(origin, seq))
 			// Bound one GC round to keep write batches small.
-			if len(keys) >= 4096 {
+			if len(keys) >= CollectUnitCap {
 				break
 			}
 		}
@@ -542,7 +547,7 @@ func (s *Store) CollectReceipts(floors map[ids.NodeID]uint64) (int, error) {
 			seq := binary.BigEndian.Uint64(raw[16:])
 			if fl, ok := effectiveFloors[origin]; ok && seq <= fl {
 				keys = append(keys, append([]byte(nil), it.Key()...))
-				if len(keys) >= 4096 {
+				if len(keys) >= CollectUnitCap {
 					break
 				}
 			}

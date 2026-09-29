@@ -51,9 +51,9 @@ type Metadata struct {
 	// FilesRestoredObjects/Bytes and FilesSkipped report what a restore
 	// actually unpacked. They are set on the Metadata returned by
 	// Restore, never inside the archive manifest.
-	FilesRestoredObjects int  `json:"files_restored_objects,omitempty"`
+	FilesRestoredObjects int   `json:"files_restored_objects,omitempty"`
 	FilesRestoredBytes   int64 `json:"files_restored_bytes,omitempty"`
-	FilesSkipped         bool `json:"files_skipped,omitempty"`
+	FilesSkipped         bool  `json:"files_skipped,omitempty"`
 }
 
 // FilesModeObjects marks object-inclusive backups in Metadata.FilesMode.

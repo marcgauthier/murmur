@@ -145,7 +145,7 @@ const (
 )
 ```
 
-The default constructor sets a 16 MiB block cache, 4 MiB memtable, two memtables, 1,000 open files, one concurrent compaction, and `CompressionZstd` at level 3. Explicit `CompressionNone` disables compression; zero compression configuration resolves to enabled Zstd level 3. A missing/invalid storage budget is an error rather than silently allocating an unbounded cache.
+The default constructor sets a 256 MiB block cache, 4 MiB memtable, two memtables, 1,000 open files, one concurrent compaction, and `CompressionZstd` at level 3. Explicit `CompressionNone` disables compression; zero compression configuration resolves to enabled Zstd level 3. A missing/invalid storage budget is an error rather than silently allocating an unbounded cache.
 
 Target `github.com/cockroachdb/pebble/v2` v2.1.6 and its versioned APIs. This is a new-database architecture change: detect and reject existing Badger directories with `ErrUnsupportedStorageFormat` before creating or modifying storage files. No importer, automatic conversion, or Badger runtime fallback is planned. The current Go implementation uses Pebble; the roadmap describes target capabilities and is not a record of completed phases. See the [implementation inventory](capability-gaps.md).
 
@@ -184,9 +184,8 @@ db, err := replicateddb.Open(ctx, replicateddb.Config{
     Pebble: replicateddb.DefaultPebbleConfig(), // includes Zstd level 3
 
     QueryStore: replicateddb.QueryStoreConfig{
-        Mode: replicateddb.QueryStoreMMap, // disposable; LumoSQL LMDB with lumosql build tag
-        TempDir: "./tmp",                // optional parent directory
-        MMapBytes: 256 << 20,             // optional; default 256 MiB
+        RemoteApplyInterval: 1 * time.Second,
+        RemoteApplyMaxTransactions: 1000,
     },
 
     Schema: replicateddb.SchemaConfig{
@@ -287,6 +286,11 @@ store batches affected rows until `QueryStore.RemoteApplyInterval` (default 1s)
 or `QueryStore.RemoteApplyMaxTransactions` (default 1,000) is reached. Zero
 selects the default for each; negative values are invalid. A local SQL write
 flushes pending remote rows first.
+
+The SQL materialization is always in memory. Older `QueryStore.Mode`,
+`QueryStore.TempDir`, and `QueryStore.MMapBytes` settings have been removed;
+remove those fields from Go config literals.
+Pebble data and replication formats are unchanged.
 
 ### Transport
 

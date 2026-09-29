@@ -1,4 +1,4 @@
-//go:build lumosql && sqlite_preupdate_hook
+//go:build !modernc && sqlite_preupdate_hook
 
 package sqlengine
 
@@ -10,7 +10,7 @@ import (
 	"github.com/nomadsql/replicateddb/ids"
 )
 
-func TestLumoSQLPreUpdatePreservesTextAndBlobTypes(t *testing.T) {
+func TestMattnSQLitePreUpdatePreservesTextAndBlobTypes(t *testing.T) {
 	e, err := Open(testRegistry(t), nil, nil, 16)
 	if err != nil {
 		t.Fatal(err)

@@ -15,6 +15,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net"
 	"net/url"
 	"strings"
 	"time"
@@ -95,6 +96,12 @@ func GenerateCA(ttl time.Duration) (*CA, error) {
 
 // IssueNode issues a node certificate bound to id.
 func (ca *CA) IssueNode(id ids.NodeID, ttl time.Duration) (certPEM, keyPEM []byte, err error) {
+	return ca.IssueNodeForHosts(id, ttl, []string{"localhost"}, []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")})
+}
+
+// IssueNodeForHosts issues a NodeID-bound node certificate with DNS/IP SANs
+// suitable for HTTPS when the node certificate is also used by the API.
+func (ca *CA) IssueNodeForHosts(id ids.NodeID, ttl time.Duration, dnsNames []string, ips []net.IP) (certPEM, keyPEM []byte, err error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, err
@@ -112,6 +119,8 @@ func (ca *CA) IssueNode(id ids.NodeID, ttl time.Duration) (certPEM, keyPEM []byt
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		URIs:         []*url.URL{NodeURI(id)},
+		DNSNames:     append([]string(nil), dnsNames...),
+		IPAddresses:  append([]net.IP(nil), ips...),
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.Cert, &key.PublicKey, ca.Key)
 	if err != nil {

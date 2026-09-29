@@ -1,12 +1,16 @@
 # SPeD-SQL
 
+<p align="center">
+  <img src="spedsql.png" alt="SPeD-SQL Logo" width="280"/>
+</p>
+
 Fast In Memory Secure Peer-Distributed SQL with persistance.
 
 An embedded, replicated SQL package for Go. Applications can link it directly;
 `cmd/spedsql` also provides a standalone node daemon for multi-process deployments.
 
-- **SQL queries** through an embedded SQLite-compatible engine, either memory
-  resident or backed by a disposable mmap-enabled file
+- **SQL queries** through an embedded SQLite engine held in memory and rebuilt
+  from Pebble on startup
 - **Durable state** in Pebble (authoritative; the SQL database is rebuildable)
 - **Masterless multi-writer replication** over QUIC with mutual TLS
 - **Offline writes** on every node, per-column last-writer-wins via hybrid
@@ -28,7 +32,7 @@ The implementation leans on existing Go packages instead of reinventing them:
 |---|---|
 | Durable LSM KV + block cache + compression | `github.com/cockroachdb/pebble/v2` |
 | At-rest AEADs (AES-GCM, AEGIS, ChaCha20-Poly1305, XChaCha20) | `github.com/ericlagergren/aegis`, `golang.org/x/crypto` |
-| SQL + pre-update hook + FTS5 | `modernc.org/sqlite` (default), optional `mattn/go-sqlite3` LumoSQL build |
+| SQL + pre-update hook + FTS5 | `mattn/go-sqlite3` with bundled SQLite (default), optional `modernc.org/sqlite` (`-tags modernc`) |
 | QUIC transport with TLS 1.3 | `github.com/quic-go/quic-go` |
 | SWIM membership discovery & transport | `github.com/hashicorp/memberlist` |
 | Node/row/tx/cluster IDs | `github.com/google/uuid` |
@@ -36,17 +40,13 @@ The implementation leans on existing Go packages instead of reinventing them:
 | Snapshot/wire compression | `github.com/klauspost/compress/zstd` |
 | SQL pooling surface, mTLS PKI, structured logging | stdlib (`database/sql`, `crypto/x509`, `log/slog`) |
 
-The SQL engine sits behind a narrow internal interface, so the optional LumoSQL
-CGO driver can replace `modernc.org/sqlite` under a build tag without touching
-replication, durability, or conflict resolution.
+The default build uses mattn SQLite. The optional pure-Go `modernc.org/sqlite`
+driver can replace it under the `modernc` build tag without changing replication,
+durability, or conflict resolution.
 
-`QueryStoreMemory` is the default. `QueryStoreMMap` creates a disposable
-file-backed materialization, rebuilds it from Pebble on open, and removes its
-temporary directory on close. In the default build it uses mmap-enabled
-SQLite and retains SQLite locking. With the `lumosql` build tag it uses an
-external LumoSQL LMDB library and pooled MVCC reads. See the
-[LumoSQL backend guide](architecture/lumosql-backend.md); an external LMDBv1
-build passes the focused read-snapshot/write-progress acceptance test.
+The SQL materialization is memory resident, non-authoritative, and rebuilt from
+Pebble on open. Reads hold the engine read lock until their rows are closed or
+exhausted; writes wait for active reads. See the [SQLite backend guide](architecture/sqlite-backends.md).
 
 Startup rebuild materializes current Pebble state with bounded multi-row SQL
 inserts (900 bind parameters per statement, commits at most every 5,000 rows).
@@ -199,25 +199,38 @@ READMEs and environment-configurable longer acceptance runs.
 
 ## Build, vet, test
 
-```sh
-go build ./...
-go vet ./...
-go test ./...
-go test -race ./...   # required: no data races
-go test ./... -short  # skip soak + 100K benchmarks
+The default mattn CGO build requires SQLite feature tags. Use one of the two
+supported build configurations:
 
-# Cross-compilation targets
-GOOS=windows GOARCH=amd64 go build ./...
-GOOS=linux GOARCH=arm64 go build ./...
+```sh
+TAGS="sqlite_preupdate_hook sqlite_fts5"   # default mattn SQLite backend
+# TAGS="modernc"                           # pure-Go backend (CGO_ENABLED=0)
+
+go build -tags "$TAGS" ./...
+go vet -tags "$TAGS" ./...
+go test -tags "$TAGS" ./...
+go test -tags "$TAGS" -race ./...   # required: no data races
+go test -tags "$TAGS" ./... -short  # skip soak + 100K benchmarks
+
+# Cross-compilation targets (pure-Go backend)
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags modernc ./...
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags modernc ./...
+
+# Live multi-process scenarios (applies SPEDSQL_TAGS automatically)
+bash tests-live/run.sh three-node-sync
+bash tests-live/run.sh all   # full live matrix (long)
 ```
 
-Continuous integration (.github/workflows/ci.yml) checks Linux (amd64/arm64) and Windows (amd64) in both pure-Go (`modernc.org/sqlite`) and CGO (`mattn/go-sqlite3` and `lumosql` tag) configurations. See [versioning and release](architecture/versioning-and-release.md#86-packaging-and-release) for platform pins and licensing.
+All `go test ./tests-live/...` commands elsewhere in this README need the
+same `-tags` prefix, or use `tests-live/run.sh <scenario>` instead.
+
+Continuous integration (.github/workflows/ci.yml) checks the default mattn CGO backend and pure-Go (`modernc.org/sqlite` via `-tags modernc`) configuration. See [versioning and release](architecture/versioning-and-release.md#86-packaging-and-release) for supported platforms and licensing.
 
 Benchmarks (`benchmark/`): point/indexed/range/order/join/group reads, FTS
 term/prefix, single/multi-cell writes, 10/1000/10000-row transactions,
 Pebble commit latency, replication throughput (2-node, 5-node, backlog,
 snapshot seed), cipher/compression matrix, checkpoint, maintenance
-rewrite, startup components, memory/mmap backends, and a stock SQLite
+rewrite, startup components, and stock SQLite
 baseline. Baselines below are illustrative only (10K contacts + 20K
 orders, Intel i5-6500, encryption enabled; see
 [Benchmarks](architecture/benchmarks.md) for commands and full results):
@@ -240,7 +253,8 @@ Full open (30K rows)  ~1.0  s
 5-node star (30K)      9.5  s to last convergence
 ```
 
-Run them with:
+Run them with (`-tags "sqlite_preupdate_hook sqlite_fts5"` throughout,
+or `-tags modernc` for the pure-Go backend):
 
 ```sh
 go test ./benchmark/ -bench . -short -benchtime 1s   # fast pass, 10K rows
@@ -278,15 +292,16 @@ go test ./replication/ -run XXX -fuzz FuzzFrame -fuzztime 30s
 
 ## Status
 
-The architecture audit added ten missing tasks to
-[TASKS_PENDING.md](TASKS_PENDING.md#pending-tasks): snapshot tail-log leases,
-restore membership cleanup, bridge export/import atomicity, outbox encryption,
-aggregate bridge capacity, schema-definition validation, SWIM/pool diagnostics,
-the remaining benchmark matrix, and platform/release checks. Bridge journal
-recovery and per-bundle SQL atomicity do not yet establish atomic source receipts
-and stream progress across High receivers. Outbox payloads currently use base64
-JSON rather than encrypted storage.
-
+The [verified release status](architecture/release-status.md) is the single
+source of truth for implemented, partial, and pending work, with evidence
+for each claim. Residual pending items: snapshot source tail-history
+retention lease, SWIM discovery runtime wiring (static peers only; the QUIC
+transport adapter is unit-tested), multi-hour/impaired-network soak
+acceptance, and the TODO.md automatic-PK request. The daemon HTTP API requires
+HTTPS with a CA-signed client certificate for every route except public
+`GET /healthz`.
+No release commit exists yet; see the release-commit record before citing
+any hash in production claims.
 
  Working: local durable engine, pre-update capture, transaction coalescing,
  per-cell LWW + row tombstones, encrypted Pebble, startup rebuild, two-node
@@ -374,11 +389,11 @@ admission for all state writers.
  until restart, and restart recovers the last durable state), and a
  two-node randomized soak test with convergence assertion.
 
- Deferred to later milestones: external LumoSQL validation on additional
- platforms/build variants, large-BLOB chunking, long-duration impaired-network soak measurements,
- and long (multi-hour) soak runs (blocked on replication convergence at
- soak scale). SWIM discovery and
- the shared bounded QUIC connection pool have implementations.
+ Deferred to later milestones: large-BLOB chunking, long-duration impaired-network soak measurements,
+ and long (multi-hour) soak runs (short soaks pass; multi-hour runs not yet
+ accepted). The SWIM QUIC transport adapter and
+ the shared bounded QUIC connection pool have implementations; SWIM runtime
+ discovery wiring remains pending.
 
  The [capability inventory](architecture/capability-gaps.md) distinguishes existing
  code from target requirements, including remaining bounded dissemination,

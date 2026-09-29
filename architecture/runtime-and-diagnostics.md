@@ -13,7 +13,7 @@ Lifecycle, workers, metrics, logging/errors, resource budgeting, and concurrency
 - [54. Error Model](#54-error-model)
 - [62. Memory Budgeting](#62-memory-budgeting)
 - [63. Concurrency Model](#63-concurrency-model)
-- [64. LumoSQL Connection & MVCC Concurrency Model](#64-lumosql-connection--mvcc-concurrency-model)
+- [64. SQLite Connection and Locking Model](#64-sqlite-connection-and-locking-model)
 - [Optional service and administration adapters](#optional-service-and-administration-adapters)
 
 ---
@@ -56,7 +56,8 @@ Failed
 
 unless a specific state safely permits them.
 
-Reads may be allowed during key rotation because LumoSQL is in memory, but this should be explicit.
+Reads use the in-memory SQLite materialization during key rotation; durable
+writes and remote apply remain gated by maintenance.
 
 Storage failure (disk full, unrecoverable I/O error, MANIFEST or background
 flush/compaction failure) fails the node closed: the store records the first
@@ -102,7 +103,7 @@ cancel peer workers
 finish/abort active transactions
 flush required state
 close QUIC
-close LumoSQL
+close the SQLite materialization
 close Pebble
 zero cached key material where practical
 return
@@ -251,8 +252,8 @@ Wrap underlying errors with context while preserving `errors.Is` / `errors.As`.
 Total memory approximately includes:
 
 ```text
-LumoSQL table data
-LumoSQL indexes
+SQLite table data
+SQLite indexes
 FTS indexes
 Pebble block cache
 encrypted-VFS index and buffer memory
@@ -265,7 +266,7 @@ one bounded transaction reassembly/apply group (separate from queue byte budgets
 snapshot buffers
 prepared statements
 Go heap
-CGO/LumoSQL allocations
+CGO allocations (default mattn build)
 ```
 
 Add config-level memory controls.
@@ -274,7 +275,7 @@ Account for encrypted-VFS index checkpoints, plaintext chunk buffers, and retain
 
 Partial transaction staging and snapshot candidate generations consume bounded encrypted disk capacity, not an unbounded RAM queue. Include the active plus staged/previous generations in disk budgeting; reject/defer transfers before exceeding receiver capacity. Network queues, transient caches, and reassembly each have distinct accounting; configuring one does not silently expand the others.
 
-Do not set a 1 GiB Pebble cache by default when the same process already holds the complete dataset in LumoSQL memory.
+Do not set a 1 GiB Pebble cache by default when the same process already holds the complete dataset in SQLite memory.
 
 Expose memory-related metrics wherever practical.
 
@@ -288,7 +289,7 @@ Recommended v1:
 
 ```text
 one serialized local write coordinator
-one remote apply coordinator into LumoSQL
+one remote apply coordinator into SQLite
 one state-store writer coordinator shared by all local/remote/GC/metadata merges
 concurrent Pebble snapshot readers
 concurrent SQL readers where validated
@@ -311,28 +312,26 @@ Increase concurrency only after profiling.
 
 ---
 
-## 64. LumoSQL Connection & MVCC Concurrency Model
+## 64. SQLite Connection and Locking Model
 
-Regular SQLite in `:memory:` mode is connection-scoped and uses a rollback journal (`PRAGMA journal_mode = MEMORY`). Under shared-cache mode (`cache=shared`), regular SQLite introduces coarse table-level locks: active readers block writes (`SQLITE_LOCKED`), and active writes freeze all readers. Furthermore, regular SQLite lacks MVCC, and SQLite WAL mode is unsupported in pure `:memory:` and prone to checkpoint starvation when readers are active.
-
-LumoSQL with its **LMDB backend** provides the planned MVCC behavior. The default `QueryStoreMMap` uses a disposable file-backed `modernc.org/sqlite` database with SQLite mmap enabled; readers and writers still follow SQLite locking. A tagged LumoSQL implementation now opens pooled read connections so readers retain LMDB snapshots while writes proceed. Actual-LMDB builds and acceptance runs remain pending.
+Both supported drivers use one named shared-cache in-memory SQLite database,
+with a reserved write connection and a pool of read connections. The engine
+read/write lock permits overlapping queries while a materialization is stable.
+A write takes the exclusive lock, waits for active result sets to close or
+exhaust, and prevents new reads until commit or rollback. Callers should close
+rows promptly.
 
 Remote Pebble commits can temporarily lead SQLite materialization. Compare
 `StateGeneration` with `MaterializedGeneration` to see this lag; the one-second
 or 1,000-transaction bulk flush closes it. The materialized generation is held
-in memory and initialized after the startup rebuild; reporting it does not
-write to Pebble. A receive watermark certifies durable Pebble state and is not
-a query-visibility marker.
+in memory and initialized after startup rebuild; reporting it does not write
+to Pebble. A receive watermark certifies durable Pebble state, not query
+visibility.
 
-The LMDB target is expected to provide:
-1. **Copy-on-Write MVCC:** Every write transaction creates a new root in an immutable B+ tree. Readers hold an immutable root pointer and read virtual memory pages directly with **zero locks** on database tables or pages.
-2. **Readers Never Block Writers:** Long-running read queries do not block write transactions.
-3. **Writers Never Block Readers:** Writing new transactions does not block existing or new read queries.
-4. **No Checkpointing Contention:** Unlike SQLite WAL, LMDB has no separate checkpointing step that can stall or lock. Old pages are tracked in an internal free-list and safely reused only after old reader transactions finish.
-5. **No RAM Disk Required on Windows or Linux:** LMDB operates as a memory-mapped file (`mmap`) on normal disk storage (e.g. `%LOCALAPPDATA%\NOMADSQL\query_lmdb\` or `./node-data/query_lmdb/`).
-6. **RAM-Speed Commits:** Configured with `PRAGMA synchronous = OFF;` (`MDB_NOSYNC | MDB_NOMETASYNC`), write commits return in microseconds at memory speed. Physical disk durability is handled exclusively by Pebble via `batch.Commit(pebble.Sync)`.
-
-For lightweight environments without a C compiler, `QueryStoreMemory` provides a pure-Go fallback using `modernc.org/sqlite`, with writes serialized via the write coordinator.
+The default mattn build enables the SQLite pre-update hook and FTS5 with
+`sqlite_preupdate_hook sqlite_fts5`. The optional `modernc` build uses the
+pure-Go driver and `CGO_ENABLED=0`. SQLite durability pragmas apply only to the
+rebuildable query view; Pebble controls the durable acknowledgement contract.
 
 ---
 
@@ -382,6 +381,15 @@ return a generic response and do not publish an unlocked runtime. `GET
 /v1/status` reports only locked/unlocked state, and `POST /v1/lock` closes the
 active DB. Applications mount the handler on their own TLS listener; the core
 library starts no HTTP listener and existing `db.Open` behavior is unchanged.
+
+The standalone daemon API uses a different deployment boundary: its listener
+is HTTPS-only and verifies client certificates against `tls_ca_cert_file`.
+It uses the configured node certificate/key as the HTTPS server identity;
+server certificates need DNS/IP SANs matching client connection names. Every
+route, including `/metrics`, requires a trusted client certificate except
+public `GET /healthz`, which remains HTTPS-only. The `spedsql` CLI requires
+server CA and client certificate/key files for API commands. Bearer tokens are
+not daemon API credentials; mTLS is the API access control.
 
 Acceptance for an adapter includes authorization separation, failed unlock,
 worker startup only after successful unlock, streaming cancellation, shutdown,

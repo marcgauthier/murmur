@@ -18,26 +18,32 @@ import (
 	"testing"
 	"time"
 
+	db "github.com/nomadsql/replicateddb"
+	"github.com/nomadsql/replicateddb/schema"
 	"github.com/nomadsql/replicateddb/tests-live/harness"
 )
 
-const schemaSQL = `
-CREATE TABLE IF NOT EXISTS snap_rows (
-  id BLOB PRIMARY KEY NOT NULL,
-  name TEXT NOT NULL DEFAULT ''
-);
-`
-
 func TestStaleNodeRejoinsViaSnapshot(t *testing.T) {
+	// NOTE: the table must ride in the replicated SchemaConfig. Tables
+	// created only from schema.sql exist in the local engine but never
+	// enter the replication registry, so their writes stay local-only and
+	// peers silently skip them as unknown tables.
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:     "snapshot-resync",
-		NumNodes: 3,
+		Name:        "snapshot-resync",
+		NumNodes:    3,
+		AwaitUnlock: true,
 		Replication: &harness.ReplicationOptions{
 			MinLogRetentionMs:        1000,
 			MaxOfflineLogRetentionMs: 20000,
 			MinRetainedBatches:       10,
 		},
-		SchemaSQL: schemaSQL,
+		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
+			Name: "snap_rows",
+			Columns: []schema.ColumnSchema{
+				{Name: "id", Type: schema.ColBlob},
+				{Name: "name", Type: schema.ColText, Nullable: true},
+			},
+		}}},
 	})
 
 	// Phase 1: node3 writes acknowledged rows, then all three converge.
@@ -74,11 +80,12 @@ func TestStaleNodeRejoinsViaSnapshot(t *testing.T) {
 
 	// Phase 3: node3 restarts with the same durable directory and rejoins.
 	cluster.StartNode(2)
+	cluster.UnlockNode(2, cluster.Nodes[2].KeyHex)
 	cluster.WaitNodeReady(2)
 	waitConverged(t, cluster, "snap_rows", 65, 90*time.Second)
 
 	// The rejoin must have used the snapshot path, not log catch-up.
-	if got := snapshotCounter(t, cluster.Nodes[2].APIAddr, "repl_snapshots_received_total"); got < 1 {
+	if got := snapshotCounter(t, cluster.Nodes[2].APIAddr, "spedsql_repl_snapshots_received_total"); got < 1 {
 		t.Fatalf("node3 snapshots received = %v, want >= 1 (log catch-up would hide a snapshot-path regression)", got)
 	}
 
@@ -89,6 +96,79 @@ func TestStaleNodeRejoinsViaSnapshot(t *testing.T) {
 	}
 	if len(res.Rows) != 5 {
 		t.Fatalf("node3 stale rows = %d, want 5", len(res.Rows))
+	}
+}
+
+// Two stale nodes restarting together request snapshots concurrently from
+// the same survivor. The source serves one transfer per peer at a time and
+// answers the other with an explicit busy deferral; the receiver backs off
+// and the stall watchdog re-requests, so both rejoins converge instead of
+// stalling on a silently dropped request.
+func TestDualStaleNodesRejoinViaSnapshot(t *testing.T) {
+	cluster := harness.NewCluster(t, harness.ClusterOptions{
+		Name:        "snapshot-resync-dual",
+		NumNodes:    3,
+		AwaitUnlock: true,
+		Replication: &harness.ReplicationOptions{
+			MinLogRetentionMs:        1000,
+			MaxOfflineLogRetentionMs: 20000,
+			MinRetainedBatches:       10,
+		},
+		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
+			Name: "snap_rows",
+			Columns: []schema.ColumnSchema{
+				{Name: "id", Type: schema.ColBlob},
+				{Name: "name", Type: schema.ColText, Nullable: true},
+			},
+		}}},
+	})
+
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("%032x", 1000+i)
+		if err := cluster.ExecSQL(2, "INSERT INTO snap_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("stale-%d", i)); err != nil {
+			t.Fatalf("node3 pre-stop write: %v", err)
+		}
+	}
+	waitConverged(t, cluster, "snap_rows", 5, 30*time.Second)
+
+	cluster.StopNode(1)
+	cluster.StopNode(2)
+	for i := 0; i < 60; i++ {
+		id := fmt.Sprintf("%032x", 2000+i)
+		if err := cluster.ExecSQL(0, "INSERT INTO snap_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("fresh-%d", i)); err != nil {
+			t.Fatalf("survivor write: %v", err)
+		}
+	}
+	if _, err := waitRowCount(t, cluster, 0, "snap_rows", 65, 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same expiry + GC-pass wait as the single-stale test, now covering
+	// two down peers' retention pins.
+	t.Logf("waiting for member-deadline expiry and a GC pass")
+	time.Sleep(55 * time.Second)
+
+	// Restart both stale nodes back-to-back so their snapshot requests
+	// overlap on the survivor.
+	cluster.StartNode(1)
+	cluster.StartNode(2)
+	cluster.UnlockNode(1, cluster.Nodes[1].KeyHex)
+	cluster.UnlockNode(2, cluster.Nodes[2].KeyHex)
+	cluster.WaitNodeReady(1)
+	cluster.WaitNodeReady(2)
+	waitConverged(t, cluster, "snap_rows", 65, 120*time.Second)
+
+	for _, idx := range []int{1, 2} {
+		if got := snapshotCounter(t, cluster.Nodes[idx].APIAddr, "spedsql_repl_snapshots_received_total"); got < 1 {
+			t.Fatalf("node%d snapshots received = %v, want >= 1", idx+1, got)
+		}
+		// The progress/deferral diagnostics surface end to end, even
+		// when this run needed no deferral (presence, not value).
+		snapshotCounter(t, cluster.Nodes[idx].APIAddr, "spedsql_repl_snapshots_busy_deferred_total")
+		snapshotCounter(t, cluster.Nodes[idx].APIAddr, "spedsql_repl_snapshot_busy_received_total")
+		snapshotCounter(t, cluster.Nodes[idx].APIAddr, "spedsql_peer_awaiting_snapshot")
+		snapshotCounter(t, cluster.Nodes[idx].APIAddr, "spedsql_peer_snapshot_chunks_received")
+		snapshotCounter(t, cluster.Nodes[idx].APIAddr, "spedsql_peer_snapshot_chunks_total")
 	}
 }
 
@@ -145,7 +225,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 
 func snapshotCounter(t *testing.T, apiAddr, name string) float64 {
 	t.Helper()
-	resp, err := http.Get(fmt.Sprintf("http://%s/metrics", apiAddr))
+	resp, err := http.Get(fmt.Sprintf("https://%s/metrics", apiAddr))
 	if err != nil {
 		t.Fatalf("metrics: %v", err)
 	}

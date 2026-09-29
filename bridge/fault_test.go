@@ -15,7 +15,7 @@ type failFS struct {
 	armed atomic.Bool
 }
 
-func (f *failFS) arm()   { f.armed.Store(true) }
+func (f *failFS) arm()    { f.armed.Store(true) }
 func (f *failFS) disarm() { f.armed.Store(false) }
 
 func (f *failFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {

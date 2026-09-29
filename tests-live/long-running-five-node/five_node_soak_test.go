@@ -227,7 +227,7 @@ func waitForPeers(t *testing.T, cluster *harness.Cluster, want int, timeout time
 }
 
 func connectedPeers(apiAddr string) int {
-	resp, err := statusClient.Get("http://" + apiAddr + "/v1/status")
+	resp, err := statusClient.Get("https://" + apiAddr + "/v1/status")
 	if err != nil {
 		return -1
 	}
@@ -299,7 +299,7 @@ func waitForConvergence(t *testing.T, cluster *harness.Cluster, count int, timeo
 }
 
 func scrapeMetrics(apiAddr string) (string, error) {
-	resp, err := statusClient.Get("http://" + apiAddr + "/metrics")
+	resp, err := statusClient.Get("https://" + apiAddr + "/metrics")
 	if err != nil {
 		return "", err
 	}

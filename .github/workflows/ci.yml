@@ -5,6 +5,11 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  schedule:
+    # Weekly long-soak acceptance (ten-minute file soak, two-hour write
+    # SLO, one-hour five-node mesh); see the live-soak job below.
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
 
 jobs:
   test-linux:
@@ -30,25 +35,109 @@ jobs:
       - name: Go vet
         env:
           CGO_ENABLED: ${{ matrix.cgo }}
-        run: go vet ./...
+        run: |
+          if [ "${{ matrix.cgo }}" = "0" ]; then
+            go vet -tags "modernc" ./...
+          else
+            go vet -tags "sqlite_preupdate_hook sqlite_fts5" ./...
+          fi
 
-      - name: Run tests (pure Go / default)
+      - name: Run tests (pure Go modernc)
         if: matrix.cgo == '0'
         env:
           CGO_ENABLED: 0
-        run: go test -v ./...
+        run: go test -tags "modernc" -v ./...
 
-      - name: Run tests with race detector (CGO enabled)
+      - name: Run tests with race detector (CGO enabled, default mattn SQLite)
         if: matrix.cgo == '1'
         env:
           CGO_ENABLED: 1
-        run: go test -race -v ./...
+        run: go test -tags "sqlite_preupdate_hook sqlite_fts5" -race -v ./...
 
-      - name: Run LumoSQL tag build validation
+      - name: Run mattn SQLite preupdate validation
         if: matrix.cgo == '1'
         env:
           CGO_ENABLED: 1
-        run: go test -tags "lumosql sqlite_preupdate_hook" -run '^TestLumoSQLPreUpdatePreservesTextAndBlobTypes|TestPreUpdateCaptureInsertUpdateDelete$' ./sqlengine
+        run: go test -tags "sqlite_preupdate_hook sqlite_fts5" -run '^TestMattnSQLitePreUpdatePreservesTextAndBlobTypes|TestPreUpdateCaptureInsertUpdateDelete$' ./sqlengine
+
+  live-gate:
+    name: Live acceptance gate (release daemon binary)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Build release daemon binary
+        env:
+          CGO_ENABLED: 1
+        run: |
+          mkdir -p bin
+          go build -tags "sqlite_preupdate_hook sqlite_fts5" -o bin/spedsql ./cmd/spedsql
+
+      - name: Run live release-gate scenarios
+        env:
+          CGO_ENABLED: 1
+        run: bash tests-live/run.sh gate
+
+      - name: Upload release daemon binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: spedsql-linux-amd64
+          path: bin/spedsql
+          retention-days: 5
+
+      - name: Run pure-Go live smoke
+        env:
+          CGO_ENABLED: 0
+          SPEDSQL_TAGS: modernc
+        run: bash tests-live/run.sh three-node-sync
+
+      - name: Upload live failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-failures
+          path: tests-live/failures/
+          retention-days: 7
+
+  live-soak:
+    name: Live long-soak acceptance (scheduled)
+    runs-on: ubuntu-latest
+    timeout-minutes: 260
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Run scheduled long soaks
+        env:
+          CGO_ENABLED: 1
+        run: bash tests-live/run.sh soak
+
+      - name: Upload live failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-soak-failures
+          path: tests-live/failures/
+          retention-days: 14
 
   test-windows:
     name: Test Windows amd64 (Go ${{ matrix.go-version }})
@@ -70,12 +159,12 @@ jobs:
         run: go mod verify
 
       - name: Go vet
-        run: go vet ./...
+        run: go vet -tags "modernc" ./...
 
-      - name: Run tests (Windows default pure Go)
+      - name: Run tests (Windows pure Go modernc)
         env:
           CGO_ENABLED: 0
-        run: go test -v ./...
+        run: go test -tags "modernc" -v ./...
 
   cross-compile:
     name: Cross-Compilation Matrix (arm64/windows/linux)
@@ -89,23 +178,30 @@ jobs:
         with:
           go-version: '1.26.x'
 
-      - name: Build Linux amd64 (Default)
+      - name: Build Linux amd64 (Default mattn SQLite CGO)
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 1
+        run: go build -tags "sqlite_preupdate_hook sqlite_fts5" ./...
+
+      - name: Build Linux amd64 (Pure Go modernc)
         env:
           GOOS: linux
           GOARCH: amd64
           CGO_ENABLED: 0
-        run: go build ./...
+        run: go build -tags "modernc" ./...
 
-      - name: Build Linux arm64
+      - name: Build Linux arm64 (Pure Go modernc)
         env:
           GOOS: linux
           GOARCH: arm64
           CGO_ENABLED: 0
-        run: go build ./...
+        run: go build -tags "modernc" ./...
 
-      - name: Build Windows amd64
+      - name: Build Windows amd64 (Pure Go modernc)
         env:
           GOOS: windows
           GOARCH: amd64
           CGO_ENABLED: 0
-        run: go build ./...
+        run: go build -tags "modernc" ./...

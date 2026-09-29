@@ -44,7 +44,7 @@ func TestMain(m *testing.M) {
 }
 
 // templateFor returns the shared template for n rows, building it once.
-func templateFor(b *testing.B, n int) *benchTemplate {
+func templateFor(b testing.TB, n int) *benchTemplate {
 	b.Helper()
 	templatesMu.Lock()
 	defer templatesMu.Unlock()
@@ -75,7 +75,7 @@ func templateFor(b *testing.B, n int) *benchTemplate {
 // openTemplateDB copies the n-row template to a fresh dir and opens it.
 // The copy keeps the template's node identity (single-node benchmarks
 // only); multi-node benchmarks populate live with distinct identities.
-func openTemplateDB(b *testing.B, n int) (*replicateddb.DB, []replicateddb.RowID) {
+func openTemplateDB(b testing.TB, n int) (*replicateddb.DB, []replicateddb.RowID) {
 	b.Helper()
 	tmpl := templateFor(b, n)
 	dest := b.TempDir()

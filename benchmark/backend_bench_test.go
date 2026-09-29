@@ -12,58 +12,47 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// BenchmarkBackendCompare runs point and range lookups under the memory
-// and mmap query-store backends on identical template copies.
-func BenchmarkBackendCompare(b *testing.B) {
-	backends := []struct {
-		name string
-		mode replicateddb.QueryStoreMode
-	}{
-		{"memory", replicateddb.QueryStoreMemory},
-		{"mmap", replicateddb.QueryStoreMMap},
-	}
+// BenchmarkQueryMaterialization measures point and range lookups against the
+// in-memory SQL view rebuilt by the replicated database.
+func BenchmarkQueryMaterialization(b *testing.B) {
 	for _, n := range datasetSizes(b) {
-		for _, be := range backends {
-			name := fmt.Sprintf("%s/%s", sizeName(n), be.name)
-			b.Run(name, func(b *testing.B) {
-				tmpl := templateFor(b, n)
-				dest := b.TempDir()
-				if err := copyDir(tmpl.dir, dest); err != nil {
-					b.Fatal(err)
+		b.Run(sizeName(n), func(b *testing.B) {
+			tmpl := templateFor(b, n)
+			dest := b.TempDir()
+			if err := copyDir(tmpl.dir, dest); err != nil {
+				b.Fatal(err)
+			}
+			cfg := benchConfig(dest, tmpl.node, tmpl.dbid)
+			db, err := replicateddb.Open(context.Background(), cfg)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { _ = db.Close() })
+			ctx := context.Background()
+			rng := rand.New(rand.NewSource(21))
+			var lat latency
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				start := time.Now()
+				var rows *replicateddb.Rows
+				var err error
+				if i%2 == 0 {
+					rows, err = db.QueryContext(ctx,
+						`SELECT name, phone, score FROM contacts WHERE id = ?`, tmpl.ids[rng.Intn(len(tmpl.ids))][:])
+				} else {
+					lo := (i * 131) % 900
+					rows, err = db.QueryContext(ctx,
+						`SELECT id FROM contacts WHERE score BETWEEN ? AND ? LIMIT 100`, lo, lo+100)
 				}
-				cfg := benchConfig(dest, tmpl.node, tmpl.dbid)
-				cfg.QueryStore = replicateddb.QueryStoreConfig{Mode: be.mode}
-				db, err := replicateddb.Open(context.Background(), cfg)
 				if err != nil {
 					b.Fatal(err)
 				}
-				b.Cleanup(func() { _ = db.Close() })
-				ctx := context.Background()
-				rng := rand.New(rand.NewSource(21))
-				var lat latency
-				b.ReportAllocs()
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					start := time.Now()
-					var rows *replicateddb.Rows
-					var err error
-					if i%2 == 0 {
-						rows, err = db.QueryContext(ctx,
-							`SELECT name, phone, score FROM contacts WHERE id = ?`, tmpl.ids[rng.Intn(len(tmpl.ids))][:])
-					} else {
-						lo := (i * 131) % 900
-						rows, err = db.QueryContext(ctx,
-							`SELECT id FROM contacts WHERE score BETWEEN ? AND ? LIMIT 100`, lo, lo+100)
-					}
-					if err != nil {
-						b.Fatal(err)
-					}
-					drainRows(b, rows)
-					lat.record(time.Since(start))
-				}
-				lat.report(b, 1, "ops")
-			})
-		}
+				drainRows(b, rows)
+				lat.record(time.Since(start))
+			}
+			lat.report(b, 1, "ops")
+		})
 	}
 }
 

@@ -26,11 +26,11 @@ type HTTPSDestination struct {
 
 // HTTPSOptions configures an HTTPS destination.
 type HTTPSOptions struct {
-	BaseURL     string
-	AuthBearer  string
-	Headers     map[string]string
-	TLSConfig   *tls.Config
-	Timeout     time.Duration
+	BaseURL    string
+	AuthBearer string
+	Headers    map[string]string
+	TLSConfig  *tls.Config
+	Timeout    time.Duration
 }
 
 // NewHTTPSDestination creates a new HTTPS destination.

@@ -85,21 +85,36 @@ Continuous integration (GitHub Actions `.github/workflows/ci.yml`) validates the
 
 | Platform / Architecture | Build Mode / Driver | Compiler & Toolchain | CI Checks |
 |---|---|---|---|
-| **Linux amd64** | Default pure Go (`modernc.org/sqlite`) | Go 1.26.x (`CGO_ENABLED=0`) | `go vet`, unit/integration test suite |
-| **Linux amd64** | CGO Native (`mattn/go-sqlite3`) | Go 1.26.x (`CGO_ENABLED=1`, gcc) | Race detector (`go test -race ./...`), smoke tests |
-| **Linux amd64** | Optional LumoSQL CGO | Go 1.26.x (`-tags "lumosql sqlite_preupdate_hook"`) | LumoSQL backend tag build & adapter tests |
-| **Linux arm64** | Pure Go (`modernc.org/sqlite`) | Go 1.26.x (`GOARCH=arm64`, `CGO_ENABLED=0`) | Cross-compilation build verification |
-| **Windows amd64** | Pure Go (`modernc.org/sqlite`) | Go 1.26.x (`GOOS=windows`, `CGO_ENABLED=0`) | Windows native test suite & cross-build |
+| **Linux amd64** | Default bundled SQLite CGO (`mattn/go-sqlite3`) | Go 1.26.x (`CGO_ENABLED=1`, gcc; `sqlite_preupdate_hook sqlite_fts5` tags) | `go vet`, race detector (`go test -race ./...`), smoke tests |
+| **Linux amd64** | Optional Pure Go (`modernc.org/sqlite`) | Go 1.26.x (`-tags "modernc"`, `CGO_ENABLED=0`) | `go vet`, unit/integration test suite |
+| **Linux arm64** | Pure Go (`modernc.org/sqlite`) | Go 1.26.x (`GOARCH=arm64`, `-tags "modernc"`, `CGO_ENABLED=0`) | Cross-compilation build verification |
+| **Windows amd64** | Pure Go (`modernc.org/sqlite`) | Go 1.26.x (`GOOS=windows`, `-tags "modernc"`, `CGO_ENABLED=0`) | Windows native test suite & cross-build |
 
 ### Build Tags and Driver Selection
 
-The default build produces a zero-CGO binary using `modernc.org/sqlite` for both `QueryStoreMemory` and `QueryStoreMMap`.
+The default backend is bundled SQLite through `mattn/go-sqlite3`; the SQL
+materialization is in memory and uses SQLite reader/writer locking.
 
-When building with CGO or specialized backend engines:
-- **Default (no tags)**: Pure Go SQL engine (`modernc.org/sqlite`).
+When building with specialized tags or zero-CGO fallbacks:
+- **Default (`!modernc`)**: mattn CGO driver (`mattn/go-sqlite3`) with bundled SQLite.
+- **`modernc`**: Switches SQL engine to pure Go (`modernc.org/sqlite`), enabling zero-CGO compilation.
 - **`sqlite_preupdate_hook`**: Enables native SQLite pre-update hook capture via `mattn/go-sqlite3`.
-- **`lumosql`**: Enables the LumoSQL MVCC driver integration (`sqlengine/backend_lumosql.go`), switching SQL materialization to LMDB with reader snapshot isolation.
-- **`lumosql_mvcc`**: Enables advanced concurrent reader-snapshot acceptance tests against external LMDB builds.
+- **`sqlite_fts5`**: Enables SQLite FTS5 full-text search module in bundled SQLite builds.
+
+### Build-tag contract
+
+The default CGO configuration requires tags
+(`sqlengine/capture_mattn.go` needs the pre-update-hook API). Every build,
+vet, and test invocation must pass `-tags "sqlite_preupdate_hook sqlite_fts5"`
+or `-tags modernc`; `tests-live/run.sh` applies `SPEDSQL_TAGS` (defaulting to
+the CGO set) to both the daemon build and the test run.
+
+### Release status and release commit
+
+The [verified release status](release-status.md) is the single source for the
+feature matrix, supported platforms, deployment instructions, verification
+record, and the exact release commit. No release commit exists yet; do not
+cite a hash in production claims until the §5 procedure there is complete.
 
 ### Pinned Dependencies and Toolchains
 
@@ -108,12 +123,13 @@ The codebase maintains explicit pins in `go.mod`:
 | Component | Pinned Version / Source | Rationale / Capability |
 |---|---|---|
 | **Go Toolchain** | `1.26.0+` (minimum `1.25.x`) | Primary runtime, compiler, and standard library |
+| **mattn SQLite** | `github.com/mattn/go-sqlite3 v1.14.32` | Default CGO SQLite driver with pre-update hook and FTS5 build features |
 | **Pebble** | `github.com/cockroachdb/pebble/v2 v2.1.6` | Authoritative LSM KV, Zstd level 3, VFS encryption, reader/writer version checks |
 | **Memberlist** | `github.com/hashicorp/memberlist v0.7.0` | SWIM cluster membership and gossip |
 | **quic-go** | `github.com/quic-go/quic-go v0.63.0` | QUIC transport, mTLS connection multiplexing, DATAGRAM capabilities |
 | **Compress** | `github.com/klauspost/compress v1.19.1` | Zstandard payload and snapshot wire compression |
 | **Aegis** | `github.com/ericlagergren/aegis v0.0.0-20250325060835-cd0defd64358` | High-performance AEGIS AEAD authenticated ciphers |
-| **Modernc SQLite** | `modernc.org/sqlite v1.44.3` | Pure Go embedded SQLite engine and pre-update hook parser |
+| **Modernc SQLite** | `modernc.org/sqlite v1.44.3` | Optional pure Go embedded SQLite engine (`-tags modernc`) |
 | **Google UUID** | `github.com/google/uuid v1.6.0` | 128-bit identity serialization for nodes, transactions, and snapshots |
 | **Prometheus Client**| `github.com/prometheus/client_golang v1.24.1` | Standard metrics exposition types for runtime observability |
 
@@ -137,18 +153,14 @@ Before publishing release binaries, container images, or vendored amalgamations,
    - Go standard library and `golang.org/x/*` packages (`x/crypto`, `x/sys`, `x/net`)
    - `github.com/klauspost/compress` (BSD 3-Clause)
    - *Requirement*: Retain copyright notice, conditions list, and disclaimer.
-5. **Public Domain / BSD (SQLite & LumoSQL)**:
+5. **Public Domain / MIT (SQLite drivers)**:
    - SQLite source code is dedicated to the public domain.
-   - LumoSQL backend modifications and amalgamations follow permissive open licenses (MIT/BSD/LGPL depending on backend). Binary distributions must include applicable backend notices.
 
 ---
 
 ## 90. References Used for This Plan
 
 Architecture references; the Pebble storage/compression design is pinned to v2.1.6, and cipher/VFS conformance must be validated during implementation.
-
-- LumoSQL documentation and amalgamation/backend information:
-  https://lumosql.org/src/lumosql/doc/trunk/README.md
 
 - SQLite pre-update hook:
   https://sqlite.org/c3ref/preupdate_blobwrite.html
@@ -197,4 +209,3 @@ Architecture references; the Pebble storage/compression design is pinned to v2.1
   https://quic-go.net/docs/quic/datagrams/
 
 ---
-

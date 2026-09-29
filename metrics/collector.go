@@ -72,6 +72,8 @@ func counters() []seriesDef {
 	return []seriesDef{
 		{"pebble_cache_hits_total", "Pebble block cache hits.", func(s *replicateddb.Status) float64 { return float64(s.PebbleCacheHits) }},
 		{"pebble_cache_misses_total", "Pebble block cache misses.", func(s *replicateddb.Status) float64 { return float64(s.PebbleCacheMisses) }},
+		{"stmt_cache_hits_total", "Prepared-statement cache hits.", func(s *replicateddb.Status) float64 { return float64(s.Metrics.StmtCacheHits) }},
+		{"stmt_cache_misses_total", "Prepared-statement cache misses.", func(s *replicateddb.Status) float64 { return float64(s.Metrics.StmtCacheMisses) }},
 		{"local_commits_total", "Durable local commits.", func(s *replicateddb.Status) float64 { return float64(s.Metrics.LocalCommits) }},
 		{"local_commit_mutations_total", "Mutations in durable local commits.", func(s *replicateddb.Status) float64 { return float64(s.Metrics.LocalCommitMutations) }},
 		{"local_commit_latency_seconds_total", "Total local commit latency.", func(s *replicateddb.Status) float64 { return nanosSeconds(s.Metrics.LocalCommitLatencyNanos) }},
@@ -153,6 +155,8 @@ func counters() []seriesDef {
 		{"repl_snapshot_bytes_sent_total", "Sent snapshot chunk bytes.", func(s *replicateddb.Status) float64 { return float64(s.Replication.SnapshotBytesSent) }},
 		{"repl_snapshot_bytes_received_total", "Received snapshot chunk bytes.", func(s *replicateddb.Status) float64 { return float64(s.Replication.SnapshotBytesReceived) }},
 		{"repl_snapshot_rerequested_total", "Re-requested incomplete snapshots.", func(s *replicateddb.Status) float64 { return float64(s.Replication.SnapshotReRequested) }},
+		{"repl_snapshots_busy_deferred_total", "Snapshot requests deferred while a transfer was in flight.", func(s *replicateddb.Status) float64 { return float64(s.Replication.SnapshotsBusyDeferred) }},
+		{"repl_snapshot_busy_received_total", "Snapshot busy deferrals received from sources.", func(s *replicateddb.Status) float64 { return float64(s.Replication.SnapshotBusyReceived) }},
 		{"repl_schema_requests_sent_total", "Sent schema requests.", func(s *replicateddb.Status) float64 { return float64(s.Replication.SchemaRequestsSent) }},
 		{"repl_schema_requests_received_total", "Received schema requests.", func(s *replicateddb.Status) float64 { return float64(s.Replication.SchemaRequestsReceived) }},
 		{"repl_schema_requests_served_total", "Served schema requests.", func(s *replicateddb.Status) float64 { return float64(s.Replication.SchemaRequestsServed) }},
@@ -218,6 +222,8 @@ type Collector struct {
 	peerSchemaAgreed       *prometheus.Desc
 	peerSnapshotRequired   *prometheus.Desc
 	peerAwaitingSnapshot   *prometheus.Desc
+	peerSnapChunksReceived *prometheus.Desc
+	peerSnapChunksTotal    *prometheus.Desc
 	peerRetired            *prometheus.Desc
 	peerExcluded           *prometheus.Desc
 	peerRetirementDeadline *prometheus.Desc
@@ -226,6 +232,7 @@ type Collector struct {
 	schedCancels      *prometheus.Desc
 	schedWait         *prometheus.Desc
 	schedService      *prometheus.Desc
+	schedDualService  *prometheus.Desc
 	schedWaiters      *prometheus.Desc
 	schedOldestWait   *prometheus.Desc
 	schedDebt         *prometheus.Desc
@@ -255,6 +262,8 @@ func NewCollector(src SnapshotFunc) *Collector {
 	c.peerSchemaAgreed = prometheus.NewDesc("spedsql_peer_schema_agreed", "Peer session has agreed schemas.", []string{"peer"}, nil)
 	c.peerSnapshotRequired = prometheus.NewDesc("spedsql_peer_snapshot_required", "Peer must snapshot-resync for a collected log range.", []string{"peer"}, nil)
 	c.peerAwaitingSnapshot = prometheus.NewDesc("spedsql_peer_awaiting_snapshot", "Outbound snapshot request awaiting completion.", []string{"peer"}, nil)
+	c.peerSnapChunksReceived = prometheus.NewDesc("spedsql_peer_snapshot_chunks_received", "Inbound snapshot chunks received from the peer.", []string{"peer"}, nil)
+	c.peerSnapChunksTotal = prometheus.NewDesc("spedsql_peer_snapshot_chunks_total", "Inbound snapshot chunk count advertised by the peer manifest.", []string{"peer"}, nil)
 	c.peerRetired = prometheus.NewDesc("spedsql_peer_retired", "Peer is explicitly retired (holds no retention obligation).", []string{"peer"}, nil)
 	c.peerExcluded = prometheus.NewDesc("spedsql_peer_excluded", "Peer is locally excluded (retired and refusing sessions).", []string{"peer"}, nil)
 	c.peerRetirementDeadline = prometheus.NewDesc("spedsql_peer_retirement_deadline_seconds", "Unix timestamp when peer retention obligation expires.", []string{"peer"}, nil)
@@ -262,6 +271,7 @@ func NewCollector(src SnapshotFunc) *Collector {
 	c.schedCancels = prometheus.NewDesc("spedsql_sched_cancels_total", "Canceled writer admissions by class.", []string{"class"}, nil)
 	c.schedWait = prometheus.NewDesc("spedsql_sched_wait_seconds_total", "Total writer admission queue wait by class.", []string{"class"}, nil)
 	c.schedService = prometheus.NewDesc("spedsql_sched_service_seconds_total", "Total admitted writer service time by class.", []string{"class"}, nil)
+	c.schedDualService = prometheus.NewDesc("spedsql_sched_dual_service_seconds_total", "Admitted writer service time granted while the other interactive class had waiters.", []string{"class"}, nil)
 	c.schedWaiters = prometheus.NewDesc("spedsql_sched_waiters", "Current writer admission waiters by class.", []string{"class"}, nil)
 	c.schedOldestWait = prometheus.NewDesc("spedsql_sched_oldest_wait_seconds", "Oldest queued writer admission by class.", []string{"class"}, nil)
 	c.schedDebt = prometheus.NewDesc("spedsql_sched_debt_seconds", "Normalized service-time debt spread between local and remote classes.", nil, nil)
@@ -289,6 +299,8 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.peerSchemaAgreed
 	ch <- c.peerSnapshotRequired
 	ch <- c.peerAwaitingSnapshot
+	ch <- c.peerSnapChunksReceived
+	ch <- c.peerSnapChunksTotal
 	ch <- c.peerRetired
 	ch <- c.peerExcluded
 	ch <- c.peerRetirementDeadline
@@ -296,6 +308,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.schedCancels
 	ch <- c.schedWait
 	ch <- c.schedService
+	ch <- c.schedDualService
 	ch <- c.schedWaiters
 	ch <- c.schedOldestWait
 	ch <- c.schedDebt
@@ -331,6 +344,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.schedCancels, prometheus.CounterValue, float64(cl.st.Cancels), cl.name)
 		ch <- prometheus.MustNewConstMetric(c.schedWait, prometheus.CounterValue, nanosSeconds(cl.st.WaitNanos), cl.name)
 		ch <- prometheus.MustNewConstMetric(c.schedService, prometheus.CounterValue, nanosSeconds(cl.st.ServiceNanos), cl.name)
+		ch <- prometheus.MustNewConstMetric(c.schedDualService, prometheus.CounterValue, nanosSeconds(cl.st.DualServiceNanos), cl.name)
 		ch <- prometheus.MustNewConstMetric(c.schedWaiters, prometheus.GaugeValue, float64(cl.st.Waiters), cl.name)
 		ch <- prometheus.MustNewConstMetric(c.schedOldestWait, prometheus.GaugeValue, nanosSeconds(cl.st.OldestWaitNanos), cl.name)
 	}
@@ -350,6 +364,8 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.peerSchemaAgreed, prometheus.GaugeValue, boolVal(p.SchemaAgreed), peer)
 		ch <- prometheus.MustNewConstMetric(c.peerSnapshotRequired, prometheus.GaugeValue, boolVal(p.SnapshotRequired), peer)
 		ch <- prometheus.MustNewConstMetric(c.peerAwaitingSnapshot, prometheus.GaugeValue, boolVal(p.AwaitingSnapshot), peer)
+		ch <- prometheus.MustNewConstMetric(c.peerSnapChunksReceived, prometheus.GaugeValue, float64(p.SnapshotChunksReceived), peer)
+		ch <- prometheus.MustNewConstMetric(c.peerSnapChunksTotal, prometheus.GaugeValue, float64(p.SnapshotChunksTotal), peer)
 		ch <- prometheus.MustNewConstMetric(c.peerRetired, prometheus.GaugeValue, boolVal(p.Retired), peer)
 		ch <- prometheus.MustNewConstMetric(c.peerExcluded, prometheus.GaugeValue, boolVal(p.Excluded), peer)
 		var deadlineSec float64

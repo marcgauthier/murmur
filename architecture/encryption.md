@@ -41,6 +41,14 @@ Preserve random `ReadAt`/`WriteAt`, sequential reads/writes, partial-operation e
 
 Assign immutable random file identities; rename and hard links retain identity, while reuse creates fresh content identity. Associate checkpoints with their own registry copy and pin keys for their lifetime. Rewriting a linked file must create a replacement inode rather than mutate a checkpoint's copy.
 
+### SQL materialization
+
+The SQLite query materialization is memory resident and rebuildable from
+Pebble. SPeD-SQL does not create a query database file. Operating systems may
+page process memory to swap; deployments that require protection from that
+exposure must disable or encrypt swap at the host level. The encrypted Pebble
+VFS remains the at-rest protection for authoritative database files.
+
 ### Pragmatic Authenticated File Containers
 
 Rather than attempting to build a full general-purpose copy-on-write filesystem with dynamic chunk replacement and obsolete-chunk compaction inside `vfs.FS`, leverage Pebble's real I/O contracts by implementing a pragmatic dual-mode authenticated container:
@@ -216,4 +224,3 @@ Do not reuse the Pebble storage key as a TLS private key, PSK, replication paylo
 Independent key domains.
 
 ---
-

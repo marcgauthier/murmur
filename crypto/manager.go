@@ -71,8 +71,8 @@ type EncryptionStatus struct {
 // Manager drives data-key rotation, file re-encryption, key retirement, and
 // the expiry worker. It is safe for concurrent use.
 type Manager struct {
-	fs   *EncryptedFS
-	reg  *Registry
+	fs    *EncryptedFS
+	reg   *Registry
 	roots []string
 
 	minInterval time.Duration

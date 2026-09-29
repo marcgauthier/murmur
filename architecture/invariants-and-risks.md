@@ -14,14 +14,14 @@ Design risks, non-negotiable architecture invariants, and security review requir
 
 ## 78. Key Risks
 
-### Risk 1: CGO/LumoSQL integration
+### Risk 1: SQLite driver integration
 
 Mitigation:
 
 - Prove it first.
-- Pin a known LumoSQL build.
-- Generate/retain reproducible amalgamation build instructions.
-- CI on Linux, Windows, and any required target OS.
+- Pin the mattn driver and use its bundled SQLite build with pre-update
+  capture and FTS5 enabled.
+- Test the default CGO build and optional modernc build in CI on supported OSes.
 
 ### Risk 2: In-memory SQL connection model
 
@@ -36,7 +36,7 @@ Mitigation:
 
 - Pebble authoritative.
 - Do not ACK before Pebble.
-- Mark/rebuild LumoSQL on post-SQL/pre-Pebble failures.
+- Mark/rebuild the SQLite materialization on post-SQL/pre-Pebble failures.
 - TxID idempotency.
 - Heavy crash injection.
 
@@ -95,7 +95,7 @@ Pebble current state can recreate the complete replicated SQL-visible state.
 
 ### Invariant B
 
-LumoSQL contains no unique authoritative user data.
+SQLite contains no unique authoritative user data.
 
 ### Invariant C
 

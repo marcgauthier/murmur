@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -248,8 +250,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	}
 	var engine *sqlengine.Engine
 	if cfg.QueryStore.Mode == QueryStoreMMap {
-		engine, err = sqlengine.OpenMMap(reg, cfg.Schema.DDL, cfg.Schema.LocalDDL,
-			cfg.Cache.StatementCacheEntries, cfg.QueryStore.TempDir, cfg.QueryStore.MMapBytes)
+		engine, err = sqlengine.OpenMMap(reg, cfg.Schema.DDL, cfg.Schema.LocalDDL, cfg.Cache.StatementCacheEntries, cfg.QueryStore.TempDir, cfg.QueryStore.MMapBytes)
 	} else {
 		engine, err = sqlengine.Open(reg, cfg.Schema.DDL, cfg.Schema.LocalDDL, cfg.Cache.StatementCacheEntries)
 	}
@@ -1303,34 +1304,36 @@ func (db *DB) statusLive() Status {
 				memState = "alive"
 			}
 			pd := PeerDiagnostics{
-				NodeID:             p.NodeID,
-				Addrs:              p.Addrs,
-				Connected:          p.Connected,
-				Dynamic:            p.Dynamic,
-				SchemaAgreed:       p.SchemaAgreed,
-				SnapshotRequired:   p.SnapshotRequired,
-				AwaitingSnapshot:   p.AwaitingSnapshot,
-				Retired:            retired,
-				Excluded:           excluded,
-				Selected:           p.Selected,
-				MembershipState:    memState,
-				RetirementDeadline: deadline,
-				RTT:                p.RTT,
-				LastSeen:           p.LastSeen,
-				LastHandshake:      p.LastHandshake,
-				LastSend:           p.LastSend,
-				LastRecv:           p.LastRecv,
-				LastAntiEntropy:    p.LastAntiEntropy,
-				RemoteSchemaEpoch:  p.RemoteSchemaEpoch,
-				RemoteSchemaHash:   p.RemoteSchemaHash,
-				BytesSent:          p.BytesSent,
-				BytesReceived:      p.BytesReceived,
-				QueuedNeed:         p.QueuedNeed,
-				QueuedCtrl:         p.QueuedCtrl,
-				QueuedSchema:       p.QueuedSchema,
-				Have:               p.Have,
-				Sent:               p.Sent,
-				LagByOrigin:        make(map[NodeID]uint64, len(applied)),
+				NodeID:                 p.NodeID,
+				Addrs:                  p.Addrs,
+				Connected:              p.Connected,
+				Dynamic:                p.Dynamic,
+				SchemaAgreed:           p.SchemaAgreed,
+				SnapshotRequired:       p.SnapshotRequired,
+				AwaitingSnapshot:       p.AwaitingSnapshot,
+				SnapshotChunksReceived: p.SnapshotChunksReceived,
+				SnapshotChunksTotal:    p.SnapshotChunksTotal,
+				Retired:                retired,
+				Excluded:               excluded,
+				Selected:               p.Selected,
+				MembershipState:        memState,
+				RetirementDeadline:     deadline,
+				RTT:                    p.RTT,
+				LastSeen:               p.LastSeen,
+				LastHandshake:          p.LastHandshake,
+				LastSend:               p.LastSend,
+				LastRecv:               p.LastRecv,
+				LastAntiEntropy:        p.LastAntiEntropy,
+				RemoteSchemaEpoch:      p.RemoteSchemaEpoch,
+				RemoteSchemaHash:       p.RemoteSchemaHash,
+				BytesSent:              p.BytesSent,
+				BytesReceived:          p.BytesReceived,
+				QueuedNeed:             p.QueuedNeed,
+				QueuedCtrl:             p.QueuedCtrl,
+				QueuedSchema:           p.QueuedSchema,
+				Have:                   p.Have,
+				Sent:                   p.Sent,
+				LagByOrigin:            make(map[NodeID]uint64, len(applied)),
 			}
 			for origin, seq := range applied {
 				if have := p.Have[origin]; seq > have {
@@ -1475,33 +1478,46 @@ func (db *DB) gcOnce(withReceipts bool) {
 			}
 		}
 		// GC is maintenance-class work in bounded per-origin units: each
-		// collection re-admits so interactive writers interleave.
-		ticket, err := db.sched.Admit(db.ctx, WriterMaintenance)
-		if err != nil {
-			return
-		}
-		n, cerr := db.store.CollectLog(origin, floor, cutoff, db.cfg.Replication.MinRetainedBatches)
-		ticket.Release()
-		if cerr != nil {
-			db.metrics.gcFailures.Add(1)
-			db.log.Debug("log GC failed", "origin", origin.String(), "err", cerr.Error())
-		} else {
+		// unit re-admits so interactive writers interleave. Units repeat
+		// until a short return proves the origin drained: one unit per
+		// 30s pass caps collection at ~137 batches/s, which any
+		// sustained workload outruns (unbounded retained growth).
+		for {
+			ticket, err := db.sched.Admit(db.ctx, WriterMaintenance)
+			if err != nil {
+				return
+			}
+			n, cerr := db.store.CollectLog(origin, floor, cutoff, db.cfg.Replication.MinRetainedBatches)
+			ticket.Release()
+			if cerr != nil {
+				db.metrics.gcFailures.Add(1)
+				db.log.Debug("log GC failed", "origin", origin.String(), "err", cerr.Error())
+				break
+			}
 			db.metrics.gcLogCollected.Add(uint64(n))
+			if n < state.CollectUnitCap {
+				break
+			}
 		}
 		floors[origin] = floor
 	}
 	if withReceipts {
-		ticket, err := db.sched.Admit(db.ctx, WriterMaintenance)
-		if err != nil {
-			return
-		}
-		n, cerr := db.store.CollectReceipts(floors)
-		ticket.Release()
-		if cerr != nil {
-			db.metrics.gcFailures.Add(1)
-			db.log.Debug("receipt GC failed", "err", cerr.Error())
-		} else {
+		for {
+			ticket, err := db.sched.Admit(db.ctx, WriterMaintenance)
+			if err != nil {
+				return
+			}
+			n, cerr := db.store.CollectReceipts(floors)
+			ticket.Release()
+			if cerr != nil {
+				db.metrics.gcFailures.Add(1)
+				db.log.Debug("receipt GC failed", "err", cerr.Error())
+				break
+			}
 			db.metrics.gcReceiptsCollected.Add(uint64(n))
+			if n < state.CollectUnitCap {
+				break
+			}
 		}
 	}
 }
@@ -1565,40 +1581,94 @@ func (db *DB) newReplicationManager(extraPeers []replication.PeerInfo) (*replica
 		}
 	}
 	schemaId := db.schemaIdentity()
-	return replication.NewManager(replication.ManagerConfig{
-		Store:                   db.store,
-		Applier:                 db,
-		Creds:                   db.replCreds,
-		Local:                   db.cfg.NodeID,
-		DBID:                    db.store.DBID(),
-		SchemaEpoch:             schemaId.Epoch,
-		SchemaHash:              schemaId.Hash,
-		SchemaAuthor:            schemaId.Author,
-		SchemaTime:              schemaId.TimeCreated,
-		AcceptRemoteSchema:      db.cfg.Schema.acceptRemoteSchema(),
-		SchemaSync:              db,
-		ListenAddr:              db.cfg.Replication.ListenAddr,
-		Peers:                   peers,
-		MaxBatchBytes:           db.cfg.Replication.MaxBatchBytes,
-		MaxBatchMutations:       db.cfg.Replication.MaxBatchMutations,
-		SendInterval:            db.cfg.Replication.SendInterval,
-		DialInterval:            db.cfg.Replication.DialInterval,
-		AckInterval:             db.cfg.Replication.AckInterval,
-		AckRetention:            db.cfg.Replication.MaxOfflineLogRetention,
-		SnapshotChunkCells:      db.cfg.Replication.SnapshotChunkCells,
-		MaxSnapshotBytes:        uint64(db.cfg.Replication.MaxSnapshotBytes),
-		SnapshotTransferTimeout: db.cfg.Replication.SnapshotTransferTimeout,
-		Fanout:                  db.cfg.Replication.Fanout,
-		PeerRotationInterval:    db.cfg.Replication.PeerRotationInterval,
-		AntiEntropyInterval:     db.cfg.Replication.AntiEntropyInterval,
-		MaxConcurrentRepairs:    db.cfg.Replication.MaxConcurrentRepairs,
-		MaxReplicationSessions:  db.cfg.Replication.MaxReplicationSessions,
-		MaxQUICConnections:      db.cfg.Replication.MaxQUICConnections,
-		EnablePlumtree:          db.cfg.Replication.Dissemination == DisseminationPlumtree,
-		MaxTransactionBytes:     db.cfg.MaxTransactionBytes,
-		Limits:                  codec.Limits{MaxValueBytes: db.cfg.MaxReplicatedValueBytes, MaxMutations: db.cfg.MaxBatchMutations, MaxTransactionBytes: db.cfg.MaxTransactionBytes},
-		Logger:                  db.cfg.Logger,
+	mgr, err := replication.NewManager(replication.ManagerConfig{
+		Store:                       db.store,
+		Applier:                     db,
+		Creds:                       db.replCreds,
+		Local:                       db.cfg.NodeID,
+		DBID:                        db.store.DBID(),
+		SchemaEpoch:                 schemaId.Epoch,
+		SchemaHash:                  schemaId.Hash,
+		SchemaAuthor:                schemaId.Author,
+		SchemaTime:                  schemaId.TimeCreated,
+		AcceptRemoteSchema:          db.cfg.Schema.acceptRemoteSchema(),
+		SchemaSync:                  db,
+		ListenAddr:                  db.cfg.Replication.ListenAddr,
+		Peers:                       peers,
+		MaxBatchBytes:               db.cfg.Replication.MaxBatchBytes,
+		MaxBatchMutations:           db.cfg.Replication.MaxBatchMutations,
+		SendInterval:                db.cfg.Replication.SendInterval,
+		DialInterval:                db.cfg.Replication.DialInterval,
+		AckInterval:                 db.cfg.Replication.AckInterval,
+		AckRetention:                db.cfg.Replication.MaxOfflineLogRetention,
+		SnapshotChunkCells:          db.cfg.Replication.SnapshotChunkCells,
+		MaxSnapshotBytes:            uint64(db.cfg.Replication.MaxSnapshotBytes),
+		SnapshotTransferTimeout:     db.cfg.Replication.SnapshotTransferTimeout,
+		SnapshotRequestTimeout:      db.cfg.Replication.SnapshotRequestTimeout,
+		Fanout:                      db.cfg.Replication.Fanout,
+		PeerRotationInterval:        db.cfg.Replication.PeerRotationInterval,
+		AntiEntropyInterval:         db.cfg.Replication.AntiEntropyInterval,
+		MaxConcurrentRepairs:        db.cfg.Replication.MaxConcurrentRepairs,
+		MaxReplicationSessions:      db.cfg.Replication.MaxReplicationSessions,
+		MaxQUICConnections:          db.cfg.Replication.MaxQUICConnections,
+		EnablePlumtree:              db.cfg.Replication.Dissemination == DisseminationPlumtree,
+		AdvertiseProtocolVersion:    db.cfg.Replication.ProtocolVersionOverride,
+		AdvertiseMinProtocolVersion: db.cfg.Replication.MinProtocolVersionOverride,
+		MaxTransactionBytes:         db.cfg.MaxTransactionBytes,
+		Limits:                      codec.Limits{MaxValueBytes: db.cfg.MaxReplicatedValueBytes, MaxMutations: db.cfg.MaxBatchMutations, MaxTransactionBytes: db.cfg.MaxTransactionBytes},
+		Logger:                      db.cfg.Logger,
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	memCfg := db.cfg.Replication.Membership
+	bootstrap := append([]string(nil), memCfg.Bootstrap...)
+	if len(bootstrap) == 0 && len(db.cfg.Replication.Bootstrap) > 0 {
+		bootstrap = append(bootstrap, db.cfg.Replication.Bootstrap...)
+	}
+	if len(bootstrap) > 0 {
+		advAddr := memCfg.AdvertiseAddr
+		if advAddr == "" {
+			advAddr = db.cfg.Replication.ListenAddr
+		}
+		tr, err := transport.NewMemberlistTransport(transport.MemberlistTransportConfig{
+			LocalNodeID:   db.cfg.NodeID,
+			DBID:          db.store.DBID(),
+			Creds:         db.replCreds,
+			Pool:          mgr.Pool(),
+			BindAddr:      "127.0.0.1:0",
+			AdvertiseAddr: advAddr,
+		})
+		if err == nil {
+			var slogLogger *slog.Logger
+			if db.cfg.Logger != nil {
+				slogLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
+			}
+			svc, err := replication.NewMembershipService(
+				db.cfg.NodeID,
+				db.store.DBID(),
+				replication.MembershipConfig{
+					Bootstrap:      bootstrap,
+					AdvertiseAddr:  advAddr,
+					ProbeInterval:  memCfg.ProbeInterval,
+					ProbeTimeout:   memCfg.ProbeTimeout,
+					GossipInterval: memCfg.GossipInterval,
+					GossipNodes:    memCfg.GossipNodes,
+					IndirectChecks: memCfg.IndirectChecks,
+				},
+				tr,
+				mgr,
+				slogLogger,
+			)
+			if err == nil {
+				mgr.SetMembership(svc)
+			} else {
+				_ = tr.Shutdown()
+			}
+		}
+	}
+	return mgr, nil
 }
 
 // startReplication runs a manager to completion.

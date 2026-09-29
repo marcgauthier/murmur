@@ -46,7 +46,7 @@ func (s *Subscription) Close() { s.cancel() }
 // daemon streams the same wire format as the TLS service handler.
 func (c *Cluster) Subscribe(idx int, query string) (*Subscription, error) {
 	node := c.Nodes[idx]
-	u := fmt.Sprintf("http://%s/v1/subscribe?%s", node.APIAddr,
+	u := fmt.Sprintf("https://%s/v1/subscribe?%s", node.APIAddr,
 		url.Values{"query": {query}}.Encode())
 	ctx, cancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)

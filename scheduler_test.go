@@ -81,6 +81,82 @@ func TestWriterSharesConverge(t *testing.T) {
 
 // TestSchedulerIdleBorrowing proves either class uses full capacity when
 // the other is idle.
+// TestSchedulerDualServiceAttribution proves only service granted while
+// the other interactive class waits counts as dual: a solo grant never
+// does, a grant chosen between backlogged classes always does, and the
+// grant after the other queue drains does not.
+func TestSchedulerDualServiceAttribution(t *testing.T) {
+	s := newWriterScheduler(DefaultWriterSchedulingConfig())
+	ctx := context.Background()
+
+	l1, err := s.Admit(ctx, WriterLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitAsync := func(class WriterClass) <-chan *Ticket {
+		ch := make(chan *Ticket, 1)
+		go func() {
+			tk, err := s.Admit(ctx, class)
+			if err != nil {
+				return
+			}
+			ch <- tk
+		}()
+		return ch
+	}
+	r1ch := admitAsync(WriterRemote)
+	waitWaiters := func(class WriterClass, want int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if got := s.Snapshot(); (class == WriterLocal && got.Local.Waiters >= want) ||
+				(class == WriterRemote && got.Remote.Waiters >= want) {
+				return
+			}
+			if time.Now().After(deadline) {
+				l1.Release()
+				s.Close()
+				t.Fatalf("class %v waiters did not reach %d", class, want)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	waitWaiters(WriterRemote, 1)
+	l2ch := admitAsync(WriterLocal)
+	waitWaiters(WriterLocal, 1)
+
+	// Both classes wait and local already accrued L1's service, so
+	// releasing L1 grants R1 (least normalized service) with the dual
+	// mark; L2 follows once the remote queue drains (not dual), and the
+	// solo L1 grant was never dual either.
+	l1.Release()
+	select {
+	case r1 := <-r1ch:
+		time.Sleep(5 * time.Millisecond)
+		r1.Release()
+	case <-time.After(5 * time.Second):
+		s.Close()
+		t.Fatal("R1 never granted")
+	}
+	select {
+	case l2 := <-l2ch:
+		l2.Release()
+	case <-time.After(5 * time.Second):
+		s.Close()
+		t.Fatal("L2 never granted")
+	}
+	st := s.Snapshot()
+	if st.Remote.DualServiceNanos == 0 {
+		t.Fatal("remote grant between backlogged classes recorded no dual service")
+	}
+	if st.Local.DualServiceNanos != 0 {
+		t.Fatalf("local grants with empty remote queue recorded %d dual nanos", st.Local.DualServiceNanos)
+	}
+	if st.Local.ServiceNanos == 0 {
+		t.Fatal("local service unrecorded")
+	}
+}
+
 func TestSchedulerIdleBorrowing(t *testing.T) {
 	s := newWriterScheduler(DefaultWriterSchedulingConfig())
 	ctx := context.Background()

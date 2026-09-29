@@ -33,9 +33,11 @@ func TestCollectorSeries(t *testing.T) {
 			LocalCommits:            3,
 			LocalCommitMutations:    12,
 			LocalCommitLatencyNanos: uint64(time.Second),
+			StmtCacheHits:           9,
+			StmtCacheMisses:         2,
 			Scheduler: replicateddb.SchedulerSnapshot{
-				Local:     replicateddb.SchedulerClassStats{Acquisitions: 5, ServiceNanos: uint64(2 * time.Second)},
-				Remote:    replicateddb.SchedulerClassStats{Acquisitions: 2, Waiters: 1},
+				Local:     replicateddb.SchedulerClassStats{Acquisitions: 5, ServiceNanos: uint64(2 * time.Second), DualServiceNanos: uint64(1500 * time.Millisecond)},
+				Remote:    replicateddb.SchedulerClassStats{Acquisitions: 2, Waiters: 1, DualServiceNanos: uint64(200 * time.Millisecond)},
 				DebtNanos: uint64(100 * time.Millisecond),
 			},
 		},
@@ -79,20 +81,25 @@ func TestCollectorSeries(t *testing.T) {
 			StreamDialFailures:     0,
 		},
 		Replication: replication.StatsSnapshot{
-			SessionsOpened:   2,
-			BatchesSent:      5,
-			MemberAdmissions: 1,
-			GatingMembers:    1,
+			SessionsOpened:        2,
+			BatchesSent:           5,
+			MemberAdmissions:      1,
+			GatingMembers:         1,
+			SnapshotsBusyDeferred: 3,
+			SnapshotBusyReceived:  1,
 		},
 		Peers: []replicateddb.PeerDiagnostics{{
-			NodeID:             peer,
-			Connected:          true,
-			Selected:           true,
-			SchemaAgreed:       true,
-			MembershipState:    "alive",
-			RetirementDeadline: time.Unix(1800000000, 0),
-			BytesSent:          100,
-			LagByOrigin:        map[replicateddb.NodeID]uint64{node: 4},
+			NodeID:                 peer,
+			Connected:              true,
+			Selected:               true,
+			SchemaAgreed:           true,
+			AwaitingSnapshot:       true,
+			SnapshotChunksReceived: 3,
+			SnapshotChunksTotal:    7,
+			MembershipState:        "alive",
+			RetirementDeadline:     time.Unix(1800000000, 0),
+			BytesSent:              100,
+			LagByOrigin:            map[replicateddb.NodeID]uint64{node: 4},
 		}, {
 			NodeID:          retired,
 			Retired:         true,
@@ -185,11 +192,41 @@ spedsql_sched_acquisitions_total{class="remote"} 2
 spedsql_sched_service_seconds_total{class="local"} 2
 spedsql_sched_service_seconds_total{class="maintenance"} 0
 spedsql_sched_service_seconds_total{class="remote"} 0
+# HELP spedsql_sched_dual_service_seconds_total Admitted writer service time granted while the other interactive class had waiters.
+# TYPE spedsql_sched_dual_service_seconds_total counter
+spedsql_sched_dual_service_seconds_total{class="local"} 1.5
+spedsql_sched_dual_service_seconds_total{class="maintenance"} 0
+spedsql_sched_dual_service_seconds_total{class="remote"} 0.2
 # HELP spedsql_sched_debt_seconds Normalized service-time debt spread between local and remote classes.
 # TYPE spedsql_sched_debt_seconds gauge
 spedsql_sched_debt_seconds 0.1
+# HELP spedsql_repl_snapshots_busy_deferred_total Snapshot requests deferred while a transfer was in flight.
+# TYPE spedsql_repl_snapshots_busy_deferred_total counter
+spedsql_repl_snapshots_busy_deferred_total 3
+# HELP spedsql_repl_snapshot_busy_received_total Snapshot busy deferrals received from sources.
+# TYPE spedsql_repl_snapshot_busy_received_total counter
+spedsql_repl_snapshot_busy_received_total 1
+# HELP spedsql_peer_awaiting_snapshot Outbound snapshot request awaiting completion.
+# TYPE spedsql_peer_awaiting_snapshot gauge
+spedsql_peer_awaiting_snapshot{peer=%q} 1
+spedsql_peer_awaiting_snapshot{peer=%q} 0
+# HELP spedsql_peer_snapshot_chunks_received Inbound snapshot chunks received from the peer.
+# TYPE spedsql_peer_snapshot_chunks_received gauge
+spedsql_peer_snapshot_chunks_received{peer=%q} 3
+spedsql_peer_snapshot_chunks_received{peer=%q} 0
+# HELP spedsql_peer_snapshot_chunks_total Inbound snapshot chunk count advertised by the peer manifest.
+# TYPE spedsql_peer_snapshot_chunks_total gauge
+spedsql_peer_snapshot_chunks_total{peer=%q} 7
+spedsql_peer_snapshot_chunks_total{peer=%q} 0
+# HELP spedsql_stmt_cache_hits_total Prepared-statement cache hits.
+# TYPE spedsql_stmt_cache_hits_total counter
+spedsql_stmt_cache_hits_total 9
+# HELP spedsql_stmt_cache_misses_total Prepared-statement cache misses.
+# TYPE spedsql_stmt_cache_misses_total counter
+spedsql_stmt_cache_misses_total 2
 `, dbid.String(), node.String(), peer.String(), retired.String(), peer.String(), retired.String(), peer.String(), retired.String(), peer.String(), retired.String(),
-		node.String(), peer.String(), peer.String(), retired.String(), peer.String(), retired.String())
+		node.String(), peer.String(), peer.String(), retired.String(), peer.String(), retired.String(),
+		peer.String(), retired.String(), peer.String(), retired.String(), peer.String(), retired.String())
 	if err := testutil.CollectAndCompare(c, strings.NewReader(want),
 		"spedsql_info", "spedsql_state_generation", "spedsql_membership_alive_count",
 		"spedsql_quic_sessions_active", "spedsql_local_commits_total",
@@ -202,7 +239,11 @@ spedsql_sched_debt_seconds 0.1
 		"spedsql_peer_lag_sequences", "spedsql_gating_members",
 		"spedsql_repl_member_admissions_total", "spedsql_peer_retired",
 		"spedsql_peer_excluded", "spedsql_sched_acquisitions_total",
-		"spedsql_sched_service_seconds_total", "spedsql_sched_debt_seconds"); err != nil {
+		"spedsql_sched_service_seconds_total", "spedsql_sched_dual_service_seconds_total", "spedsql_sched_debt_seconds",
+		"spedsql_repl_snapshots_busy_deferred_total", "spedsql_repl_snapshot_busy_received_total",
+		"spedsql_peer_awaiting_snapshot", "spedsql_peer_snapshot_chunks_received",
+		"spedsql_peer_snapshot_chunks_total",
+		"spedsql_stmt_cache_hits_total", "spedsql_stmt_cache_misses_total"); err != nil {
 		t.Fatal(err)
 	}
 }

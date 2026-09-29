@@ -8,11 +8,11 @@ import (
 )
 
 // Rows is a standalone read result. Close must be called promptly: an open
-// Rows holds a read lock that stalls writers. Close is idempotent.
+// Rows holds a read lock that stalls writers. Exhausting the rows also closes
+// the cursor and releases the lock. Close is idempotent.
 type Rows struct {
 	rows    *sql.Rows
 	release func()
-	engine  *Engine
 	cols    []string
 	once    sync.Once
 	cerr    error
@@ -26,32 +26,7 @@ func (e *Engine) Query(ctx context.Context, query string, args ...any) (*Rows, e
 		e.rw.RUnlock()
 		return nil, fmt.Errorf("sqlengine: closed")
 	}
-	if e.concurrentMVCC {
-		conn, err := e.db.Conn(ctx)
-		if err != nil {
-			e.rw.RUnlock()
-			return nil, err
-		}
-		stmt, err := conn.PrepareContext(ctx, query)
-		if err != nil {
-			_ = conn.Close()
-			e.rw.RUnlock()
-			return nil, fmt.Errorf("sqlengine: prepare read: %w", err)
-		}
-		rows, err := stmt.QueryContext(ctx, args...)
-		if err != nil {
-			_ = stmt.Close()
-			_ = conn.Close()
-			e.rw.RUnlock()
-			return nil, err
-		}
-		return &Rows{rows: rows, release: func() {
-			_ = stmt.Close()
-			_ = conn.Close()
-			e.rw.RUnlock()
-		}, engine: e}, nil
-	}
-	stmt, err := e.readStmts.prepare(ctx, e.read, query)
+	stmt, err := e.readStmts.prepare(ctx, e.db, query)
 	if err != nil {
 		e.rw.RUnlock()
 		return nil, err
@@ -61,7 +36,7 @@ func (e *Engine) Query(ctx context.Context, query string, args ...any) (*Rows, e
 		e.rw.RUnlock()
 		return nil, err
 	}
-	return &Rows{rows: rows, release: e.rw.RUnlock, engine: e}, nil
+	return &Rows{rows: rows, release: e.rw.RUnlock}, nil
 }
 
 // QueryRowContext runs a single-row standalone read. Unlike Query it does not
@@ -73,20 +48,7 @@ func (e *Engine) QueryRowContext(ctx context.Context, query string, args []any, 
 	if e.closed {
 		return fmt.Errorf("sqlengine: closed")
 	}
-	if e.concurrentMVCC {
-		conn, err := e.db.Conn(ctx)
-		if err != nil {
-			return err
-		}
-		defer conn.Close()
-		stmt, err := conn.PrepareContext(ctx, query)
-		if err != nil {
-			return fmt.Errorf("sqlengine: prepare read: %w", err)
-		}
-		defer stmt.Close()
-		return fn(stmt.QueryRowContext(ctx, args...))
-	}
-	stmt, err := e.readStmts.prepare(ctx, e.read, query)
+	stmt, err := e.readStmts.prepare(ctx, e.db, query)
 	if err != nil {
 		return err
 	}
@@ -109,7 +71,7 @@ func (r *Rows) Next() bool {
 	if r.rows.Next() {
 		return true
 	}
-	if r.engine != nil && r.engine.concurrentMVCC {
+	if r.release != nil {
 		_ = r.Close()
 	}
 	return false

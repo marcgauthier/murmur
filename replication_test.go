@@ -10,7 +10,6 @@ import (
 	"github.com/nomadsql/replicateddb/transport"
 )
 
-
 // testClusterCA issues node credentials for tests.
 func testClusterCA(t testing.TB, nodes ...NodeID) (*transport.CA, map[NodeID]*TLSCredential) {
 	t.Helper()
@@ -93,7 +92,6 @@ func waitForRows(t testing.TB, db *DB, want int, timeout time.Duration) [][]any 
 	t.Fatalf("timed out waiting for %d rows", want)
 	return nil
 }
-
 
 func waitForValue(t *testing.T, db *DB, id RowID, want string, timeout time.Duration) {
 	t.Helper()

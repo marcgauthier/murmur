@@ -106,7 +106,7 @@ func rowCount(t *testing.T, cluster *harness.Cluster, idx int) int {
 
 func scrapeMetrics(t *testing.T, cluster *harness.Cluster, idx int) string {
 	t.Helper()
-	resp, err := http.Get(fmt.Sprintf("http://%s/metrics", cluster.Nodes[idx].APIAddr))
+	resp, err := http.Get(fmt.Sprintf("https://%s/metrics", cluster.Nodes[idx].APIAddr))
 	if err != nil {
 		t.Fatal(err)
 	}

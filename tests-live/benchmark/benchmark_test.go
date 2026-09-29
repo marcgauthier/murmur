@@ -116,7 +116,7 @@ func stateOf(t *testing.T, cluster *harness.Cluster, idx int) (int, [32]byte) {
 func replBatchBytes(t *testing.T, cluster *harness.Cluster) (sent, received uint64) {
 	t.Helper()
 	for i := range cluster.Nodes {
-		resp, err := http.Get(fmt.Sprintf("http://%s/metrics", cluster.Nodes[i].APIAddr))
+		resp, err := http.Get(fmt.Sprintf("https://%s/metrics", cluster.Nodes[i].APIAddr))
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -27,7 +27,7 @@ type Options struct {
 	// WALDir overrides the WAL directory. Empty keeps Pebble's default
 	// (the data directory itself).
 	WALDir string
-	// CacheBytes sizes Pebble's unified block cache. Default 16 MiB.
+	// CacheBytes sizes Pebble's unified block cache. Default 256 MiB.
 	CacheBytes int64
 	// MemTableSize caps one memtable. Default 4 MiB (small hot set).
 	MemTableSize uint64
@@ -206,7 +206,7 @@ func Open(path string, nodeID ids.NodeID, dbID ids.DBID, opt Options) (*Store, e
 	fs = &watchFS{FS: fs, fatal: fatal}
 	opt.FS = fs
 	if opt.CacheBytes <= 0 {
-		opt.CacheBytes = 16 << 20
+		opt.CacheBytes = 256 << 20
 	}
 	if opt.MemTableSize == 0 {
 		opt.MemTableSize = 4 << 20

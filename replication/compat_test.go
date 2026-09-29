@@ -36,6 +36,32 @@ func TestNegotiateCapabilities(t *testing.T) {
 	}
 }
 
+// TestValidateIdentityHonorsVersionOverride proves enforcement matches
+// advertisement: a node overridden to min 99 must refuse a stock (3,3)
+// peer inbound (not just be refused outbound), so no transient session is
+// ever attached. With zero overrides the constants still apply.
+func TestValidateIdentityHonorsVersionOverride(t *testing.T) {
+	peer := ids.NodeID{7}
+	dbid := ids.DBID{9}
+	stock := &Hello{ProtocolVersion: ProtocolVersion, MinProtocolVersion: MinProtocolVersion, NodeID: peer, DBID: dbid}
+	future := &Hello{ProtocolVersion: 99, MinProtocolVersion: 99, NodeID: peer, DBID: dbid}
+
+	overridden := &Manager{cfg: ManagerConfig{DBID: dbid, AdvertiseProtocolVersion: 99, AdvertiseMinProtocolVersion: 99}}
+	if err := overridden.validateIdentity(stock, peer); err == nil {
+		t.Fatalf("min-99 node accepted stock peer hello, want refusal")
+	}
+	if err := overridden.validateIdentity(future, peer); err != nil {
+		t.Fatalf("min-99 node refused matching peer hello: %v", err)
+	}
+	stockMgr := &Manager{cfg: ManagerConfig{DBID: dbid}}
+	if err := stockMgr.validateIdentity(future, peer); err == nil {
+		t.Fatalf("stock node accepted version-99 hello, want refusal")
+	}
+	if err := stockMgr.validateIdentity(stock, peer); err != nil {
+		t.Fatalf("stock node refused stock hello: %v", err)
+	}
+}
+
 func TestDisseminationCapabilityMismatchRefuses(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

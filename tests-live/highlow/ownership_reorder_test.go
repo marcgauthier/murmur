@@ -37,7 +37,7 @@ func TestHighLowOwnershipReorderAcrossPeersLive(t *testing.T) {
 		Schema: liveSchemaConfig(liveContactsSchema()),
 		Bridge: &harness.BridgeOptions{
 			Role: "high-importer", Stream: liveStream, NodeIndices: []int{0, 1},
-			StagingDir: staging,
+			StagingDir:       staging,
 			RecipientKeyFile: keys.files.RecipientKeyFile, SignerPubFile: keys.files.SignerPubFile,
 		},
 	})

@@ -136,7 +136,7 @@ func assertNeverReady(t *testing.T, cluster *harness.Cluster, idx int, timeout t
 			return // failed unlock exited the daemon: old key invalidated
 		default:
 		}
-		resp, err := http.Get(fmt.Sprintf("http://%s/healthz", node.APIAddr))
+		resp, err := http.Get(fmt.Sprintf("https://%s/healthz", node.APIAddr))
 		if err == nil {
 			resp.Body.Close()
 			t.Fatal("node with retired key became ready")

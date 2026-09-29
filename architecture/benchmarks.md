@@ -42,8 +42,7 @@ mixed read/write
 Compare:
 
 ```text
-LumoSQL memory
-LumoSQL mmap/LMDB mode if implemented
+SPeD-SQL in-memory SQLite materialization
 ordinary SQLite baseline
 ```
 
@@ -106,7 +105,7 @@ Pebble open
 schema initialization
 state scan
 row assembly
-LumoSQL inserts
+SQLite materialization inserts
 index creation
 FTS build
 time until first query
@@ -135,6 +134,10 @@ key unless the benchmark varies the cipher). Datasets are reproducible:
 `benchmark/populate` seeds its generator with 42, and single-node
 benchmarks share one lazily built template store per size (copied per
 benchmark, so setup cost is paid once per size per run).
+
+All commands below need the build tags (`-tags "sqlite_preupdate_hook
+sqlite_fts5"`, or `-tags modernc` for the pure-Go backend); the CGO
+concurrent-reader commands already include their full tag sets.
 
 ```bash
 # Fast pass: 10K datasets (short mode)
@@ -166,6 +169,15 @@ SPEDSQL_LOCAL_BATCH_BENCH_SECONDS=5 go test ./benchmark/ -run '^TestLocalTransac
 
 # Live daemon, one and four concurrent HTTP SQL writers (10s each)
 SPEDSQL_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-live/benchmark/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s
+
+# Concurrent-reader query benchmarks (CGO tags required for default backend)
+go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./benchmark/ -bench 'BenchmarkConcurrent' -short -benchtime 1s
+
+# Same suite, restricted reader levels and 100K datasets
+SPEDSQL_BENCH_READERS=1,8 go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./benchmark/ -bench 'BenchmarkConcurrentMixedSQLite' -benchtime 1s
+
+# Fixed-window sustained multi-reader throughput (10s per reader level, 10K rows)
+go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./benchmark/ -run '^TestSQLiteConcurrentReaderThroughput$' -v -count=1 -timeout=300s
 ```
 
 The direct local writer benchmark opens one encrypted database with no peers
@@ -237,10 +249,55 @@ The 2026-09-28 10-second run on the four-core Intel i5-6500 measured
 294.3 inserts/sec with one writer and 328.2 inserts/sec with four writers;
 both count checks passed.
 
+The concurrent-reader benchmarks measure query speed with 1-32 simultaneous
+readers against the in-memory SQLite materialization. Each standalone query
+runs through the pooled read connections and a prepared-statement cache. Each case
+reopens the shared dataset template, starts N reader goroutines
+behind a gate, and reports per-query p50/p95/p99 plus wall-clock throughput
+(summing per-op durations would overcount under concurrency). The four
+workloads are point lookups, single-column indexed equality probes,
+100-row-capped indexed ranges, and an alternating point/range mix. Reader
+levels default to 1, 2, 4, 8, 16, 32 and accept a comma-separated
+`SPEDSQL_BENCH_READERS` override; dataset sizes follow the standard
+`REPLICATEDDB_BENCH_ROWS` / `-short` selection. The benchmarks run under
+both the default mattn driver and the optional `modernc` driver. The
+fixed-window test runs the mixed workload for
+`SPEDSQL_READ_BENCH_SECONDS` (default 10) per reader level on a 10K-row
+store and checks that every point lookup returns exactly one row.
+
+A 2026-09-28 short run on the four-core Intel i5-6500 (`-benchtime 1s`,
+10K rows) measured this wall-clock throughput in queries/sec:
+
+| Readers | Point lookup | Indexed equality | Indexed range | Mixed |
+|---:|---:|---:|---:|---:|
+| 1 | 96,810 | 135,325 | 10,157 | 18,147 |
+| 2 | 142,473 | 131,970 | 19,004 | 19,712 |
+| 4 | 100,426 | 363,348 | 31,284 | 51,329 |
+| 8 | 318,971 | 359,241 | 27,260 | 35,899 |
+| 16 | 330,045 | 376,874 | 32,063 | 38,480 |
+| 32 | 244,014 | 352,804 | 21,928 | 57,064 |
+
+Throughput scales to about the core count and then plateaus, while tail
+latency grows past 4 readers from oversubscription and pool queueing (the
+pool has a 32-connection cap, including the reserved write connection). The box
+was under background desktop load during this run, so single cells vary
+between runs: the 4-reader point-lookup cell above dipped to 100K while a
+focused rerun measured 289K there. The same-day 10-second fixed-window run
+measured 17,882 mixed queries/sec with one reader, 61,780 with four,
+41,061 with eight, and 55,661 with 32.
+
+The recorded backend comparison results below were collected before the
+SQLite-only refactor, when the query store had memory and mmap modes. They
+are historical data and do not describe the current implementation. New
+SQLite-only results should replace them after rerunning the matrix.
+
 Benchmark names map to matrix sections: `BenchmarkPKLookup`,
 `BenchmarkIndexedEquality`, `BenchmarkIndexedRange`, `BenchmarkOrderLimit`,
 `BenchmarkJoin`, `BenchmarkGroupBy`, `BenchmarkFTSTerm`,
-`BenchmarkFTSPrefix` (§59 search); `BenchmarkSingleCellUpdate`,
+`BenchmarkFTSPrefix`, `BenchmarkConcurrentPKLookupSQLite`,
+`BenchmarkConcurrentIndexedEqualitySQLite`,
+`BenchmarkConcurrentRangeLookupSQLite`, `BenchmarkConcurrentMixedSQLite`
+(§59 search); `BenchmarkSingleCellUpdate`,
 `BenchmarkMultiColumnUpdate`, `BenchmarkTxn10Rows`,
 `BenchmarkTxn1000Rows`, `BenchmarkTxn10000Rows`, `BenchmarkMixedReadWrite`,
 `BenchmarkPebbleCommitLatency`, `BenchmarkRemoteApplyRate`,
@@ -254,9 +311,8 @@ with on-disk bytes), `BenchmarkCheckpoint`,
 first query; compare full against store across runs to size the
 rebuild), `BenchmarkReplicationReady`,
 `BenchmarkRebuild` (§61 startup);
-`BenchmarkBackendCompare` (memory vs mmap query store) and
-`BenchmarkSQLiteBaseline` (stock SQLite reference) cover backend
-comparisons.
+`BenchmarkQueryMaterialization` and `BenchmarkSQLiteBaseline` (stock SQLite
+reference) cover query materialization comparisons.
 
 Coverage notes and manual procedures:
 
@@ -271,8 +327,8 @@ Coverage notes and manual procedures:
   build) have no phase hooks; the suite reports rebuild as one derived
   component. Compaction is Pebble-automatic with no public trigger, so it
   is not benchmarked separately. Substring/trigram search is not enabled.
-- LMDB backend comparisons depend on external-backend validation and are
-  out of scope; the mmap file-backed backend is the current alternative.
+- File-backed query-store comparisons are no longer applicable; SQLite
+  materialization is always in memory.
 
 ## 63. Recorded Results (10K, 2026-09-27)
 

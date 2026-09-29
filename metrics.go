@@ -100,6 +100,11 @@ type MetricsSnapshot struct {
 	SchemaConflicts  uint64
 	SchemaAgreements uint64
 	SchemaSyncNeeds  uint64
+
+	// StmtCacheHits/Misses count prepared-statement cache lookups
+	// summed over the engine's read and write caches.
+	StmtCacheHits    uint64
+	StmtCacheMisses  uint64
 	SchemaAdoptions  uint64
 	SchemaMerges     uint64
 	SchemaMergeReuse uint64
@@ -164,5 +169,8 @@ func (m *dbMetrics) snapshot() MetricsSnapshot {
 func (db *DB) Metrics() MetricsSnapshot {
 	m := db.metrics.snapshot()
 	m.Scheduler = db.sched.Snapshot()
+	if db.engine != nil {
+		m.StmtCacheHits, m.StmtCacheMisses = db.engine.StmtCacheStats()
+	}
 	return m
 }

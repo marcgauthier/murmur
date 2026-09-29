@@ -137,7 +137,7 @@ func openBenchDB(b *testing.B, path string) *replicateddb.DB {
 // populate inserts n contacts (+2 orders each) in 5000-row transactions
 // (sized under MaxBatchMutations/MaxTransactionBytes for fast setup).
 // It returns the contact row IDs for point lookups.
-func populate(b *testing.B, db *replicateddb.DB, n int) []replicateddb.RowID {
+func populate(b testing.TB, db *replicateddb.DB, n int) []replicateddb.RowID {
 	b.Helper()
 	ctx := context.Background()
 	rng := rand.New(rand.NewSource(42))

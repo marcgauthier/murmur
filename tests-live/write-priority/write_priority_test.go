@@ -49,16 +49,20 @@ func TestLocalWritePriority(t *testing.T) {
 		}}}},
 	})
 
-	localBefore, remoteBefore := schedService(t, cluster)
+	dualBefore := dualService(t, cluster)
 	deadline := time.Now().Add(writeFor)
 
-	// Two writers per node with disjoint key ranges; the daemon's
+	// Sixteen writers per node with disjoint key ranges; the daemon's
 	// single-statement service surface issues one transaction each.
+	// Deep queues maximize dual contention (both classes backlogged,
+	// where the 90/10 policy binds) so the policy is actually
+	// exercised, including under `-race` on a loaded box, where each
+	// synchronous driver loop runs several times slower.
 	var wg sync.WaitGroup
-	errCh := make(chan error, 4)
+	errCh := make(chan error, 32)
 	var written atomic.Int64
 	for node := 0; node < 2; node++ {
-		for worker := 0; worker < 2; worker++ {
+		for worker := 0; worker < 16; worker++ {
 			wg.Add(1)
 			go func(node, worker int) {
 				defer wg.Done()
@@ -104,16 +108,20 @@ func TestLocalWritePriority(t *testing.T) {
 		t.Fatalf("insufficient local progress: %d rows, %d reads", expected, reads)
 	}
 
-	localAfter, remoteAfter := schedService(t, cluster)
-	local := localAfter - localBefore
-	remote := remoteAfter - remoteBefore
-	if local <= 0 || remote <= 0 {
-		t.Fatalf("both classes were not contended: local=%.6fs replication=%.6fs", local, remote)
+	dualAfter := dualService(t, cluster)
+	local := dualAfter.local - dualBefore.local
+	remote := dualAfter.remote - dualBefore.remote
+	// Vacuity gate: the policy assertion needs proven dual contention
+	// (service granted while both classes waited). Near-zero dual mass
+	// means the queues never overlapped and there is no policy decision
+	// to measure — fail loudly instead of asserting on borrowing.
+	t.Logf("dual-contention writer service: local=%.3fs replication=%.3fs share=%.3f",
+		local, remote, remote/(local+remote))
+	if local+remote < 1.0 {
+		t.Fatalf("only %.3fs of dual-contention service, want >= 1s to measure the 90/10 policy", local+remote)
 	}
-	share := remote / (local + remote)
-	t.Logf("contended writer service: local=%.3fs replication=%.3fs share=%.3f", local, remote, share)
-	if share > 0.25 {
-		t.Fatalf("replication occupied %.1f%% of contended writer service time", share*100)
+	if share := remote / (local + remote); share > 0.25 {
+		t.Fatalf("replication occupied %.1f%% of dual-contention writer service time", share*100)
 	}
 
 	// Convergence: identical row counts and identical hashes.
@@ -141,13 +149,21 @@ func stateOf(t *testing.T, cluster *harness.Cluster, idx int) (int, [32]byte) {
 	return len(res.Rows), sha256.Sum256([]byte(fmt.Sprintf("%v", res.Rows)))
 }
 
-// schedService sums admitted writer service seconds by scheduler class
-// across both daemons. Values render as float64 text (scientific
-// notation at the extremes), so ParseFloat, not ParseUint.
-func schedService(t *testing.T, cluster *harness.Cluster) (local, remote float64) {
+// dualCounters sums dual-contention service seconds (granted while the
+// other interactive class waited) by scheduler class across both
+// daemons. Values render as float64 text (scientific notation at the
+// extremes), so ParseFloat, not ParseUint.
+type dualCounters struct {
+	local  float64
+	remote float64
+}
+
+func dualService(t *testing.T, cluster *harness.Cluster) (out dualCounters) {
 	t.Helper()
 	for i := range cluster.Nodes {
-		resp, err := http.Get(fmt.Sprintf("http://%s/metrics", cluster.Nodes[i].APIAddr))
+		// Default client: the harness hijacks it with the cluster CA
+		// and a per-target client certificate.
+		resp, err := http.Get(fmt.Sprintf("https://%s/metrics", cluster.Nodes[i].APIAddr))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -157,7 +173,7 @@ func schedService(t *testing.T, cluster *harness.Cluster) (local, remote float64
 			t.Fatal(err)
 		}
 		for _, line := range strings.Split(string(body), "\n") {
-			if !strings.HasPrefix(line, "spedsql_sched_service_seconds_total{") {
+			if !strings.HasPrefix(line, "spedsql_sched_dual_service_seconds_total{") {
 				continue
 			}
 			fields := strings.Fields(line)
@@ -170,11 +186,11 @@ func schedService(t *testing.T, cluster *harness.Cluster) (local, remote float64
 			}
 			switch {
 			case strings.Contains(line, `class="local"`):
-				local += v
+				out.local += v
 			case strings.Contains(line, `class="remote"`):
-				remote += v
+				out.remote += v
 			}
 		}
 	}
-	return local, remote
+	return out
 }

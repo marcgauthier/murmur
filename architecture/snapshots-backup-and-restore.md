@@ -88,14 +88,18 @@ renew nothing. `RemovePeer` persists retirement plus exclusion and refuses
 rejoining handshakes; `AddPeer` clears both for a fresh admission. Log GC
 gates on the persisted live-obligation set only, never on session `lastSeen`,
 and grants pre-upgrade durable ack progress one explicit window instead of
-dropping it. Retirement/exclusion surface per peer in `Status` and the
+dropping it. Each pass drains every origin in bounded 4096-batch units
+(`state.CollectUnitCap`), re-admitting the maintenance ticket per unit so
+interactive writers interleave; units repeat until a short return proves
+the origin caught up, so sustained write rates cannot outrun collection.
+Retirement/exclusion surface per peer in `Status` and the
 `metrics` collectors.
 
 ---
 
 ## 37. Snapshot / Full Seed
 
-A snapshot is a logical copy of current replicated state, not a copy of LumoSQL.
+A snapshot is a logical copy of current replicated state, not a copy of the SQLite materialization.
 
 ### Current implementation and remaining gap
 
@@ -126,10 +130,11 @@ published) or the complete merged state; a preempting newer transfer can
 never publish the older partial merge. SQL stays gated on the pre-snapshot
 materialization until publication completes, then rebuilds once from the
 committed state. The source holds its consistent Pebble read cut for at most
-`Replication.SnapshotTransferTimeout` (10 minutes by default) and acquires a bounded
-source log-retention lease covering the snapshot's watermarks so concurrent source
-writes and log GC preserve tail repair history until transfer completion or expiry.
-Explicit progress diagnostics and fault injection at every publication boundary
+`Replication.SnapshotTransferTimeout` (10 minutes by default). A bounded
+source log-retention lease covering the snapshot's watermarks — so concurrent
+source writes and log GC preserve tail repair history until transfer
+completion or expiry — remains pending; no lease code exists yet. Explicit
+progress diagnostics and fault injection at every publication boundary also
 remain outstanding.
 
 Snapshot manifest:
@@ -161,7 +166,7 @@ Snapshot includes:
 
 It does not include:
 
-- LumoSQL indexes.
+- SQLite indexes.
 - FTS structures.
 - Prepared statements.
 - Pebble cache.
@@ -193,7 +198,7 @@ An empty node has no local state to merge. A stale existing node must never repl
 
 For an origin represented in both consistent cuts, the merged watermark may use the maximum of their contiguous covered prefixes only after all corresponding state/tombstones are merged. Never promote a staged/observed head to a watermark. Keep out-of-order pending transactions separately until gaps or snapshot-covered prefixes resolve them. Snapshot watermarks provide state coverage, not permission to fabricate missing historical log entries; track retained-log availability independently.
 
-The final publication uses a single bounded Pebble batch rather than swapping database directories. Pebble's synced batch is the durable publication boundary: a crash exposes either the complete old state or the complete merged state, never a partial set of chunks or watermarks. Startup rebuilds SQL from that authoritative state. Cancellation, bad hashes, incompatible schema, or staging budget exhaustion leave applied cells and watermarks untouched. Larger snapshots merge chunk by chunk with durable resume progress (see above) and publish through the same single-batch boundary, so the configured bound no longer depends on fitting the whole merge in one batch. Use [Section 32](synchronization-and-overload.md#32-mutation-batching)'s repair admission limits and add snapshot progress/deferral diagnostics.
+The final publication uses a single bounded Pebble batch rather than swapping database directories. Pebble's synced batch is the durable publication boundary: a crash exposes either the complete old state or the complete merged state, never a partial set of chunks or watermarks. Startup rebuilds SQL from that authoritative state. Cancellation, bad hashes, incompatible schema, or staging budget exhaustion leave applied cells and watermarks untouched. Larger snapshots merge chunk by chunk with durable resume progress (see above) and publish through the same single-batch boundary, so the configured bound no longer depends on fitting the whole merge in one batch. Repair admission follows [Section 32](synchronization-and-overload.md#32-mutation-batching) limits. Snapshot progress/deferral diagnostics are implemented: the receiver tracks per-peer transfer progress (`PeerStatus.SnapshotChunksReceived/Total`, Prometheus `spedsql_peer_snapshot_chunks_*`), a source with a transfer in flight answers concurrent requests with an explicit `ErrSnapshotBusy` deferral (counter `repl_snapshots_busy_deferred_total`), and a stall watchdog re-requests waits with no progress within `Replication.SnapshotRequestTimeout` (default 30 s; re-requests counted in `repl_snapshot_rerequested_total`).
 
 ---
 
@@ -260,7 +265,7 @@ For an online, zero-downtime backup of a 10–20+ GB dataset, executing a raw Ke
 - **Autonomous Query Store Rebuild:** When `replicateddb.Open` is invoked with the master key:
   1. `crypto.OpenRegistry` authenticates and unwraps data keys.
   2. Pebble mounts the restored data directory via `crypto.EncryptedFS`.
-  3. `sqlengine.Engine.Rebuild(store)` scans Pebble's authoritative state and reconstructs the LumoSQL LMDB MVCC query store.
+  3. `sqlengine.Engine.Rebuild(store)` scans Pebble's authoritative state and reconstructs the in-memory SQLite query store.
   4. Validate the restore identity policy below, rebuild the query store, then admit writable QUIC replication. Catch-up depends on available retained history or snapshot merging; it is not unconditional.
 
 #### Restart, restore/clone, and coordinated reseed

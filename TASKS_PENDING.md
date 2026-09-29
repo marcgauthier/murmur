@@ -25,12 +25,27 @@ No pending items remain in the areas below; design links are kept for reference.
 - Observability and Optional Service Adapters ([Runtime and diagnostics](architecture/runtime-and-diagnostics.md), [Query and search](architecture/query-and-search.md#reactive-query-subscriptions))
 - Hardening, Benchmarking, and Release Acceptance ([Testing and acceptance](architecture/testing.md), [Benchmarks](architecture/benchmarks.md), [Versioning and release](architecture/versioning-and-release.md), [Storage](architecture/storage.md))
 
+### Known follow-ups (from release-gate verification, 2026-09-28)
+
+- CHAOS-HEAL-STATUS-STALL: `tests-live/chaos-load` hung once (~1/6 runs)
+  with a `/v1/status` GET stuck 5+ minutes during heal while writes kept
+  succeeding; one daemon later ignored SIGTERM (shutdown wedged). Daemons
+  were idle-but-alive afterwards. Not reproduced under isolation (3/3
+  passes since). Mitigation applied: the test's status poll now uses a
+  5s-timeout client so a recurrence fails fast at the 30s assertion
+  instead of the 6-minute `go test` timeout. Still needs product-side
+  diagnosis (status-path contention under heal storm, shutdown hang).
+- LIVE-RUNNER-ISOLATION: concurrent `run.sh` invocations on one checkout
+  corrupt each other's runtime dirs (observed); documented
+  `SPEDSQL_LIVE_RUNTIME` isolation. A locking or auto-isolation mechanism
+  in the harness would remove the footgun.
+
 ### Sequencing notes
 
 [Architecture index](architecture/README.md) · [Project README](README.md)
 
 - Outstanding core work and the GALVANIZE comparison live in [capability gaps](architecture/capability-gaps.md); implement in the [documented delivery order](architecture/capability-gaps.md#delivery-order).
-- Prioritize the snapshot progress issue before treating current snapshot resync as fully hardened.
+- Snapshot resync hardening is complete (stall watchdog, busy deferral, per-peer progress diagnostics, dual-requester live test, CI live gate); see TASKS_COMPLETED.md SNAPSHOT-PROGRESS-001 and LIVE-GATE-001.
 - Each extension requires its subsystem acceptance scenarios before status is updated.
 
 (Historical note: the original phase-by-phase bootstrap sequence was removed on 2026-09-27 as fully superseded; it remains recoverable from this file's git history.)
@@ -56,4 +71,4 @@ No pending items remain in the areas below; design links are kept for reference.
 19. `highlow-faults` — DONE (covered by tests-live/highlow forgery test, see TASKS_COMPLETED.md).
 20. `highlow-schema` — DONE (covered by tests-live/highlow schema-hold test, see TASKS_COMPLETED.md).
 22. `write-priority` — DONE (multi-process redo, see TASKS_COMPLETED.md).
-23.–30. (Claimed by Muse Code (Muse Spark) for the new-suite campaign; see TASKS_INPROGRESS.md.)
+23.–29. `backup-restore`, `bridge-two-streams`, `churn-retirement`, `overload-budgets`, `partial-mesh`, `plumtree-live`, `schema-evolution` — DONE (implemented and verified 2026-09-28, see TASKS_COMPLETED.md LIVE-SUITES-VERIFY-001).

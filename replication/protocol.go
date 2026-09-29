@@ -388,6 +388,11 @@ const (
 	ErrPeerExcludedCode uint16 = 6
 	ErrRangeUnavailable uint16 = 7
 	ErrOverloadedCode   uint16 = 8
+	// ErrSnapshotBusy tells a snapshot requester the source already has
+	// an outbound transfer in flight for it. The requester backs off and
+	// the stall watchdog re-requests; older peers log it as a plain
+	// peer error and converge through the same watchdog.
+	ErrSnapshotBusy uint16 = 9
 )
 
 // Hello is the replication handshake.
@@ -634,11 +639,23 @@ func WriteFrame(w io.Writer, typ uint16, flags uint16, payload []byte) error {
 	return err
 }
 
+// ErrMembershipStream is returned when a stream begins with the SWIM memberlist header.
+type ErrMembershipStream struct {
+	Prefix []byte
+}
+
+func (e *ErrMembershipStream) Error() string {
+	return "replication: received memberlist stream"
+}
+
 // ReadFrame reads one frame with bounded allocation.
 func ReadFrame(r io.Reader) (*Frame, error) {
 	var hdr [frameHdrLen]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
+	}
+	if binary.BigEndian.Uint32(hdr[0:4]) == 0x53504544 { // transport.StreamMagic "SPED"
+		return nil, &ErrMembershipStream{Prefix: hdr[:]}
 	}
 	if binary.BigEndian.Uint16(hdr[0:2]) != frameMagic {
 		return nil, fmt.Errorf("replication: bad frame magic")

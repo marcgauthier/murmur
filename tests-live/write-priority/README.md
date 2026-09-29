@@ -1,14 +1,21 @@
 # Local-write priority live scenario
 
-Two `spedsql` daemons take continuous writes on both nodes (two writers
+Two `spedsql` daemons take continuous writes on both nodes (sixteen writers
 per node, disjoint 16-byte row-ID ranges) while serving reads, under
 full-mesh replication. The test gates on:
 
 1. Local progress: at least 80 rows written and 4 reads served.
-2. Priority: both scheduler classes contended, with the remote
-   (replication) share of admitted writer service time at most 25%.
-   The scheduler targets 90/10 local/remote with a 1s debt bound; the
-   gate leaves headroom above the 10% target.
+2. Priority: the remote (replication) share of dual-contention
+   writer service time (`spedsql_sched_dual_service_seconds_total`,
+   granted while the other interactive class had waiters, so the
+   scheduler actually chose between backlogged classes) is at most
+   25%, with at least 1s of dual service measured. The scheduler
+   targets 90/10 local/remote with a 1s debt bound; the gate
+   leaves headroom above the 10% target. Dual-contention
+   attribution is load-bearing: whenever either queue drains, the
+   other legitimately borrows the idle share, and counting
+   borrowed service would measure driver stalls instead of the
+   scheduling policy.
 3. Convergence: identical row counts and matching SHA-256
    application-data hashes after writes stop.
 
@@ -23,8 +30,8 @@ go test ./tests-live/write-priority/ -run TestLocalWritePriority -v -count=1
 Sample report lines:
 
 ```text
-contended writer service: local=17.998s replication=2.725s share=0.131
-converged: 3415 rows, 384 reads, identical SHA-256 1a859088…
+dual-contention writer service: local=20.305s replication=2.284s share=0.101
+converged: 9622 rows, 420 reads, identical SHA-256 6fd8cc0e…
 ```
 
 ## Notes

@@ -1,7 +1,7 @@
 // Package sqlengine implements the rebuildable SQL query materialization.
 //
-// The default engine uses modernc.org/sqlite, a pure-Go build with pre-update
-// hook support. A build-tagged LumoSQL backend can instead use its CGO driver.
+// The default engine uses bundled SQLite through mattn/go-sqlite3.
+// The modernc build tag selects modernc.org/sqlite for a pure-Go build.
 // It owns:
 //
 //   - base-table DDL creation and ordinal validation
@@ -17,9 +17,6 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"fmt"
-	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -63,19 +60,17 @@ type ChangeCapture interface {
 	Reset()
 }
 
-// Engine is a serialized in-memory SQLite query database with change capture.
+// Engine is a serialized SQLite query database with change capture.
 //
 // Concurrency: writers are fully serialized (one write txn at a time).
-// Standalone reads run on a second shared-cache connection and proceed
-// concurrently; they block only while a writer holds the write section,
-// and writers drain in-flight reads before starting. Rows must be closed
+// Standalone reads use the database/sql connection pool;
+// writers drain in-flight reads before starting. Rows must be closed
 // promptly, otherwise writers stall.
 type Engine struct {
 	reg *schema.Registry
 
 	db    *sql.DB
 	write *sql.Conn
-	read  *sql.Conn
 
 	tables map[string]*schema.TableSchema // lowercase name -> table
 
@@ -89,139 +84,71 @@ type Engine struct {
 
 	writeStmts *stmtCache
 	readStmts  *stmtCache
-
-	ddl      []string
-	localDDL []string
+	ddl        []string
+	localDDL   []string
 
 	// failCommit injects COMMIT failures (tests only).
 	failCommit func() error
 
-	closed         bool
-	cleanupDir     string
-	concurrentMVCC bool
+	closed     bool
+	cleanupDir string
 }
 
 // Open creates the in-memory query database, registers change capture, and
 // creates the schema. ddl overrides generated DDL; localDDL holds
 // local-only objects applied after every (re)build.
 func Open(reg *schema.Registry, ddl, localDDL []string, stmtCacheEntries int) (*Engine, error) {
-	return open(reg, ddl, localDDL, stmtCacheEntries, "", 0)
+	return open(reg, ddl, localDDL, stmtCacheEntries)
 }
 
-// OpenMMap opens a file-backed, disposable SQLite materialization with mmap
-// enabled. Pebble remains authoritative; the temporary directory is removed
-// when the engine closes and the materialization is rebuilt on the next open.
-// This provides mmap-backed pages with the current pure-Go SQLite driver, but
-// does not provide LMDB's lock-free MVCC semantics.
-func OpenMMap(reg *schema.Registry, ddl, localDDL []string, stmtCacheEntries int, tempBase string, mmapBytes int64) (*Engine, error) {
-	if mmapBytes <= 0 {
-		mmapBytes = 256 << 20
-	}
-	dir, err := os.MkdirTemp(tempBase, "spedsql-query-")
-	if err != nil {
-		return nil, fmt.Errorf("sqlengine: create disposable query directory: %w", err)
-	}
-	e, err := open(reg, ddl, localDDL, stmtCacheEntries, filepath.Join(dir, "query.db"), mmapBytes)
-	if err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, err
-	}
-	e.cleanupDir = dir
-	return e, nil
-}
-
-func open(reg *schema.Registry, ddl, localDDL []string, stmtCacheEntries int, filePath string, mmapBytes int64) (*Engine, error) {
+func open(reg *schema.Registry, ddl, localDDL []string, stmtCacheEntries int) (*Engine, error) {
 	if stmtCacheEntries <= 0 {
 		stmtCacheEntries = 256
 	}
-	// Unique shared-cache name per engine: shared-cache memory databases
-	// are keyed by name process-wide, so a fixed name would alias separate
-	// engines (e.g., two nodes in one test process) onto one database.
 	var randSuffix [8]byte
 	if _, err := rand.Read(randSuffix[:]); err != nil {
 		return nil, fmt.Errorf("sqlengine: rand: %w", err)
 	}
 	dsn := fmt.Sprintf("file:replicateddb_%x?mode=memory&cache=shared", randSuffix)
-	if filePath != "" {
-		dsn = (&url.URL{Scheme: "file", Path: filePath}).String()
-	}
-	if backendConcurrentMVCC {
-		if strings.Contains(dsn, "?") {
-			dsn += "&_busy_timeout=5000&_foreign_keys=off&_sync=off"
-		} else {
-			dsn += "?_busy_timeout=5000&_foreign_keys=off&_sync=off"
-		}
-	}
 	db, err := sql.Open(sqlDriverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sqlengine: open: %w", err)
 	}
-	// LumoSQL's independent MVCC readers require a file-backed LMDB
-	// environment. Its named in-memory DSN is connection-local, so keep the
-	// reserved read connection for Open() and enable the pool only for
-	// OpenMMap().
-	concurrentMVCC := backendConcurrentMVCC && filePath != ""
-	maxConns := 2
-	if concurrentMVCC {
-		maxConns = 32
-	}
-	db.SetMaxOpenConns(maxConns)
-	db.SetMaxIdleConns(maxConns)
+	// Reserve one connection for serialized writes. Standalone reads use the
+	// database/sql pool so concurrent readers do not share one SQLite handle.
+	const maxConnections = 32
+	db.SetMaxOpenConns(maxConnections)
+	db.SetMaxIdleConns(maxConnections)
 	ctx := context.Background()
 	write, err := db.Conn(ctx)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("sqlengine: write conn: %w", err)
 	}
-	var read *sql.Conn
-	if backendConcurrentMVCC && filePath == "" {
-		// The LumoSQL memory DSN creates a private environment per connection.
-		// Open() promises an in-memory engine, so share its one connection and
-		// use the ordinary reader/writer lock instead of the file-backed MVCC
-		// pool.
-		read = write
-	} else {
-		read, err = db.Conn(ctx)
-		if err != nil {
-			write.Close()
-			db.Close()
-			return nil, fmt.Errorf("sqlengine: read conn: %w", err)
-		}
-	}
 	e := &Engine{
-		reg:            reg,
-		db:             db,
-		write:          write,
-		read:           read,
-		tables:         make(map[string]*schema.TableSchema, len(reg.Tables)),
-		writeStmts:     newStmtCache(stmtCacheEntries),
-		readStmts:      newStmtCache(stmtCacheEntries),
-		ddl:            ddl,
-		localDDL:       localDDL,
-		concurrentMVCC: concurrentMVCC,
+		reg:        reg,
+		db:         db,
+		write:      write,
+		tables:     make(map[string]*schema.TableSchema, len(reg.Tables)),
+		writeStmts: newStmtCache(stmtCacheEntries),
+		readStmts:  newStmtCache(stmtCacheEntries),
+		ddl:        ddl,
+		localDDL:   localDDL,
 	}
 	for _, t := range reg.Tables {
 		e.tables[strings.ToLower(t.Name)] = t
 	}
-	for _, c := range []*sql.Conn{write, read} {
+	for _, c := range []*sql.Conn{write} {
 		pragmas := []string{
 			"PRAGMA busy_timeout = 5000",
 			"PRAGMA synchronous = OFF",
 			"PRAGMA foreign_keys = OFF",
 		}
-		if !e.concurrentMVCC {
-			pragmas = append(pragmas, "PRAGMA journal_mode = MEMORY")
-		}
+		pragmas = append(pragmas, "PRAGMA journal_mode = MEMORY")
 		for _, pr := range pragmas {
 			if _, err := c.ExecContext(ctx, pr); err != nil {
 				e.Close()
 				return nil, fmt.Errorf("sqlengine: pragma %q: %w", pr, err)
-			}
-		}
-		if mmapBytes > 0 && !e.concurrentMVCC {
-			if _, err := c.ExecContext(ctx, fmt.Sprintf("PRAGMA mmap_size = %d", mmapBytes)); err != nil {
-				e.Close()
-				return nil, fmt.Errorf("sqlengine: configure mmap: %w", err)
 			}
 		}
 	}
@@ -243,6 +170,14 @@ func open(reg *schema.Registry, ddl, localDDL []string, stmtCacheEntries int, fi
 // Registry returns the schema registry.
 func (e *Engine) Registry() *schema.Registry { return e.reg }
 
+// StmtCacheStats returns cumulative prepared-statement cache hits and
+// misses summed over the read and write caches (sizing diagnostics).
+func (e *Engine) StmtCacheStats() (hits, misses uint64) {
+	rh, rm := e.readStmts.Stats()
+	wh, wm := e.writeStmts.Stats()
+	return rh + wh, rm + wm
+}
+
 // Close releases all resources.
 func (e *Engine) Close() error {
 	e.wmu.Lock()
@@ -258,15 +193,12 @@ func (e *Engine) Close() error {
 	if e.write != nil {
 		e.write.Close()
 	}
-	if e.read != nil && e.read != e.write {
-		e.read.Close()
-	}
 	var first error
 	if e.db != nil {
 		first = e.db.Close()
 	}
 	if e.cleanupDir != "" {
-		if err := os.RemoveAll(e.cleanupDir); err != nil && first == nil {
+		if err := secureWipeAndRemoveDir(e.cleanupDir); err != nil && first == nil {
 			first = err
 		}
 	}

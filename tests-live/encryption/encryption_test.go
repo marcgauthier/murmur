@@ -65,7 +65,7 @@ func TestEncryptedStoreRejectsWrongKeyAndReopens(t *testing.T) {
 
 	// Attempt unlock with wrong key: must be rejected with 401 Unauthorized
 	wrongKey := hex.EncodeToString(make([]byte, 32))
-	unlockURL := fmt.Sprintf("http://%s/v1/admin/unlock", cluster.Nodes[0].APIAddr)
+	unlockURL := fmt.Sprintf("https://%s/v1/admin/unlock", cluster.Nodes[0].APIAddr)
 	payload, _ := json.Marshal(map[string]string{
 		"key_hex": wrongKey,
 		"cipher":  "chacha20",

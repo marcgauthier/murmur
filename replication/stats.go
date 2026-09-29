@@ -80,6 +80,8 @@ type stats struct {
 	snapshotBytesSent         atomic.Uint64
 	snapshotBytesReceived     atomic.Uint64
 	snapshotReRequested       atomic.Uint64
+	snapshotBusyReceived      atomic.Uint64
+	snapshotsBusyDeferred     atomic.Uint64
 
 	// Schema synchronization.
 	schemaRequestsSent      atomic.Uint64
@@ -180,6 +182,8 @@ type StatsSnapshot struct {
 	SnapshotBytesSent         uint64
 	SnapshotBytesReceived     uint64
 	SnapshotReRequested       uint64
+	SnapshotBusyReceived      uint64
+	SnapshotsBusyDeferred     uint64
 
 	SchemaRequestsSent      uint64
 	SchemaRequestsReceived  uint64
@@ -266,6 +270,8 @@ func (m *Manager) Stats() StatsSnapshot {
 		SnapshotBytesSent:         s.snapshotBytesSent.Load(),
 		SnapshotBytesReceived:     s.snapshotBytesReceived.Load(),
 		SnapshotReRequested:       s.snapshotReRequested.Load(),
+		SnapshotsBusyDeferred:     s.snapshotsBusyDeferred.Load(),
+		SnapshotBusyReceived:      s.snapshotBusyReceived.Load(),
 
 		SchemaRequestsSent:      s.schemaRequestsSent.Load(),
 		SchemaRequestsReceived:  s.schemaRequestsReceived.Load(),

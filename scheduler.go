@@ -103,6 +103,10 @@ type Ticket struct {
 	grantedAt time.Time
 	sched     *writerScheduler
 	released  bool
+	// dual marks tickets granted while the other interactive class had
+	// waiters: the scheduler chose between backlogged classes, so the
+	// share policy binds and the service counts as dual contention.
+	dual bool
 }
 
 // Class reports the ticket's scheduling class.
@@ -117,6 +121,7 @@ type schedWaiter struct {
 	class   WriterClass
 	grant   chan struct{}
 	granted bool
+	dual    bool
 	result  error
 	enqueue time.Time
 }
@@ -138,7 +143,10 @@ type writerScheduler struct {
 	cancels      [3]uint64
 	waitNanos    [3]uint64
 	serviceNanos [3]uint64
-	service      [2]uint64 // normalized-debt accounting: local, remote
+	// dualServiceNanos is service granted while the other interactive
+	// class had waiters (the share policy bound the decision).
+	dualServiceNanos [3]uint64
+	service          [2]uint64 // normalized-debt accounting: local, remote
 }
 
 func newWriterScheduler(cfg WriterSchedulingConfig) *writerScheduler {
@@ -187,7 +195,7 @@ func (s *writerScheduler) Admit(ctx context.Context, class WriterClass) (*Ticket
 	}
 	// Granted (possibly racing a concurrent cancellation: the grant wins
 	// and the ticket must be used and released normally).
-	t := &Ticket{class: class, grantedAt: time.Now(), sched: s}
+	t := &Ticket{class: class, grantedAt: time.Now(), sched: s, dual: w.dual}
 	s.mu.Unlock()
 	return t, nil
 }
@@ -227,6 +235,9 @@ func (s *writerScheduler) release(t *Ticket) {
 	t.released = true
 	service := uint64(now.Sub(t.grantedAt).Nanoseconds())
 	s.serviceNanos[t.class] += service
+	if t.dual {
+		s.dualServiceNanos[t.class] += service
+	}
 	if t.class == WriterLocal {
 		s.service[0] += service
 	} else if t.class == WriterRemote {
@@ -268,6 +279,10 @@ func (s *writerScheduler) grantNextLocked() {
 	w := s.queues[class][0]
 	s.queues[class] = s.queues[class][1:]
 	w.granted = true
+	// Dual contention: the grant chose between backlogged interactive
+	// classes, so the share policy bound the decision. Maintenance is
+	// granted only with no interactive waiters, hence never dual.
+	w.dual = (class == WriterLocal && remoteQ) || (class == WriterRemote && localQ)
 	s.active = w
 	s.acquisitions[class]++
 	s.waitNanos[class] += uint64(time.Since(w.enqueue).Nanoseconds())
@@ -300,12 +315,15 @@ func (s *writerScheduler) clampDebtLocked() {
 
 // SchedulerClassStats is one class's diagnostics.
 type SchedulerClassStats struct {
-	Acquisitions    uint64
-	Cancels         uint64
-	WaitNanos       uint64
-	ServiceNanos    uint64
-	Waiters         int
-	OldestWaitNanos uint64
+	Acquisitions uint64
+	Cancels      uint64
+	WaitNanos    uint64
+	ServiceNanos uint64
+	// DualServiceNanos is service granted while the other interactive
+	// class had waiters (the share policy bound the decision).
+	DualServiceNanos uint64
+	Waiters          int
+	OldestWaitNanos  uint64
 }
 
 // SchedulerSnapshot is the coordinator diagnostics snapshot.
@@ -326,11 +344,12 @@ func (s *writerScheduler) Snapshot() SchedulerSnapshot {
 	now := time.Now()
 	stat := func(class WriterClass) SchedulerClassStats {
 		st := SchedulerClassStats{
-			Acquisitions: s.acquisitions[class],
-			Cancels:      s.cancels[class],
-			WaitNanos:    s.waitNanos[class],
-			ServiceNanos: s.serviceNanos[class],
-			Waiters:      len(s.queues[class]),
+			Acquisitions:     s.acquisitions[class],
+			Cancels:          s.cancels[class],
+			WaitNanos:        s.waitNanos[class],
+			ServiceNanos:     s.serviceNanos[class],
+			DualServiceNanos: s.dualServiceNanos[class],
+			Waiters:          len(s.queues[class]),
 		}
 		for _, w := range s.queues[class] {
 			if age := uint64(now.Sub(w.enqueue).Nanoseconds()); age > st.OldestWaitNanos {

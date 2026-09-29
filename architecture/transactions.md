@@ -39,7 +39,7 @@ This is a better primary design than generating a trigger for every replicated c
 ### Advantages
 
 - No persistent trigger objects required.
-- No per-table replication log table in LumoSQL.
+- No per-table replication log table in SQLite.
 - Captures writes regardless of SQL statement shape.
 - Multi-row updates naturally produce per-row events.
 - Old and new values are available.
@@ -49,7 +49,7 @@ This is a better primary design than generating a trigger for every replicated c
 
 ### Required build check
 
-The LumoSQL amalgamation must be built with:
+The bundled mattn SQLite build enables:
 
 ```text
 SQLITE_ENABLE_PREUPDATE_HOOK
@@ -65,7 +65,7 @@ That is acceptable for this architecture because FTS/search virtual tables are l
 
 ### Trigger fallback
 
-Implement a generated-trigger capture backend only if the pre-update hook cannot be used reliably with the chosen LumoSQL build.
+Implement a generated-trigger capture backend only if the pre-update hook cannot be used reliably with the supported SQLite drivers.
 
 Define:
 
@@ -172,19 +172,19 @@ This is one of the most important correctness requirements.
 
 ## 16. Local SQL Commit Ordering
 
-There is no distributed ACID transaction shared by LumoSQL and Pebble.
+There is no distributed ACID transaction shared by SQLite and Pebble.
 
-Because LumoSQL is disposable, exploit that fact instead of attempting a complex two-phase commit between two embedded engines.
+Because the SQLite materialization is disposable, exploit that fact instead of attempting a complex two-phase commit between two embedded engines.
 
 Recommended local write path:
 
 ```text
 1. Acquire local write transaction context.
-2. Begin LumoSQL transaction.
+2. Begin SQLite transaction.
 3. Execute SQL.
 4. Pre-update hook records all row/cell changes.
 5. Coalesce transaction delta.
-6. Validate the coalesced transaction's encoded size against MaxTransactionBytes; roll back SQL on overflow. Otherwise COMMIT LumoSQL (fast in-memory/mmap commit; PRAGMA synchronous = OFF / MDB_NOSYNC).
+6. Validate the coalesced transaction's encoded size against MaxTransactionBytes; roll back SQL on overflow. Otherwise COMMIT SQLite (in-memory commit; `PRAGMA synchronous = OFF`).
 7. Build final MutationBatch.
 8. Commit MutationBatch + current state atomically to Pebble (batch.Commit(pebble.Sync) performs the single authoritative fsync).
 9. Record SQL materialization generation = Pebble generation.
@@ -193,9 +193,9 @@ Recommended local write path:
 
 Why commit SQL first?
 
-Because COMMIT can still fail due to SQL constraints or deferred checks. The package should not durably replicate a transaction that LumoSQL itself rejected. Furthermore, because LumoSQL runs with `PRAGMA synchronous = OFF` (`MDB_NOSYNC`), Step 6 takes microseconds; physical disk synchronization happens strictly once per transaction in Step 8 on Pebble.
+Because COMMIT can still fail due to SQL constraints or deferred checks. The package should not durably replicate a transaction that SQLite rejected. The in-memory SQLite commit does not establish durability; physical disk synchronization happens once per transaction in Step 8 on Pebble.
 
-### Failure after LumoSQL commit but before Pebble commit
+### Failure after SQLite commit but before Pebble commit
 
 The application must not receive success.
 
@@ -206,12 +206,12 @@ Immediately:
 ```text
 mark materializer DIRTY
 block subsequent writes
-rebuild affected rows or rebuild complete LumoSQL state from Pebble
+rebuild affected rows or rebuild complete SQLite state from Pebble
 resume
 return error to caller
 ```
 
-Because LumoSQL is non-authoritative, this failure is recoverable.
+Because SQLite is non-authoritative, this failure is recoverable.
 
 ### Failure after Pebble commit but before client receives success
 
@@ -283,7 +283,7 @@ If the bulk SQLite apply fails:
 ```text
 Pebble remains correct.
 mark materializer DIRTY.
-rebuild LumoSQL.
+rebuild SQLite.
 ```
 
 Do not roll back Pebble because of a cache/materialization failure.
@@ -294,7 +294,7 @@ Applying several complete remote transactions in one synchronized Pebble commit 
 
 ## 19. Prevent Replication Echo
 
-Applying a remote update to LumoSQL must not create a new local mutation.
+Applying a remote update to SQLite must not create a new local mutation.
 
 With the pre-update-hook implementation, associate an apply mode with the SQL connection:
 
@@ -364,7 +364,7 @@ WHERE id = ?;
 Flow:
 
 ```text
-LumoSQL UPDATE
+SQLite UPDATE
       |
       v
 pre-update hook

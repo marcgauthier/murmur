@@ -33,7 +33,7 @@ const (
 	defaultGossipNodes    = 3
 	defaultIndirectChecks = 3
 
-	maxBootstrapBackoff = 30 * time.Second
+	maxBootstrapBackoff     = 30 * time.Second
 	initialBootstrapBackoff = 500 * time.Millisecond
 )
 
@@ -186,14 +186,14 @@ type MembershipStats struct {
 // MembershipService manages HashiCorp memberlist SWIM discovery, failure detection,
 // suspicion/refutation, partial seed bootstrap/retry, and event reconciliation.
 type MembershipService struct {
-	mu           sync.RWMutex
-	localID      ids.NodeID
-	dbid         ids.DBID
-	cfg          MembershipConfig
-	transport    *transport.MemberlistTransport
-	ml           *memberlist.Memberlist
-	handler      MembershipHandler
-	log          *slog.Logger
+	mu        sync.RWMutex
+	localID   ids.NodeID
+	dbid      ids.DBID
+	cfg       MembershipConfig
+	transport *transport.MemberlistTransport
+	ml        *memberlist.Memberlist
+	handler   MembershipHandler
+	log       *slog.Logger
 
 	aliveMembers map[ids.NodeID]NodeMetadata
 	eventCh      chan MembershipEvent
@@ -637,6 +637,13 @@ func (s *MembershipService) Leave(timeout time.Duration) error {
 	return s.ml.Leave(timeout)
 }
 
+// Transport returns the underlying QUIC memberlist transport.
+func (s *MembershipService) Transport() *transport.MemberlistTransport {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.transport
+}
+
 // Shutdown stops the membership service and terminates background workers.
 func (s *MembershipService) Shutdown() error {
 	s.mu.Lock()
@@ -651,6 +658,9 @@ func (s *MembershipService) Shutdown() error {
 	var err error
 	if s.ml != nil {
 		err = s.ml.Shutdown()
+	}
+	if s.transport != nil {
+		_ = s.transport.Shutdown()
 	}
 
 	s.wg.Wait()

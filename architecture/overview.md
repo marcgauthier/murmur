@@ -4,10 +4,10 @@ Fast In Memory Secure Peer-Distributed SQL with persistance.
 
 **Status:** Architecture and implementation plan  
 **Target language:** Go  
-**Primary components:** LumoSQL (LMDB MVCC backend) + Pebble + HashiCorp memberlist + quic-go  
+**Primary components:** SQLite + Pebble + HashiCorp memberlist + quic-go
 **Replication model:** Masterless, offline-capable, per-column last-writer-wins using HLC  
 **Durable source of truth:** Pebble  
-**Query/search engine:** LumoSQL materialized database with LMDB MVCC backend (disposable query cache)  
+**Query/search engine:** in-memory SQLite materialization, rebuilt from Pebble
 **Prepared:** 2026-09-26  
 **Storage revision:** Pebble v2.1.6 with authenticated encrypted VFS; new databases only
 **Membership revision:** 2026-09-27; SWIM discovery and bounded replication, with all inter-node traffic over QUIC
@@ -21,7 +21,7 @@ Fast In Memory Secure Peer-Distributed SQL with persistance.
 
 - [1. Goal](#1-goal)
 - [2. Important Design Decision: Do Not Use CR-SQLite in Version 1](#2-important-design-decision-do-not-use-cr-sqlite-in-version-1)
-- [3. LumoSQL Role](#3-lumosql-role)
+- [3. SQLite Role](#3-sqlite-role)
 - [4. Go and CGO Boundary](#4-go-and-cgo-boundary)
 - [88. Final Target Architecture](#88-final-target-architecture)
 
@@ -33,7 +33,7 @@ Build a reusable Go package that applications can embed directly. It is not a st
 
 The package will provide:
 
-- SQL queries through an embedded LumoSQL engine.
+- SQL queries through an embedded SQLite engine.
 - Very fast local search by keeping the query database in memory and building normal SQL indexes and optional FTS indexes.
 - Durable state in Pebble.
 - Masterless multi-writer replication between nodes.
@@ -72,7 +72,7 @@ Application
              |                      |
              v                      v
      +---------------+       +---------------+
-     |    LumoSQL    |       |    Pebble     |
+     |    SQLite     |       |    Pebble     |
      |               |       |               |
      | in-memory     |       | durable state |
      | query tables  |       | mutation log  |
@@ -88,9 +88,9 @@ Application
 
 The fundamental rule is:
 
-> Pebble is authoritative. LumoSQL is a rebuildable materialized query database.
+> Pebble is authoritative. SQLite is a rebuildable materialized query database.
 
-If the complete LumoSQL database disappears, the node must be able to recreate it solely from Pebble state.
+If the in-memory SQLite database disappears, the node recreates it solely from Pebble state.
 
 ---
 
@@ -101,7 +101,7 @@ Do not embed CR-SQLite into the first implementation.
 CR-SQLite solves replication inside SQLite. This design already has a separate replication and durable-state layer. Using CR-SQLite would create two overlapping replication systems:
 
 ```text
-LumoSQL
+SQLite
    |
 CR-SQLite
    |
@@ -122,9 +122,9 @@ Benefits:
 
 - Replication format is independent of the SQL engine.
 - Pebble remains the authoritative replicated database.
-- The LumoSQL database can be dropped and rebuilt.
+- The SQLite materialization can be dropped and rebuilt.
 - The query engine can be replaced later without changing the replication protocol.
-- No requirement to make CR-SQLite work with every LumoSQL backend.
+- No requirement to make CR-SQLite work with multiple SQLite drivers.
 - No duplicated conflict-resolution metadata.
 - Easier control of tombstones, snapshots, log retention, node watermarks, and encryption.
 
@@ -132,63 +132,35 @@ CR-SQLite can still be studied as a reference for conflict semantics and testing
 
 ---
 
-## 3. LumoSQL Role
+## 3. SQLite Role
 
-LumoSQL is the embedded SQL/query engine.
+SQLite is the embedded SQL engine and holds the query-visible materialization
+in memory. Pebble stores the durable current state and replication history.
+SQLite is rebuilt from Pebble during open and can be discarded at any time.
 
-Regular SQLite is strictly a Two-Phase Locking (2PL) single-version database; even in WAL mode, it is not true MVCC and suffers from checkpoint lock contention where readers block checkpoints and writers stall. LumoSQL replaces SQLite's monolithic B-tree with pluggable key-value storage engines, notably **LMDB** (and MDBX), which provide **true Multi-Version Concurrency Control (MVCC)** via Copy-on-Write (COW) B+ trees.
+The default build uses `mattn/go-sqlite3` with bundled SQLite. It requires
+`sqlite_preupdate_hook` and `sqlite_fts5` build tags. The optional `modernc`
+build tag selects the pure-Go `modernc.org/sqlite` driver and builds with
+`CGO_ENABLED=0`. Both drivers use SQLite locking: active queries hold a shared
+engine read lock, while writes, rebuilds, migrations, and remote apply take the
+exclusive engine lock. An open result set therefore delays writes until it is
+closed or exhausted.
 
-`QueryStoreMMap` is a disposable file-backed SQL materialization. In the default build it uses `modernc.org/sqlite` with SQLite mmap enabled and keeps SQLite's locking behavior. With the `lumosql` build tag it uses an externally built LumoSQL LMDB driver, opens pooled MVCC read connections, and allows reads to proceed during writes. The LumoSQL LMDBv1 build passes the focused external MVCC acceptance test; see [the LumoSQL backend guide](lumosql-backend.md) for build flags and platform limitations.
-
-In this design:
-- Readers hold an immutable root pointer and read memory-mapped pages directly with **zero locks** on database pages or tables.
-- **Readers never block writers, and writers never block readers.**
-- There is **no checkpointing step**. When a write commits, it updates the root pointer in virtual memory; obsolete pages are tracked in an internal free-list and reclaimed only when older readers finish.
-- The engine runs on standard disk paths (e.g. on Windows or Linux) without needing a RAM disk.
-- All LumoSQL connections are explicitly configured with `PRAGMA synchronous = OFF;` (`MDB_NOSYNC | MDB_NOMETASYNC`). Because **Pebble is the authoritative durable store** (`pebble.Sync`), LumoSQL does not perform synchronous disk flushes (`FlushFileBuffers`/`fdatasync`). Write transactions commit in microseconds at RAM speed without duplicating Pebble's disk I/O.
-- If LumoSQL files are corrupted or the process crashes, the entire LMDB directory is discarded and rebuilt cleanly from Pebble current state.
-
-Do not use LMDB as the authoritative database. That would duplicate Pebble's responsibility.
-
-### 3.1 Query-store modes
-
-Design the package so the SQL materialization mode is configurable:
-
-```go
-type QueryStoreMode int
-
-const (
-    QueryStoreMemory QueryStoreMode = iota // Pure-Go in-memory SQLite (modernc.org/sqlite)
-    QueryStoreMMap                         // Disposable file-backed SQLite with mmap; LMDB is pending
-)
-```
-
-#### `QueryStoreMMap` (Implemented Disposable Mode)
-
-Uses a disposable database file in a temporary directory and rebuilds from Pebble at startup. In the default Go build it is mmap-enabled SQLite and retains SQLite locking. In a `lumosql` CGO build the file is an LMDB-backed LumoSQL database with concurrent MVCC read snapshots.
-
-- Configure `QueryStore.TempDir` to choose the parent directory and `QueryStore.MMapBytes` to choose the SQLite mmap limit (default 256 MiB).
-- The temporary materialization is non-authoritative and is rebuilt from Pebble on startup.
-- Configure the LumoSQL dependency and build tags as described in [the backend guide](lumosql-backend.md); external LMDBv1 MVCC acceptance is implemented and tested.
-
-#### `QueryStoreMemory` (Pure-Go CGO-Free Fallback)
-
-Optional fallback mode for lightweight deployments or environments lacking a C compiler.
-
-- Uses pure-Go SQLite (`modernc.org/sqlite`) in memory or on tmpfs.
-- CGO-free: compiles instantly with standard `go build`.
-- Useful for unit tests, development, and resource-constrained environments where installing CGO toolchains is undesirable.
-- Rebuilt from Pebble at startup.
+The SQL materialization always stays in memory. Pebble remains the only durable
+database and remains responsible for the successful-write durability contract.
+See [SQLite backends](sqlite-backends.md) for build and validation commands.
 
 ---
 
 ## 4. Go and CGO Boundary
 
-Pebble and quic-go are Go libraries. LumoSQL is C code exposed through the SQLite C API.
+Pebble and quic-go are Go libraries. The default SQLite driver uses CGO; the
+optional modernc driver is pure Go.
 
 Therefore the package will be embedded in Go, but the complete package will not be pure Go.
 
-Plan for CGO from the beginning.
+Use the default CGO build when the mattn driver is desired. Use `-tags modernc`
+with `CGO_ENABLED=0` on systems without a C toolchain.
 
 Recommended repository layout:
 
@@ -270,20 +242,11 @@ SPeD-SQL/
         retry/
         testutil/
 
-    lumosql/
-        amalgamation/
-        driver/
-        build/
 ```
 
-Build tags should eventually allow:
-
-```text
-lumosql
-sqlite
-```
-
-The initial supported production build should be LumoSQL only, but isolating the SQL interface will make testing easier and will prevent the rest of the architecture from being permanently coupled to one C implementation.
+The build tag `modernc` selects the pure-Go driver. The default CGO build uses
+the bundled SQLite in mattn/go-sqlite3 and enables pre-update capture plus FTS5
+with `sqlite_preupdate_hook sqlite_fts5`.
 
 ---
 
@@ -306,7 +269,7 @@ The initial supported production build should be LumoSQL only, but isolating the
                              |
                              v
                +-----------------------------+
-               |           LumoSQL           |
+               |            SQLite           |
                |                             |
                | in-memory base tables       |
                | secondary indexes           |
@@ -355,7 +318,7 @@ The initial supported production build should be LumoSQL only, but isolating the
 The design intentionally separates:
 
 ```text
-Search/query performance  -> LumoSQL
+Search/query performance  -> SQLite
 Durability                -> Pebble
 Conflict resolution       -> CRDT/HLC layer
 Replication transport     -> quic-go

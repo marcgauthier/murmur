@@ -92,7 +92,7 @@ func waitForPeers(t *testing.T, cluster *harness.Cluster, want []int, timeout ti
 }
 
 func connectedPeers(apiAddr string) int {
-	resp, err := http.Get("http://" + apiAddr + "/v1/status")
+	resp, err := http.Get("https://" + apiAddr + "/v1/status")
 	if err != nil {
 		return -1
 	}

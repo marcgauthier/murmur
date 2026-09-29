@@ -299,4 +299,8 @@ and honors context cancellation and shutdown. Open-time rebuild and Close
 drains predate/follow service and bypass the coordinator. Diagnostics ride
 `MetricsSnapshot.Scheduler` and the `metrics` collectors (per-class
 acquisitions, cancels, wait/service totals, waiters, oldest wait, debt).
+Per-class dual-contention service (`spedsql_sched_dual_service_seconds_total`,
+granted while the other interactive class had waiters) isolates the share
+policy from idle borrowing: it is the only service-time ratio the 90/10
+target binds, and the `write-priority` live suite gates on it.
 Uncontended admission costs ~0.6µs (`BenchmarkSchedulerAdmitRelease`).

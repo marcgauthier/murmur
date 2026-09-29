@@ -77,12 +77,14 @@ func openSchemaManifest(store *state.Store, cfg Config) (*schema.Registry, *sche
 		return nil, nil, fmt.Errorf("%w: stored epoch %d != %d (migrate with Migrate, not config drift)",
 			ErrSchemaMismatch, stored.Version, reg.Epoch)
 	}
-	// The persisted tables are authoritative for stable IDs.
-	live, err := stored.Registry()
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: persisted schema unbuildable: %w", ErrSchemaMismatch, err)
-	}
-	return live, stored, nil
+	// The persisted manifest is authoritative for content (the hash match
+	// above proves identical IDs, names, and types), but the manifest
+	// encoding sorts columns by ID while the engine's DDL follows
+	// declaration order. Keep the config-built registry so restarts
+	// preserve declaration order: rebuilding from the stored manifest
+	// would permute physical column order on every reopen whenever
+	// ID order differs from declaration order.
+	return reg, stored, nil
 }
 
 func registryTables(reg *schema.Registry) []schema.TableSchema {

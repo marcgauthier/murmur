@@ -5,6 +5,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 scenario=${1:-all}
 binary=${SPEDSQL_BIN:-"$root/bin/spedsql"}
+tags=${SPEDSQL_TAGS:-"sqlite_preupdate_hook sqlite_fts5"}
 runtime_root=${SPEDSQL_LIVE_RUNTIME:-"$root/tests-live/runtime"}
 started_at=$SECONDS
 
@@ -12,43 +13,65 @@ echo "======================================================================"
 echo "  SPeD-SQL LIVE MULTI-PROCESS SCENARIO RUNNER"
 echo "======================================================================"
 
-# Build spedsql daemon binary if not found or out of date
-if [[ ! -x "$binary" ]]; then
-  echo "Building spedsql daemon binary at $binary..."
-  mkdir -p "$(dirname "$binary")"
-  (cd "$root" && go build -o "$binary" ./cmd/spedsql)
-fi
+# Always compile spedsql daemon binary to ensure it matches current sources & tags
+echo "Compiling spedsql daemon binary at $binary with tags: '$tags'..."
+mkdir -p "$(dirname "$binary")"
+(cd "$root" && go build -tags "$tags" -o "$binary" ./cmd/spedsql)
+
+scenario_timeout() {
+  # go test timeouts sized for each scenario's longest routine form
+  # (the soak target extends durations via env; see below).
+  case "$1" in
+    soak-slo) echo "3h" ;;
+    long-running-five-node) echo "75m" ;;
+    files-soak) echo "15m" ;;
+    snapshot-resync) echo "10m" ;;
+    crash-recovery|chaos-load) echo "6m" ;;
+    allow-nodes|benchmark) echo "8m" ;;
+    *) echo "10m" ;;
+  esac
+}
 
 run_scenario() {
   local scn=$1
   echo ""
   echo ">>> RUNNING LIVE SCENARIO: $scn"
-  (cd "$root" && go test -v -count=1 "./tests-live/$scn")
+  (cd "$root" && go test -tags "$tags" -v -count=1 -timeout="$(scenario_timeout "$scn")" "./tests-live/$scn")
   echo ">>> SCENARIO COMPLETED: $scn"
 }
 
+ALL_SCENARIOS="addrpolicy allow-nodes api-mtls backup-restore benchmark bridge-two-streams chaos-load churn-retirement crash-recovery crdt-contention encryption files-bridge files-soak gc-balance highlow large-payload loadshare long-running-five-node overload-budgets partial-mesh partition plumtree-live rekey rolling-restart scale-mesh schema-evolution snapshot-resync soak-slo subscribe three-node-sync version-skew views write-priority"
+
+# Release-gate subset, run by CI on every push/PR against the freshly built
+# daemon binary: smoke, encryption, backup/restore, partitions, version
+# skew, High/Low, files, scale mesh, upgrades, snapshot resync, GC
+# balance, rolling restart, and crash recovery. Fast suites first.
+GATE_SCENARIOS="api-mtls three-node-sync encryption backup-restore partition version-skew schema-evolution highlow files-bridge files-soak scale-mesh subscribe loadshare rolling-restart snapshot-resync gc-balance crash-recovery chaos-load"
+
 case "$scenario" in
   all)
-    run_scenario "encryption"
-    run_scenario "crash-recovery"
-    run_scenario "three-node-sync"
-    run_scenario "partition"
-    run_scenario "chaos-load"
-    run_scenario "addrpolicy"
-    run_scenario "allow-nodes"
-    run_scenario "crdt-contention"
-    run_scenario "soak-slo"
-    run_scenario "long-running-five-node"
+    for scn in $ALL_SCENARIOS; do
+      run_scenario "$scn"
+    done
     ;;
-  encryption|crash-recovery|three-node-sync|partition|chaos-load|addrpolicy|allow-nodes|crdt-contention|soak-slo|long-running-five-node)
-    run_scenario "$scenario"
+  gate)
+    for scn in $GATE_SCENARIOS; do
+      run_scenario "$scn"
+    done
+    ;;
+  soak)
+    # Long acceptance runs, scheduled separately (CI cron + manual dispatch):
+    # ten-minute file soak, two-hour write SLO, one-hour five-node mesh.
+    SPEDSQL_FILES_SOAK_DURATION_SECONDS=600 SPEDSQL_FILES_SOAK_INTERVAL_SECONDS=60 run_scenario "files-soak"
+    SPEDSQL_SLO_DURATION_SECONDS=7200 SPEDSQL_SLO_SETTLE_SECONDS=300 run_scenario "soak-slo"
+    SPEDSQL_FIVE_NODE_DURATION_SECONDS=3600 SPEDSQL_FIVE_NODE_SETTLE_SECONDS=300 run_scenario "long-running-five-node"
     ;;
   *)
-    if [[ -d "$root/tests-live/$scenario" ]]; then
+    if [[ " $ALL_SCENARIOS " == *" $scenario "* ]]; then
       run_scenario "$scenario"
     else
       echo "Unknown scenario: $scenario" >&2
-      echo "Available scenarios: encryption, crash-recovery, three-node-sync, partition, chaos-load, addrpolicy, allow-nodes, crdt-contention, soak-slo, long-running-five-node, all" >&2
+      echo "Available scenarios: $ALL_SCENARIOS all gate soak" >&2
       exit 1
     fi
     ;;

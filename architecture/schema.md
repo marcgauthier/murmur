@@ -195,7 +195,7 @@ The node:
 1. **Automated Additive Operations (Allowed):**
    - `CREATE TABLE`: New replicated tables.
    - `ALTER TABLE ADD COLUMN`: New replicated columns on existing tables.
-   - When a peer with `AcceptRemoteSchema = true` connects, these changes are discovered during handshake, applied automatically to LumoSQL, persisted to Pebble, and replication continues uninterrupted.
+   - When a peer with `AcceptRemoteSchema = true` connects, these changes are discovered during handshake, applied automatically to SQLite, persisted to Pebble, and replication continues uninterrupted.
 
 2. **Destructive Operations (Restricted/Coordinated):**
    - `DROP TABLE`, `DROP COLUMN`, or altering primary keys.
@@ -257,5 +257,12 @@ Configured local views are dropped and recreated around an authoritative-state
 rebuild, after their replicated base tables have been reconstructed. This
 ensures startup and recovery restore the view definition without replicating
 the view itself.
+
+Reopening a database preserves declaration column order. The stored
+manifest encoding sorts columns by hash-derived ID, so the reopen path
+keeps the config-built registry (whose hash match proves identical IDs,
+names, and types) instead of rebuilding from the manifest: rebuilding
+from the manifest would permute physical column order on every reopen
+whenever ID order differs from declaration order.
 
 ---

@@ -22,8 +22,8 @@ type OutboxKey struct {
 const outboxEnvelopeVersion = 2
 
 type outboxEnvelope struct {
-	V    int    `json:"v"`
-	Key  string `json:"key_id"`
+	V     int    `json:"v"`
+	Key   string `json:"key_id"`
 	Nonce string `json:"nonce"`
 	Data  string `json:"data"`
 }
