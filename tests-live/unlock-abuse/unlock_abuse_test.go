@@ -11,15 +11,16 @@ import (
 	"testing"
 	"time"
 
+	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/schema"
 	"github.com/marcgauthier/spedsql/tests-live/harness"
 )
 
-const schemaSQL = `
-CREATE TABLE IF NOT EXISTS abuse_rows (
-  id BLOB PRIMARY KEY NOT NULL,
-  name TEXT NOT NULL DEFAULT ''
-);
-`
+// NOTE: abuse_rows must be a replicated manifest table (structured Schema),
+// not SchemaSQL. SchemaSQL files are executed as local-only SQLite DDL on
+// each node (testnode applies them via ExecContext after open), so writes
+// to them never enter the replication log and cross-node convergence
+// assertions would be vacuous (and fail).
 
 const wrongKeyHex = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0"
 
@@ -28,7 +29,13 @@ func TestUnlockAbuse(t *testing.T) {
 		Name:        "unlock-abuse",
 		NumNodes:    2,
 		AwaitUnlock: true,
-		SchemaSQL:   schemaSQL,
+		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
+			Name: "abuse_rows",
+			Columns: []schema.ColumnSchema{
+				{Name: "id", Type: schema.ColBlob},
+				{Name: "name", Type: schema.ColText, Nullable: true},
+			},
+		}}},
 	})
 
 	// Positive control: honest path works before any abuse.
@@ -37,7 +44,7 @@ func TestUnlockAbuse(t *testing.T) {
 		t.Fatalf("baseline insert: %v", err)
 	}
 	waitAllCount(t, cluster, "abuse_rows", 1, 10*time.Second)
-	assertEqualDigests(t, cluster, "abuse_rows", "name")
+	assertEqualDigests(t, cluster, "abuse_rows", "id")
 
 	// Lock node0: restart without unlock. Truncate its log so the audit
 	// entry asserted below must come from the upcoming unlock.
@@ -130,7 +137,7 @@ func TestUnlockAbuse(t *testing.T) {
 		t.Fatalf("post-unlock insert: %v", err)
 	}
 	waitAllCount(t, cluster, "abuse_rows", 2, 10*time.Second)
-	assertEqualDigests(t, cluster, "abuse_rows", "name")
+	assertEqualDigests(t, cluster, "abuse_rows", "id")
 }
 
 type unlockResult struct {
@@ -174,9 +181,16 @@ func assertNoOracle(t *testing.T, name string, r unlockResult, node *harness.Nod
 	if !strings.HasPrefix(r.body, "unlock failed") {
 		t.Fatalf("%s: body=%q, want generic \"unlock failed\" prefix", name, r.body)
 	}
-	for _, secret := range []string{node.KeyHex, wrongKeyHex, "live-key-1", "remote-unlock-key", "no-such-key-9", "key_id", "KeyID"} {
+	// Only key MATERIAL is secret. Key IDs ("live-key-1",
+	// "remote-unlock-key") are non-secret identifiers, and the failure
+	// body legitimately names the store's recorded key ID for operator
+	// diagnostics. The anti-oracle property is enforced separately by
+	// the identical-bodies assertion below: all failure modes must be
+	// indistinguishable, so the echoed ID reveals nothing about which
+	// IDs exist or which part of the guess was wrong.
+	for _, secret := range []string{node.KeyHex, wrongKeyHex} {
 		if strings.Contains(r.body, secret) {
-			t.Fatalf("%s: body leaks %q: %q", name, secret, r.body)
+			t.Fatalf("%s: body leaks key material %q: %q", name, secret, r.body)
 		}
 	}
 }

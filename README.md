@@ -4,7 +4,7 @@
   <img src="murmur-sql.png" alt="MURMUR-SQL logo" width="600"/>
 </p>
 
-*Coordinated starling flock flight.*
+*Database cluster coordinated as starlink flock flight.*
 
 Murmur-SQL is a Golang embedded package that provides an in-memory SQLite database with masterless/offline distributed cluster with persistence on disk via Pebble saving only change deltas.
 
@@ -15,6 +15,7 @@ Murmur-SQL is a Golang embedded package that provides an in-memory SQLite databa
 - **Offline writes** on every node, per-column last-writer-wins via hybrid
   logical clock (CR-SQLite-style cell model, engine-independent)
 - **Encrypted storage** with multiple cipher options, storage-key rotation, snapshots for new or stale nodes, replication-log garbage collection
+- **Cross-domain unidirectional airgap**: allow data to transfer from a low domain flock to a high domain flock
 
 The architecture and implementation documentation is in [architecture/](architecture/README.md) folder, split into smaller topic documents.  Start with the [architecture overview](architecture/overview.md).
 

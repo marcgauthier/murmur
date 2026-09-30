@@ -1,10 +1,11 @@
 // Three-way-heal acceptance.
 //
 // Four fully meshed daemons split into isolated pairs, diverge with
-// deterministic writes, then heal link-by-link in a caller-supplied
+// deterministic writes (disjoint inserts plus conflicting updates to
+// the same base rows), then heal link-by-link in a caller-supplied
 // order. The suite runs two different heal orders and requires the
 // final digest to be identical across orders: heal order must not
-// affect the converged state.
+// affect the converged state, including LWW conflict winners.
 package threewayheal_test
 
 import (
@@ -74,7 +75,12 @@ func runHealOrder(t *testing.T, order []int, tag string) string {
 		}
 	}
 
-	// Deterministic divergent writes per side.
+	// Deterministic divergent writes per side: disjoint inserts plus
+	// CONFLICTING updates to the same base rows (F2). Union-merge alone
+	// cannot prove heal-order independence where it matters; LWW must
+	// pick the same winner per cell regardless of arrival order. Side B
+	// writes strictly after side A in wall time, so the relative HLC
+	// order (and hence the winner) is deterministic across runs.
 	for i := 0; i < 10; i++ {
 		id := fmt.Sprintf("%032x", 2000+i)
 		if err := cluster.ExecSQL(1, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)", id, fmt.Sprintf("sideA-%d", i)); err != nil {
@@ -85,16 +91,28 @@ func runHealOrder(t *testing.T, order []int, tag string) string {
 			t.Fatalf("order %v sideB write: %v", order, err)
 		}
 	}
+	for i := 0; i < 10; i++ {
+		id := fmt.Sprintf("%032x", 1000+i)
+		if err := cluster.ExecSQL(1, "UPDATE "+tableName+" SET name = ? WHERE id = ?", fmt.Sprintf("conflict-A-%d", i), id); err != nil {
+			t.Fatalf("order %v sideA conflict write: %v", order, err)
+		}
+	}
+	for i := 0; i < 10; i++ {
+		id := fmt.Sprintf("%032x", 1000+i)
+		if err := cluster.ExecSQL(3, "UPDATE "+tableName+" SET name = ? WHERE id = ?", fmt.Sprintf("conflict-B-%d", i), id); err != nil {
+			t.Fatalf("order %v sideB conflict write: %v", order, err)
+		}
+	}
 
 	// Each pair converges internally; equal counts but divergent digests
 	// prove the split held (otherwise this test would be vacuous).
 	waitConvergedOn(t, cluster, []int{0, 1}, 20, 150*time.Second)
 	waitConvergedOn(t, cluster, []int{2, 3}, 20, 150*time.Second)
-	dA, err := cluster.ComputeTableDigest(0, tableName, "name")
+	dA, err := cluster.ComputeTableDigest(0, tableName, "id")
 	if err != nil {
 		t.Fatal(err)
 	}
-	dB, err := cluster.ComputeTableDigest(2, tableName, "name")
+	dB, err := cluster.ComputeTableDigest(2, tableName, "id")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,8 +120,10 @@ func runHealOrder(t *testing.T, order []int, tag string) string {
 		t.Fatalf("order %v: sides unexpectedly agree during split (%s)", order, dA)
 	}
 
-	// Heal link-by-link in the prescribed order, settling briefly
-	// between links so the order is real, not nominal.
+	// Heal link-by-link in the prescribed order. After each heal we
+	// wait for real cross-side traffic on the new link (not a blind
+	// sleep that could elapse before anything flows, making the orders
+	// effectively identical).
 	for step, linkIdx := range order {
 		link := crossLinks[linkIdx]
 		if err := cluster.AddPeer(link[0], link[1]); err != nil {
@@ -113,15 +133,50 @@ func runHealOrder(t *testing.T, order []int, tag string) string {
 			t.Fatalf("order %v heal %v: %v", order, link, err)
 		}
 		t.Logf("order %v: healed link %d/%d (%d<->%d)", order, step+1, len(order), link[0], link[1])
-		time.Sleep(time.Second)
+		waitLinkFlowed(t, cluster, order, link)
 	}
 
 	waitConverged(t, cluster, 30, 150*time.Second)
-	final, err := cluster.ComputeTableDigest(0, tableName, "name")
+	final, err := cluster.ComputeTableDigest(0, tableName, "id")
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Log the LWW winner on a conflicted row: the digest comparison
+	// across orders is the assertion, this names the value for forensics.
+	res, err := cluster.QuerySQL(0, "SELECT name FROM "+tableName+" WHERE id = ?", fmt.Sprintf("%032x", 1000))
+	if err == nil && len(res.Rows) > 0 && len(res.Rows[0]) > 0 {
+		t.Logf("order %v: conflict winner row 1000 = %v", order, res.Rows[0][0])
+	}
 	return final
+}
+
+// waitLinkFlowed blocks until a side-originated row is visible across the
+// newly healed link in either direction: a sideA row (2xxx, written on
+// node 1) on the sideB endpoint, or a sideB row (3xxx, written on node
+// 3) on the sideA endpoint.
+func waitLinkFlowed(t *testing.T, c *harness.Cluster, order []int, link [2]int) {
+	t.Helper()
+	sideA := fmt.Sprintf("%032x", 2000)
+	sideB := fmt.Sprintf("%032x", 3000)
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if hasRow(t, c, link[1], sideA) || hasRow(t, c, link[0], sideB) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("order %v: no cross-side traffic on healed link %v within 30s", order, link)
+}
+
+func hasRow(t *testing.T, c *harness.Cluster, idx int, id string) bool {
+	t.Helper()
+	res, err := c.QuerySQL(idx, "SELECT count(*) FROM "+tableName+" WHERE id = ?", id)
+	if err != nil || len(res.Rows) == 0 || len(res.Rows[0]) == 0 {
+		return false
+	}
+	var n int
+	_, _ = fmt.Sscanf(fmt.Sprintf("%v", res.Rows[0][0]), "%d", &n)
+	return n == 1
 }
 
 // parseOrder reads a comma-separated permutation of link indexes;
@@ -167,7 +222,7 @@ func waitConvergedOn(t *testing.T, c *harness.Cluster, idxs []int, want int, tim
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(idx, tableName, "name")
+			d, err := c.ComputeTableDigest(idx, tableName, "id")
 			if err != nil {
 				ok = false
 				break
@@ -195,7 +250,7 @@ func waitConvergedOn(t *testing.T, c *harness.Cluster, idxs []int, want int, tim
 	}
 	for _, idx := range idxs {
 		n, _ := c.QueryRowCount(idx, tableName)
-		d, _ := c.ComputeTableDigest(idx, tableName, "name")
+		d, _ := c.ComputeTableDigest(idx, tableName, "id")
 		t.Logf("node %d at timeout: count=%d digest=%s", idx, n, d)
 	}
 	t.Fatalf("nodes %v did not converge on %d rows with equal digests within %v", idxs, want, timeout)

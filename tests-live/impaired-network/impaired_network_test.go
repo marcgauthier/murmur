@@ -98,6 +98,9 @@ func TestImpairedNetworkConverges(t *testing.T) {
 	}
 
 	t.Run("latency-150ms", func(t *testing.T) {
+		if force {
+			t.Log("FORCE mode: NO 150ms latency applied; green here proves the workload only, not impairment tolerance")
+		}
 		impair("netem", "delay", "150ms")
 		defer clear()
 		lat := timedWrites(t, cluster, "lat", base, rows, 30*time.Second)
@@ -110,6 +113,9 @@ func TestImpairedNetworkConverges(t *testing.T) {
 	base += rows
 
 	t.Run("loss-3pct", func(t *testing.T) {
+		if force {
+			t.Log("FORCE mode: NO 3% loss applied; green here proves the workload only, not impairment tolerance")
+		}
 		impair("netem", "loss", "3%")
 		defer clear()
 		lat := timedWrites(t, cluster, "loss", base, rows, 45*time.Second)
@@ -122,6 +128,9 @@ func TestImpairedNetworkConverges(t *testing.T) {
 	base += rows
 
 	t.Run("capped-snapshot-resync", func(t *testing.T) {
+		if force {
+			t.Log("FORCE mode: NO bandwidth cap applied; green here proves the workload only, not impairment tolerance")
+		}
 		// Stale rows on node3, then it stops with acknowledged state.
 		for i := 0; i < 5; i++ {
 			if err := cluster.ExecSQL(2, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)",
@@ -365,7 +374,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, tableName, "name")
+			d, err := c.ComputeTableDigest(i, tableName, "id")
 			if err != nil {
 				ok = false
 				break

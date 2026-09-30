@@ -84,17 +84,23 @@ func TestPlaintextAuditMarkersAndKeysAbsentOnDisk(t *testing.T) {
 	t.Logf("positive control: all %d markers round-trip intact", len(markers))
 
 	// Stop both nodes so the on-disk image is quiescent, then scan the
-	// ENTIRE node directory: pebble, WAL, keys, tmp, scratch, logs.
+	// ENTIRE node directory of BOTH nodes: pebble, WAL, keys, tmp,
+	// scratch, logs. Node 1 learned the rows via replication apply (not
+	// local commit), so its disk image exercises different code paths
+	// and must be audited too.
 	cluster.StopNode(0)
 	cluster.StopNode(1)
-	for i, m := range markers {
-		if hit, err := scanTree(node.Dir, []byte(m), nil); err != nil {
-			t.Fatalf("scan marker %d: %v", i, err)
-		} else if hit != "" {
-			t.Fatalf("PLAINTEXT LEAK: marker %d found on disk in %s", i, hit)
+	for n := range cluster.Nodes {
+		nodedir := cluster.Nodes[n].Dir
+		for i, m := range markers {
+			if hit, err := scanTree(nodedir, []byte(m), nil); err != nil {
+				t.Fatalf("scan node%d marker %d: %v", n, i, err)
+			} else if hit != "" {
+				t.Fatalf("PLAINTEXT LEAK: marker %d found on disk in %s", i, hit)
+			}
 		}
+		t.Logf("markers absent from entire node dir %s", nodedir)
 	}
-	t.Logf("markers absent from entire node dir %s", node.Dir)
 
 	// Key material must not leak outside the provisioned config file,
 	// where the harness itself places the operator key.
@@ -103,12 +109,15 @@ func TestPlaintextAuditMarkersAndKeysAbsentOnDisk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	skipConfig := map[string]bool{node.ConfigFile: true}
-	for _, needle := range [][]byte{[]byte(keyHex), []byte(strings.ToUpper(keyHex)), keyRaw} {
-		if hit, err := scanTree(node.Dir, needle, skipConfig); err != nil {
-			t.Fatalf("scan key material: %v", err)
-		} else if hit != "" {
-			t.Fatalf("KEY LEAK: key material found on disk in %s", hit)
+	for n := range cluster.Nodes {
+		nnode := cluster.Nodes[n]
+		skipConfig := map[string]bool{nnode.ConfigFile: true}
+		for _, needle := range [][]byte{[]byte(keyHex), []byte(strings.ToUpper(keyHex)), keyRaw} {
+			if hit, err := scanTree(nnode.Dir, needle, skipConfig); err != nil {
+				t.Fatalf("scan node%d key material: %v", n, err)
+			} else if hit != "" {
+				t.Fatalf("KEY LEAK: key material found on disk in %s", hit)
+			}
 		}
 	}
 	t.Logf("key material absent outside provisioned config.json")

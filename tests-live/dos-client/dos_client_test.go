@@ -524,7 +524,7 @@ func waitConvergedDeadline(t *testing.T, c *harness.Cluster, want int, deadline 
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, "dos_rows", "name")
+			d, err := c.ComputeTableDigest(i, "dos_rows", "id")
 			if err != nil {
 				ok = false
 				break

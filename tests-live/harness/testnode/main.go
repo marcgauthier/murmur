@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	db "github.com/marcgauthier/spedsql"
+	"github.com/marcgauthier/spedsql/crypto"
 	"github.com/marcgauthier/spedsql/metrics"
 	"github.com/marcgauthier/spedsql/schema"
 	"github.com/marcgauthier/spedsql/service"
@@ -694,6 +696,16 @@ func (d *NodeDaemon) handleAdminUnlock(w http.ResponseWriter, r *http.Request) {
 
 	_, err := d.openDatabase(r.Context(), keyBytes, keyID)
 	if err != nil {
+		if isUnlockAuthFailure(err) {
+			// Credential failures stay generic: the wrong-key and
+			// unknown-key-id errors differ ("registry seal" vs
+			// "storage key unavailable"), which would make this
+			// endpoint a key/key-ID oracle. The detail is logged
+			// server-side for operators instead.
+			log.Printf("unlock failed for node %s: %v", d.nodeID, err)
+			http.Error(w, "unlock failed", http.StatusUnauthorized)
+			return
+		}
 		http.Error(w, fmt.Sprintf("unlock failed: %v", err), http.StatusUnauthorized)
 		return
 	}
@@ -701,6 +713,21 @@ func (d *NodeDaemon) handleAdminUnlock(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "unlocked": true})
+}
+
+// isUnlockAuthFailure reports whether an openDatabase error is a credential
+// failure (wrong key material or unknown key ID) as opposed to a state
+// problem (schema mismatch, corruption). Only credential failures are
+// normalized to a generic response; state problems keep their detail so
+// callers can classify them.
+func isUnlockAuthFailure(err error) bool {
+	if errors.Is(err, crypto.ErrAuth) {
+		return true
+	}
+	// The registry reports an unresolvable recorded key ID as
+	// "storage key %q unavailable" (see crypto.Registry); match the
+	// same marker the product itself uses.
+	return strings.Contains(err.Error(), "unavailable")
 }
 
 func (d *NodeDaemon) handleAdminStatus(w http.ResponseWriter, r *http.Request) {

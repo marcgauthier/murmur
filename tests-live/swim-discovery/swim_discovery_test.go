@@ -289,7 +289,7 @@ func waitConvergedOn(t *testing.T, c *harness.Cluster, idxs []int, want int, tim
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(idx, tableName, "name")
+			d, err := c.ComputeTableDigest(idx, tableName, "id")
 			if err != nil {
 				ok = false
 				break
@@ -326,7 +326,7 @@ func waitConvergedOn(t *testing.T, c *harness.Cluster, idxs []int, want int, tim
 	}
 	for _, idx := range idxs {
 		n, _ := c.QueryRowCount(idx, tableName)
-		d, _ := c.ComputeTableDigest(idx, tableName, "name")
+		d, _ := c.ComputeTableDigest(idx, tableName, "id")
 		t.Logf("node %d at timeout: count=%d digest=%s", idx, n, d)
 	}
 	dumpTopoForensics(t, c)

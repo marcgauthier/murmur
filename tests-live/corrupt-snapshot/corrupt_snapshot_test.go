@@ -60,7 +60,7 @@ func TestStaleNodeDiscardsCorruptSnapshotThenConverges(t *testing.T) {
 		}
 	}
 	waitConverged(t, cluster, "snap_rows", 5, 60*time.Second)
-	preStopDigest, err := cluster.ComputeTableDigest(stale, "snap_rows", "name")
+	preStopDigest, err := cluster.ComputeTableDigest(stale, "snap_rows", "id")
 	if err != nil {
 		t.Fatalf("pre-stop digest: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestStaleNodeDiscardsCorruptSnapshotThenConverges(t *testing.T) {
 	if n, err := cluster.QueryRowCount(stale, "snap_rows"); err != nil || n != 5 {
 		t.Fatalf("stale node rows = %d, err = %v after corrupt transfer, want 5 (partial publication)", n, err)
 	}
-	if d, err := cluster.ComputeTableDigest(stale, "snap_rows", "name"); err != nil || d != preStopDigest {
+	if d, err := cluster.ComputeTableDigest(stale, "snap_rows", "id"); err != nil || d != preStopDigest {
 		t.Fatalf("stale node digest changed by corrupt transfer: %q -> %q, err = %v", preStopDigest, d, err)
 	}
 	if got := metricValue(t, victimAPI, "spedsql_state_generation"); got != genBeforeAttack {
@@ -227,7 +227,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, table, "name")
+			d, err := c.ComputeTableDigest(i, table, "id")
 			if err != nil {
 				ok = false
 				break
@@ -246,7 +246,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 	}
 	for i := range c.Nodes {
 		n, nerr := c.QueryRowCount(i, table)
-		d, derr := c.ComputeTableDigest(i, table, "name")
+		d, derr := c.ComputeTableDigest(i, table, "id")
 		t.Logf("node %d at timeout: count=%d countErr=%v digest=%s digestErr=%v", i, n, nerr, d, derr)
 	}
 	t.Fatalf("nodes did not converge on %d %s rows with equal digests within %v", want, table, timeout)

@@ -400,7 +400,7 @@ func frameSummary(frames []*replication.Frame) string {
 
 func nodeDigest(t *testing.T, cluster *harness.Cluster, idx int, table string) string {
 	t.Helper()
-	d, err := cluster.ComputeTableDigest(idx, table, "name")
+	d, err := cluster.ComputeTableDigest(idx, table, "id")
 	if err != nil {
 		t.Fatalf("node %d digest: %v", idx, err)
 	}
@@ -426,7 +426,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, table, "name")
+			d, err := c.ComputeTableDigest(i, table, "id")
 			if err != nil {
 				ok = false
 				break
@@ -445,7 +445,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 	}
 	for i := range c.Nodes {
 		n, nerr := c.QueryRowCount(i, table)
-		d, derr := c.ComputeTableDigest(i, table, "name")
+		d, derr := c.ComputeTableDigest(i, table, "id")
 		t.Logf("node %d at timeout: count=%d countErr=%v digest=%s digestErr=%v", i, n, nerr, d, derr)
 	}
 	t.Fatalf("nodes did not converge on %d %s rows with equal digests within %v", want, table, timeout)

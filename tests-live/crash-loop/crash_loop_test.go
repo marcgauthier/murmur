@@ -209,26 +209,24 @@ func waitForConvergence(t *testing.T, c *harness.Cluster, timeout time.Duration)
 	for time.Now().Before(deadline) {
 		ok := true
 		var wantCount int
-		var wantName, wantID string
+		var wantID string
 		for i := range c.Nodes {
 			n, err := c.QueryRowCount(i, "cl_rows")
 			if err != nil {
 				ok = false
 				break
 			}
-			dName, err := c.ComputeTableDigest(i, "cl_rows", "name")
-			if err != nil {
-				ok = false
-				break
-			}
+			// Ordered by PK id only: names are unique today but a
+			// future duplicate would make a name-ordered digest
+			// nondeterministic, so the name digest is dropped.
 			dID, err := c.ComputeTableDigest(i, "cl_rows", "id")
 			if err != nil {
 				ok = false
 				break
 			}
 			if i == 0 {
-				wantCount, wantName, wantID = n, dName, dID
-			} else if n != wantCount || dName != wantName || dID != wantID {
+				wantCount, wantID = n, dID
+			} else if n != wantCount || dID != wantID {
 				ok = false
 				break
 			}

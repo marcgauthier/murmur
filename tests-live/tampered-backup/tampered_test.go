@@ -58,7 +58,7 @@ func TestTamperedBackupsFailClosed(t *testing.T) {
 	if n, err := cluster.QueryRowCount(0, "tb_rows"); err != nil || n != rows {
 		t.Fatalf("seeded count = %d, %v; want %d", n, err, rows)
 	}
-	wantDigest, err := cluster.ComputeTableDigest(0, "tb_rows", "name")
+	wantDigest, err := cluster.ComputeTableDigest(0, "tb_rows", "id")
 	if err != nil {
 		t.Fatalf("pre-backup digest: %v", err)
 	}
@@ -341,7 +341,7 @@ func countRows(ctx context.Context, t *testing.T, handle *db.DB) (int, error) {
 // round trip the daemon HTTP path applies before %v formatting.
 func offlineDigest(ctx context.Context, t *testing.T, handle *db.DB) string {
 	t.Helper()
-	rows, err := handle.QueryContext(ctx, "SELECT * FROM tb_rows ORDER BY name")
+	rows, err := handle.QueryContext(ctx, "SELECT * FROM tb_rows ORDER BY id")
 	if err != nil {
 		t.Fatal(err)
 	}

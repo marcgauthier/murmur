@@ -426,7 +426,7 @@ func waitFullConverged(t *testing.T, c *harness.Cluster, want int, timeout time.
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, "mc_rows", "name")
+			d, err := c.ComputeTableDigest(i, "mc_rows", "id")
 			if err != nil {
 				ok = false
 				break
@@ -445,7 +445,7 @@ func waitFullConverged(t *testing.T, c *harness.Cluster, want int, timeout time.
 	}
 	for i := range c.Nodes {
 		n, nerr := c.QueryRowCount(i, "mc_rows")
-		d, derr := c.ComputeTableDigest(i, "mc_rows", "name")
+		d, derr := c.ComputeTableDigest(i, "mc_rows", "id")
 		ep := statusEpoch(t, c.Nodes[i].APIAddr)
 		t.Logf("node %d at timeout: count=%d countErr=%v digest=%.16s digestErr=%v epoch=%d", i, n, nerr, d, derr, ep)
 	}

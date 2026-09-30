@@ -125,7 +125,7 @@ func TestPauseResumeLosesNoWrites(t *testing.T) {
 	// a healthy 3-node mesh reads 2; detection of the frozen member may
 	// dip survivors to 1. (The suspect/dead gauges are hardwired to zero
 	// in MembershipService.Stats, so the alive dip is the observable.)
-	leavesBefore := map[int]float64{
+	probeFailuresBefore := map[int]float64{
 		0: metricValue(t, cluster.Nodes[0].APIAddr, "spedsql_swim_probe_failures_total"),
 		2: metricValue(t, cluster.Nodes[2].APIAddr, "spedsql_swim_probe_failures_total"),
 	}
@@ -143,11 +143,18 @@ func TestPauseResumeLosesNoWrites(t *testing.T) {
 	ackMu.Lock()
 	ackedDuringPause := len(acknowledged) - ackedAtStop
 	ackMu.Unlock()
-	leavesDuring := 0.0
-	for idx, before := range leavesBefore {
-		leavesDuring += metricValue(t, cluster.Nodes[idx].APIAddr, "spedsql_swim_probe_failures_total") - before
+	probeFailuresDuring := 0.0
+	for idx, before := range probeFailuresBefore {
+		probeFailuresDuring += metricValue(t, cluster.Nodes[idx].APIAddr, "spedsql_swim_probe_failures_total") - before
 	}
-	t.Logf("during %v freeze: minAlivePeers=%d leaveEvents=%.0f ackedDuringPause=%d", stopWindow, minAlive, leavesDuring, ackedDuringPause)
+	t.Logf("during %v freeze: minAlivePeers=%d probeFailures=%.0f ackedDuringPause=%d", stopWindow, minAlive, probeFailuresDuring, ackedDuringPause)
+	// Freeze detection proof (F3): survivors must notice the frozen
+	// member, either as an alive-view dip or as failed SWIM probes.
+	// Without this, broken probing would pass silently.
+	if minAlive >= len(cluster.Nodes)-1 && probeFailuresDuring <= 0 {
+		t.Fatalf("freeze undetected: survivors kept alive=%d with zero probe failures during %v (SWIM probing ineffective?)",
+			minAlive, stopWindow)
+	}
 	if ackedDuringPause <= 0 {
 		t.Fatalf("no writes acknowledged while node2 was frozen; pause proved nothing")
 	}
@@ -166,7 +173,11 @@ func TestPauseResumeLosesNoWrites(t *testing.T) {
 	ackMu.Lock()
 	total := len(acknowledged)
 	ackMu.Unlock()
-	waitConverged(t, cluster, total, 120*time.Second)
+	// 180s bound: post-resume range-repair of ~2k rows normally lands in
+	// ~10s, but one modernc-backend run needed past 120s (observed once
+	// in 7 runs; pure-Go SQLite + cold page cache). The bound stays
+	// finite and the no-loss assertions below are unchanged.
+	waitConverged(t, cluster, total, 180*time.Second)
 	assertAcknowledgedPresent(t, cluster, acknowledged)
 
 	// Sessions resumed on every link; SWIM re-admitted the member.
@@ -348,7 +359,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, "pr_rows", "name")
+			d, err := c.ComputeTableDigest(i, "pr_rows", "id")
 			if err != nil {
 				ok = false
 				break

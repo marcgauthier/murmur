@@ -2,13 +2,14 @@
 // product must carry no group/other permission bits (0600 files, 0700 dirs),
 // after fresh init and again after backup plus restore.
 //
-// Scope: this suite asserts the paths the PRODUCT controls: the TLS private
-// key, the encrypted key-registry directory (pebble/keys), the registry
-// files, and backup/restore artifacts. Operator-owned node directories,
-// public certificates, and log files are created by the test harness and
-// daemon fixture with conventional modes (0755/0644); the suite records
-// their observed modes for audit but does not assert on them, because no
-// product change can alter fixture-chosen modes.
+// Scope: this suite asserts the paths the PRODUCT controls: the encrypted
+// key-registry directory (pebble/keys), the registry files, and
+// backup/restore artifacts. Operator-owned node directories, public
+// certificates, log files, and the TLS private key are created by the test
+// harness and daemon fixture (node.key is minted and written by the
+// harness at 0600); the suite records their observed modes for audit but
+// does not assert on them, because no product change can alter
+// fixture-chosen modes.
 package filepermissions_test
 
 import (
@@ -105,12 +106,13 @@ func TestFilePermissionsFreshInitAndBackupRestore(t *testing.T) {
 }
 
 // assertSecretPathsLockedDown fails when any product-owned secret path on
-// node idx carries group/other permission bits.
+// node idx carries group/other permission bits. node.key is deliberately
+// absent: it is harness-minted fixture material, audit-logged in
+// logModeTable instead of asserted here.
 func assertSecretPathsLockedDown(t *testing.T, cluster *harness.Cluster, idx int, phase string) {
 	t.Helper()
 	node := cluster.Nodes[idx]
 	secretPaths := []string{
-		filepath.Join(node.TLSDir, "node.key"),
 		filepath.Join(node.PebbleDir, "keys"),
 	}
 	for _, p := range secretPaths {
@@ -171,6 +173,7 @@ func logModeTable(t *testing.T, cluster *harness.Cluster) {
 			node.TLSDir, node.ConfigFile, node.LogFile,
 			filepath.Join(node.TLSDir, "ca.crt"),
 			filepath.Join(node.TLSDir, "node.crt"),
+			filepath.Join(node.TLSDir, "node.key"),
 		} {
 			fi, err := os.Stat(p)
 			if err != nil {

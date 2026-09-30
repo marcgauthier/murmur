@@ -332,7 +332,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, table, "name")
+			d, err := c.ComputeTableDigest(i, table, "id")
 			if table == "sqli_secrets" {
 				d, err = c.ComputeTableDigest(i, table, "secret")
 			}

@@ -374,7 +374,7 @@ func TestBackupUnderFire(t *testing.T) {
 	}
 	t.Logf("load phase: %d writes, zero failures", total)
 	waitConverged(t, cluster, total, 90*time.Second)
-	survivorDigest, err := cluster.ComputeTableDigest(0, "buf_rows", "name")
+	survivorDigest, err := cluster.ComputeTableDigest(0, "buf_rows", "id")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -530,7 +530,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 				ready = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, "buf_rows", "name")
+			d, err := c.ComputeTableDigest(i, "buf_rows", "id")
 			if err != nil {
 				ready = false
 				break
@@ -649,7 +649,7 @@ func restoreCountDigest(ctx context.Context, t *testing.T, cluster *harness.Clus
 // JSON value rendering (see tampered-backup for the rationale).
 func offlineDigest(ctx context.Context, t *testing.T, handle *db.DB) string {
 	t.Helper()
-	rows, err := handle.QueryContext(ctx, "SELECT * FROM buf_rows ORDER BY name")
+	rows, err := handle.QueryContext(ctx, "SELECT * FROM buf_rows ORDER BY id")
 	if err != nil {
 		t.Fatal(err)
 	}

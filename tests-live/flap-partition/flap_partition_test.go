@@ -81,6 +81,13 @@ func TestFlappingPartitionLosesNoWrites(t *testing.T) {
 	for c := 0; c < cycles; c++ {
 		setPartition(t, cluster, true)
 		t.Logf("cycle %d/%d: node3 isolated for %v", c+1, cycles, split)
+		if c == 0 {
+			// Isolation proof (F1): while split, a marker written on
+			// node0 must reach node1 but never node2. Without this,
+			// a no-op RemovePeer would pass vacuously. The marker is
+			// counted in written so the final want stays exact.
+			proveIsolated(t, cluster, &written)
+		}
 		time.Sleep(split)
 		setPartition(t, cluster, false)
 		t.Logf("cycle %d/%d: healed, settling %v", c+1, cycles, healGap)
@@ -98,6 +105,51 @@ func TestFlappingPartitionLosesNoWrites(t *testing.T) {
 	}
 	waitConverged(t, cluster, want, 150*time.Second)
 	t.Logf("post-flap convergence: %d rows, identical digests", want)
+}
+
+// proveIsolated writes a marker row on node 0 while node 2 is split off
+// and proves the split is real: node 1 must observe the marker (the
+// 0<->1 link works and enough time passes for the row to plausibly
+// travel), while node 2 must not observe it during the whole window.
+func proveIsolated(t *testing.T, c *harness.Cluster, written *atomic.Int64) {
+	t.Helper()
+	marker := fmt.Sprintf("%032x", 9_000_000)
+	if err := c.ExecSQL(0, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)", marker, "isolation-marker"); err != nil {
+		t.Fatalf("isolation marker write: %v", err)
+	}
+	written.Add(1)
+	// Node 1 must see the marker: proves cross-node traffic flows on
+	// the intact side while we watch node 2 for leaks.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if hasRow(t, c, 1, marker) {
+			break
+		}
+		if hasRow(t, c, 2, marker) {
+			t.Fatal("isolation violated: node2 observed the marker while split (RemovePeer ineffective?)")
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("node1 never observed the isolation marker within 10s")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// Node 1 has it; give a leak one more second to show on node 2.
+	time.Sleep(time.Second)
+	if hasRow(t, c, 2, marker) {
+		t.Fatal("isolation violated: node2 observed the marker while split (RemovePeer ineffective?)")
+	}
+	t.Log("isolation proven: marker reached node1, never node2")
+}
+
+func hasRow(t *testing.T, c *harness.Cluster, idx int, id string) bool {
+	t.Helper()
+	res, err := c.QuerySQL(idx, "SELECT count(*) FROM "+tableName+" WHERE id = ?", id)
+	if err != nil || len(res.Rows) == 0 || len(res.Rows[0]) == 0 {
+		return false
+	}
+	var n int
+	_, _ = fmt.Sscanf(fmt.Sprintf("%v", res.Rows[0][0]), "%d", &n)
+	return n == 1
 }
 
 // setPartition isolates (true) or rejoins (false) node index 2.
@@ -131,7 +183,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, tableName, "name")
+			d, err := c.ComputeTableDigest(i, tableName, "id")
 			if err != nil {
 				ok = false
 				break
@@ -159,7 +211,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 	}
 	for i := range c.Nodes {
 		n, _ := c.QueryRowCount(i, tableName)
-		d, _ := c.ComputeTableDigest(i, tableName, "name")
+		d, _ := c.ComputeTableDigest(i, tableName, "id")
 		t.Logf("node %d at timeout: count=%d digest=%s", i, n, d)
 	}
 	t.Fatalf("nodes did not converge on %d rows with equal digests within %v", want, timeout)

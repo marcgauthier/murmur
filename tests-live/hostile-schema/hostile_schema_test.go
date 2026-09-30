@@ -170,11 +170,11 @@ func TestHostileSchemaManifestsQuarantined(t *testing.T) {
 	}
 	waitConverged(t, cluster, "schema_rows", 4, 30*time.Second)
 	// Explicit honest-pair check: nodes 2 and 3 agree bit-for-bit.
-	d1, err := cluster.ComputeTableDigest(1, "schema_rows", "name")
+	d1, err := cluster.ComputeTableDigest(1, "schema_rows", "id")
 	if err != nil {
 		t.Fatalf("honest-pair digest node2: %v", err)
 	}
-	d2, err := cluster.ComputeTableDigest(2, "schema_rows", "name")
+	d2, err := cluster.ComputeTableDigest(2, "schema_rows", "id")
 	if err != nil {
 		t.Fatalf("honest-pair digest node3: %v", err)
 	}
@@ -237,7 +237,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, table, "name")
+			d, err := c.ComputeTableDigest(i, table, "id")
 			if err != nil {
 				ok = false
 				break
@@ -256,7 +256,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 	}
 	for i := range c.Nodes {
 		n, nerr := c.QueryRowCount(i, table)
-		d, derr := c.ComputeTableDigest(i, table, "name")
+		d, derr := c.ComputeTableDigest(i, table, "id")
 		t.Logf("node %d at timeout: count=%d countErr=%v digest=%s digestErr=%v", i, n, nerr, d, derr)
 	}
 	t.Fatalf("nodes did not converge on %d %s rows with equal digests within %v", want, table, timeout)
