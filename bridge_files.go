@@ -19,10 +19,10 @@ import (
 	"io"
 	"strings"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/objectstore"
-	"github.com/marcgauthier/spedsql/replication"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/objectstore"
+	"github.com/marcgauthier/murmur/replication"
 )
 
 // Bridge file record contract: table and column names as they appear in

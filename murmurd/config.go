@@ -11,8 +11,8 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/schema"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 // ExampleConfig is the documented config.example.toml, embedded for

@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // Capturer drains Low origin logs into the outbox, one transaction-linked

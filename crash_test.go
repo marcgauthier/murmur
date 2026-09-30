@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/replication"
-	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/replication"
+	"github.com/marcgauthier/murmur/state"
 )
 
 // dumpSQL returns the query-visible rows keyed by row-id hex.

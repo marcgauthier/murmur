@@ -14,8 +14,8 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/transport"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/transport"
 )
 
 const testKeyHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

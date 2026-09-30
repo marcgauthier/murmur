@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func TestParseAddressPolicy(t *testing.T) {

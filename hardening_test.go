@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/crypto"
+	"github.com/marcgauthier/murmur/crypto"
 )
 
 // TestOpenBadPathFailsCleanly proves Open surfaces storage errors instead of

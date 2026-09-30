@@ -21,10 +21,10 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/backup"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/tests-live/harness"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func schemaConfig() *db.SchemaConfig {

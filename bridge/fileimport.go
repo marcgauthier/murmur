@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/objectstore"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/objectstore"
 )
 
 // High-side file object installation.

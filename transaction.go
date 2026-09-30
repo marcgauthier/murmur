@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"sync"
 
-	"github.com/marcgauthier/spedsql/sqlengine"
+	"github.com/marcgauthier/murmur/sqlengine"
 )
 
 // TxOptions configures an explicit transaction. Reserved for future

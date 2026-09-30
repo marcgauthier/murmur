@@ -4,10 +4,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/replication"
-	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/replication"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 // shadowTestContacts resolves the contacts table IDs of a test DB.

@@ -57,10 +57,11 @@ Release-specific execution evidence belongs in [§4](#4-verification-record).
 | 14 | SWIM/memberlist over QUIC | Implemented | `db.go` starts `replication.NewMembershipService` with configured bootstrap seeds; `replication/membership.go` calls `memberlist.Create`. Membership/transport tests exist. `TestDynamicBootstrapDiscovery` (partial-mesh) starts 3 nodes with no static peers and seed addresses only, requires SWIM membership of 3 on all nodes plus exact 20-row convergence with zero `AddPeer` calls (verified passing live; see §4 format for recording a candidate run). |
 | 15 | High/Low bridge: domain roles, recipient-sealed bundles, durable outbox (encrypted payloads) / inbox journals, aggregate capacity with backpressure, atomic imports with stable source receipts + contiguous stream progress, waiting-schema holds, status/replay diagnostics, ownership/provenance with reorder convergence, sealed file-object transfer | Implemented | `bridge/`; `go test ./bridge/`; `go test -tags ... ./tests-live/highlow ./tests-live/files-bridge ./tests-live/bridge-two-streams` |
 | 16 | Encrypted file objects: replicated metadata, streaming upload/read, search/list, delete tombstones, availability, grace collection, bounded mesh fetch from static peers, per-file key generations, object-inclusive vs metadata-only backup | Implemented | `objectstore/`, `files*.go`; `go test ./objectstore`; `go test -tags ... ./tests-live/files-soak`; File-fetch SWIM discovery remains pending independently of SQL membership (#14). |
-| 17 | Writer scheduling (90/10 shares, idle borrowing, bounded debt, cancellation-aware admission), reactive subscriptions, IP/CIDR admission, `database/sql` driver, optional service/admin HTTP adapters, internal test-node HTTPS API with client-certificate authorization, `DB.Status`/`DB.Metrics`/Prometheus collectors | Implemented | `scheduler.go`, `subscriptions.go`, `transport/addrs.go`, `driver.go`, `service/`, `admin/`, `tests-live/harness/testnode/` TLS middleware (HTTPS health is exempt from client-certificate authorization); `go test -tags ... ./tests-live/api-mtls ./tests-live/loadshare ./tests-live/subscribe ./tests-live/addrpolicy`; `go test -tags ... ./service/ ./admin/ ./metrics/` |
+| 17 | Writer scheduling (90/10 shares, idle borrowing, bounded debt, cancellation-aware admission), reactive subscriptions, IP/CIDR admission, `database/sql` driver, internal test-node HTTPS API with client-certificate authorization, `DB.Status`/`DB.Metrics`/Prometheus collectors | Implemented | `scheduler.go`, `subscriptions.go`, `transport/addrs.go`, `driver.go`, `tests-live/harness/testnode/` TLS middleware (HTTPS health is exempt from client-certificate authorization); `go test -tags ... ./tests-live/api-mtls ./tests-live/loadshare ./tests-live/subscribe ./tests-live/addrpolicy`; `go test -tags ... ./metrics/` |
 | 18 | Hardening: decoder fuzz targets, crash-injection suite, adversarial-peer tests, cert-expiry rejection, disk-full fail-closed, short multi-process soaks | Implemented | `codec/`, `replication/fuzz_test.go`, `crash_test.go`, `diskfull_test.go`, `soak_test.go`; `go test -tags ... ./tests-live/soak-slo ./tests-live/long-running-five-node` (smoke durations; multi-hour/impaired-network acceptance remains pending) |
 | 19 | Benchmark matrix (§59–§61) with recorded 10K/100K results, cipher/compression matrix, local/live writer throughput, transaction-size matrix, concurrent-reader suite | Implemented | `benchmark/`; [Benchmarks](benchmarks.md#62-running-the-matrix) |
 | 20 | Automatic primary-key derivation (default `id` UUIDv4 / UUIDv5 from a flagged column) | Pending | Not implemented; v1 still requires the application to supply an explicit `BLOB(16)` PK. Not release-blocking. |
+| 21 | Embedded GORM dialect (SQLite-flavored DML, `Migrate`-based additive migrations, `murmur.Model`/`ID`/`Time`/`DeletedAt`, loud rejection of indexes/defaults/checks/constraints, real transactions) | Implemented | `gormmurmur/`; `go test -tags "sqlite_preupdate_hook sqlite_fts5" ./gormmurmur/` and `go test -tags modernc ./gormmurmur/`; `tests-live/gorm-sync`, `tests-live/gorm-migrate`, `tests-live/gorm-tx` (GORM-only access, real QUIC replication) |
 
 ## 2. Supported platforms
 
@@ -90,7 +91,7 @@ Murmur-SQL is an embedded Go library. Applications link the package directly int
 ### 3.1 Embedded library
 
 ```sh
-go get github.com/marcgauthier/spedsql
+go get github.com/marcgauthier/murmur
 ```
 
 Open a node as in the [project README quick start](../README.md#quick-start):
@@ -231,7 +232,7 @@ fixture; the embedded package starts no HTTP listener.
 
 2026-09-29 release and upgrade verification of candidate
 `31bf1b582fd21b50b049d0c0b9a47d5d4589a3ac` (“Rename module to
-github.com/marcgauthier/spedsql”), linux/amd64, Go 1.26.x, executed in
+github.com/marcgauthier/murmur”), linux/amd64, Go 1.26.x, executed in
 an isolated worktree checkout of that commit (clean tree, no patch):
 
 - `go build` with both tag sets and `go vet` with both tag sets — pass.

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/marcgauthier/spedsql/crypto"
+	"github.com/marcgauthier/murmur/crypto"
 )
 
 // EncryptionAlgorithm names an at-rest AEAD. Canonical values double as the

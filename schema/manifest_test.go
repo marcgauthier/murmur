@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func manifestTestTables() []TableSchema {

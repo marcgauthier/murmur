@@ -16,7 +16,7 @@ import (
 	"github.com/dolthub/vitess/go/mysql"
 	wire "github.com/jeroenrinzema/psql-wire"
 
-	db "github.com/marcgauthier/spedsql"
+	db "github.com/marcgauthier/murmur"
 )
 
 // Server is a running murmurd daemon: one murmur engine with a MySQL

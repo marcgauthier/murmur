@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/crdt"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/crdt"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func TestValueRoundTrip(t *testing.T) {

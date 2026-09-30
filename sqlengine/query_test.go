@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func TestQueryRowsCloseIsIdempotentAndUnblocksWriter(t *testing.T) {

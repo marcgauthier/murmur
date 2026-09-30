@@ -27,13 +27,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/filefetch"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/objectstore"
-	"github.com/marcgauthier/spedsql/replication"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/filefetch"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/objectstore"
+	"github.com/marcgauthier/murmur/replication"
+	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/state"
 )
 
 // fileTableName is the reserved metadata table. Application schemas must

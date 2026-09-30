@@ -7,7 +7,7 @@ import (
 
 	"github.com/dolthub/go-mysql-server/sql"
 
-	db "github.com/marcgauthier/spedsql"
+	db "github.com/marcgauthier/murmur"
 )
 
 // murmurTable is one sql.Table over a murmur materialized table. It

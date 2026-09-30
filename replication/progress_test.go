@@ -3,7 +3,7 @@ package replication
 import (
 	"testing"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func TestProgressRequestAndPageCodec(t *testing.T) {

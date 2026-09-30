@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // SessionPurpose classifies the intent of a connection or session for admission.

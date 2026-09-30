@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func TestCommitRemotePreparedRecoveryIsAtomic(t *testing.T) {

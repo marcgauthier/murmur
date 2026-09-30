@@ -24,11 +24,10 @@ import (
 	"syscall"
 	"time"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/crypto"
-	"github.com/marcgauthier/spedsql/metrics"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/service"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/crypto"
+	"github.com/marcgauthier/murmur/metrics"
+	"github.com/marcgauthier/murmur/schema"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -963,7 +962,7 @@ func (d *NodeDaemon) handleServiceSubscribe(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "query is required", http.StatusBadRequest)
 		return
 	}
-	args, err := service.DecodeJSONArgs(r.URL.Query().Get("args"))
+	args, err := DecodeJSONArgs(r.URL.Query().Get("args"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -993,7 +992,7 @@ func (d *NodeDaemon) handleServiceSubscribe(w http.ResponseWriter, r *http.Reque
 	w.WriteHeader(http.StatusOK)
 	enc := json.NewEncoder(w)
 	ctx := r.Context()
-	emit := func(eventType string, cursor uint64, columns []string, rows [][]service.Value, errText string) bool {
+	emit := func(eventType string, cursor uint64, columns []string, rows [][]Value, errText string) bool {
 		out := map[string]any{"type": eventType, "cursor": cursor}
 		if columns != nil {
 			out["columns"] = columns
@@ -1032,7 +1031,7 @@ func (d *NodeDaemon) handleServiceSubscribe(w http.ResponseWriter, r *http.Reque
 			for i, row := range ev.Rows {
 				raw[i] = row.Values
 			}
-			encRows, err := service.MarshalRows(raw)
+			encRows, err := MarshalRows(raw)
 			if err != nil {
 				emit("error", ev.Cursor, nil, nil, err.Error())
 				return

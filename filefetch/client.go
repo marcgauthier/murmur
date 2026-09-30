@@ -7,9 +7,9 @@ import (
 	"io"
 	"time"
 
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/objectstore"
-	"github.com/marcgauthier/spedsql/transport"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/objectstore"
+	"github.com/marcgauthier/murmur/transport"
 )
 
 // Client errors. ErrNotFound and ErrBadOffset select the next source;

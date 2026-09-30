@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/marcgauthier/spedsql/crypto"
-	"github.com/marcgauthier/spedsql/replication"
+	"github.com/marcgauthier/murmur/crypto"
+	"github.com/marcgauthier/murmur/replication"
 )
 
 // --- key rotation ---

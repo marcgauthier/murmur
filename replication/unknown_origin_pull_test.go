@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/state"
 )
 
 // TestUnknownAdvertisedNeedsPullsMissingOrigins pins the pull decision:
@@ -137,17 +137,46 @@ func TestFirstDeliveryLossHealsViaUnknownOriginPull(t *testing.T) {
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		calls, succeeded := recv.snapshot()
-		if succeeded == 10 {
-			if calls != 20 {
-				t.Fatalf("applier calls = %d, want 20 (10 dropped + 10 redelivered)", calls)
+		// Threshold, not exact equality: pull-triggered redelivery can
+		// overlap the periodic resend, so duplicate batches may land
+		// between polls and skip straight past succeeded == 10.
+		// Idempotent apply makes duplicates harmless; the watermark
+		// is the real convergence property.
+		if succeeded >= 10 {
+			if calls < 20 {
+				t.Fatalf("applier calls = %d, want at least 20 (10 dropped + 10 redelivered)", calls)
 			}
 			if wm, err := storeB.ReceiveWatermark(nodeA); err != nil || wm != 10 {
 				t.Fatalf("receiver watermark = %d, err = %v, want 10", wm, err)
 			}
-			return
+			// Delivery must quiesce: stale queued Needs can still
+			// drain one bounded duplicate tail after convergence
+			// (idempotent apply absorbs it), but a true resend
+			// loop would grow calls forever. Require a full
+			// quiet second within budget.
+			quietNeed := time.Second
+			quietStart := time.Now()
+			lastCalls := calls
+			stableDeadline := time.Now().Add(10 * time.Second)
+			for {
+				time.Sleep(100 * time.Millisecond)
+				cur, _ := recv.snapshot()
+				if cur != lastCalls {
+					lastCalls = cur
+					quietStart = time.Now()
+				}
+				if time.Since(quietStart) >= quietNeed {
+					return
+				}
+				if time.Now().After(stableDeadline) {
+					t.Fatalf("applier calls kept growing after convergence (%d -> %d): resend loop", calls, cur)
+				}
+			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("stall unrepaired: calls = %d, succeeded = %d, want succeeded = 10", calls, succeeded)
+			wm, werr := storeB.ReceiveWatermark(nodeA)
+			t.Fatalf("stall unrepaired: calls = %d, succeeded = %d, watermark = %d (err = %v), want watermark 10",
+				calls, succeeded, wm, werr)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

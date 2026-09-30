@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/backup"
-	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 var testObjectKey = bytes.Repeat([]byte{0x71}, 32)

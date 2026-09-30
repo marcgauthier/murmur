@@ -10,8 +10,8 @@ import (
 
 	"github.com/cockroachdb/pebble/v2/sstable/block"
 
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/objectstore"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/objectstore"
 )
 
 func openCoverageDB(t *testing.T) *DB {

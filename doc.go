@@ -11,7 +11,7 @@
 //	Application SQL -> query engine -> TxDelta -> CRDT merge -> Pebble -> QUIC peers
 package replicateddb
 
-import "github.com/marcgauthier/spedsql/ids"
+import "github.com/marcgauthier/murmur/ids"
 
 // Identity aliases so the public API reads naturally (replicateddb.NodeID)
 // while subpackages share one definition without import cycles.

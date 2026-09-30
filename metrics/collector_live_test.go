@@ -8,8 +8,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	replicateddb "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/schema"
+	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 // TestCollectorLiveDB proves the collector serves a real DB snapshot with

@@ -4,9 +4,9 @@ import (
 	"context"
 	"testing"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // TestImportReceiptsAndStreamProgress validates that imported bundles commit

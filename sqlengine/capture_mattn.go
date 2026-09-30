@@ -9,8 +9,8 @@ import (
 
 	sqlite "github.com/mattn/go-sqlite3"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 type preupdateRegistrar interface {

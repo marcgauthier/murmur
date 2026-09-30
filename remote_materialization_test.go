@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/murmur/codec"
 )
 
 func TestRemoteMaterializationFlushesAtTransactionCount(t *testing.T) {

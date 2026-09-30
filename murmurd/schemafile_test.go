@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	murmurSchema "github.com/marcgauthier/spedsql/schema"
+	murmurSchema "github.com/marcgauthier/murmur/schema"
 )
 
 func writeSchemaFile(t *testing.T, dir, name, body string) string {

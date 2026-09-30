@@ -15,7 +15,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // Manifest is one immutable schema revision.

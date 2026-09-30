@@ -14,9 +14,9 @@ import (
 	"os"
 	"path/filepath"
 
-	replicateddb "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/backup"
-	"github.com/marcgauthier/spedsql/schema"
+	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 func schemaTables() []schema.TableSchema {

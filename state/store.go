@@ -14,9 +14,9 @@ import (
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/cockroachdb/pebble/v2/vfs"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/crdt"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/crdt"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // Options configures the durable store.

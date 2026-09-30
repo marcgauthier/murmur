@@ -3,8 +3,8 @@ package sqlengine
 import (
 	"fmt"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // CellKey identifies one replicated cell.

@@ -141,46 +141,46 @@ concurrent-reader commands already include their full tag sets.
 
 ```bash
 # Fast pass: 10K datasets (short mode)
-go test ./benchmark/ -bench . -short -benchtime 1s
+go test ./tests-benchmark/benchmark/ -bench . -short -benchtime 1s
 
 # Standard pass: 10K + 100K datasets
-go test ./benchmark/ -bench . -benchtime 1s
+go test ./tests-benchmark/benchmark/ -bench . -benchtime 1s
 
 # Large datasets (slow one-time template build: minutes for 1M)
-REPLICATEDDB_BENCH_ROWS=1000000 go test ./benchmark/ -bench . -benchtime 1s
+REPLICATEDDB_BENCH_ROWS=1000000 go test ./tests-benchmark/benchmark/ -bench . -benchtime 1s
 
 # White-box snapshot-seed benchmark (root package)
 go test . -bench 'BenchmarkSnapshotSeed' -benchtime 1x
 
 # Cipher x compression matrix only
-go test ./benchmark/ -bench 'BenchmarkCipherMatrix' -short
+go test ./tests-benchmark/benchmark/ -bench 'BenchmarkCipherMatrix' -short
 
 # Five-node / backlog / throughput replication scenarios only
-go test ./benchmark/ -bench 'BenchmarkReplicationThroughput|BenchmarkFiveNodeSync|BenchmarkReconnectBacklog' -short
+go test ./tests-benchmark/benchmark/ -bench 'BenchmarkReplicationThroughput|BenchmarkFiveNodeSync|BenchmarkReconnectBacklog' -short
 
 # Direct Go API, one encrypted database, one and four concurrent writers
-SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./benchmark/ -run '^TestLocalWriterThroughput$' -v -count=1 -timeout=90s
+SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./tests-benchmark/benchmark/ -run '^TestLocalWriterThroughput$' -v -count=1 -timeout=90s
 
 # Same local workload, async commits with a Pebble sync about once per second
-SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./benchmark/ -run '^TestLocalPeriodicSyncThroughput$' -v -count=1 -timeout=90s
+SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./tests-benchmark/benchmark/ -run '^TestLocalPeriodicSyncThroughput$' -v -count=1 -timeout=90s
 
 # Local transaction-size matrix: 1/10/100/1000 rows, 1/4 writers, both durability modes
-SPEDSQL_LOCAL_BATCH_BENCH_SECONDS=5 go test ./benchmark/ -run '^TestLocalTransactionBatchThroughput$' -v -count=1 -timeout=300s
+SPEDSQL_LOCAL_BATCH_BENCH_SECONDS=5 go test ./tests-benchmark/benchmark/ -run '^TestLocalTransactionBatchThroughput$' -v -count=1 -timeout=300s
 
 # Live multi-process cluster, one and four concurrent SQL writers (10s each)
-SPEDSQL_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-live/benchmark/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s
+SPEDSQL_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-benchmark/replication/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s
 
 # Pebble folder-size matrix across compression modes and traffic shapes
 go test ./tests-live/compression/ -run '^TestPebbleCompressionSizes$' -v -count=1 -timeout=15m
 
 # Concurrent-reader query benchmarks (CGO tags required for default backend)
-go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./benchmark/ -bench 'BenchmarkConcurrent' -short -benchtime 1s
+go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./tests-benchmark/benchmark/ -bench 'BenchmarkConcurrent' -short -benchtime 1s
 
 # Same suite, restricted reader levels and 100K datasets
-SPEDSQL_BENCH_READERS=1,8 go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./benchmark/ -bench 'BenchmarkConcurrentMixedSQLite' -benchtime 1s
+SPEDSQL_BENCH_READERS=1,8 go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./tests-benchmark/benchmark/ -bench 'BenchmarkConcurrentMixedSQLite' -benchtime 1s
 
 # Fixed-window sustained multi-reader throughput (10s per reader level, 10K rows)
-go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./benchmark/ -run '^TestSQLiteConcurrentReaderThroughput$' -v -count=1 -timeout=300s
+go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./tests-benchmark/benchmark/ -run '^TestSQLiteConcurrentReaderThroughput$' -v -count=1 -timeout=300s
 ```
 
 The direct local writer benchmark opens one encrypted database with no peers
@@ -245,7 +245,7 @@ The live writer benchmark starts a fresh encrypted single-node process per
 writer count and measures acknowledged single-row `INSERT` statements per
 wall-clock second. It checks the final SQL row count against the number of
 acknowledged inserts. It is separate from the in-process write microbenchmarks and QUIC replication
-measurements. See [the live benchmark scenario](../tests-live/benchmark/README.md).
+measurements. See [the live benchmark scenario](../tests-benchmark/replication/README.md).
 
 The 2026-09-28 10-second run on the four-core Intel i5-6500 measured
 294.3 inserts/sec with one writer and 328.2 inserts/sec with four writers;
@@ -335,7 +335,7 @@ Coverage notes and manual procedures:
 ## 63. Recorded Results (10K, 2026-09-27)
 
 Machine: linux/amd64, Intel i5-6500 @ 3.20GHz (4 cores).
-Command: `go test ./benchmark/ -bench . -short -benchtime 1s`
+Command: `go test ./tests-benchmark/benchmark/ -bench . -short -benchtime 1s`
 (plus `go test . -bench 'BenchmarkSnapshotSeed' -benchtime 1x`).
 Encryption enabled throughout (AES-256-GCM unless varied).
 
@@ -399,7 +399,7 @@ full open ≈0.6-1.2s, first query ≈0.1ms, replication ready ≈2.0s
 (includes dial plus handshake). Checkpoint 0.45s / 2.9MB. Full
 maintenance rewrite 3.2s at 2.6MB/sec (10 files).
 
-At 100K rows (same machine, `go test ./benchmark/ -bench .`): point
+At 100K rows (same machine, `go test ./tests-benchmark/benchmark/ -bench .`): point
 lookups hold steady (PK 121K ops/sec); full-scan GroupBy drops to
 20 ops/sec; single-cell writes hold at 313 ops/sec; 10K-row
 transactions drop to 11K rows/sec (index maintenance grows with data);

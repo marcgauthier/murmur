@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/tests-live/harness"
+	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func TestThreeNodeConcurrentWritesConverge(t *testing.T) {

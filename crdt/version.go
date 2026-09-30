@@ -6,7 +6,7 @@
 package crdt
 
 import (
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // Version is the conflict version of one cell or row tombstone.

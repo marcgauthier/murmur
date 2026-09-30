@@ -5,7 +5,7 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // Member admission, acknowledgement-progress retention deadlines, and

@@ -18,15 +18,15 @@ import (
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/cockroachdb/pebble/v2/sstable/block"
 	"github.com/cockroachdb/pebble/v2/vfs"
-	"github.com/marcgauthier/spedsql/backup"
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/crypto"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/replication"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/sqlengine"
-	"github.com/marcgauthier/spedsql/state"
-	"github.com/marcgauthier/spedsql/transport"
+	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/crypto"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/replication"
+	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/sqlengine"
+	"github.com/marcgauthier/murmur/state"
+	"github.com/marcgauthier/murmur/transport"
 )
 
 // DB is an embedded replicated database. All methods are safe for concurrent
@@ -544,6 +544,13 @@ func (db *DB) requireRead() error {
 // SQL COMMIT, then one atomic Pebble commit; success is acknowledged only
 // after Pebble durability. Read-only statements are executed directly.
 func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	// PRAGMA never runs through Exec: reads belong on the Query path
+	// (Exec discards rows) and assignments are rejected everywhere.
+	// Without this the read-only branch below would accept PRAGMA
+	// reads that return nothing to the caller.
+	if firstSQLKeyword(query) == "PRAGMA" {
+		return nil, fmt.Errorf("%w: PRAGMA is not allowed through Exec (use Query for read-only introspection)", sqlengine.ErrStatementNotAllowed)
+	}
 	if isReadOnlyStatement(query) {
 		if err := db.requireRead(); err != nil {
 			return nil, err
@@ -1908,6 +1915,33 @@ func (db *DB) Close() error {
 	}
 	db.setState(StateClosed)
 	return first
+}
+
+// firstSQLKeyword returns the uppercased first keyword of q, skipping
+// whitespace and SQL comments, or "" when none is present.
+func firstSQLKeyword(q string) string {
+	s := strings.TrimSpace(q)
+	for {
+		if strings.HasPrefix(s, "--") {
+			if i := strings.IndexByte(s, '\n'); i >= 0 {
+				s = strings.TrimSpace(s[i+1:])
+				continue
+			}
+			return ""
+		}
+		if strings.HasPrefix(s, "/*") {
+			if i := strings.Index(s, "*/"); i >= 0 {
+				s = strings.TrimSpace(s[i+2:])
+				continue
+			}
+			return ""
+		}
+		break
+	}
+	if i := strings.IndexAny(s, " \t\n\r(;"); i >= 0 {
+		s = s[:i]
+	}
+	return strings.ToUpper(s)
 }
 
 // isReadOnlyStatement reports whether q is a read-only statement. Unknown or

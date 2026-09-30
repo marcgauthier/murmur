@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/state"
 )
 
 func TestSeparateStreamsDataAndControl(t *testing.T) {

@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/state"
 )
 
 func testRegistry(t *testing.T) *schema.Registry {
@@ -274,9 +274,12 @@ func TestTxCommitFailureRollsBack(t *testing.T) {
 
 func TestFTS5Available(t *testing.T) {
 	ctx := context.Background()
-	e, err := Open(testRegistry(t), nil, nil, 64)
+	// FTS5 virtual tables must be creatable as local-only objects.
+	// DDL runs through LocalDDL (never through Exec), so the table
+	// is declared at Open and only DML runs in the transaction.
+	e, err := Open(testRegistry(t), nil, []string{`CREATE VIRTUAL TABLE ft USING fts5(x)`}, 64)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("FTS5 unavailable: %v", err)
 	}
 	defer e.Close()
 	tx, err := e.Begin(ctx)
@@ -284,10 +287,6 @@ func TestFTS5Available(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	// FTS5 virtual tables must be creatable (local-only search structures).
-	if _, err := tx.Exec(`CREATE VIRTUAL TABLE ft USING fts5(x)`); err != nil {
-		t.Fatalf("FTS5 unavailable: %v", err)
-	}
 	if _, err := tx.Exec(`INSERT INTO ft (x) VALUES ('hello world')`); err != nil {
 		t.Fatal(err)
 	}

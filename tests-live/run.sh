@@ -52,7 +52,7 @@ scenario_timeout() {
     files-soak) echo "15m" ;;
     snapshot-resync) echo "10m" ;;
     crash-recovery|chaos-load) echo "6m" ;;
-    allow-nodes|benchmark) echo "8m" ;;
+    allow-nodes) echo "8m" ;;
     compression) echo "15m" ;;
     *) echo "10m" ;;
   esac
@@ -72,15 +72,28 @@ run_scenario() {
   echo ">>> SCENARIO COMPLETED: $scn"
 }
 
-ALL_SCENARIOS="addrpolicy allow-nodes api-mtls backup-restore benchmark bridge-two-streams chaos-load churn-retirement compression crash-recovery crdt-contention encryption files-bridge files-soak gc-balance graceful-shutdown highlow large-payload loadshare long-running-five-node migration-crash overload-budgets partial-mesh partition pause-resume plumtree-live rekey release-upgrade rolling-restart scale-mesh schema-evolution snapshot-resync soak-slo subscribe three-node-sync version-skew views write-priority"
+ALL_SCENARIOS="addrpolicy allow-nodes api-mtls backup-restore backup-under-fire bridge-two-streams cert-lifecycle chaos-load churn-retirement clock-skew compression corrupt-snapshot crash-loop crash-recovery crdt-contention dbid-isolation delete-pruning diskfull-live dos-client downgrade-guard encryption file-permissions files-bridge files-corrupt-source files-crash files-soak flap-partition fts-crash gc-balance graceful-shutdown gorm-migrate gorm-sync gorm-tx highlow hostile-peer hostile-schema impaired-network large-payload loadshare log-boundedness long-running-five-node maintenance-under-load migration-concurrency migration-crash overload-budgets partial-mesh partition pause-resume plaintext-audit plumtree-live rejoin-storm rekey release-upgrade rolling-restart scale-mesh schema-evolution snapshot-resync soak-slo sqli-api subscribe subscribe-backlog swim-discovery tail-repair tampered-backup three-node-sync three-way-heal tls-floor txchunk-resume unlock-abuse version-skew views write-priority"
 
 # Release-gate subset, run by CI on every push/PR against the freshly built
 # daemon binary: smoke, encryption, backup/restore, partitions, version
 # skew, schema upgrades, release upgrades (previous-release binaries),
 # High/Low, files, scale mesh, snapshot resync, GC balance, rolling
 # restart, crash recovery, discovery mesh, migration crash,
-# pause/resume, and graceful shutdown. Fast suites first.
-GATE_SCENARIOS="api-mtls three-node-sync encryption backup-restore partition version-skew schema-evolution release-upgrade highlow files-bridge files-soak scale-mesh subscribe loadshare migration-crash pause-resume partial-mesh rolling-restart snapshot-resync gc-balance crash-recovery chaos-load graceful-shutdown"
+# pause/resume, graceful shutdown, delete/crash/discovery/partition
+# hardening (delete-pruning, tail-repair, txchunk-resume,
+# swim-discovery, flap-partition, three-way-heal, crash-loop,
+# rejoin-storm), backup integrity (backup-under-fire, tampered-backup),
+# security posture (plaintext-audit, file-permissions, hostile-peer,
+# hostile-schema, sqli-api, unlock-abuse, corrupt-snapshot), and
+# subscription/migration coverage (subscribe-backlog,
+# migration-concurrency), GORM-dialect acceptance (gorm-sync,
+# gorm-migrate, gorm-tx), identity-crypto hardening (cert-lifecycle,
+# tls-floor, dbid-isolation), and storage/ops hardening (fts-crash,
+# files-corrupt-source, maintenance-under-load). Fast suites first. Env-gated
+# (clock-skew, impaired-network, diskfull-live), adversarial-load
+# (dos-client, log-boundedness), and history-dependent
+# (downgrade-guard) suites run via `all`, not the gate.
+GATE_SCENARIOS="api-mtls three-node-sync gorm-sync gorm-migrate gorm-tx encryption backup-restore partition version-skew schema-evolution release-upgrade highlow files-bridge files-soak scale-mesh subscribe loadshare migration-crash pause-resume partial-mesh rolling-restart snapshot-resync gc-balance crash-recovery chaos-load graceful-shutdown tampered-backup files-crash file-permissions plaintext-audit unlock-abuse rejoin-storm migration-concurrency sqli-api subscribe-backlog crash-loop swim-discovery txchunk-resume hostile-peer hostile-schema tail-repair three-way-heal flap-partition delete-pruning corrupt-snapshot backup-under-fire tls-floor dbid-isolation cert-lifecycle files-corrupt-source fts-crash maintenance-under-load"
 
 case "$scenario" in
   all)

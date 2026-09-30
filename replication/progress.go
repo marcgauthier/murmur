@@ -3,7 +3,7 @@ package replication
 import (
 	"fmt"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func (m *Manager) requestProgress(p *peerState, after ids.NodeID) {

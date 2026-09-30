@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // RecordOp distinguishes row upserts from row deletes.

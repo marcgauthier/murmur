@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 const (

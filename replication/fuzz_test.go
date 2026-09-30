@@ -5,8 +5,8 @@ import (
 	"io"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // FuzzFrame feeds arbitrary bytes to the frame reader: must never panic and

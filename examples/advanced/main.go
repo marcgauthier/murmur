@@ -17,9 +17,9 @@ import (
 	"sync"
 	"time"
 
-	replicateddb "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/transport"
+	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/transport"
 )
 
 func freePort() int {

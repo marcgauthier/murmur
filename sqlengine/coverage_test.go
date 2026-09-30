@@ -6,10 +6,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/crdt"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/crdt"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 func queryName(t *testing.T, e *Engine, id ids.RowID) (string, bool) {

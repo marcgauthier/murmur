@@ -5,7 +5,7 @@ import (
 	"os"
 	"strings"
 
-	murmurSchema "github.com/marcgauthier/spedsql/schema"
+	murmurSchema "github.com/marcgauthier/murmur/schema"
 )
 
 // parseSchemaFile reads a user-provided schema.sql and converts it to

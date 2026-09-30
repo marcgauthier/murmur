@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/plumtree"
-	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/plumtree"
+	"github.com/marcgauthier/murmur/state"
 )
 
 func testPlumtreeManager(t *testing.T, count int) (*Manager, []*peerState) {

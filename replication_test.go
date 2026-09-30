@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/transport"
+	"github.com/marcgauthier/murmur/transport"
 )
 
 // testClusterCA issues node credentials for tests.

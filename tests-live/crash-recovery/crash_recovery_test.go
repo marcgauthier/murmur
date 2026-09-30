@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/tests-live/harness"
+	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func TestAbruptProcessDeathRecoversCommittedRows(t *testing.T) {

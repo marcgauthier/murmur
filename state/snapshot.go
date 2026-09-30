@@ -10,9 +10,9 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/crdt"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/crdt"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // DefaultSnapshotAtomicMergeBytes caps the encoded snapshot size merged in

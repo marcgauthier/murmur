@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/backup"
-	"github.com/marcgauthier/spedsql/crypto"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/crypto"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 func testEncryptionProvider(key []byte) crypto.KeyProvider {

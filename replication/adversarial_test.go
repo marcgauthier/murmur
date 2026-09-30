@@ -9,10 +9,10 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/state"
-	"github.com/marcgauthier/spedsql/transport"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/state"
+	"github.com/marcgauthier/murmur/transport"
 )
 
 // fakeApplier records applied batches.

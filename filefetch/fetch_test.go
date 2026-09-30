@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/objectstore"
-	"github.com/marcgauthier/spedsql/transport"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/objectstore"
+	"github.com/marcgauthier/murmur/transport"
 )
 
 func fetchTestPair(t *testing.T) (srvCreds, cliCreds *transport.Credentials, nodeA, nodeB ids.NodeID, dbid ids.DBID) {

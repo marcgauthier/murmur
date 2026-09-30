@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/tests-live/harness"
+	"github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 // TestAllowedNodeIDsAcrossProcesses checks that certificate validity alone

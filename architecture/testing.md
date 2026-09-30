@@ -371,6 +371,211 @@ convergence, acquisitions in both scheduler classes, service debt
 within the 1s bound, and reports the local-commit latency distribution.
 Run it with `go test -count=1 ./tests-live/loadshare`.
 
+The `tests-live/delete-pruning/` scenario shares 300 rows across three
+daemons, then concurrently deletes, updates, and resurrects disjoint
+thirds under aggressive log retention. A log-GC pass is forced
+mid-flight and all nodes must converge on exact counts plus equal
+PK-ordered digests. Run it with
+`go test -count=1 ./tests-live/delete-pruning`.
+
+The `tests-live/tail-repair/` scenario partitions one node during a
+peer write burst, proves the isolation (frozen count, zero snapshots
+sent), then heals: the node must repair its tail from peer logs with
+equal digests everywhere. Run it with
+`go test -count=1 ./tests-live/tail-repair`.
+
+The `tests-live/txchunk-resume/` scenario SIGKILLs a peer mid-receipt
+of a large chunked transaction (the kill only counts when chunks were
+in flight) and requires the transfer to resume to exactly-once
+delivery with equal digests. Run it with
+`go test -count=1 ./tests-live/txchunk-resume`.
+
+The `tests-live/clock-skew/` scenario runs nodes under libfaketime
+with skewed clocks and requires concurrent writes to resolve to
+identical LWW winners on every node. It skips when libfaketime is
+absent. Run it with `go test -count=1 ./tests-live/clock-skew`.
+
+The `tests-live/swim-discovery/` scenario starts nodes with seed
+addresses only, requires a connected mesh to form, then kills the
+seed and requires rediscovery plus reconvergence with equal digests.
+Run it with `go test -count=1 ./tests-live/swim-discovery`.
+
+The `tests-live/impaired-network/` scenario applies tc/netem latency,
+loss, and a bandwidth-capped snapshot resync on loopback, each with a
+p95-visibility bound. It skips without `CAP_NET_ADMIN`;
+`SPEDSQL_IMPAIRED_NETWORK_FORCE=1` runs the workload unimpaired as a
+smoke path. Run it with
+`go test -count=1 ./tests-live/impaired-network`.
+
+The `tests-live/flap-partition/` scenario flaps one node's links
+through split/heal cycles under continuous writes from all nodes. The
+first split carries an isolation proof (marker reaches the intact
+peer, never the split node); no write to a live node may fail, and
+the final heal must converge every written row. Run it with
+`go test -count=1 ./tests-live/flap-partition`.
+
+The `tests-live/three-way-heal/` scenario splits four daemons into
+pairs, diverges them with disjoint inserts plus conflicting updates
+to the same base rows, then heals link-by-link in two different
+orders, waiting for real cross-side traffic at each step. Both orders
+must reach the identical digest, including identical LWW conflict
+winners. Run it with `go test -count=1 ./tests-live/three-way-heal`.
+
+The `tests-live/pause-resume/` scenario SIGSTOP-freezes one node for
+20 seconds while survivors write, asserts the freeze was detected
+(alive-view dip or failed SWIM probes), then requires every
+acknowledged write on all nodes with equal digests after SIGCONT.
+Run it with `go test -count=1 ./tests-live/pause-resume`.
+
+The `tests-live/migration-crash/` scenario SIGKILLs a node
+mid-migration and requires it to land in exactly one defined state
+(old schema with pre-crash rows intact, or new schema), never a mix,
+with post-migration writes replicating to equal digests. Run it with
+`go test -count=1 ./tests-live/migration-crash`.
+
+The `tests-live/backup-under-fire/` scenario takes repeated online
+backups via a suite-local agent while both mesh nodes absorb
+sustained writes with zero failures. Every backup restores;
+intermediate snapshots are non-empty, non-decreasing subsets, and the
+final backup matches the survivors exactly. Run it with
+`go test -count=1 ./tests-live/backup-under-fire`.
+
+The `tests-live/tampered-backup/` scenario tampers backup artifacts
+(byte flips, truncation, manifest edits) and requires every restore
+attempt to fail closed, while an untampered backup restores exactly.
+Run it with `go test -count=1 ./tests-live/tampered-backup`.
+
+The `tests-live/downgrade-guard/` scenario builds the
+previous-release daemon from git history, creates a store with it,
+and requires the current build to refuse the combination loudly.
+Run it with `go test -count=1 ./tests-live/downgrade-guard`.
+
+The `tests-live/diskfull-live/` scenario runs a node on a small
+tmpfs mount: writes past ENOSPC must fail closed with pre-full data
+intact, and freeing space plus restart must recover to full
+convergence. It skips without mount privilege. Run it with
+`go test -count=1 ./tests-live/diskfull-live`.
+
+The `tests-live/plaintext-audit/` scenario writes random per-run
+markers, proves they round-trip through SQL, then scans both nodes'
+entire directories plus a backup artifact: marker plaintext and key
+material must be absent except in the harness-provisioned config.
+Run it with `go test -count=1 ./tests-live/plaintext-audit`.
+
+The `tests-live/file-permissions/` scenario requires every
+product-owned secret path (key-registry files, backup/restore
+artifacts) to grant nothing to group/other after fresh init and
+after backup plus restore. Harness-minted material is audit-logged,
+never asserted. Run it with
+`go test -count=1 ./tests-live/file-permissions`.
+
+The `tests-live/log-boundedness/` scenario sustains writes while
+log-GC runs and requires retained-batch counts and on-disk log size
+to stay bounded, with exact convergence at the end. Run it with
+`go test -count=1 ./tests-live/log-boundedness`.
+
+The `tests-live/hostile-peer/` scenario throws protocol attacks
+(forged/oversized/malformed frames, handshake abuse) from a malicious
+fixture peer at an honest mesh: every attack must be rejected
+(metrics-observed), honest writes keep converging, and digests stay
+equal. Run it with `go test -count=1 ./tests-live/hostile-peer`.
+
+The `tests-live/hostile-schema/` scenario serves hostile schema
+manifests from a malicious fixture peer: the mesh must quarantine
+them without adopting or wedging, with the schema epoch unmoved and
+digests equal. Run it with
+`go test -count=1 ./tests-live/hostile-schema`.
+
+The `tests-live/corrupt-snapshot/` scenario feeds corrupt snapshot
+chunks to a stale node: every corrupt chunk must be discarded
+(rejection observed), and the node must then converge via the honest
+resync path. Run it with
+`go test -count=1 ./tests-live/corrupt-snapshot`.
+
+The `tests-live/sqli-api/` scenario sends classic SQLi payloads
+through the test-node API's exec/query paths and requires every one to
+be contained: no out-of-scope rows, honest data untouched, digests
+equal. Run it with `go test -count=1 ./tests-live/sqli-api`.
+
+The `tests-live/dos-client/` scenario layers connection abuse (TCP
+half-open/partial, TLS idle, QUIC half-open, slow-loris trickle)
+while requiring honest writes and replication to keep succeeding
+within bounds, with exact convergence afterwards. Run it with
+`go test -count=1 ./tests-live/dos-client`.
+
+The `tests-live/unlock-abuse/` scenario requires certless admin
+access to be refused, wrong-key and unknown-key-id unlock attempts
+to return byte-identical generic 401s (no key/key-ID oracle), and
+an honest unlock to succeed with data intact and the mesh
+reconverged. Run it with `go test -count=1 ./tests-live/unlock-abuse`.
+
+The `tests-live/subscribe-backlog/` scenario holds a live
+subscription across a partition and requires healing to deliver the
+complete backlog exactly once. Run it with
+`go test -count=1 ./tests-live/subscribe-backlog`.
+
+The `tests-live/files-crash/` scenario SIGKILLs the file uploader
+mid-upload and the fetcher mid-fetch (kills only count when the op
+was in flight), then requires byte-complete digest-verified
+downloads, exact metadata convergence, and an attributable on-disk
+inventory. Run it with `go test -count=1 ./tests-live/files-crash`.
+
+The `tests-live/migration-concurrency/` scenario publishes disjoint
+additive migrations concurrently from different nodes and requires
+convergence on the union schema with all rows intact. Run it with
+`go test -count=1 ./tests-live/migration-concurrency`.
+
+The `tests-live/crash-loop/` scenario crash-loops one node while
+peers write, then requires the node to rejoin and converge on every
+row with equal digests. Run it with
+`go test -count=1 ./tests-live/crash-loop`.
+
+The `tests-live/rejoin-storm/` scenario kills two nodes at once
+during outage writes, restarts both simultaneously, and requires the
+full mesh to reconverge on every row with equal digests. Run it with
+`go test -count=1 ./tests-live/rejoin-storm`.
+
+The `tests-live/cert-lifecycle/` scenario swaps a node's certificate
+for a short-expiry cert minted for the same NodeID, requires the mesh
+to stay connected pre-expiry, then requires fresh handshakes to
+reject the node after NotAfter (disconnected, markers never cross,
+served cert proven expired at assert time), and requires rotation to
+a fresh cert to fully reconverge the mesh. Run it with
+`go test -count=1 ./tests-live/cert-lifecycle`.
+
+The `tests-live/tls-floor/` scenario requires the HTTPS API to refuse
+TLS 1.1/1.0 with a server-side rejection while TLS 1.2 succeeds with
+a live query, and guards the product's QUIC TLS constructors at TLS
+1.3 (a live sub-1.3 QUIC probe is infeasible; the gap is documented
+in the suite). Run it with
+`go test -count=1 ./tests-live/tls-floor`.
+
+The `tests-live/dbid-isolation/` scenario cross-peers two clusters
+with different DBIDs, identical schemas, and shared CA trust, and
+requires every cross edge to stay disconnected with markers never
+crossing, identity refusals advancing on all nodes, and both
+clusters internally healthy. Run it with
+`go test -count=1 ./tests-live/dbid-isolation`.
+
+The `tests-live/fts-crash/` scenario seeds an FTS5 index over known
+docs, proves MATCH equals the base table pre-crash, SIGKILLs
+mid-index-write, then requires the restart to rebuild from the
+durable base table with every MATCH exact and integrity clean. Run
+it with `go test -count=1 ./tests-live/fts-crash`.
+
+The `tests-live/files-corrupt-source/` scenario corrupts a published
+object's bytes on its source node and requires a peer fetch to fail
+with the exact invalid-object sentinel, leave no partial install,
+fail identically on retry, and leave honest objects fetching. Run it
+with `go test -count=1 ./tests-live/files-corrupt-source`.
+
+The `tests-live/maintenance-under-load/` scenario sustains
+concurrent writes with zero failures while tight retention forces
+log-GC on every node (counter-observed, failures flat), then
+requires exact convergence plus a post-maintenance write that
+replicates everywhere. Run it with
+`go test -count=1 ./tests-live/maintenance-under-load`.
+
 Invariant:
 
 ```text

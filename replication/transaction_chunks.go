@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/overload"
-	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/overload"
+	"github.com/marcgauthier/murmur/state"
 )
 
 func (m *Manager) onTransactionChunk(p *peerState, raw []byte) error {

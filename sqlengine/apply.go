@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/crdt"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/crdt"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/state"
 )
 
 // StateReader is the durable state needed for rebuild and apply.
@@ -391,7 +391,7 @@ func (e *Engine) MigrateToWithLocalDDL(newReg *schema.Registry, ddl, localDDL []
 		if err := e.validateOrdinals(ctx); err != nil {
 			return err
 		}
-		return nil
+		return e.validateResultingSchema(ctx)
 	})
 }
 
@@ -448,12 +448,10 @@ func (e *Engine) Rebuild(src StateReader) error {
 				return err
 			}
 		}
-		for _, s := range e.localDDL {
-			if _, err := e.write.ExecContext(ctx, s); err != nil {
-				return fmt.Errorf("sqlengine: local schema %q: %w", trunc(s, 120), err)
-			}
+		if err := e.applyLocalDDL(ctx, e.localDDL); err != nil {
+			return err
 		}
-		return nil
+		return e.validateResultingSchema(ctx)
 	})
 }
 

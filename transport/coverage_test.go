@@ -19,7 +19,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 type customAddr struct{ s string }

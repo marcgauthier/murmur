@@ -13,12 +13,12 @@ import (
 
 	"github.com/hashicorp/memberlist"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/crdt"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/state"
-	"github.com/marcgauthier/spedsql/transport"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/crdt"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/state"
+	"github.com/marcgauthier/murmur/transport"
 )
 
 // TestManagerAccessors pins pool/membership accessors and the exclusion

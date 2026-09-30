@@ -16,11 +16,11 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/replication"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/tests-live/harness"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/replication"
+	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 const stale = 2 // node3 goes stale, then rejoins

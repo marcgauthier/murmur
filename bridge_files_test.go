@@ -6,8 +6,8 @@ import (
 	"io"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/objectstore"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/objectstore"
 )
 
 func TestBridgeFileResolver(t *testing.T) {

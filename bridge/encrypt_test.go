@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func testOutboxKey(id string, seed byte) OutboxKey {

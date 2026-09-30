@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 // waitForRowsSync polls like waitForRows but tolerates the materializer

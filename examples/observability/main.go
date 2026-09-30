@@ -14,8 +14,8 @@ import (
 	"log/slog"
 	"os"
 
-	replicateddb "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/schema"
+	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 // slogLogger adapts the standard slog logger to replicateddb.Logger.

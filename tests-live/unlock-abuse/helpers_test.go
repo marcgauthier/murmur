@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/tests-live/harness"
+	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 // certlessClient trusts the cluster CA but presents no client certificate.

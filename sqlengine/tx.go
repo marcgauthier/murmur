@@ -47,6 +47,12 @@ func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.R
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := checkSingleStatement(query); err != nil {
+		return nil, err
+	}
+	if err := checkExecAllowed(query); err != nil {
+		return nil, err
+	}
 	stmt, err := tx.e.writeStmts.prepare(ctx, tx.e.write, query)
 	if err != nil {
 		return nil, err
@@ -70,6 +76,12 @@ func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := checkSingleStatement(query); err != nil {
+		return nil, err
+	}
+	if err := checkTxQueryAllowed(query); err != nil {
+		return nil, err
+	}
 	stmt, err := tx.e.writeStmts.prepare(ctx, tx.e.write, query)
 	if err != nil {
 		return nil, err
@@ -91,6 +103,12 @@ func (tx *Tx) QueryRowContext(ctx context.Context, query string, args ...any) (*
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := checkSingleStatement(query); err != nil {
+		return nil, err
+	}
+	if err := checkTxQueryAllowed(query); err != nil {
 		return nil, err
 	}
 	stmt, err := tx.e.writeStmts.prepare(ctx, tx.e.write, query)

@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/marcgauthier/spedsql/bridge"
+	"github.com/marcgauthier/murmur/bridge"
 )
 
 func generateBridgeKeys(dir string) (BridgeKeyFiles, error) {

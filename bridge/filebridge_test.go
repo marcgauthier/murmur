@@ -10,10 +10,10 @@ import (
 	"strings"
 	"testing"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/schema"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 // fileBridgeHarness wires a real Low/High pair with the full bridge pipeline.

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/murmur/codec"
 )
 
 // holdWorker admits repeatedly, holding each ticket for service time, until

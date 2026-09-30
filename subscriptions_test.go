@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/murmur/codec"
 )
 
 func testSubscriptionDB(t *testing.T, modCfg func(*Config)) *DB {

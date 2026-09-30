@@ -10,7 +10,7 @@ import (
 	sqlite "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 
-	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/murmur/codec"
 )
 
 // preupdateRegistrar matches modernc's *conn hook registration.

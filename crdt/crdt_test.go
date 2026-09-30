@@ -3,7 +3,7 @@ package crdt
 import (
 	"testing"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func TestCompareVersion(t *testing.T) {

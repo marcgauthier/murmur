@@ -8,7 +8,7 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // Restore errors returned during fresh-identity adoption.

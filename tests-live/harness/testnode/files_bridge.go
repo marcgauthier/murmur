@@ -17,10 +17,10 @@ import (
 	"sync"
 	"time"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/bridge"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/schema"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/bridge"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 // FilesConfigFile mirrors db.FilesConfig in node JSON configuration.

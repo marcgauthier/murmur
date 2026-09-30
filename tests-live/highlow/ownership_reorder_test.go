@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/tests-live/harness"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func TestHighLowOwnershipReorderAcrossPeersLive(t *testing.T) {

@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/state"
 )
 
 // ErrBridgeLogGone indicates a bridge exporter's source log was

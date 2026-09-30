@@ -26,8 +26,8 @@ import (
 	"strings"
 	"time"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/backup"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/backup"
 )
 
 var out = bufio.NewWriter(os.Stdout)

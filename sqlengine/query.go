@@ -19,8 +19,19 @@ type Rows struct {
 }
 
 // Query runs a standalone read on the read connection. The caller must
-// Close the Rows.
+// Close the Rows. Only read statements are accepted: pool connections
+// carry no capture hook, so anything that could write would diverge
+// silently.
 func (e *Engine) Query(ctx context.Context, query string, args ...any) (*Rows, error) {
+	// Structural check first: a stacked input's first keyword can
+	// mislead the verb gate, and the one-query-one-statement
+	// contract reports ErrMultiStatement on every path.
+	if err := checkSingleStatement(query); err != nil {
+		return nil, err
+	}
+	if err := checkPoolQueryAllowed(query); err != nil {
+		return nil, err
+	}
 	if err := e.lock.RLock(ctx); err != nil {
 		return nil, err
 	}
@@ -47,6 +58,12 @@ func (e *Engine) Query(ctx context.Context, query string, args ...any) (*Rows, e
 // hold the read lock after returning: the row is scanned immediately, so fn
 // receives the *sql.Row while the lock is held and must Scan synchronously.
 func (e *Engine) QueryRowContext(ctx context.Context, query string, args []any, fn func(*sql.Row) error) error {
+	if err := checkSingleStatement(query); err != nil {
+		return err
+	}
+	if err := checkPoolQueryAllowed(query); err != nil {
+		return err
+	}
 	if err := e.lock.RLock(ctx); err != nil {
 		return err
 	}

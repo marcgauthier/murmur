@@ -16,10 +16,10 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/replication"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/tests-live/harness"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/replication"
+	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func TestHostileSchemaManifestsQuarantined(t *testing.T) {

@@ -11,7 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	wire "github.com/jeroenrinzema/psql-wire"
 
-	db "github.com/marcgauthier/spedsql"
+	db "github.com/marcgauthier/murmur"
 )
 
 // This file is the PostgreSQL wire-protocol frontend (psql-wire). It

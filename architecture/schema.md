@@ -64,6 +64,19 @@ Foreign-key declarations and normal JOIN queries are allowed, but enforcement mu
 
 Create only non-unique secondary indexes during startup and rebuild; primary-key enforcement remains required. Apply the same validation to migrations and all package-controlled index creation.
 
+The embedded engine enforces this section at its own boundary, independent of the wire frontends: `sqlengine` classifies every `DDL`/`LocalDDL` statement before it runs (`CREATE TABLE` and non-unique `CREATE INDEX` only for replicated DDL; `CREATE`-only for local objects) and validates the resulting materialized schema after `Open`, `Migrate`, and `Rebuild` (no secondary unique indexes, no table-level or cross-column checks, no `AUTOINCREMENT`/`STRICT`/`WITHOUT ROWID`/virtual tables, matching shape, nullability, and decltypes). The normal statement paths are gated too: `Exec` rejects DDL, attach, `PRAGMA`, and transaction control; standalone `Query` additionally rejects writes (pool connections carry no capture); in-transaction `Query` allows writes but keeps the DDL/attach/`PRAGMA`-assignment/transaction-word bans. Violations fail loudly with `schema.ErrUnsupportedSchema` (DDL) or `sqlengine.ErrStatementNotAllowed` (statements) — never silent drops, never partial commits. Live engine proof lives in [exec_guard_test.go](../exec_guard_test.go); parser and gate units in [sqlengine/guard_test.go](../sqlengine/guard_test.go) and [sqlengine/ddlvalidate_test.go](../sqlengine/ddlvalidate_test.go).
+
+### Wire-frontend enforcement
+
+`murmurd`'s MySQL and PostgreSQL frontends enforce this section before anything commits, so clients that assume a full MySQL/PostgreSQL dialect fail closed with an explicit Murmur reason instead of a confusing engine error or a half-created table:
+
+- Secondary `UNIQUE` constraints and `CREATE UNIQUE INDEX` are rejected on both frontends: Murmur replicates only the primary-key index. Plain secondary indexes are local-only objects managed through embedded `LocalDDL`, never over the wire.
+- `CREATE TABLE` without exactly one `PRIMARY KEY`, or with a key that is not the single `id` blob column, is rejected. The wires normalize a bare `PRIMARY KEY` to a stored `PRIMARY KEY NOT NULL`; `Migrate`/`BuildRegistry` still rejects any nullable or non-blob key that reaches it.
+- Column and table options Murmur does not model — `DEFAULT`, `AUTO_INCREMENT`/`SERIAL` (column or table option), generated columns, `CHECK`, `FOREIGN KEY`/`REFERENCES` — are rejected rather than silently dropped. Single-column checks and unenforced foreign-key declarations remain tolerated at the embedded-engine level only; the wires stay a strict subset.
+- A `UNIQUE` keyword merged into the MySQL `PRIMARY KEY` column itself is redundant and normalized away; no secondary index exists afterwards. Every other rejected statement leaves no residue: no table, no schema-epoch advance, no sidecar change.
+
+The MySQL side guards at pre-analyze time (its engine would otherwise commit the table before creating indexes); the PostgreSQL side guards in its strict `CREATE TABLE` parser. Live over-the-wire proof lives in [wire_rules_test.go](../murmurd/wire_rules_test.go).
+
 ### Primary-key stability and column resolution
 
 Primary-key columns and their identities are immutable once a table participates in replication. Changing them requires explicit teardown and rebuild of that table's replica state; ordinary migrations must reject the change.

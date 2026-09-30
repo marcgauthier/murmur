@@ -8,8 +8,8 @@ import (
 	"os"
 	"path/filepath"
 
-	db "github.com/marcgauthier/spedsql"
-	murmurSchema "github.com/marcgauthier/spedsql/schema"
+	db "github.com/marcgauthier/murmur"
+	murmurSchema "github.com/marcgauthier/murmur/schema"
 )
 
 // liveSchemaFile is the daemon-owned sidecar next to node.json. It stores

@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func TestFrameRoundTrip(t *testing.T) {

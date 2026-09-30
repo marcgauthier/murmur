@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/tests-live/harness"
+	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 const soakObjectKey = "5151515151515151515151515151515151515151515151515151515151515151"

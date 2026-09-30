@@ -16,12 +16,12 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/crdt"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/replication"
-	"github.com/marcgauthier/spedsql/tests-live/harness"
-	"github.com/marcgauthier/spedsql/transport"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/crdt"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/replication"
+	"github.com/marcgauthier/murmur/tests-live/harness"
+	"github.com/marcgauthier/murmur/transport"
 )
 
 // attacker holds credentials for one malicious peer identity.

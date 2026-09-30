@@ -8,7 +8,7 @@ package state
 import (
 	"encoding/binary"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // Key prefixes (PLAN section 14).

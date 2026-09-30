@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/overload"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/overload"
 )
 
 // TestQueueDropCounters proves overload drops are counted. Drops are safe

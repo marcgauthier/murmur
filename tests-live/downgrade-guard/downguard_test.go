@@ -28,9 +28,9 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/tests-live/harness"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 // defaultPrevRef pins the previous release the current build must refuse
@@ -48,6 +48,9 @@ func prevRef() string {
 func prevTags() string {
 	if tags := os.Getenv("SPEDSQL_TAGS"); tags != "" {
 		return tags
+	}
+	if os.Getenv("CGO_ENABLED") == "0" {
+		return "modernc"
 	}
 	return "sqlite_preupdate_hook sqlite_fts5"
 }

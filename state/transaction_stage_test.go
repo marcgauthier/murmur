@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func stagedBatch(t *testing.T, origin ids.NodeID) (*codec.MutationBatch, [][]byte) {

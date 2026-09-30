@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/murmur/codec"
 )
 
 func TestBridgeLogSource(t *testing.T) {

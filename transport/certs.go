@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // NextProto is the QUIC/TLS ALPN for replication.

@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"testing"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/state"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/state"
 )
 
 type stubLogSource struct {

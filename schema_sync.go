@@ -15,9 +15,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/marcgauthier/spedsql/replication"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/murmur/replication"
+	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/state"
 )
 
 // schemaRegistry returns the live registry. The pointer is swapped on

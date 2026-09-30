@@ -102,7 +102,7 @@ Supported on **both** frontends:
 | `INSERT` / `UPDATE` / `DELETE` | Single statements, autocommit. PG placeholders are `$1..$N` (sequential); `$n` inside the target column list binds by position. |
 | `REPLACE` (MySQL) | Rewritten to delete-by-key + insert. |
 | `SHOW TABLES` / `DESCRIBE` (MySQL) | Engine-provided over the provider. (PG `SHOW` is rejected; there is no `pg_catalog`.) |
-| `CREATE TABLE` | Additive only, mapped to a murmur migration: exactly one `PRIMARY KEY` on `id`, blob-typed; columns limited to integer/real/text/blob. MySQL note: `BLOB PRIMARY KEY` is rejected by MySQL itself — use `VARBINARY(16)`. Types with no murmur equivalent (`JSON`, `SERIAL`, dates, numerics, …), defaults, checks, and composite keys are rejected with reasons. |
+| `CREATE TABLE` | Additive only, mapped to a murmur migration: exactly one `PRIMARY KEY` on `id`, blob-typed, stored `NOT NULL` (the `NOT NULL` keyword itself is optional — both wires normalize a bare `PRIMARY KEY` to stored `PRIMARY KEY NOT NULL`); columns limited to integer/real/text/blob. MySQL note: `BLOB PRIMARY KEY` is rejected by MySQL itself — use `VARBINARY(16)`. Missing/composite/non-`id`/non-blob keys, types with no murmur equivalent (`JSON`, `SERIAL`, dates, numerics, …), `UNIQUE`, secondary indexes, defaults, `AUTO_INCREMENT`, generated columns, checks, and foreign keys are rejected with Murmur reasons, leaving no table, epoch advance, or sidecar change behind. |
 | `TRUNCATE [TABLE] t` | Rewritten to `DELETE FROM t` (SQLite has no `TRUNCATE`). |
 | Transaction framing (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`…) | Absorbed per session: the engine autocommits every statement, so these succeed and do nothing. Never rely on atomicity or rollback. |
 | Session statements (`SET`, `RESET`, `DISCARD`) | Accepted and ignored (drivers send these on connect). |
@@ -112,7 +112,20 @@ Rejected on **both** frontends (explicit errors, never silent):
 
 - `DROP` / `ALTER` / `RENAME` — murmur schema changes are
   additive-only.
-- `CREATE INDEX`/`VIEW`/`TRIGGER`/`FUNCTION`/`SEQUENCE`/…
+- Secondary `UNIQUE` (column attribute, table constraint,
+  `UNIQUE KEY`, `CREATE UNIQUE INDEX`, `ALTER … ADD UNIQUE`) —
+  murmur replicates only the primary-key index. (MySQL note: a
+  `UNIQUE` keyword merged into the `PRIMARY KEY` column itself is
+  redundant and normalized away; no secondary index exists
+  afterwards.)
+- Plain secondary `CREATE INDEX` / `ALTER … ADD KEY` — local-only
+  in murmur, managed through embedded `LocalDDL`, never over the
+  wire.
+- `DEFAULT`, `AUTO_INCREMENT` (column or table option),
+  `SERIAL`, generated columns, `CHECK`, `FOREIGN KEY` /
+  `REFERENCES` — murmur models none of these; they are rejected
+  rather than silently dropped.
+- `CREATE VIEW`/`TRIGGER`/`FUNCTION`/`SEQUENCE`/…
 - `INSERT`/`UPDATE`/`DELETE … RETURNING` (writes return no rows).
 - `GRANT`/`REVOKE`, users, roles, `COPY`, `LISTEN`/`NOTIFY`,
   `VACUUM`/`ANALYZE`, `PREPARE` (SQL-level), procedures.
@@ -207,6 +220,9 @@ cannot render fail loudly instead of corrupting.
   frontends.
 - [`provider.go`](provider.go), [`table.go`](table.go) —
   go-mysql-server backend over murmur.
+- [`mysqlguard.go`](mysqlguard.go) — pre-analyze guard rejecting
+  non-murmur DDL (secondary/unique indexes, checks, foreign keys,
+  defaults, autoincrement) before anything commits.
 - [`pgwire.go`](pgwire.go) — psql-wire frontend.
 - [`server.go`](server.go) — daemon lifecycle (`New`/`Run`/`Close`).
 - [`schema_state.go`](schema_state.go) — live-schema sidecar
@@ -219,5 +235,8 @@ cannot render fail loudly instead of corrupting.
   (`--config`, `--generate-config`, `--version`).
 - [`config.example.toml`](config.example.toml) — documented example.
 - [`murmurd_test.go`](murmurd_test.go),
-  [`filter_config_test.go`](filter_config_test.go) — live
-  over-the-wire tests plus filter/config units.
+  [`filter_config_test.go`](filter_config_test.go),
+  [`wire_rules_test.go`](wire_rules_test.go) — live
+  over-the-wire tests plus filter/config units. `wire_rules_test.go`
+  is the schema-rule matrix: every rejection asserted live on both
+  frontends, with ghost-table, epoch, and sidecar residue checks.

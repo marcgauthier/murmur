@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/marcgauthier/murmur/state"
 )
 
 // TestStatusWriterMetrics proves local commits, write acquisitions, and
@@ -47,8 +49,11 @@ func TestStatusWriterMetrics(t *testing.T) {
 	if st.Metrics.LocalCommits != 3 {
 		t.Fatalf("Status.Metrics.LocalCommits = %d, want 3", st.Metrics.LocalCommits)
 	}
-	if st.FormatFormat != 2 {
-		t.Fatalf("Status.FormatFormat = %d, want 2", st.FormatFormat)
+	// Pinned to the product constant, not a literal: the persistent
+	// format version intentionally moves (2 -> 3 for the downgrade
+	// guard), and this assertion covers the store-to-status plumbing.
+	if st.FormatFormat != state.FormatVersion {
+		t.Fatalf("Status.FormatFormat = %d, want %d", st.FormatFormat, state.FormatVersion)
 	}
 	if st.Replication.SessionsOpened != 0 {
 		t.Fatalf("SessionsOpened = %d without replication", st.Replication.SessionsOpened)

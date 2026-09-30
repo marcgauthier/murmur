@@ -110,7 +110,9 @@ func classifyCreate(q, rest string) (StmtClass, *FilterError) {
 	switch strings.ToLower(head) {
 	case "table":
 		return ClassCreateTable, nil
-	case "index", "unique":
+	case "unique":
+		return ClassReject, &FilterError{Stmt: q, Reason: "secondary UNIQUE indexes are not supported (murmur replicates only the primary-key index)"}
+	case "index":
 		return ClassReject, &FilterError{Stmt: q, Reason: "explicit indexes are local-only in murmur and not managed over the wire (see LocalDDL)"}
 	case "view", "trigger", "function", "procedure", "sequence",
 		"schema", "database", "user", "role", "extension", "type":

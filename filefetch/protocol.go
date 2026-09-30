@@ -18,8 +18,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/objectstore"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/objectstore"
 )
 
 // Protocol version 1: request/response object fetch with byte offsets.

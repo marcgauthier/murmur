@@ -8,8 +8,8 @@ import (
 	"log"
 	"os"
 
-	replicateddb "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/schema"
+	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 func main() {

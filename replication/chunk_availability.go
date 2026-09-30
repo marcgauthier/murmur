@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func (m *Manager) onChunkAvailabilityRequest(p *peerState, payload []byte) error {

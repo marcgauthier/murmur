@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func chunkTestBatch(payloadBytes int) *MutationBatch {

@@ -6,9 +6,9 @@ import (
 	"io"
 	"os"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/objectstore"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/objectstore"
 )
 
 // FilePublisher emits recipient-sealed object chunks for file metadata

@@ -69,10 +69,11 @@ flushes pending rows before it starts. SQLite materialization progress is held
 in memory; startup rebuilds SQLite from Pebble without a separate progress
 write to the durable store.
 
-The optional `admin` package provides a TLS-only unlock/status/lock handler with
-a bearer token separate from mesh identity. It starts no listener by itself;
-applications explicitly mount it on their own TLS server. See
-[runtime and diagnostics](architecture/runtime-and-diagnostics.md#optional-service-and-administration-adapters).
+Key delivery is the hosting process's responsibility: the process obtains the
+encryption key (local config, KMS, or its own HTTP listener) and passes key
+material to `Open` directly or through a `KeyProvider`. Murmur provides no
+HTTP unlock endpoint. See
+[runtime and diagnostics](architecture/runtime-and-diagnostics.md#optional-service-adapter).
 
 ## Quick start
 
@@ -191,15 +192,14 @@ MURMUR-SQL/               public API (db.go, transaction.go, config.go, ...)
   crypto/                at-rest encryption: AEADs, key registry, encrypted VFS, rotation
   objectstore/           local immutable encrypted file payload storage
   ids/                   128-bit identity types
-  service/               optional authenticated HTTP adapter + remote SDK (status, SQL, subscriptions)
   metrics/               Prometheus collectors over DB.Status (caller-owned registry)
-  admin/                 TLS-only unlock/status/lock HTTP handler (app-mounted, no listener)
   bridge/                one-way Low-to-High logical replication roles and transfer types
   backup/                backup/restore with local/HTTPS/FTP destinations, file objects
   filefetch/             bounded mesh fetch of file object bytes (client/server protocol)
   example/               runnable single-node example
   examples/              graduated examples: single node → 3-node mesh
   murmurd/               assembled database daemon (MySQL + Postgres frontends, config.toml)
+  gormmurmur/            GORM dialect for the embedded engine (models, migrator)
   tests-live/             live multi-process integration test scenarios
 ```
 
@@ -275,7 +275,7 @@ same `-tags` prefix, or use `tests-live/run.sh <scenario>` instead.
 
 Continuous integration (.github/workflows/ci.yml) checks the default mattn CGO backend and pure-Go (`modernc.org/sqlite` via `-tags modernc`) configuration. See [versioning and release](architecture/versioning-and-release.md#86-packaging-and-release) for supported platforms and licensing.
 
-Benchmarks (`benchmark/`): point/indexed/range/order/join/group reads, FTS
+Benchmarks (`tests-benchmark/benchmark/`): point/indexed/range/order/join/group reads, FTS
 term/prefix, single/multi-cell writes, 10/1000/10000-row transactions,
 Pebble commit latency, replication throughput (2-node, 5-node, backlog,
 snapshot seed), cipher/compression matrix, checkpoint, maintenance
@@ -306,13 +306,13 @@ Run them with (`-tags "sqlite_preupdate_hook sqlite_fts5"` throughout,
 or `-tags modernc` for the pure-Go backend):
 
 ```sh
-go test ./benchmark/ -bench . -short -benchtime 1s   # fast pass, 10K rows
-go test ./benchmark/ -bench . -benchtime 1s          # 10K + 100K datasets
-REPLICATEDDB_BENCH_ROWS=1000000 go test ./benchmark/ -bench .  # 1M rows
-SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./benchmark/ -run '^TestLocalWriterThroughput$' -v -count=1 -timeout=90s  # direct local API, 1 vs 4 writers
-SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./benchmark/ -run '^TestLocalPeriodicSyncThroughput$' -v -count=1 -timeout=90s  # one-second disk sync, 1 vs 4 writers
-SPEDSQL_LOCAL_BATCH_BENCH_SECONDS=5 go test ./benchmark/ -run '^TestLocalTransactionBatchThroughput$' -v -count=1 -timeout=300s  # 1/10/100/1000 inserts per transaction
-SPEDSQL_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-live/benchmark/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s  # live multi-process cluster, 1 vs 4 writers
+go test ./tests-benchmark/benchmark/ -bench . -short -benchtime 1s   # fast pass, 10K rows
+go test ./tests-benchmark/benchmark/ -bench . -benchtime 1s          # 10K + 100K datasets
+REPLICATEDDB_BENCH_ROWS=1000000 go test ./tests-benchmark/benchmark/ -bench .  # 1M rows
+SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./tests-benchmark/benchmark/ -run '^TestLocalWriterThroughput$' -v -count=1 -timeout=90s  # direct local API, 1 vs 4 writers
+SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./tests-benchmark/benchmark/ -run '^TestLocalPeriodicSyncThroughput$' -v -count=1 -timeout=90s  # one-second disk sync, 1 vs 4 writers
+SPEDSQL_LOCAL_BATCH_BENCH_SECONDS=5 go test ./tests-benchmark/benchmark/ -run '^TestLocalTransactionBatchThroughput$' -v -count=1 -timeout=300s  # 1/10/100/1000 inserts per transaction
+SPEDSQL_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-benchmark/replication/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s  # live multi-process cluster, 1 vs 4 writers
 ```
 
 The direct local writer benchmark reports acknowledged SQL inserts per second
@@ -365,7 +365,6 @@ admission (`Replication.AllowedNetworks` / `Replication.AllowedPeers`), reactive
 canonical `MaxTransactionBytes` pre-commit validation with rollback, handshake receive limit advertising, and bounded decode/reassembly,
  fresh-writer-identity backup restore/clone with a durable restore marker (same-identity rollback rejected),
 coordinated new-DBID reseed with crash-safe ciphertext rebind and old-cluster traffic rejection,
-optional authenticated HTTP service adapter + remote SDK (`service/`),
 High/Low bridge (`bridge/`): domain-isolated one-way roles, sealed
  recipient-encrypted bundles, durable outbox (capture/publish, dir/HTTP/FTP
  adapters) and inbox (contiguous progress, gaps, quarantine, restart
@@ -457,4 +456,3 @@ recipient-sealed encrypted file object transfer with High-local
 re-encryption, and reordered-delivery reconciliation between Low values and
 High ownership records via same-row shadow cells (all High peers converge
 on High-owned state regardless of arrival order).
- Optional service/administration adapters remain separate from the embedded core.

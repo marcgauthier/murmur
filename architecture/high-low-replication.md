@@ -289,8 +289,8 @@ caps; sweeping it is future work.
 
 Expose role, stream progress/gaps, pending/held/quarantined bundles, oldest backlog
 age, publication/import failures, key identities, replay status, and provenance.
-Do not log plaintext payloads or keys. Controls stay authenticated when wrapped by
-an optional service adapter.
+Do not log plaintext payloads or keys. Controls stay authenticated when exposed
+by the hosting process's own API.
 
 Implemented (status/diagnostics): `bridge/status.go` composes the embedded
 snapshot — `Outbox.ExportStatus` (pending/failed events with attempts,
@@ -303,7 +303,7 @@ Gap enumeration is capped with an exact arithmetic total (a far-ahead
 bundle cannot hang listing), every section carries exact totals alongside
 capped lists, and summaries exclude record payloads and private key
 material by construction. Provenance is inspectable through the DB APIs above;
-service-adapter wrapping stays a future integration.
+any HTTP exposure is the hosting process's responsibility.
 
 Acceptance requires:
 

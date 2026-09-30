@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func testCreds(t *testing.T, ca *CA, id ids.NodeID, allowed []ids.NodeID) *Credentials {

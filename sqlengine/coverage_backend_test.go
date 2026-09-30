@@ -5,7 +5,7 @@ package sqlengine
 import (
 	"testing"
 
-	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/murmur/codec"
 )
 
 // TestAnyRowToValues pins the driver-row conversion used by the capture

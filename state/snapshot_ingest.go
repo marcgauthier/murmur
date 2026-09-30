@@ -11,7 +11,7 @@ import (
 	"github.com/cockroachdb/pebble/v2/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/cockroachdb/pebble/v2/vfs"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 const snapshotIngestDir = "snapshot-ingest"

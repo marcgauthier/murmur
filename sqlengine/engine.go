@@ -20,9 +20,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/schema"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 // CaptureMode controls whether the pre-update hook records mutations.
@@ -164,6 +164,10 @@ func open(reg *schema.Registry, ddl, localDDL []string, stmtCacheEntries int) (*
 		e.Close()
 		return nil, err
 	}
+	if err := e.validateResultingSchema(ctx); err != nil {
+		e.Close()
+		return nil, err
+	}
 	return e, nil
 }
 
@@ -200,6 +204,8 @@ func (e *Engine) Close() error {
 }
 
 // createSchema builds replicated tables then local-only objects.
+// Both lists are classified before anything runs, so a forbidden
+// statement fails before partial application.
 func (e *Engine) createSchema(ctx context.Context, ddl, localDDL []string) error {
 	stmts := ddl
 	if len(stmts) == 0 {
@@ -208,11 +214,29 @@ func (e *Engine) createSchema(ctx context.Context, ddl, localDDL []string) error
 		}
 	}
 	for _, s := range stmts {
+		if err := checkReplicatedDDLStatement(s); err != nil {
+			return err
+		}
+	}
+	for _, s := range localDDL {
+		if err := checkLocalDDLStatement(s); err != nil {
+			return err
+		}
+	}
+	for _, s := range stmts {
 		if _, err := e.write.ExecContext(ctx, s); err != nil {
 			return fmt.Errorf("sqlengine: schema %q: %w", trunc(s, 120), err)
 		}
 	}
+	return e.applyLocalDDL(ctx, localDDL)
+}
+
+// applyLocalDDL runs classified local-only statements.
+func (e *Engine) applyLocalDDL(ctx context.Context, localDDL []string) error {
 	for _, s := range localDDL {
+		if err := checkLocalDDLStatement(s); err != nil {
+			return err
+		}
 		if _, err := e.write.ExecContext(ctx, s); err != nil {
 			return fmt.Errorf("sqlengine: local schema %q: %w", trunc(s, 120), err)
 		}

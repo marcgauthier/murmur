@@ -10,9 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/objectstore"
-	"github.com/marcgauthier/spedsql/transport"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/objectstore"
+	"github.com/marcgauthier/murmur/transport"
 )
 
 // Server serves container byte ranges to cluster peers over a dedicated

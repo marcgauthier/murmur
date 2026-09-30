@@ -5,10 +5,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
-	"github.com/marcgauthier/spedsql/backup"
-	"github.com/marcgauthier/spedsql/replication"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/transport"
+	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/replication"
+	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/transport"
 )
 
 // QueryStoreConfig configures the SQL materialization.

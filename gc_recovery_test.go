@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/state"
 )
 
 // scanOriginLog counts live origin-log batches; fully collected logs

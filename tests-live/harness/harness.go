@@ -22,8 +22,8 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/transport"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/transport"
 )
 
 // Node represents a running spedsql daemon instance in the test cluster.
@@ -737,7 +737,10 @@ func (c *Cluster) Cleanup() {
 	// its suite to collide with the next run.
 	c.reapStragglers()
 	if c.T.Failed() || c.failed {
-		failuresDir := filepath.Join(repoRoot(c.T), "tests-live", "failures")
+		failuresDir := os.Getenv("SPEDSQL_LIVE_FAILURES")
+		if failuresDir == "" {
+			failuresDir = filepath.Join(repoRoot(c.T), "tests-live", "failures")
+		}
 		_ = os.MkdirAll(failuresDir, 0755)
 		dest := filepath.Join(failuresDir, fmt.Sprintf("%s-%s", time.Now().UTC().Format("20060102T150405Z"), c.Name))
 		_ = os.Rename(c.RuntimeDir, dest)
@@ -757,9 +760,15 @@ func findOrBuildSpedSQL(t *testing.T) string {
 	}
 	// The default CGO build requires the SQLite feature tags; SPEDSQL_TAGS
 	// overrides them (e.g. SPEDSQL_TAGS=modernc for the pure-Go backend).
+	// Without an override, a CGO-disabled environment implies the
+	// pure-Go backend so bare `CGO_ENABLED=0 go test -tags modernc`
+	// runs build a working daemon instead of a mattn/modernc mix.
 	tags := os.Getenv("SPEDSQL_TAGS")
 	if tags == "" {
 		tags = "sqlite_preupdate_hook sqlite_fts5"
+		if os.Getenv("CGO_ENABLED") == "0" {
+			tags = "modernc"
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
 		t.Fatalf("create test bin dir: %v", err)

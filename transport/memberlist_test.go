@@ -9,7 +9,7 @@ import (
 
 	"github.com/hashicorp/memberlist"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 type testCertAuthority struct {

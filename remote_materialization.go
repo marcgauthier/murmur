@@ -5,8 +5,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/marcgauthier/spedsql/sqlengine"
-	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/murmur/sqlengine"
+	"github.com/marcgauthier/murmur/state"
 )
 
 // queueRemoteLocked records final row identities, not copies of values. Later

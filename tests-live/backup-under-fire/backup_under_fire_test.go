@@ -33,10 +33,10 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/backup"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/tests-live/harness"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func schemaConfig() *db.SchemaConfig {
@@ -52,6 +52,9 @@ func schemaConfig() *db.SchemaConfig {
 func agentTags() string {
 	if tags := os.Getenv("SPEDSQL_TAGS"); tags != "" {
 		return tags
+	}
+	if os.Getenv("CGO_ENABLED") == "0" {
+		return "modernc"
 	}
 	return "sqlite_preupdate_hook sqlite_fts5"
 }

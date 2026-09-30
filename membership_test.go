@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/state"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/state"
 )
 
 func openPairForMembership(t *testing.T, mutate func(*Config)) (nodeA, nodeB NodeID, dbA, dbB *DB) {

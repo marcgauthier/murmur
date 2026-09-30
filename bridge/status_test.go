@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func appendBatch(t *testing.T, o *Outbox, origin ids.NodeID, originSeq uint64) uint64 {

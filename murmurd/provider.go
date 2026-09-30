@@ -13,8 +13,8 @@ import (
 	"github.com/dolthub/go-mysql-server/sql/types"
 	"github.com/dolthub/vitess/go/vt/proto/query"
 
-	db "github.com/marcgauthier/spedsql"
-	murmurSchema "github.com/marcgauthier/spedsql/schema"
+	db "github.com/marcgauthier/murmur"
+	murmurSchema "github.com/marcgauthier/murmur/schema"
 )
 
 // This file adapts murmur to go-mysql-server. One murmur *DB backs one
@@ -51,9 +51,11 @@ func NewProvider(database *db.DB, name string, declared []murmurSchema.TableSche
 	return &Provider{db: database, name: name, tables: cp}
 }
 
-// Engine builds the default go-mysql-server engine over the provider.
+// Engine builds the go-mysql-server engine over the provider, with
+// the Murmur wire guard (see mysqlguard.go) installed ahead of the
+// default analysis.
 func (p *Provider) Engine() *sqle.Engine {
-	return sqle.NewDefault(p)
+	return newMurmurEngine(p)
 }
 
 func (p *Provider) Database(_ *sql.Context, name string) (sql.Database, error) {
@@ -196,6 +198,17 @@ func (d *murmurDB) CreateTable(ctx *sql.Context, name string, sch sql.PrimaryKey
 	pkCol := sch.Schema[sch.PkOrdinals[0]]
 	if !strings.EqualFold(pkCol.Name, "id") {
 		return fmt.Errorf("murmurd: CREATE TABLE %s: primary key must be the `id` column (murmur key convention)", name)
+	}
+	if pkType, err := gmsTypeToMurmur(pkCol.Type); err != nil || pkType != murmurSchema.ColBlob {
+		return fmt.Errorf("murmurd: CREATE TABLE %s: primary key `id` must be a blob type (use VARBINARY(16))", name)
+	}
+	// Column-level second layer: the pre-analyze guard reports these
+	// first, but CreateTable must not silently drop them on any path
+	// that bypasses analysis.
+	for _, c := range sch.Schema {
+		if err := guardColumnOption(name, c); err != nil {
+			return err
+		}
 	}
 	ts := murmurSchema.TableSchema{Name: name}
 	for _, c := range sch.Schema {

@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/marcgauthier/spedsql/codec"
+	"github.com/marcgauthier/murmur/codec"
 )
 
 // recoverPreparedRemote finishes the one remote transaction whose durable

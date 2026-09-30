@@ -19,13 +19,13 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/quic-go/quic-go"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
-	"github.com/marcgauthier/spedsql/overload"
-	"github.com/marcgauthier/spedsql/plumtree"
-	"github.com/marcgauthier/spedsql/schema"
-	"github.com/marcgauthier/spedsql/state"
-	"github.com/marcgauthier/spedsql/transport"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/overload"
+	"github.com/marcgauthier/murmur/plumtree"
+	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/state"
+	"github.com/marcgauthier/murmur/transport"
 )
 
 var (

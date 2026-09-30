@@ -15,7 +15,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/marcgauthier/spedsql/murmurd"
+	"github.com/marcgauthier/murmur/murmurd"
 )
 
 func main() {

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/marcgauthier/spedsql/backup"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // DestinationPublisher adapts a backup.Destination blob store (local

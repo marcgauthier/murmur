@@ -7,8 +7,8 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // TestFormatMarkersWrittenFresh proves new stores record the format and

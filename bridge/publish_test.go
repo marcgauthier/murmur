@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/spedsql/backup"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 func TestDirPublisherRoundTrip(t *testing.T) {

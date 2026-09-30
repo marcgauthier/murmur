@@ -1,4 +1,4 @@
-module github.com/marcgauthier/spedsql
+module github.com/marcgauthier/murmur
 
 go 1.26.0
 
@@ -20,6 +20,7 @@ require (
 	github.com/quic-go/quic-go v0.63.0
 	golang.org/x/crypto v0.55.0
 	golang.org/x/sys v0.47.0
+	gorm.io/gorm v1.31.2
 	modernc.org/sqlite v1.44.3
 )
 
@@ -56,6 +57,8 @@ require (
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a // indirect
+	github.com/jinzhu/inflection v1.0.0 // indirect
+	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect

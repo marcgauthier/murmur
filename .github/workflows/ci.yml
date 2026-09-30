@@ -66,7 +66,7 @@ jobs:
   live-gate:
     name: Live acceptance gate
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -109,6 +109,23 @@ jobs:
           bash tests-live/run.sh three-node-sync
           bash tests-live/run.sh rolling-restart
           bash tests-live/run.sh partition
+
+      - name: Run privileged env-gated live suites
+        # clock-skew needs libfaketime; impaired-network needs CAP_NET_ADMIN
+        # for tc/netem on lo; diskfull-live needs a tmpfs mount. All three
+        # skip with a message when the capability is absent, so this step
+        # is what exercises them for real. Runs last so a stale mount or
+        # qdisc cannot affect other steps; artifacts are chowned back for
+        # the upload step below.
+        env:
+          CGO_ENABLED: 1
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfaketime iproute2
+          bash tests-live/run.sh clock-skew
+          sudo -E env "PATH=$PATH" "GOCACHE=$(mktemp -d)" bash tests-live/run.sh impaired-network
+          sudo -E env "PATH=$PATH" "GOCACHE=$(mktemp -d)" bash tests-live/run.sh diskfull-live
+          sudo chown -R "$(id -u):$(id -g)" tests-live/runtime tests-live/failures || true
 
       - name: Upload live failure artifacts
         if: failure()

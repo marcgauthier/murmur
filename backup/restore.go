@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // Restore unpacks a backup bundle from cfg.Source into cfg.TargetPath and cfg.KeysPath,

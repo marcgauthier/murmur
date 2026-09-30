@@ -14,7 +14,7 @@ Lifecycle, workers, metrics, logging/errors, resource budgeting, and concurrency
 - [62. Memory Budgeting](#62-memory-budgeting)
 - [63. Concurrency Model](#63-concurrency-model)
 - [64. SQLite Connection and Locking Model](#64-sqlite-connection-and-locking-model)
-- [Optional service and administration adapters](#optional-service-and-administration-adapters)
+- [Optional service adapter](#optional-service-adapter)
 
 ---
 
@@ -337,11 +337,11 @@ rebuildable query view; Pebble controls the durable acknowledgement contract.
 
 ---
 
-## Optional service and administration adapters
+## Optional service adapter
 
-GALVANIZE includes HTTP APIs, a remote client SDK, administration/unlock endpoints,
-and Prometheus instrumentation. NOMADSQL remains an embedded library; these are
-optional deployment extensions rather than a mandatory daemon or sidecar.
+No HTTP service adapter ships with the library. The embedded Go API is the
+interface; a hosting process that needs HTTP defines, authenticates, and
+serves its own endpoints, separate from the inter-node QUIC protocol.
 
 Expose new High/Low status, provenance/replay, file, subscription, and writer
 scheduling diagnostics through package-owned APIs first. Extend planned metrics
@@ -350,39 +350,17 @@ and per-class writer service time/wait. Optional Prometheus collectors are
 provided without requiring a globally registered exporter or HTTP listener
 (implemented: `metrics` package over `DB.Status`).
 
-An optional service adapter may expose authenticated SQL, streaming subscriptions,
-file operations, and narrowly authorized administrative controls. A corresponding
-SDK consumes those interfaces; it does not replace the embedded Go API. Version
-and authenticate service interfaces separately from the inter-node QUIC protocol.
+The internal `tests-live` harness serves test-only HTTPS routes for live
+scenarios. Those routes are test tooling, not a product API, and no client
+SDK is provided for them.
 
-Implemented: the `service` package serves `GET /v1/status` (redacted snapshot),
-`POST /v1/query` (read-only statements only; writes are rejected so change
-capture cannot be bypassed), `POST /v1/exec` (implicit-transaction path), and
-`GET /v1/subscribe` (SSE stream of initial/update/reset subscription events
-with resume cursors). Every endpoint requires TLS plus a 32-byte-or-longer
-Bearer [REDACTED] compared in constant time, mirroring the `admin` package; the
-core library starts no listener and the handler never closes the caller's DB.
-Results are bounded (10,000 rows and 1 MiB request bodies by default) with
-explicit too-large failures, and values use a typed JSON codec that preserves
-int64 precision and base64 blobs. `service.Client` is the remote SDK (status,
-query, exec, streaming subscribe over TLS-only https URLs). File routes
-are absent from `service.Handler`/`service.Client`, although core encrypted file
-replication and the internal test-node file routes exist. Unlock stays in `admin`.
+Key delivery is the hosting process's responsibility. Murmur provides no HTTP
+unlock endpoint: the process obtains the encryption key by whatever means it
+chooses (local config, KMS, or its own HTTP listener) and passes key material
+to `Open` directly or through a `KeyProvider`. The database opens and its
+workers start only after the key is verified; there is no locked-but-listening
+library state. Do not reuse mesh access as administrative permission or expose
+keys in status/logging.
 
-Remote unlock is a separate lifecycle extension. A locked service may expose only
-its authenticated control surface; it must not initialize/open encrypted state or
-start replication/bridge workers before key verification. Do not reuse mesh access
-as administrative permission or expose keys in status/logging. Existing direct or
-provider-based key loading at Open remains the default.
-
-The optional `admin` package provides a TLS-only handler with a separate
-32-byte-or-longer bearer token. Its `POST /v1/unlock` accepts a key ID, cipher
-name, and 32-byte key, then invokes the application's open callback; failures
-return a generic response and do not publish an unlocked runtime. `GET
-/v1/status` reports only locked/unlocked state, and `POST /v1/lock` closes the
-active DB. Applications mount the handler on their own TLS listener; the core
-library starts no HTTP listener and existing `db.Open` behavior is unchanged.
-
-Acceptance for an adapter includes authorization separation, failed unlock,
-worker startup only after successful unlock, streaming cancellation, shutdown,
-redacted diagnostics, and an embedded application running with no service listener.
+Acceptance is an embedded application running with no HTTP listener, which
+is the default: the core library starts no listener.

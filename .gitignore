@@ -23,3 +23,6 @@ coverage.txt
 tests-live/bin/
 tests-live/runtime/
 tests-live/failures/
+tests-benchmark/bin/
+tests-benchmark/runtime/
+tests-benchmark/failures/

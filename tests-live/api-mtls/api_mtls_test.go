@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/tests-live/harness"
-	"github.com/marcgauthier/spedsql/transport"
+	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/tests-live/harness"
+	"github.com/marcgauthier/murmur/transport"
 )
 
 func TestDaemonAPIRequiresMTLSExceptHealth(t *testing.T) {

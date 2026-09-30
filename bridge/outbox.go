@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // EventState tracks publication of one outbox event.

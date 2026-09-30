@@ -10,8 +10,8 @@ import (
 
 	"github.com/cockroachdb/pebble/v2/vfs"
 
-	"github.com/marcgauthier/spedsql/codec"
-	"github.com/marcgauthier/spedsql/ids"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // TestStoreMaintenanceAccessors covers the small status hooks: a fresh store

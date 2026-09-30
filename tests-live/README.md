@@ -36,8 +36,15 @@ does not instrument the separately built node.
 CI runs `bash tests-live/run.sh gate` (release acceptance: API mTLS, smoke,
 encryption, backup/restore, partitions, High/Low, files, upgrades,
 snapshot resync, crash recovery, discovery mesh, migration crash,
-pause/resume, graceful shutdown) on every push/PR, plus pure-Go (`modernc`) and `-race`
+pause/resume, graceful shutdown, plus delete/crash/discovery/partition
+hardening, backup integrity, security posture, and
+subscription/migration suites — see the `GATE_SCENARIOS` comment in
+`run.sh` for the full list) on every push/PR, plus pure-Go (`modernc`) and `-race`
 matrices over `three-node-sync`, `rolling-restart`, and `partition`.
+A privileged CI step runs the env-gated suites (`clock-skew` with
+libfaketime, `impaired-network` with tc/netem, `diskfull-live` with a
+tmpfs mount); locally they skip with a message when the capability is
+absent.
 `bash tests-live/run.sh soak` (ten-minute file soak, two-hour write SLO,
 one-hour five-node mesh) and `bash tests-live/run.sh stress`
 (repeated restart/discovery/crash/partition/snapshot runs plus a race
@@ -55,6 +62,13 @@ the harness coordinates them across processes (and checkouts) with
 claim files under `${TMPDIR:-/tmp}/spedsql-portclaims` (4h TTL).
 
 Each scenario spins up discrete node instances (e.g. `./node1`, `./node2`, `./node3`, `./node4`) running the internal test fixture binary (`tests-live/harness/testnode`) with isolated Pebble storage, certificates, log files (`node.log`), and HTTPS service/admin endpoints. API requests use a CA-signed client certificate; only `GET /healthz` permits a client without a certificate. Encrypted nodes start with `await-unlock = true` and receive their encryption key through the HTTPS Remote Unlock API (`/v1/admin/unlock`).
+
+Exception: the `gorm-sync`, `gorm-migrate`, and `gorm-tx` suites run
+their engines in-process (GORM requires an embedded engine handle)
+with isolated directories, generated cluster certificates, and the
+same on-disk encrypted state, replicating over real QUIC on
+localhost. All database access in those suites goes through the
+GORM dialect (`tests-live/gormharness` wraps each node).
 
 Successful runtime directories under `tests-live/runtime/` are automatically removed. Failures are preserved under `tests-live/failures/<timestamp>-<scenario>/` with full node directories and log files for inspection.
 

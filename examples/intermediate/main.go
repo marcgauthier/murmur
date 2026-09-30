@@ -15,8 +15,8 @@ import (
 	"os"
 	"time"
 
-	replicateddb "github.com/marcgauthier/spedsql"
-	"github.com/marcgauthier/spedsql/schema"
+	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 func openNode(ctx context.Context, dir string, nodeID replicateddb.NodeID) *replicateddb.DB {

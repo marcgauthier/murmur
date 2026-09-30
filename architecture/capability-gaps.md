@@ -49,7 +49,7 @@ are tracked separately. Their acceptance criteria live with each subsystem.
 | [Encrypted file replication](file-replication.md) | Local authenticated immutable objects plus replicated metadata with streaming upload/read, search/list, delete tombstones, availability status, grace-based collection, bounded mesh fetch from static peers, recipient-sealed High/Low file artifacts with High-local re-encryption, object key rotation with generations, and object-inclusive versus metadata-only backup/restore exist; SWIM fetch discovery remains pending |
 | [Address policy](membership-and-transport.md#ip-and-cidr-admission-policy) | Implemented IP/CIDR filtering alongside certificate/NodeID authorization |
 | [Query subscriptions](query-and-search.md#reactive-query-subscriptions) | Implemented bounded subscriptions to committed SQL-visible changes with explicit resume/reset behavior |
-| [Optional service adapters](runtime-and-diagnostics.md#optional-service-and-administration-adapters) | Implemented optional authenticated SQL/status/subscription HTTP handler and SDK plus separate admin unlock controls; file routes remain absent from the reusable service handler/SDK despite core file replication and internal test-node file routes |
+| [Optional service adapter](runtime-and-diagnostics.md#optional-service-adapter) | Removed: no HTTP handler or client SDK ships with the library; the embedded Go API is the interface and any HTTP is the hosting process's own; the internal test-node HTTPS routes remain test tooling |
 
 High/Low identifies security domains and permitted data direction. It is distinct
 from local/replication writer priority, and neither implies a network bandwidth

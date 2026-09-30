@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	murmurSchema "github.com/marcgauthier/spedsql/schema"
+	murmurSchema "github.com/marcgauthier/murmur/schema"
 )
 
 // TestRestartPersistsSQLCreatedTables is the sidecar's reason to exist:
