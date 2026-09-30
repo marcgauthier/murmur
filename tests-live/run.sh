@@ -72,19 +72,15 @@ run_scenario() {
   echo ">>> SCENARIO COMPLETED: $scn"
 }
 
-# NOTE: graceful-shutdown is intentionally unwired: its mid-snapshot
-# SIGTERM intercept and snapshot-vs-log forcing are timing-fragile
-# (3/3 solo, 1/4 under contention 2026-09-29). Wire it once the
-# intercept window and GC-phase forcing are deterministic.
-ALL_SCENARIOS="addrpolicy allow-nodes api-mtls backup-restore benchmark bridge-two-streams chaos-load churn-retirement compression crash-recovery crdt-contention encryption files-bridge files-soak gc-balance highlow large-payload loadshare long-running-five-node migration-crash overload-budgets partial-mesh partition pause-resume plumtree-live rekey release-upgrade rolling-restart scale-mesh schema-evolution snapshot-resync soak-slo subscribe three-node-sync version-skew views write-priority"
+ALL_SCENARIOS="addrpolicy allow-nodes api-mtls backup-restore benchmark bridge-two-streams chaos-load churn-retirement compression crash-recovery crdt-contention encryption files-bridge files-soak gc-balance graceful-shutdown highlow large-payload loadshare long-running-five-node migration-crash overload-budgets partial-mesh partition pause-resume plumtree-live rekey release-upgrade rolling-restart scale-mesh schema-evolution snapshot-resync soak-slo subscribe three-node-sync version-skew views write-priority"
 
 # Release-gate subset, run by CI on every push/PR against the freshly built
 # daemon binary: smoke, encryption, backup/restore, partitions, version
 # skew, schema upgrades, release upgrades (previous-release binaries),
 # High/Low, files, scale mesh, snapshot resync, GC balance, rolling
-# restart, crash recovery, discovery mesh, migration crash, and
-# pause/resume. Fast suites first.
-GATE_SCENARIOS="api-mtls three-node-sync encryption backup-restore partition version-skew schema-evolution release-upgrade highlow files-bridge files-soak scale-mesh subscribe loadshare migration-crash pause-resume partial-mesh rolling-restart snapshot-resync gc-balance crash-recovery chaos-load"
+# restart, crash recovery, discovery mesh, migration crash,
+# pause/resume, and graceful shutdown. Fast suites first.
+GATE_SCENARIOS="api-mtls three-node-sync encryption backup-restore partition version-skew schema-evolution release-upgrade highlow files-bridge files-soak scale-mesh subscribe loadshare migration-crash pause-resume partial-mesh rolling-restart snapshot-resync gc-balance crash-recovery chaos-load graceful-shutdown"
 
 case "$scenario" in
   all)

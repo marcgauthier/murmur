@@ -310,10 +310,11 @@ decision 2026-09-29, discovery stays a v1.0 feature (stabilize, not
 experimental); needs re-verification per §5 step 3 like the above.
 
 Test-harness changes in the same uncommitted set: the live gate now
-also runs `partial-mesh` (discovery), `migration-crash`, and
-`pause-resume`; `graceful-shutdown` stays unwired (mid-snapshot
-SIGTERM intercept and snapshot-vs-log forcing flaked 1/4 under
-contention); new scheduled `run.sh stress` repetition lane plus
+also runs `partial-mesh` (discovery), `migration-crash`,
+`pause-resume`, and `graceful-shutdown` (mid-snapshot SIGTERM
+intercept made deterministic via member-deadline sleep plus a polled
+GC pass and a widened ~2MB snapshot payload; 4/4 including contention
+and modernc); new scheduled `run.sh stress` repetition lane plus
 `live-stress` CI job; shared `Cluster.DumpForensics` helper (used by
 rolling-restart and partial-mesh); daemon straggler reaping in
 harness cleanup plus a `run.sh` exit trap; CI `modernc`/`-race` live

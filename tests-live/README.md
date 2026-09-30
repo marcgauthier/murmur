@@ -36,7 +36,7 @@ does not instrument the separately built node.
 CI runs `bash tests-live/run.sh gate` (release acceptance: API mTLS, smoke,
 encryption, backup/restore, partitions, High/Low, files, upgrades,
 snapshot resync, crash recovery, discovery mesh, migration crash,
-pause/resume) on every push/PR, plus pure-Go (`modernc`) and `-race`
+pause/resume, graceful shutdown) on every push/PR, plus pure-Go (`modernc`) and `-race`
 matrices over `three-node-sync`, `rolling-restart`, and `partition`.
 `bash tests-live/run.sh soak` (ten-minute file soak, two-hour write SLO,
 one-hour five-node mesh) and `bash tests-live/run.sh stress`
