@@ -320,6 +320,23 @@ func (db *DB) CurrentSchema() replication.SchemaIdentity {
 	return db.schemaIdentity()
 }
 
+// LiveSchema returns the current schema epoch and a deep copy of the live
+// table declaration (resolved IDs included). Long-lived applications
+// persist this after every local migration and before shutdown: a reopen
+// requires the configuration to match the stored manifest exactly, and a
+// replicated adoption can advance the stored schema at any time.
+// Reopening with a persisted LiveSchema declaration reproduces the stored
+// registry exactly (BuildRegistry honors preset IDs and the canonical
+// hash is ID-ordered, so declaration order is irrelevant).
+func (db *DB) LiveSchema() (uint64, []schema.TableSchema, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.reg == nil {
+		return 0, nil, fmt.Errorf("replicateddb: schema not initialized")
+	}
+	return db.reg.Epoch, registryTables(db.reg), nil
+}
+
 // RevisionsForPeer implements replication.SchemaSyncer: our current tip
 // first, then requested and ancestor revisions within budget.
 func (db *DB) RevisionsForPeer(wantCurrent bool, wantIDs [][32]byte, maxBytes int) ([]*schema.Manifest, error) {

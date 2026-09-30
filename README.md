@@ -17,6 +17,12 @@ Murmur-SQL is a Golang embedded package that provides an in-memory SQLite databa
 - **Encrypted storage** with multiple cipher options, storage-key rotation, snapshots for new or stale nodes, replication-log garbage collection
 - **Cross-domain unidirectional airgap**: allow data to transfer from a low domain flock to a high domain flock
 
+> **Want the assembled database instead of the building block?**
+> [`murmurd`](murmurd/README.md) is the same engine as a runnable
+> server: configure it with `config.toml` and connect over the
+> MySQL or PostgreSQL wire protocols. This page documents the
+> embeddable Go package.
+
 The architecture and implementation documentation is in [architecture/](architecture/README.md) folder, split into smaller topic documents.  Start with the [architecture overview](architecture/overview.md).
 
 ## Reused packages
@@ -184,6 +190,7 @@ MURMUR-SQL/               public API (db.go, transaction.go, config.go, ...)
   filefetch/             bounded mesh fetch of file object bytes (client/server protocol)
   example/               runnable single-node example
   examples/              graduated examples: single node → 3-node mesh
+  murmurd/               assembled database daemon (MySQL + Postgres frontends, config.toml)
   tests-live/             live multi-process integration test scenarios
 ```
 

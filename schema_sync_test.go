@@ -466,3 +466,54 @@ func TestOrderRegistryLikeLocalPreservesPhysicalOrder(t *testing.T) {
 	orderRegistryLikeLocal(nil, wire)
 	orderRegistryLikeLocal(current, nil)
 }
+
+// TestLiveSchemaExport tracks Migrate and round-trips through Open:
+// the exported declaration reopens the store exactly.
+func TestLiveSchemaExport(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir()
+	cfg := testConfig(path)
+	db, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch, tables, err := db.LiveSchema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if epoch != 1 || len(tables) != 1 || tables[0].Name != "contacts" {
+		t.Fatalf("genesis LiveSchema = epoch %d tables %+v", epoch, tables)
+	}
+	if err := db.Migrate(ctx, migrateTestTables()); err != nil {
+		t.Fatal(err)
+	}
+	epoch, tables, err = db.LiveSchema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if epoch != 2 {
+		t.Fatalf("epoch = %d, want 2", epoch)
+	}
+	if len(tables) != 1 || len(tables[0].Columns) != 5 {
+		t.Fatalf("migrated LiveSchema = %+v", tables)
+	}
+	// Deep copy: mutating the export must not affect the live registry.
+	tables[0].Columns[0].Name = "MUTATED"
+	_, tables2, err := db.LiveSchema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tables2[0].Columns[0].Name == "MUTATED" {
+		t.Fatal("LiveSchema aliases live registry memory")
+	}
+	_ = db.Close()
+
+	// The exported declaration reopens the migrated store exactly.
+	cfg.Schema.Version = epoch
+	cfg.Schema.Tables = tables2
+	db2, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatalf("reopen with LiveSchema declaration: %v", err)
+	}
+	defer db2.Close()
+}

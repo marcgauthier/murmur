@@ -265,4 +265,10 @@ names, and types) instead of rebuilding from the manifest: rebuilding
 from the manifest would permute physical column order on every reopen
 whenever ID order differs from declaration order.
 
+Long-lived applications (daemons) obtain the reopen declaration from
+`DB.LiveSchema`, which exports the current epoch plus the resolved
+table declaration; persisting that export after each migration and
+before shutdown keeps restarts exact across local DDL and replicated
+adoptions (see [murmurd/README.md](../murmurd/README.md), "Schema evolution and restarts").
+
 ---
