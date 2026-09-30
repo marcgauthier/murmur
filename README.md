@@ -4,7 +4,16 @@
   <img src="murmur-sql.png" alt="MURMUR-SQL logo" width="600"/>
 </p>
 
-*Database cluster coordinated as starlink flock flight.*
+A murmuration is a flock of starlings wheeling across the sky as
+one: no bird leads, each one simply watches its neighbors and adjusts,
+and from those small local reactions emerges a single shape that holds
+together even as birds drift apart and rejoin. Murmur-SQL is built on
+that pattern. Every node is a fully writable database that keeps
+working offline, exchanges only change deltas with the peers it can
+currently reach, and converges with the rest of the flock without a
+leader — so a cluster that is sometimes partitioned, sometimes
+disconnected, still acts in unison and heals into one consistent
+shape whenever its nodes talk again.
 
 Murmur-SQL is a Golang embedded package that provides an in-memory SQLite database with masterless/offline distributed cluster with persistence on disk via Pebble saving only change deltas.
 
