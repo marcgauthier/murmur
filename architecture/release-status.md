@@ -9,8 +9,9 @@ documents consistent with this inventory.
 [Versioning and release](versioning-and-release.md)
 
 Documentation reconciled by static inspection on 2026-09-28, using HEAD
-`4bdd2974766786865c6222bb4843cab79e41e5c5` and the working-tree move of the
-standalone daemon into `tests-live/harness/testnode/`. Historical results in
+`4bdd2974766786865c6222bb4843cab79e41e5c5`. The standalone `murmurd` daemon
+has been removed from the repository (deferred for a future development phase);
+the embedded Go package is the current focus. Historical results in
 [§4](#4-verification-record) do not certify this revision or subsequent edits.
 Execution evidence for candidate `31bf1b5` is recorded in the 2026-09-29
 §4 entry; no release tag has been cut ([§5](#5-release-commit)).
@@ -187,7 +188,7 @@ SQLite backend refactor verification, 2026-09-28, linux/amd64:
 - New `replication/dialloop_stop_test.go` (detach-stops-dialer fix),
   including a `-race` run — pass; fails without the fix.
 - All 28 live suites via `tests-live/run.sh` (repaired to pass
-  `SPEDSQL_TAGS` to both the daemon build and `go test`, mirroring the
+  `SPEDSQL_TAGS` to both the test-node harness build and `go test`, mirroring the
   harness fix): `addrpolicy`, `allow-nodes` (20 s development window),
   `backup-restore`, `benchmark`, `bridge-two-streams`, `chaos-load`
   (3/3 after the dialLoop fix), `churn-retirement`, `crash-recovery`,
@@ -212,18 +213,20 @@ node: the current runner builds that executable without `-race`.
 runs `bash tests-live/run.sh gate` (smoke, encryption, backup/restore,
 partitions, version skew, High/Low, files, scale mesh, upgrades,
 snapshot resync, GC balance, rolling restart, crash recovery) against
-the freshly built daemon on every push/PR, plus a pure-Go live smoke;
+the freshly built test-node harness on every push/PR, plus a pure-Go live smoke;
 all gate suites pass locally (completion notes were in TASKS_COMPLETED.md
 under SNAPSHOT-PROGRESS-001, LIVE-GATE-001, LIVE-GROUP-A-001; the file was
 removed since, content survives in git history). Do not run two
 runner invocations against one checkout concurrently; isolate with
 `SPEDSQL_LIVE_RUNTIME`.
 
-2026-09-28 daemon API mTLS follow-up: the listener now serves HTTPS only,
-verifies optional client certificates during the handshake against the
-configured CA, and rejects missing certificates at every route except
-`GET /healthz`. The full live release gate passed, including the new
-`api-mtls` scenario; see the 2026-09-28 20:58:47 UTC entry titled
+2026-09-28 daemon API mTLS follow-up (historical — this feature was part of
+the now-removed `murmurd/` standalone daemon, which has been deferred for a
+future development phase): the listener served HTTPS only, verified optional
+client certificates during the handshake against the configured CA, and
+rejected missing certificates at every route except `GET /healthz`. The full
+live release gate passed, including the new `api-mtls` scenario; see the
+2026-09-28 20:58:47 UTC entry titled
 “Require HTTPS with client-certificate verification for the daemon API” in
 TASKS_COMPLETED.md (removed since; content survives in git history). This
 is a historical report for the then-working tree, not verification of a
@@ -317,7 +320,7 @@ intercept made deterministic via member-deadline sleep plus a polled
 GC pass and a widened ~2MB snapshot payload; 4/4 including contention
 and modernc); new scheduled `run.sh stress` repetition lane plus
 `live-stress` CI job; shared `Cluster.DumpForensics` helper (used by
-rolling-restart and partial-mesh); daemon straggler reaping in
+rolling-restart and partial-mesh); test-node straggler reaping in
 harness cleanup plus a `run.sh` exit trap; CI `modernc`/`-race` live
 lanes widened to three suites each.
 

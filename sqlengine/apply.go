@@ -398,7 +398,30 @@ func (e *Engine) MigrateToWithLocalDDL(newReg *schema.Registry, ddl, localDDL []
 // Rebuild drops and recreates the query database from durable state, then
 // re-applies local-only objects (indexes, FTS). Capture is suppressed.
 func (e *Engine) Rebuild(src StateReader) error {
-	return e.WriteSection(func(ctx context.Context) error {
+	return e.RebuildContext(context.Background(), src, nil)
+}
+
+// RebuildProgress reports internal materialization milestones. RowsInserted
+// counts committed rows; RowsSkipped counts invisible/unmaterializable rows.
+// The observer runs inside the writer section and must not call engine methods.
+type RebuildProgress struct {
+	CurrentTable string
+	Indexing     bool
+	RowsInserted uint64
+	RowsSkipped  uint64
+}
+
+// RebuildContext is Rebuild with cancellation and an optional internal observer.
+func (e *Engine) RebuildContext(ctx context.Context, src StateReader, observe func(RebuildProgress)) error {
+	return e.WriteSectionContext(ctx, func(ctx context.Context) error {
+		var progress RebuildProgress
+		report := func(inserted, skipped uint64) {
+			progress.RowsInserted += inserted
+			progress.RowsSkipped += skipped
+			if observe != nil {
+				observe(progress)
+			}
+		}
 		e.SetCaptureMode(CaptureSuppressed)
 		defer e.SetCaptureMode(CaptureLocal)
 		// DROP invalidates prepared statements; purge caches first.
@@ -444,10 +467,15 @@ func (e *Engine) Rebuild(src StateReader) error {
 			return err
 		}
 		for _, t := range e.reg.Tables {
-			if err := e.rebuildTable(ctx, src, t); err != nil {
+			progress.CurrentTable = t.Name
+			report(0, 0)
+			if err := e.rebuildTable(ctx, src, t, report); err != nil {
 				return err
 			}
 		}
+		progress.CurrentTable = ""
+		progress.Indexing = true
+		report(0, 0)
 		if err := e.applyLocalDDL(ctx, e.localDDL); err != nil {
 			return err
 		}
@@ -455,7 +483,7 @@ func (e *Engine) Rebuild(src StateReader) error {
 	})
 }
 
-func (e *Engine) rebuildTable(ctx context.Context, src StateReader, t *schema.TableSchema) error {
+func (e *Engine) rebuildTable(ctx context.Context, src StateReader, t *schema.TableSchema, report func(uint64, uint64)) error {
 	if len(t.Columns) == 0 {
 		return fmt.Errorf("sqlengine: rebuild table %s has no columns", t.Name)
 	}
@@ -477,6 +505,7 @@ func (e *Engine) rebuildTable(ctx context.Context, src StateReader, t *schema.Ta
 			_, _ = e.write.ExecContext(context.Background(), "ROLLBACK")
 			return fmt.Errorf("sqlengine: rebuild commit: %w", err)
 		}
+		report(uint64(txnRows), 0)
 		txnRows = 0
 		return nil
 	}
@@ -516,10 +545,15 @@ func (e *Engine) rebuildTable(ctx context.Context, src StateReader, t *schema.Ta
 		return nil
 	}
 	err := src.IterateTable(t.ID, func(r *state.Row) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if !r.Visible() {
+			report(0, 1)
 			return nil
 		}
 		if !rowMaterializable(t, r.Cells) {
+			report(0, 1)
 			return nil // unmaterializable (partial/corrupt batch): skip, stay up
 		}
 		args := make([]any, len(t.Columns))

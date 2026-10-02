@@ -30,10 +30,14 @@ type User struct {
 tables, err := murmur.GenesisTables(&User{})
 if err != nil { /* model violates the contract (see below) */ }
 
+// NodeID/DBID are this node's stable identity: generate once with
+// NewNodeID()/NewDBID() and persist them — a fresh identity on every
+// restart breaks cluster membership. (Key management likewise belongs
+// to the application; see Opening below.)
 db, err := replicateddb.Open(ctx, replicateddb.Config{
     Path:       "data/pebble",
-    NodeID:     replicateddb.NewNodeID(),
-    DBID:       replicateddb.NewDBID(),
+    NodeID:     nodeID, // loaded after first run, not regenerated
+    DBID:       dbID,   // loaded after first run, not regenerated
     Encryption: replicateddb.EncryptionConfig{Key: key, KeyID: "k1"},
     Schema:     replicateddb.SchemaConfig{Version: 1, Tables: tables},
 })
@@ -47,6 +51,49 @@ gdb.Create(&u)
 Custom `NamingStrategy` users must derive genesis with
 `GenesisTablesWithNamer` using the same strategy GORM parses with,
 or table/column names diverge.
+
+## Opening: engine first, then GORM
+
+Unlike normal GORM dialects, `gormmurmur` does not open the database:
+`murmur.Open(db)` wraps an already-open `*replicateddb.DB`. This is
+deliberate. Opening a Murmur node is distributed-system bootstrap,
+not a DSN connect: node identity, encryption keys, storage path,
+genesis schema, replication (listen address, peers, TLS), and bridge
+settings. Identity and keys must be stable across restarts, and the
+genesis schema must be derived from your models *before* GORM exists
+(the engine requires at least one table at open) — none of that fits
+inside a dialector.
+
+The split, in practice:
+
+- **Preopen** (`GenesisTables` → `replicateddb.Open`): everything
+  GORM has no vocabulary for. Replication, encryption, and
+  node-local `LocalDDL` indexes all live in the engine `Config`.
+- **After that, everything is GORM**: queries, creates, preloading,
+  transactions, `AutoMigrate`. GORM never sees replication or
+  encryption.
+
+Keep the `*replicateddb.DB` handle: you need it for `Close`, for
+reopens, and for cluster operations (add/remove peers, backups),
+which are engine APIs, not GORM.
+
+**Restarts** reopen from the `LiveSchema` export, never by
+re-deriving genesis: after `AutoMigrate` (or a peer adoption) the
+stored schema epoch has advanced, and reopening must match the
+stored manifest exactly.
+
+```go
+epoch, live, err := db.LiveSchema()
+if err != nil { /* ... */ }
+db.Close()
+
+cfg.Schema = replicateddb.SchemaConfig{Version: epoch, Tables: live}
+db2, err := replicateddb.Open(ctx, cfg) // same Path, IDs, key
+gdb2, err := gorm.Open(murmur.Open(db2))
+gdb2.AutoMigrate(&User{}) // still idempotent
+```
+
+See `TestGormMurmurReopen` for the full pattern.
 
 ## Model rules
 
@@ -121,9 +168,8 @@ Rejected loudly at migrate time (never silently dropped):
   errors.
 - Add `NOT NULL` columns only to empty tables (SQLite cannot add a
   `NOT NULL` column to populated tables); prefer nullable columns.
-- Restarts: reopen the engine from the `LiveSchema` export (epoch +
-  tables), exactly like any Murmur application; `AutoMigrate` stays
-  idempotent afterwards. See `TestGormMurmurReopen`.
+- Restarts reopen from the `LiveSchema` export; `AutoMigrate` stays
+  idempotent afterwards. See Opening above.
 
 ## Transactions and caveats
 

@@ -82,7 +82,8 @@ type DB struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	openedAt time.Time
+	openedAt     time.Time
+	openProgress *openProgressReporter
 
 	crash *crashHooks // failure injection; nil in production
 }
@@ -106,7 +107,19 @@ func zstdProfileForLevel(level int) *sstable.CompressionProfile {
 
 // Open opens or creates the database, rebuilds the in-memory query database
 // from durable state, and starts replication and maintenance workers.
-func Open(ctx context.Context, cfg Config) (*DB, error) {
+func Open(ctx context.Context, cfg Config) (result *DB, openErr error) {
+	progress := newOpenProgressReporter(cfg.OnOpenProgress)
+	defer func() {
+		if result == nil && openErr == nil {
+			// A panic must not emit a successful terminal event.
+			progress.finish(errors.New("replicateddb: open interrupted"))
+		} else {
+			progress.finish(openErr)
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	cfg.withDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -116,6 +129,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		return nil, fmt.Errorf("%w: %w", ErrUnsupportedSchema, err)
 	}
 	db := &DB{cfg: cfg, log: cfg.Logger, reg: reg, dbState: StateOpening, openedAt: time.Now(), sched: newWriterScheduler(cfg.Scheduling), remoteFlushWake: make(chan struct{}, 1)}
+	db.openProgress = progress
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
 	if err := db.recoverRotationLeftovers(); err != nil {
@@ -276,7 +290,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 
 	db.setState(StateRebuilding)
 	db.applyMu.Lock()
-	if err := engine.Rebuild(store); err != nil {
+	if err := db.rebuildOnOpen(ctx); err != nil {
 		db.applyMu.Unlock()
 		db.setState(StateFailed)
 		_ = engine.Close()
@@ -284,6 +298,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		db.cancel()
 		return nil, fmt.Errorf("replicateddb: rebuild: %w", err)
 	}
+	progress.phase(OpenFinalizing)
 	if gen, err := store.StateGeneration(); err != nil {
 		db.applyMu.Unlock()
 		db.setState(StateFailed)
@@ -336,6 +351,10 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		db.files = files
 	}
 
+	if err := ctx.Err(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	db.setState(StateReady)
 	db.wg.Add(1)
 	go db.remoteMaterializationLoop()
@@ -1259,6 +1278,7 @@ func (db *DB) Status() Status {
 		// fresh state and uptime; the store handle is closed.
 		cached.State = db.getState()
 		cached.Uptime = time.Since(db.openedAt)
+		cached.OpenProgress = db.openProgress.snapshot()
 		return cached
 	}
 	return db.statusLive()
@@ -1267,9 +1287,10 @@ func (db *DB) Status() Status {
 // statusLive reads the open store. Callers must ensure the store is usable.
 func (db *DB) statusLive() Status {
 	st := Status{
-		State:  db.getState(),
-		NodeID: db.cfg.NodeID,
-		Uptime: time.Since(db.openedAt),
+		State:        db.getState(),
+		NodeID:       db.cfg.NodeID,
+		Uptime:       time.Since(db.openedAt),
+		OpenProgress: db.openProgress.snapshot(),
 	}
 	st.Metrics = db.Metrics()
 	st.PendingApply = int(db.metrics.applyInflight.Load())

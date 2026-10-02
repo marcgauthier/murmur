@@ -34,6 +34,24 @@ complement, but do not replace, the deployment rehearsals in
 
 ## 55. Crash-Recovery Tests
 
+For a large clean-restart performance baseline, the explicit
+[reload benchmark](../tests-live/reload-benchmark/README.md) creates ten
+realistic log tables through the SQL API and reconstructs them from encrypted
+Pebble in fresh processes. It validates every table's count and full content
+digest, indexes, and the memory-only SQLite database. The default target is
+10 GB of SQLite pages; it is not crash-recovery or replication coverage and
+is excluded from routine `all` and release-gate runs. See
+[startup measurements](benchmarks.md#61-startup-benchmarks).
+
+The `tests-live/open-progress/` scenario uses the embedded Go API and real
+encrypted Pebble in separate processes. It checks multi-table reconstruction,
+processed cell counts, unknown totals, committed rows, phases and terminal events,
+callback ordering,
+cancellation, an index-build failure, and subsequent successful reopens. Run
+`bash tests-live/run.sh open-progress`; it is included in `all` and `gate`.
+The reload benchmark can additionally record startup snapshots with
+`SPEDSQL_RELOAD_PROGRESS=1`; see its README for measurement details.
+
 Inject crashes/failures after every important boundary.
 
 Local write:

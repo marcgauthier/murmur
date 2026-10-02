@@ -131,6 +131,9 @@ type Status struct {
 	PebbleMemTableBytes uint64
 
 	Uptime time.Duration
+	// OpenProgress is the latest startup snapshot, or nil when reporting was
+	// disabled. It is a copy; successful startup retains its terminal snapshot.
+	OpenProgress *OpenProgress
 }
 
 // PeerDiagnostics is the per-peer diagnostic record: session state,

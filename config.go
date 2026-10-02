@@ -360,6 +360,12 @@ type Config struct {
 
 	// Logger receives package logs. Nil means discard.
 	Logger Logger
+	// OnOpenProgress receives serialized startup snapshots from a dedicated
+	// goroutine, including processed cells and a terminal event before Open
+	// returns. It must return promptly and must not wait for Open to return.
+	// No extra counting scan is performed. Nil disables reporting. Forward events to
+	// your application's UI thread; callbacks do not run on the caller thread.
+	OnOpenProgress func(OpenProgress) `json:"-"`
 }
 
 func (c *Config) withDefaults() {

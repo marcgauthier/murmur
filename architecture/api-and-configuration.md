@@ -38,6 +38,7 @@ type Config struct {
     MaxBatchMutations       int
     MaxTransactionBytes     int64
     Logger      Logger
+    OnOpenProgress func(OpenProgress)
 }
 
 func Open(ctx context.Context, cfg Config) (*DB, error)
@@ -115,6 +116,20 @@ transaction are rejected so change capture cannot be bypassed. Closing sql
 handles never closes the underlying `*DB`. The explicit `DB`/`Tx` API remains
 the primary interface: transaction interception and connection-specific hooks
 are easier to prove there first.
+
+`Config.OnOpenProgress func(OpenProgress)` optionally reports startup while
+`Open` is blocked. `OpenProgress` contains `Phase`, `StartedAt`, `Elapsed`,
+`PhaseElapsed`, `CountedItems`, `TotalItems`, `ProcessedItems`, `TotalItemsKnown`,
+`PercentComplete`, `EstimatedRemaining`, `EstimateKnown`, `CurrentTable`,
+`RowsInserted`, `RowsSkipped`, and terminal `Error`. `OpenPhase` values are
+`OpenOpening`, `OpenRebuilding`, `OpenIndexing`, `OpenFinalizing`,
+`OpenReady`, `OpenFailed`, and `OpenCancelled`. Only `OpenReady` signals success.
+`Status.OpenProgress *OpenProgress` returns a copy of the retained startup
+snapshot, or nil when reporting was disabled. Callbacks are excluded from JSON
+configuration serialization. See [startup progress](runtime-and-diagnostics.md#startup-progress)
+for processed-cell, timing, callback, and cancellation semantics. Totals and
+estimates remain unknown; their numeric fields stay zero. `OpenCounting` remains
+defined for compatibility but is never emitted. No counting scan is performed.
 
 `Open` requires both `cfg.Schema` and `cfg.Pebble`. The schema must include its version and complete table and column declarations; do not infer it from existing data. Validate it against [Section 6](schema.md#6-schema-rules-for-version-1) and persisted schema metadata before creating tables, rebuilding data, or starting replication. Errors must identify the offending table, column, or index.
 

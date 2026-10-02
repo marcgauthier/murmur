@@ -1,7 +1,15 @@
 # MURMUR-SQL Live Multi-Process Node Tests
 
+The explicit [reload benchmark](reload-benchmark/README.md) generates a
+10 GB in-memory SQLite dataset across ten realistic log tables, persists
+encrypted Pebble under `/media/marc/2TB/TEST`, and measures fresh-process
+reopen and SQLite reconstruction. Run `bash tests-live/run.sh reload-benchmark`;
+it is excluded from `all` and `gate`. Completed datasets and JSON reports
+are retained for reuse.
+
 Run `bash tests-live/run.sh all` or an individual scenario runner:
 
+- `bash tests-live/run.sh open-progress`
 - `bash tests-live/run.sh encryption`
 - `bash tests-live/run.sh api-mtls`
 - `bash tests-live/run.sh crash-recovery`
@@ -25,7 +33,7 @@ go test -tags "sqlite_preupdate_hook sqlite_fts5" -v ./tests-live/...
 `run.sh` and the test harness build the Murmur-SQL daemon with
 `SPEDSQL_TAGS` (default `"sqlite_preupdate_hook sqlite_fts5"`; use
 `SPEDSQL_TAGS=modernc` with `CGO_ENABLED=0` for the pure-Go backend).
-`run.sh` rebuilds `tests-live/bin/testnode` on every invocation; bare
+For daemon scenarios, `run.sh` rebuilds `tests-live/bin/testnode` on every invocation; bare
 `go test` reuses the existing `tests-live/bin/testnode` as-is, so
 rebuild it (or delete it and let the harness rebuild) after changing
 product code, or a stale daemon will silently test old behavior.
@@ -61,7 +69,7 @@ directory and a private `SPEDSQL_BIN` path. Ephemeral ports need no isolation:
 the harness coordinates them across processes (and checkouts) with
 claim files under `${TMPDIR:-/tmp}/spedsql-portclaims` (4h TTL).
 
-Each scenario spins up discrete node instances (e.g. `./node1`, `./node2`, `./node3`, `./node4`) running the internal test fixture binary (`tests-live/harness/testnode`) with isolated Pebble storage, certificates, log files (`node.log`), and HTTPS service/admin endpoints. API requests use a CA-signed client certificate; only `GET /healthz` permits a client without a certificate. Encrypted nodes start with `await-unlock = true` and receive their encryption key through the HTTPS Remote Unlock API (`/v1/admin/unlock`).
+Daemon scenarios spin up discrete node instances (e.g. `./node1`, `./node2`, `./node3`, `./node4`) running the internal test fixture binary (`tests-live/harness/testnode`) with isolated Pebble storage, certificates, log files (`node.log`), and HTTPS service/admin endpoints. API requests use a CA-signed client certificate; only `GET /healthz` permits a client without a certificate. Encrypted nodes start with `await-unlock = true` and receive their encryption key through the HTTPS Remote Unlock API (`/v1/admin/unlock`).
 
 Exception: the `gorm-sync`, `gorm-migrate`, and `gorm-tx` suites run
 their engines in-process (GORM requires an embedded engine handle)
@@ -85,3 +93,10 @@ then sweeps recorded PIDs for stragglers; `run.sh` additionally traps
 exit/interrupt to reap daemons rooted at its own runtime dir. An
 external SIGKILL (`kill -9`, OOM) bypasses all cleanup by definition:
 find leftovers with `pgrep -af 'testnode agent --config <root>'`.
+
+## Embedded startup progress
+
+`open-progress` populates encrypted Pebble, then opens it in fresh embedded
+processes to validate progress callbacks, processed cells without a counting pass, committed rows,
+indexes, cancellation, failure reporting, and recovery through later reopens.
+It is included in `all` and `gate` and uses its own test worker binary.

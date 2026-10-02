@@ -26,12 +26,6 @@ Murmur-SQL is a Golang embedded package that provides an in-memory SQLite databa
 - **Encrypted storage** with multiple cipher options, storage-key rotation, snapshots for new or stale nodes, replication-log garbage collection
 - **Cross-domain unidirectional airgap**: allow data to transfer from a low domain flock to a high domain flock
 
-> **Want the assembled database instead of the building block?**
-> [`murmurd`](murmurd/README.md) is the same engine as a runnable
-> server: configure it with `config.toml` and connect over the
-> MySQL or PostgreSQL wire protocols. This page documents the
-> embeddable Go package.
-
 The architecture and implementation documentation is in [architecture/](architecture/README.md) folder, split into smaller topic documents.  Start with the [architecture overview](architecture/overview.md).
 
 ## Reused packages
@@ -133,6 +127,27 @@ A graduated progression — single node, encrypted node with transactions and
 reopen recovery, then a 3-node replicated mesh — lives in `examples/`
 (see [examples/README.md](examples/README.md)).
 
+### Display startup progress
+
+Set `Config.OnOpenProgress` before calling `Open`:
+
+```go
+cfg.OnOpenProgress = func(p replicateddb.OpenProgress) {
+    fmt.Printf("%s: %d cells processed, %d rows loaded, elapsed %s\n",
+        p.Phase, p.ProcessedItems, p.RowsInserted,
+        p.Elapsed.Round(time.Second))
+}
+db, err := replicateddb.Open(ctx, cfg)
+```
+
+Callbacks run serially on a dedicated goroutine; forward snapshots to your
+application's UI thread and return promptly. Progress comes from the existing
+rebuild scan, without a preliminary counting pass. Totals, percentage, and
+remaining time stay unknown. Nil disables reporting. Only `OpenReady` means
+startup succeeded; indexing and finalization follow cell loading. The terminal
+snapshot is also available through `db.Status().OpenProgress`.
+See [startup progress details](architecture/runtime-and-diagnostics.md#startup-progress).
+
 ## Schema rules (v1)
 
 Every replicated table must have an explicit `BLOB(16)` primary key
@@ -145,6 +160,43 @@ mutation sync, and applied under the `AcceptRemoteSchema` policy (auto-upgrade
 or strict refusal). Secondary `UNIQUE` constraints, virtual tables, and
 non-additive DDL are out of scope for v1. Foreign keys are
 application-level (not enforced during remote apply/rebuild).
+
+> [!WARNING]
+> **JSON columns are unsafe for multi-value data under replication.**
+>
+> SQLite has no native set or array type. JSON values (e.g. `tags TEXT DEFAULT '[]'`)
+> are stored as a single opaque TEXT cell. Murmur uses **per-cell last-writer-wins
+> (LWW)** conflict resolution: when two nodes concurrently modify the same cell,
+> the write with the higher hybrid logical clock timestamp wins and the other is
+> **silently discarded**.
+>
+> This means concurrent JSON mutations from different nodes will lose one side:
+>
+> ```
+> Node A writes: tags = ["red"]          -- HLC 100
+> Node B writes: tags = ["blue"]         -- HLC 101  ← wins
+> Result after convergence: tags = ["blue"]  ← "red" is lost
+> ```
+>
+> **Do not use JSON columns to represent sets, counters, or any multi-value
+> data that may be written concurrently on different nodes.**
+>
+> **Safe alternative — normalize into a join table:**
+> ```sql
+> -- Instead of:  posts.tags TEXT  (JSON array)
+> -- Use:
+> CREATE TABLE post_tags (
+>     post_id BLOB(16),
+>     tag     TEXT,
+>     PRIMARY KEY (post_id, tag)
+> );
+> ```
+> Each tag becomes its own row with its own LWW version. Adding `"red"` on Node A
+> and `"blue"` on Node B are independent writes that both survive replication with
+> no conflict.
+>
+> The same rule applies to SQLite's `json_*` functions: they operate on a TEXT cell
+> and the cell is what replication sees — not the individual JSON fields inside it.
 
 ### Local-only tables, indexes, views, and FTS
 
@@ -198,10 +250,13 @@ MURMUR-SQL/               public API (db.go, transaction.go, config.go, ...)
   filefetch/             bounded mesh fetch of file object bytes (client/server protocol)
   example/               runnable single-node example
   examples/              graduated examples: single node → 3-node mesh
-  murmurd/               assembled database daemon (MySQL + Postgres frontends, config.toml)
   gormmurmur/            GORM dialect for the embedded engine (models, migrator)
   tests-live/             live multi-process integration test scenarios
 ```
+
+> **Planned:** A standalone `murmurd` daemon (MySQL + PostgreSQL wire frontends,
+> `config.toml`) is deferred and not yet part of this repository.
+> The embedded Go package is the current focus.
 
 `objectstore/` stores immutable file payloads in authenticated encrypted
 chunks, separate from SQL rows. `Files.Enabled` adds replicated file metadata
@@ -216,6 +271,13 @@ see [encrypted file replication](architecture/file-replication.md).
 The `tests-live/encryption` scenario checks wrong-key rejection, plaintext
 absence from durable files, and correct-key restart recovery. Run it with
 `go test -count=1 ./tests-live/encryption`.
+
+The opt-in [reload benchmark](tests-live/reload-benchmark/README.md) generates
+ten realistic log tables with gofakeit, targeting 10 GB of SQLite pages, and
+measures fresh-process reload from encrypted Pebble into in-memory SQLite.
+Run `bash tests-live/run.sh reload-benchmark`. Datasets and JSON reports are
+preserved under `/media/marc/2TB/TEST`; the large run is excluded from `all`
+and `gate`.
 
 The `tests-live/three-node-sync` and `tests-live/crash-recovery` scenarios
 check three-node state convergence and encrypted-store recovery after an abrupt

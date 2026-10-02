@@ -185,6 +185,44 @@ shared connection pool and admission/eviction, QUIC sessions, origin-log repair,
 Metrics for Plumtree and overload integration land with those subsystems; remaining observability work is tracked
 in [TODO.md](../TODO.md).
 
+### Startup progress
+
+Applications opt into embedded startup reporting with `Config.OnOpenProgress`.
+`Open` remains synchronous; a dedicated reporter delivers immutable snapshots
+while it runs. Routine updates coalesce every 250 ms, including heartbeats
+through long loading or indexing work. Phase transitions and one terminal event
+are preserved. Callbacks are serialized, execute outside store and engine locks,
+and must return promptly without waiting for `Open` to return. Applications
+dispatch them to their own UI thread. `Open` waits for the final callback; none
+run after it returns.
+
+The phases are opening, rebuilding, indexing, finalizing, then ready. Failures
+or context cancellation end with failed or cancelled instead. Initial errors
+also produce terminal events. `Elapsed` covers startup work; `PhaseElapsed`
+covers the current phase. The successful terminal snapshot is retained through
+`DB.Status().OpenProgress`, with its clocks frozen. Disabled reporting returns nil.
+
+Progress uses the existing reconstruction scan, with no preliminary scan or
+durable counters. A pinned Pebble snapshot is released on every exit.
+`ProcessedItems` counts successfully decoded cells in registered tables,
+including cells in deleted or incomplete rows, but excluding replication logs,
+metadata, separate tombstone keys, and unregistered tables. Updates are batched
+in groups of 1024 cells with a final flush at each table or failure.
+`RowsInserted` counts committed SQLite rows; `RowsSkipped` counts invisible or
+unmaterializable rows. `CurrentTable` identifies the table being loaded.
+
+Pebble metrics do not provide an exact count of current registered cell keys.
+For source compatibility, `CountedItems`, `TotalItems`, `PercentComplete`, and
+`EstimatedRemaining` remain present but zero; `TotalItemsKnown` and
+`EstimateKnown` remain false, including after completion. `OpenCounting` is
+retained but never emitted. Applications display work completed and elapsed
+time without a percentage or remaining-time estimate.
+
+Secondary indexes, FTS, or other local objects are built after loading cells.
+Finalization covers generation publication and remaining startup setup. Only
+`OpenReady` means queries are available. Context cancellation is checked during
+state iteration and SQLite rebuild operations, with ordinary cleanup on failure.
+
 ---
 
 ## 53. Logging

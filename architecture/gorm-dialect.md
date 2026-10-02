@@ -82,8 +82,9 @@ SQL would land on the ephemeral materialization and never replicate.
   works inside explicit transactions and fails loudly on autocommit
   creates. Locking reads (`clause.Locking`) are rejected by the
   engine: there is no `SELECT FOR UPDATE`.
-- The dialect is embedded-only. The `murmurd` wire servers are a
-  separate deployment story with autocommit semantics.
+- The dialect is embedded-only. A standalone wire-protocol server
+  (`murmurd`) is planned but deferred; the embedded package is the
+  current deployment model.
 
 ## Evidence
 

@@ -3,6 +3,7 @@ package sqlengine
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -17,6 +18,31 @@ type fakeReader struct {
 	tables map[uint32]map[ids.RowID]map[uint32]codec.CellState
 	tombs  map[uint32]map[ids.RowID]crdt.Version
 	calls  int // GetRow call count (fast-path verification)
+}
+
+func TestRebuildContextCancellationAndCommittedProgress(t *testing.T) {
+	e, err := Open(testRegistry(t), nil, nil, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &fakeReader{}
+	err = e.RebuildContext(ctx, r, func(p RebuildProgress) {
+		if p.CurrentTable != "" {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("rebuild cancellation=%v", err)
+	}
+	var final RebuildProgress
+	if err := e.RebuildContext(context.Background(), r, func(p RebuildProgress) { final = p }); err != nil {
+		t.Fatal(err)
+	}
+	if !final.Indexing || final.RowsInserted != 0 || final.RowsSkipped != 0 {
+		t.Fatalf("empty progress=%+v", final)
+	}
 }
 
 func (f *fakeReader) IterateTable(tableID uint32, fn func(*state.Row) error) error {

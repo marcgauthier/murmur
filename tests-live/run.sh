@@ -36,17 +36,22 @@ sweep_runtime_daemons() {
     kill -KILL $pids 2>/dev/null || true
   fi
 }
-trap sweep_runtime_daemons EXIT INT TERM
+if [[ "$scenario" != "reload-benchmark" && "$scenario" != "open-progress" ]]; then
+  trap sweep_runtime_daemons EXIT INT TERM
+fi
 
-# Compile testnode fixture binary to ensure it matches current sources & tags
-echo "Compiling testnode fixture binary at $binary with tags: '$tags'..."
-mkdir -p "$(dirname "$binary")"
-(cd "$root" && go build "${race_args[@]}" -tags "$tags" -o "$binary" ./tests-live/harness/testnode)
+# Embedded startup checks launch their own test workers.
+if [[ "$scenario" != "reload-benchmark" && "$scenario" != "open-progress" ]]; then
+  echo "Compiling testnode fixture binary at $binary with tags: '$tags'..."
+  mkdir -p "$(dirname "$binary")"
+  (cd "$root" && go build "${race_args[@]}" -tags "$tags" -o "$binary" ./tests-live/harness/testnode)
+fi
 
 scenario_timeout() {
   # go test timeouts sized for each scenario's longest routine form
   # (the soak target extends durations via env; see below).
   case "$1" in
+    reload-benchmark) echo "6h" ;;
     soak-slo) echo "3h" ;;
     long-running-five-node) echo "75m" ;;
     files-soak) echo "15m" ;;
@@ -72,7 +77,7 @@ run_scenario() {
   echo ">>> SCENARIO COMPLETED: $scn"
 }
 
-ALL_SCENARIOS="addrpolicy allow-nodes api-mtls backup-restore backup-under-fire bridge-two-streams cert-lifecycle chaos-load churn-retirement clock-skew compression corrupt-snapshot crash-loop crash-recovery crdt-contention dbid-isolation delete-pruning diskfull-live dos-client downgrade-guard encryption file-permissions files-bridge files-corrupt-source files-crash files-soak flap-partition fts-crash gc-balance graceful-shutdown gorm-migrate gorm-sync gorm-tx highlow hostile-peer hostile-schema impaired-network large-payload loadshare log-boundedness long-running-five-node maintenance-under-load migration-concurrency migration-crash overload-budgets partial-mesh partition pause-resume plaintext-audit plumtree-live rejoin-storm rekey release-upgrade rolling-restart scale-mesh schema-evolution snapshot-resync soak-slo sqli-api subscribe subscribe-backlog swim-discovery tail-repair tampered-backup three-node-sync three-way-heal tls-floor txchunk-resume unlock-abuse version-skew views write-priority"
+ALL_SCENARIOS="addrpolicy allow-nodes api-mtls backup-restore backup-under-fire bridge-two-streams cert-lifecycle chaos-load churn-retirement clock-skew compression corrupt-snapshot crash-loop crash-recovery crdt-contention dbid-isolation delete-pruning diskfull-live dos-client downgrade-guard encryption file-permissions files-bridge files-corrupt-source files-crash files-soak flap-partition fts-crash gc-balance graceful-shutdown gorm-migrate gorm-sync gorm-tx highlow hostile-peer hostile-schema impaired-network large-payload loadshare log-boundedness long-running-five-node maintenance-under-load migration-concurrency migration-crash open-progress overload-budgets partial-mesh partition pause-resume plaintext-audit plumtree-live rejoin-storm rekey release-upgrade rolling-restart scale-mesh schema-evolution snapshot-resync soak-slo sqli-api subscribe subscribe-backlog swim-discovery tail-repair tampered-backup three-node-sync three-way-heal tls-floor txchunk-resume unlock-abuse version-skew views write-priority"
 
 # Release-gate subset, run by CI on every push/PR against the freshly built
 # daemon binary: smoke, encryption, backup/restore, partitions, version
@@ -93,9 +98,12 @@ ALL_SCENARIOS="addrpolicy allow-nodes api-mtls backup-restore backup-under-fire 
 # (clock-skew, impaired-network, diskfull-live), adversarial-load
 # (dos-client, log-boundedness), and history-dependent
 # (downgrade-guard) suites run via `all`, not the gate.
-GATE_SCENARIOS="api-mtls three-node-sync gorm-sync gorm-migrate gorm-tx encryption backup-restore partition version-skew schema-evolution release-upgrade highlow files-bridge files-soak scale-mesh subscribe loadshare migration-crash pause-resume partial-mesh rolling-restart snapshot-resync gc-balance crash-recovery chaos-load graceful-shutdown tampered-backup files-crash file-permissions plaintext-audit unlock-abuse rejoin-storm migration-concurrency sqli-api subscribe-backlog crash-loop swim-discovery txchunk-resume hostile-peer hostile-schema tail-repair three-way-heal flap-partition delete-pruning corrupt-snapshot backup-under-fire tls-floor dbid-isolation cert-lifecycle files-corrupt-source fts-crash maintenance-under-load"
+GATE_SCENARIOS="open-progress api-mtls three-node-sync gorm-sync gorm-migrate gorm-tx encryption backup-restore partition version-skew schema-evolution release-upgrade highlow files-bridge files-soak scale-mesh subscribe loadshare migration-crash pause-resume partial-mesh rolling-restart snapshot-resync gc-balance crash-recovery chaos-load graceful-shutdown tampered-backup files-crash file-permissions plaintext-audit unlock-abuse rejoin-storm migration-concurrency sqli-api subscribe-backlog crash-loop swim-discovery txchunk-resume hostile-peer hostile-schema tail-repair three-way-heal flap-partition delete-pruning corrupt-snapshot backup-under-fire tls-floor dbid-isolation cert-lifecycle files-corrupt-source fts-crash maintenance-under-load"
 
 case "$scenario" in
+  reload-benchmark)
+    SPEDSQL_RELOAD_BENCH=1 run_scenario "reload-benchmark"
+    ;;
   all)
     for scn in $ALL_SCENARIOS; do
       run_scenario "$scn"
@@ -133,7 +141,7 @@ case "$scenario" in
       run_scenario "$scenario"
     else
       echo "Unknown scenario: $scenario" >&2
-      echo "Available scenarios: $ALL_SCENARIOS all gate soak stress" >&2
+      echo "Available scenarios: $ALL_SCENARIOS reload-benchmark all gate soak stress" >&2
       exit 1
     fi
     ;;

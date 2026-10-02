@@ -2,6 +2,7 @@ package state
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"sort"
@@ -54,54 +55,67 @@ func (s *Store) IterateTable(tableID uint32, fn func(*Row) error) error {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
 	return s.snapshot(func(snap *pebble.Snapshot) error {
-		prefix := CellTablePrefix(tableID)
-		it, err := prefixIter(snap, prefix)
+		return s.iterateTableSnapshot(context.Background(), snap, tableID, fn, nil)
+	})
+}
+
+func (s *Store) iterateTableSnapshot(ctx context.Context, snap *pebble.Snapshot, tableID uint32, fn func(*Row) error, onCell func()) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	prefix := CellTablePrefix(tableID)
+	it, err := prefixIter(snap, prefix)
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+
+	var cur *Row
+	flush := func() error {
+		if cur == nil {
+			return nil
+		}
+		r := cur
+		cur = nil
+		tomb, present, err := getTombSnap(snap, tableID, r.ID)
 		if err != nil {
 			return err
 		}
-		defer it.Close()
-
-		var cur *Row
-		flush := func() error {
-			if cur == nil {
-				return nil
-			}
-			r := cur
-			cur = nil
-			tomb, present, err := getTombSnap(snap, tableID, r.ID)
-			if err != nil {
-				return err
-			}
-			if present {
-				r.Tomb = crdt.TombstoneState{Present: true, Version: tomb}
-			}
-			return fn(r)
+		if present {
+			r.Tomb = crdt.TombstoneState{Present: true, Version: tomb}
 		}
-		for it.SeekGE(prefix); it.Valid(); it.Next() {
-			_, row, col, ok := ParseCellKey(append([]byte(nil), it.Key()...))
-			if !ok {
-				continue
-			}
-			if cur == nil || cur.ID != row {
-				if err := flush(); err != nil {
-					return err
-				}
-				cur = &Row{Table: tableID, ID: row, Cells: make(map[uint32]codec.CellState)}
-			}
-			st, err := codec.DecodeCellState(append([]byte(nil), it.Value()...), s.limits)
-			if err != nil {
-				return fmt.Errorf("state: corrupt cell: %w", err)
-			}
-			cur.Cells[col] = st
-			if crdt.CompareVersion(st.Version, cur.Newest) > 0 {
-				cur.Newest = st.Version
-			}
-		}
-		if err := it.Error(); err != nil {
+		return fn(r)
+	}
+	for it.SeekGE(prefix); it.Valid(); it.Next() {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		return flush()
-	})
+		_, row, col, ok := ParseCellKey(append([]byte(nil), it.Key()...))
+		if !ok {
+			continue
+		}
+		if cur == nil || cur.ID != row {
+			if err := flush(); err != nil {
+				return err
+			}
+			cur = &Row{Table: tableID, ID: row, Cells: make(map[uint32]codec.CellState)}
+		}
+		st, err := codec.DecodeCellState(append([]byte(nil), it.Value()...), s.limits)
+		if err != nil {
+			return fmt.Errorf("state: corrupt cell: %w", err)
+		}
+		if onCell != nil {
+			onCell()
+		}
+		cur.Cells[col] = st
+		if crdt.CompareVersion(st.Version, cur.Newest) > 0 {
+			cur.Newest = st.Version
+		}
+	}
+	if err := it.Error(); err != nil {
+		return err
+	}
+	return flush()
 }
 
 // GetRow reads one row's stored cells (for apply-path re-materialization).

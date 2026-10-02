@@ -68,14 +68,22 @@ The embedded engine enforces this section at its own boundary, independent of th
 
 ### Wire-frontend enforcement
 
-`murmurd`'s MySQL and PostgreSQL frontends enforce this section before anything commits, so clients that assume a full MySQL/PostgreSQL dialect fail closed with an explicit Murmur reason instead of a confusing engine error or a half-created table:
+> **Planned (deferred):** The standalone `murmurd` daemon will add MySQL and
+> PostgreSQL wire frontends. The rules below describe their intended behavior.
+> The embedded engine already enforces the same invariants independently
+> (see embedded-engine enforcement above).
+
+When the wire frontends exist, they will enforce this section before anything
+commits, so clients that assume a full MySQL/PostgreSQL dialect fail closed with
+an explicit Murmur reason instead of a confusing engine error or a half-created
+table:
 
 - Secondary `UNIQUE` constraints and `CREATE UNIQUE INDEX` are rejected on both frontends: Murmur replicates only the primary-key index. Plain secondary indexes are local-only objects managed through embedded `LocalDDL`, never over the wire.
 - `CREATE TABLE` without exactly one `PRIMARY KEY`, or with a key that is not the single `id` blob column, is rejected. The wires normalize a bare `PRIMARY KEY` to a stored `PRIMARY KEY NOT NULL`; `Migrate`/`BuildRegistry` still rejects any nullable or non-blob key that reaches it.
 - Column and table options Murmur does not model — `DEFAULT`, `AUTO_INCREMENT`/`SERIAL` (column or table option), generated columns, `CHECK`, `FOREIGN KEY`/`REFERENCES` — are rejected rather than silently dropped. Single-column checks and unenforced foreign-key declarations remain tolerated at the embedded-engine level only; the wires stay a strict subset.
 - A `UNIQUE` keyword merged into the MySQL `PRIMARY KEY` column itself is redundant and normalized away; no secondary index exists afterwards. Every other rejected statement leaves no residue: no table, no schema-epoch advance, no sidecar change.
 
-The MySQL side guards at pre-analyze time (its engine would otherwise commit the table before creating indexes); the PostgreSQL side guards in its strict `CREATE TABLE` parser. Live over-the-wire proof lives in [wire_rules_test.go](../murmurd/wire_rules_test.go).
+The MySQL side will guard at pre-analyze time (its engine would otherwise commit the table before creating indexes); the PostgreSQL side will guard in its strict `CREATE TABLE` parser.
 
 ### Primary-key stability and column resolution
 
@@ -278,10 +286,12 @@ names, and types) instead of rebuilding from the manifest: rebuilding
 from the manifest would permute physical column order on every reopen
 whenever ID order differs from declaration order.
 
-Long-lived applications (daemons) obtain the reopen declaration from
+Long-lived applications obtain the reopen declaration from
 `DB.LiveSchema`, which exports the current epoch plus the resolved
 table declaration; persisting that export after each migration and
 before shutdown keeps restarts exact across local DDL and replicated
-adoptions (see [murmurd/README.md](../murmurd/README.md), "Schema evolution and restarts").
+adoptions. Call `DB.LiveSchema` after each `DB.Migrate` and before
+`DB.Close`, and pass the saved declaration back into `SchemaConfig` on
+the next `Open` call.
 
 ---

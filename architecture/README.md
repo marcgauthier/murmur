@@ -32,7 +32,7 @@ outstanding. The query materialization is in-memory only.
 | [High/Low replication and provenance](high-low-replication.md) | One-way domain bridge, sealed bundles, durable delivery, schema holds, High ownership, and replay. | New topic |
 | [Encrypted file replication](file-replication.md) | Separate encrypted objects, metadata, peer fetching, cross-domain artifacts, and retention. | New topic |
 | [Architecture overview](overview.md) | Goals, SQL engine choices, Go/CGO boundaries, and the target system diagram. | 1, 2, 3, 4, 88 |
-| [API and configuration](api-and-configuration.md) | Public Go API, configuration example, and internal interfaces. | 5, 66, 80 |
+| [API and configuration](api-and-configuration.md) | Public Go API, startup progress callback, configuration example, and internal interfaces. | 5, 66, 80 |
 | [GORM dialect](gorm-dialect.md) | Embedded GORM dialect contract: schema mapping, migration rules, and transaction semantics. | New topic |
 | [Schema and migrations](schema.md) | Schema restrictions, stable identities, concurrent additive migrations, and local-only objects. | 6, 7, 50, 51 |
 | [Transactions and change capture](transactions.md) | Change capture, transaction coalescing, commit/apply ordering, and idempotency. | 8, 9, 15, 16, 17, 18, 19, 49, 81 |
@@ -43,12 +43,12 @@ outstanding. The query materialization is in-memory only.
 | [Synchronization and overload](synchronization-and-overload.md) | Gap/range repair, transaction chunks, budgets, writer scheduling, wire encoding, acknowledgements, and large values. | 31, 32, 33, 34, 35, 48 |
 | [Snapshots, backup, and restore](snapshots-backup-and-restore.md) | Log retention, safe snapshot merging/publication, backups, restore identities, and reseeding. | 36, 37, 38 |
 | [Encryption and key management](encryption.md) | Encrypted VFS, key providers/caches, registry rotation, and maintenance rewrites. | 39, 40, 41, 42, 43, 44 |
-| [Runtime and diagnostics](runtime-and-diagnostics.md) | Lifecycle, workers, metrics, concurrency, and optional service adapter. | 45, 46, 52, 53, 54, 62, 63, 64 |
+| [Runtime and diagnostics](runtime-and-diagnostics.md) | Lifecycle, startup progress, workers, metrics, concurrency, and optional service adapter. | 45, 46, 52, 53, 54, 62, 63, 64 |
 | [SQLite backends](sqlite-backends.md) | Default mattn SQLite build, optional pure-Go modernc build, capture hooks, and reader/writer locking. | 3, 4, 64 |
 | [Query and search](query-and-search.md) | Indexes, FTS, prepared statements, and reactive query subscriptions. | 23, 24, 65 |
 | [Testing and acceptance](testing.md) | Crash/convergence/network/encryption tests and alpha acceptance criteria. | 55, 56, 57, 58, 89 |
 | [Operational rehearsals](operational-rehearsals.md) | Backup restore, lost-key, certificate-renewal, disk-full, and recovery-time drills. | New topic |
-| [Benchmarks](benchmarks.md) | Search, write/replication, and startup performance scenarios. | 59, 60, 61 |
+| [Benchmarks](benchmarks.md) | Search, write/replication, startup, and the explicit 10 GB live reload benchmark. | 59, 60, 61 |
 | Implementation roadmap (removed; content now in [TODO list](../TODO.md) and [Release status](release-status.md)) | Implementation phases, MVP boundaries, active and future tasks. | 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 87, 91 |
 | [Invariants, risks, and security](invariants-and-risks.md) | Design risks, non-negotiable architecture invariants, and security review requirements. | 78, 79, 85 |
 | [Versioning, release, and references](versioning-and-release.md) | Compatibility/versioning, packaging, platform support, and architecture sources. | 84, 86, 90 |

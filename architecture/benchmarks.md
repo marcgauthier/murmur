@@ -98,6 +98,32 @@ Measure each cipher with Zstd level 3 enabled and with compression disabled. Inc
 
 ## 61. Startup Benchmarks
 
+The explicit [live reload benchmark](../tests-live/reload-benchmark/README.md)
+populates ten realistic log tables using seeded gofakeit, targeting
+10,000,000,000 SQLite page bytes including secondary indexes. It uses real
+encrypted Pebble under `/media/marc/2TB/TEST` and separate processes for
+population, production `DB.Open`, and direct `Engine.Rebuild` measurement.
+Run `bash tests-live/run.sh reload-benchmark`; a 32 MiB development run uses
+`SPEDSQL_RELOAD_TARGET_BYTES=33554432`. It is excluded from routine live suites.
+
+Reports distinguish full open, registry/Pebble/engine open, direct rebuild,
+first query, and validation. They include logical payload and SQLite/disk
+sizes, throughput, and Linux peak RSS before validation. All table counts,
+full typed content hashes, secondary indexes, and the absence of a SQLite
+backing file are checked. FTS and replication traffic are excluded. OS cache
+is uncontrolled; these are fresh-process measurements, not cold-disk results.
+Completed datasets and measurement artifacts remain available for reuse.
+
+The 2026-10-02 UTC baseline on Linux amd64 (Go 1.26.0, SQLite 3.50.4) loaded
+1,371,480 rows across ten tables, initially occupying 10,000,498,688 SQLite
+page bytes and 5,664,469,882 encrypted Pebble file bytes. Production open
+took 362.369 seconds; direct rebuild took 153.671 seconds, including indexes.
+Both paths passed all full content hashes, counts, and index checks. The
+direct path ran second with different cache state, so the duration difference
+does not isolate startup overhead. See the scenario's
+[recorded baseline](../tests-live/reload-benchmark/README.md#recorded-10-gb-baseline)
+for peak RSS, validation times, and retained artifact locations.
+
 Measure separately:
 
 ```text
@@ -408,3 +434,9 @@ full open takes 4.0s (25K rows/sec); reconnect backlog catches up at
 SQLite baseline 9.9K ops/sec on the mixed workload.
 
 ---
+
+Embedded startup progress uses the existing rebuild scan without a preliminary
+count. A paired 10 GB SSD observation took 67.542 seconds with reporting disabled
+and 70.322 seconds with reporting enabled. OS cache was uncontrolled; see the
+[live benchmark results](../tests-live/reload-benchmark/README.md#startup-progress-without-a-counting-pass)
+for artifacts and validation details.

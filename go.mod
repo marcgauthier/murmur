@@ -3,6 +3,7 @@ module github.com/marcgauthier/murmur
 go 1.26.0
 
 require (
+	github.com/brianvoe/gofakeit/v7 v7.17.1
 	github.com/cockroachdb/pebble/v2 v2.1.6
 	github.com/dolthub/go-mysql-server v0.20.0
 	github.com/dolthub/vitess v0.0.0-20250512224608-8fb9c6ea092c
