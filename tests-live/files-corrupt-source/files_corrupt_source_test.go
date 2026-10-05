@@ -35,7 +35,7 @@ const objectKey = "4242424242424242424242424242424242424242424242424242424242424
 const errInvalidObject = "objectstore: invalid encrypted object"
 
 func TestCorruptSourceFetchFailsVerification(t *testing.T) {
-	victimSize := envInt("SPEDSQL_FILES_CORRUPT_VICTIM_KB", 256) << 10
+	victimSize := envInt("MURMUR_FILES_CORRUPT_VICTIM_KB", 256) << 10
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:     "files-corrupt-source",
 		NumNodes: 2,
@@ -274,7 +274,7 @@ func hexOf(data []byte) string {
 }
 
 func envInt(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {
 		return v
 	}
 	return fallback

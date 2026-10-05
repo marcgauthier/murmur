@@ -28,7 +28,7 @@ contain SST bytes (guards against measuring memtable residency).
 go test ./tests-live/compression/ -run TestPebbleCompressionSizes -v -count=1
 ```
 
-`SPEDSQL_LIVE_COMPRESSION_SCALE` multiplies every profile's row count
+`MURMUR_LIVE_COMPRESSION_SCALE` multiplies every profile's row count
 (default 1). Per-cell lines plus a summary table render in the test log:
 
 ```text

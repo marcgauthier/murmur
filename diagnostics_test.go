@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 // storage gauges land in Status/Metrics.
 func TestStatusWriterMetrics(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestReplicationDiagnostics(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
-	dbA, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestReplicationDiagnostics(t *testing.T) {
 
 	cfgB := replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
-	dbB, err := Open(ctx, cfgB)
+	dbB, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}

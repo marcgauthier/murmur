@@ -11,25 +11,26 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
 )
 
 func main() {
 	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "spedsql-driver-*")
+	dir, err := os.MkdirTemp("", "murmur-driver-*")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
-	db, err := replicateddb.Open(ctx, replicateddb.Config{
+	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path:   dir,
-		NodeID: replicateddb.NewNodeID(),
-		Schema: replicateddb.SchemaConfig{
+		NodeID: murmur.NewNodeID(),
+		Schema: murmur.SchemaConfig{
 			Version: 1,
 			Tables: []schema.TableSchema{{
 				Name: "widgets",
@@ -39,24 +40,24 @@ func main() {
 				},
 			}},
 		},
-		Pebble: replicateddb.DefaultPebbleConfig(),
-		Encryption: replicateddb.EncryptionConfig{
+		Pebble: murmur.DefaultPebbleConfig(),
+		Encryption: murmur.EncryptionConfig{
 			Key:   []byte("0123456789abcdef0123456789abcdef"),
 			KeyID: "driver-key",
 		},
-	})
+	}))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	replicateddb.RegisterDriverDB("primary", db)
+	murmur.RegisterDriverDB("primary", db)
 	sqldb, err := sql.Open("replicateddb", "primary")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	id := replicateddb.NewRowID()
+	id := murmur.NewRowID()
 	if _, err := sqldb.ExecContext(ctx,
 		`INSERT INTO widgets (id, label) VALUES (?, ?)`, id[:], "sprocket"); err != nil {
 		log.Fatal(err)

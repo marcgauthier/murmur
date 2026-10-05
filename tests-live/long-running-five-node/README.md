@@ -12,11 +12,11 @@ per-node Pebble capacity, then commits one final application write.
 For the one-hour capacity acceptance run:
 
 ```sh
-SPEDSQL_FIVE_NODE_DURATION_SECONDS=3600 \
-SPEDSQL_FIVE_NODE_SETTLE_SECONDS=300 \
+MURMUR_FIVE_NODE_DURATION_SECONDS=3600 \
+MURMUR_FIVE_NODE_SETTLE_SECONDS=300 \
 go test -count=1 -timeout=75m ./tests-live/long-running-five-node
 ```
 
-Tune write cadence with `SPEDSQL_FIVE_NODE_INTERVAL_MS` (default 50 ms).
+Tune write cadence with `MURMUR_FIVE_NODE_INTERVAL_MS` (default 50 ms).
 Failures retain all five node directories, configurations, and logs under
 `tests-live/failures/`.

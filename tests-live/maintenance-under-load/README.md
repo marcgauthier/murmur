@@ -2,7 +2,7 @@
 
 Run with `go test -count=1 ./tests-live/maintenance-under-load`.
 Three nodes take sustained concurrent writes
-(`SPEDSQL_MAINT_LOAD_SEED`, `SPEDSQL_MAINT_LOAD_MAX_INSERTS`) with
+(`MURMUR_MAINT_LOAD_SEED`, `MURMUR_MAINT_LOAD_MAX_INSERTS`) with
 zero failed writes allowed while tight retention forces origin-log
 GC. GC passes and batch collection must advance on every node (with
 writers provably still progressing), GC failures must stay flat, and

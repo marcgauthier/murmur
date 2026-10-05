@@ -32,13 +32,13 @@ func TestMinReaderWriterGateOpen(t *testing.T) {
 		t.Helper()
 		dir := t.TempDir()
 		node := ids.NewNodeID()
-		s, err := Open(dir, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
+		s, err := openSignedFixture(dir, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
 		if err != nil {
 			t.Fatal(err)
 		}
 		mutate(s)
 		_ = s.Close()
-		_, err = Open(dir, node, ids.DBID{}, Options{})
+		_, err = openSignedFixture(dir, node, ids.DBID{}, Options{})
 		return err
 	}
 
@@ -62,7 +62,7 @@ func TestMinReaderWriterGateOpen(t *testing.T) {
 	// markers are rewritten at the format version.
 	dir := t.TempDir()
 	node := ids.NewNodeID()
-	s, err := Open(dir, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
+	s, err := openSignedFixture(dir, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestMinReaderWriterGateOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = s.Close()
-	s2, err := Open(dir, node, ids.DBID{}, Options{})
+	s2, err := openSignedFixture(dir, node, ids.DBID{}, Options{})
 	if err != nil {
 		t.Fatalf("pre-marker store failed to open: %v", err)
 	}
@@ -109,10 +109,10 @@ func TestFreshStoreExceedsPreviousRelease(t *testing.T) {
 	}
 }
 
-// TestPreviousReleaseV2StoreOpens proves backward compatibility: a store
+// TestPreviousReleaseV2StoreRequiresBaselineMigration proves backward compatibility: a store
 // carrying previous-release v2 markers opens read-write on this binary
 // with its markers left at v2 (no eager upgrade).
-func TestPreviousReleaseV2StoreOpens(t *testing.T) {
+func TestPreviousReleaseV2StoreRequiresBaselineMigration(t *testing.T) {
 	dir := t.TempDir()
 	node := ids.NewNodeID()
 	pdb, err := pebble.Open(dir, &pebble.Options{})
@@ -137,17 +137,20 @@ func TestPreviousReleaseV2StoreOpens(t *testing.T) {
 	if err := pdb.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(dir, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
+	if _, err := openSignedFixture(dir, node, ids.DBID{}, Options{}); err == nil || !strings.Contains(err.Error(), "MigrateOriginBaseline") {
+		t.Fatalf("legacy ordinary open: %v", err)
+	}
+	s, err := openSignedFixture(dir, node, ids.DBID{}, Options{Limits: codec.DefaultLimits(), MigrateUnsignedBaseline: true})
 	if err != nil {
-		t.Fatalf("v2 store failed to open: %v", err)
+		t.Fatal(err)
 	}
 	defer s.Close()
 	format, minR, minW, err := s.FormatInfo()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if format != prevReleaseFormat || minR != prevReleaseFormat || minW != prevReleaseFormat {
-		t.Fatalf("v2 FormatInfo = %d/%d/%d, want markers left at 2", format, minR, minW)
+	if format != FormatVersion || minR != MinReaderVersion || minW != MinWriterVersion {
+		t.Fatalf("v2 FormatInfo = %d/%d/%d, want signed format markers", format, minR, minW)
 	}
 	ctx := context.Background()
 	row := ids.NewRowID()

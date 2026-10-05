@@ -12,6 +12,7 @@ import (
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crdt"
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 // Row is the assembled current state of one replicated row.
@@ -179,7 +180,20 @@ func (s *Store) iterateCellsSnap(snap *pebble.Snapshot, fn func(codec.SnapshotCe
 		}
 		if err := fn(codec.SnapshotCell{
 			TableID: table, RowID: row, ColumnID: col,
-			Version: st.Version, Value: st.Value,
+			Version: st.Version, Value: func() codec.Value {
+				p := s.columnPolicy(table, col)
+				if p == schema.PN_COUNTER || p == schema.OR_SET {
+					if s.isMergeShadow(table, col) {
+						epoch, value, active, e := codec.ShadowValue(st.Value, s.limits)
+						if e == nil && active {
+							return codec.ShadowProjection(epoch, neutralProjection(p, value))
+						}
+						return st.Value
+					}
+					return neutralProjection(p, st.Value)
+				}
+				return st.Value
+			}(),
 		}); err != nil {
 			it.Close()
 			return err
@@ -213,7 +227,10 @@ func (s *Store) iterateCellsSnap(snap *pebble.Snapshot, fn func(codec.SnapshotCe
 			return err
 		}
 	}
-	return tit.Error()
+	if err := tit.Error(); err != nil {
+		return err
+	}
+	return s.iterateCRDTSnapshot(snap, fn)
 }
 
 // LogScan reads one origin's log starting at fromSeq (inclusive), invoking
@@ -276,6 +293,12 @@ func (s *Store) LogScan(origin ids.NodeID, fromSeq uint64, maxBatches int, maxBy
 			batch, _, err := codec.DecodeBatch(raw, s.limits)
 			if err != nil {
 				return fmt.Errorf("state: corrupt log entry %s/%d: %w", origin, seq, err)
+			}
+			if err := s.VerifyOrigin(batch); err != nil {
+				return fmt.Errorf("state: invalid signed log %s/%d: %w", origin, seq, err)
+			}
+			if batch.OriginNode != origin || batch.Sequence != seq {
+				return codec.ErrOriginConflict
 			}
 			if err := fn(batch); err != nil {
 				return err
@@ -588,4 +611,16 @@ func (s *Store) CollectReceipts(floors map[ids.NodeID]uint64) (int, error) {
 		return 0, err
 	}
 	return len(keys), nil
+}
+
+// Snapshot placeholders preserve NULL versus initialized identity even when
+// the cell has no causal records yet.
+func neutralProjection(policy schema.MergePolicy, value codec.Value) codec.Value {
+	if value.Type == codec.TypeNull {
+		return value
+	}
+	if policy == schema.PN_COUNTER {
+		return codec.Text("0")
+	}
+	return codec.Text("[]")
 }

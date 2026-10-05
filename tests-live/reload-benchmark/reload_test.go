@@ -26,9 +26,11 @@ import (
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crypto"
+	"github.com/marcgauthier/murmur/internal/testidentity"
 	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/sqlengine"
 	"github.com/marcgauthier/murmur/state"
+	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 const defaultTarget = int64(10_000_000_000)
@@ -135,7 +137,7 @@ func configHash(t *testing.T) string {
 
 func envInt(t *testing.T, name string, fallback int64) int64 {
 	t.Helper()
-	if value := os.Getenv(name); value != "" {
+	if value := harness.GetEnv(name); value != "" {
 		n, err := strconv.ParseInt(value, 10, 64)
 		if err != nil || n <= 0 {
 			t.Fatalf("%s must be a positive integer, got %q", name, value)
@@ -146,13 +148,13 @@ func envInt(t *testing.T, name string, fallback int64) int64 {
 }
 
 func TestReloadBenchmark(t *testing.T) {
-	if os.Getenv("SPEDSQL_RELOAD_BENCH") != "1" {
+	if harness.GetEnv("MURMUR_RELOAD_BENCH") != "1" {
 		t.Skip("explicit large benchmark: bash tests-live/run.sh reload-benchmark")
 	}
-	target := envInt(t, "SPEDSQL_RELOAD_TARGET_BYTES", defaultTarget)
-	seed := uint64(envInt(t, "SPEDSQL_RELOAD_SEED", 42))
-	repetitions := envInt(t, "SPEDSQL_RELOAD_REPETITIONS", 1)
-	root := os.Getenv("SPEDSQL_RELOAD_ROOT")
+	target := envInt(t, "MURMUR_RELOAD_TARGET_BYTES", defaultTarget)
+	seed := uint64(envInt(t, "MURMUR_RELOAD_SEED", 42))
+	repetitions := envInt(t, "MURMUR_RELOAD_REPETITIONS", 1)
+	root := harness.GetEnv("MURMUR_RELOAD_ROOT")
 	if root == "" {
 		root = "/media/marc/2TB/TEST"
 	}
@@ -165,7 +167,7 @@ func TestReloadBenchmark(t *testing.T) {
 	checked(t, err)
 	m := manifest{Version: datasetVersion, CreatedAt: time.Now().UTC().Format(time.RFC3339),
 		TargetBytes: target, Seed: seed, ConfigHash: configHash(t), NodeID: db.NewNodeID(), DBID: db.NewDBID()}
-	runDir := os.Getenv("SPEDSQL_RELOAD_REUSE")
+	runDir := harness.GetEnv("MURMUR_RELOAD_REUSE")
 	if runDir == "" {
 		checked(t, os.MkdirAll(filepath.Join(root, "reload-benchmark"), 0700))
 		runDir, err = os.MkdirTemp(filepath.Join(root, "reload-benchmark"), time.Now().UTC().Format("20060102T150405Z")+"-*")
@@ -191,7 +193,7 @@ func TestReloadBenchmark(t *testing.T) {
 	}
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
-	if os.Getenv("SPEDSQL_RELOAD_REUSE") == "" {
+	if harness.GetEnv("MURMUR_RELOAD_REUSE") == "" {
 		runWorker(t, ctx, requestFile, filepath.Join(resultDir, "populate"), "populate")
 		readJSON(t, filepath.Join(runDir, "manifest.json"), &m)
 	}
@@ -220,7 +222,7 @@ func runWorker(t *testing.T, ctx context.Context, requestFile, prefix, role stri
 	checked(t, err)
 	defer log.Close()
 	cmd := exec.CommandContext(ctx, executable, "-test.run=^TestReloadWorker$", "-test.v", "-test.timeout=6h")
-	cmd.Env = append(os.Environ(), "SPEDSQL_RELOAD_WORKER="+role, "SPEDSQL_RELOAD_REQUEST="+requestFile, "SPEDSQL_RELOAD_RESULT="+prefix+".json")
+	cmd.Env = append(os.Environ(), "MURMUR_RELOAD_WORKER="+role, "MURMUR_RELOAD_REQUEST="+requestFile, "MURMUR_RELOAD_RESULT="+prefix+".json")
 	cmd.Stdout = io.MultiWriter(os.Stdout, log)
 	cmd.Stderr = cmd.Stdout
 	configureChild(cmd)
@@ -230,12 +232,12 @@ func runWorker(t *testing.T, ctx context.Context, requestFile, prefix, role stri
 }
 
 func TestReloadWorker(t *testing.T) {
-	role := os.Getenv("SPEDSQL_RELOAD_WORKER")
+	role := harness.GetEnv("MURMUR_RELOAD_WORKER")
 	if role == "" {
 		t.Skip("subprocess entry point")
 	}
 	var req request
-	readJSON(t, os.Getenv("SPEDSQL_RELOAD_REQUEST"), &req)
+	readJSON(t, harness.GetEnv("MURMUR_RELOAD_REQUEST"), &req)
 	if role == "populate" {
 		populate(t, req)
 		return
@@ -251,7 +253,7 @@ func TestReloadWorker(t *testing.T) {
 	if role == "full-open" {
 		start := time.Now()
 		cfg := config(m, filepath.Join(req.RunDir, "db"))
-		if os.Getenv("SPEDSQL_RELOAD_PROGRESS") == "1" {
+		if harness.GetEnv("MURMUR_RELOAD_PROGRESS") == "1" {
 			cfg.OnOpenProgress = func(p db.OpenProgress) {
 				if len(result.OpenProgress) == 0 || result.OpenProgress[len(result.OpenProgress)-1].Phase != p.Phase {
 					t.Logf("open progress: phase=%s cells=%d elapsed=%s", p.Phase, p.ProcessedItems, p.Elapsed)
@@ -324,7 +326,7 @@ func TestReloadWorker(t *testing.T) {
 	result.RowsPerSecond = float64(rows) / elapsed
 	checked(t, closeDB())
 	result.PebbleBytes = directoryBytes(t, filepath.Join(req.RunDir, "db", "data"))
-	writeJSON(t, os.Getenv("SPEDSQL_RELOAD_RESULT"), result)
+	writeJSON(t, harness.GetEnv("MURMUR_RELOAD_RESULT"), result)
 }
 
 type cursor interface {
@@ -537,7 +539,8 @@ func directRebuild(t *testing.T, runDir string, m manifest, result *measurement)
 	p := db.DefaultPebbleConfig()
 	start = time.Now()
 	store, err := state.Open(filepath.Join(runDir, "db", "data"), m.NodeID, m.DBID, state.Options{
-		FS: efs, CacheBytes: p.CacheBytes, MemTableSize: p.MemTableBytes, MemTableStopWritesThreshold: p.MemTableCount,
+		OriginSigning: testidentity.Config(m.NodeID),
+		FS:            efs, CacheBytes: p.CacheBytes, MemTableSize: p.MemTableBytes, MemTableStopWritesThreshold: p.MemTableCount,
 		MaxOpenFiles: p.MaxOpenFiles, CompactionConcurrency: p.MaxConcurrentCompactions,
 		Compression: block.CompressionProfileByName("zstd"), Limits: codec.DefaultLimits(),
 	})

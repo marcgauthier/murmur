@@ -12,7 +12,7 @@ import (
 func TestPeerScalingCapsAcrossChurn(t *testing.T) {
 	cluster := newTestCluster(t)
 	local := ids.NewNodeID()
-	st, err := state.Open(t.TempDir(), local, cluster.dbid, state.Options{Limits: codec.DefaultLimits()})
+	st, err := openSignedFixture(t.TempDir(), local, cluster.dbid, state.Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}

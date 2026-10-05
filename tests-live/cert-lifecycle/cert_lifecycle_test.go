@@ -22,8 +22,8 @@
 // returns early when a session is alive). Expiry is therefore enforced
 // on fresh handshakes, which the restart forces on both sides.
 //
-// Knobs: SPEDSQL_CERT_LIFECYCLE_TTL_S (default 25) sets the short-cert
-// lifetime; SPEDSQL_CERT_LIFECYCLE_WINDOW_S (default 10) sets the
+// Knobs: MURMUR_CERT_LIFECYCLE_TTL_S (default 25) sets the short-cert
+// lifetime; MURMUR_CERT_LIFECYCLE_WINDOW_S (default 10) sets the
 // post-expiry isolation window. Default runtime is well under 3 minutes.
 package certlifecycle_test
 
@@ -47,10 +47,10 @@ import (
 )
 
 func TestCertExpiryRejectsAndRotationHeals(t *testing.T) {
-	ttl := time.Duration(envInt("SPEDSQL_CERT_LIFECYCLE_TTL_S", 25)) * time.Second
-	window := time.Duration(envInt("SPEDSQL_CERT_LIFECYCLE_WINDOW_S", 10)) * time.Second
+	ttl := time.Duration(envInt("MURMUR_CERT_LIFECYCLE_TTL_S", 25)) * time.Second
+	window := time.Duration(envInt("MURMUR_CERT_LIFECYCLE_WINDOW_S", 10)) * time.Second
 	if ttl < 15*time.Second {
-		t.Fatalf("short-cert TTL %v too small to converge pre-expiry; raise SPEDSQL_CERT_LIFECYCLE_TTL_S", ttl)
+		t.Fatalf("short-cert TTL %v too small to converge pre-expiry; raise MURMUR_CERT_LIFECYCLE_TTL_S", ttl)
 	}
 
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
@@ -415,8 +415,5 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 }
 
 func envInt(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
-		return v
-	}
-	return fallback
+	return harness.EnvInt(name, fallback)
 }

@@ -15,7 +15,7 @@
 // use GenesisTables to derive genesis declarations from models):
 //
 //	tables, err := murmur.GenesisTables(&User{}, &Order{})
-//	db, err := replicateddb.Open(ctx, replicateddb.Config{... Schema: ...Tables: tables})
+//	db, err := murmur.Open(ctx, murmur.Config{... Schema: ...Tables: tables})
 //	gdb, err := gorm.Open(murmur.Open(db))
 //	gdb.AutoMigrate(&User{}, &Order{}) // idempotent for genesis tables
 package murmur

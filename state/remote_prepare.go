@@ -21,6 +21,9 @@ func (s *Store) recoverPreparedRemote() error {
 	if err != nil {
 		return err
 	}
+	if s.migratingOrigin {
+		return s.migratePreparedLegacy(raw)
+	}
 	batch, rest, err := codec.DecodeBatch(raw, s.limits)
 	if err != nil {
 		return fmt.Errorf("decode prepare record: %w", err)

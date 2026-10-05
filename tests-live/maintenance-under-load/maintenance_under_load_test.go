@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,9 +37,9 @@ import (
 )
 
 func TestMaintenanceUnderSustainedLoad(t *testing.T) {
-	seed := envInt("SPEDSQL_MAINT_LOAD_SEED", 120)
-	maxInserts := envInt("SPEDSQL_MAINT_LOAD_MAX_INSERTS", 4000)
-	gcTimeout := envDur("SPEDSQL_MAINT_LOAD_GC_TIMEOUT", 150*time.Second)
+	seed := envInt("MURMUR_MAINT_LOAD_SEED", 120)
+	maxInserts := envInt("MURMUR_MAINT_LOAD_MAX_INSERTS", 4000)
+	gcTimeout := envDur("MURMUR_MAINT_LOAD_GC_TIMEOUT", 150*time.Second)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:        "maintenance-under-load",
 		NumNodes:    3,
@@ -330,14 +329,14 @@ func minInt(a, b int) int {
 }
 
 func envInt(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {
 		return v
 	}
 	return fallback
 }
 
 func envDur(name string, fallback time.Duration) time.Duration {
-	if v := os.Getenv(name); v != "" {
+	if v := harness.GetEnv(name); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			return d
 		}

@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -24,7 +23,7 @@ import (
 )
 
 func TestDualKillSimultaneousRejoin(t *testing.T) {
-	outageRows := envInt("SPEDSQL_REJOIN_STORM_OUTAGE_ROWS", 40)
+	outageRows := envInt("MURMUR_REJOIN_STORM_OUTAGE_ROWS", 40)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:        "rejoin-storm",
 		NumNodes:    3,
@@ -257,7 +256,7 @@ func snapshotCounter(t *testing.T, apiAddr, name string) float64 {
 }
 
 func envInt(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {
 		return v
 	}
 	return fallback

@@ -40,3 +40,9 @@ done
 
 The original single-node demo remains at `example/` (`go run ./example` needs
 the same `-tags` prefix).
+
+Examples provision temporary random Ed25519 signing identities with
+`examples/internal/demoidentity` and explicitly trust their configured peers for
+snapshot recovery. Production applications must persist private keys and
+provision public bindings administratively; see
+[origin signatures](../architecture/origin-signatures.md).

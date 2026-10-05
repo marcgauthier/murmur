@@ -48,7 +48,7 @@ func evolvedTables() []schema.TableSchema {
 }
 
 func TestMigrationCrashLandsInDefinedState(t *testing.T) {
-	killDelay := time.Duration(envMillis("SPEDSQL_MIGRATION_CRASH_KILL_DELAY_MS", 15)) * time.Millisecond
+	killDelay := time.Duration(envMillis("MURMUR_MIGRATION_CRASH_KILL_DELAY_MS", 15)) * time.Millisecond
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:        "migration-crash",
 		NumNodes:    3,
@@ -518,7 +518,7 @@ func assertScore(t *testing.T, c *harness.Cluster, idx int, idHex string, want i
 }
 
 func envMillis(name string, fallback int) int {
-	if value, err := strconv.Atoi(os.Getenv(name)); err == nil && value >= 0 {
+	if value, err := strconv.Atoi(harness.GetEnv(name)); err == nil && value >= 0 {
 		return value
 	}
 	return fallback

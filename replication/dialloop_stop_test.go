@@ -18,7 +18,7 @@ import (
 func TestRemovePeerStopsDetachedDialState(t *testing.T) {
 	cluster := newTestCluster(t)
 	localID := ids.NewNodeID()
-	st, err := state.Open(t.TempDir(), localID, cluster.dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
+	st, err := openSignedFixture(t.TempDir(), localID, cluster.dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestRemovePeerStopsDetachedDialState(t *testing.T) {
 func TestDialLoopExitsWhenStopped(t *testing.T) {
 	cluster := newTestCluster(t)
 	localID := ids.NewNodeID()
-	st, err := state.Open(t.TempDir(), localID, cluster.dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
+	st, err := openSignedFixture(t.TempDir(), localID, cluster.dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
 	if err != nil {
 		t.Fatal(err)
 	}

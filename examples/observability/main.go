@@ -10,15 +10,16 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"log/slog"
 	"os"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
 )
 
-// slogLogger adapts the standard slog logger to replicateddb.Logger.
+// slogLogger adapts the standard slog logger to murmur.Logger.
 type slogLogger struct{ log *slog.Logger }
 
 func (l slogLogger) Debug(msg string, args ...any) { l.log.Debug(msg, args...) }
@@ -28,16 +29,16 @@ func (l slogLogger) Error(msg string, args ...any) { l.log.Error(msg, args...) }
 
 func main() {
 	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "spedsql-observability-*")
+	dir, err := os.MkdirTemp("", "murmur-observability-*")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
-	db, err := replicateddb.Open(ctx, replicateddb.Config{
+	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path:   dir,
-		NodeID: replicateddb.NewNodeID(),
-		Schema: replicateddb.SchemaConfig{
+		NodeID: murmur.NewNodeID(),
+		Schema: murmur.SchemaConfig{
 			Version: 1,
 			Tables: []schema.TableSchema{{
 				Name: "events",
@@ -47,22 +48,22 @@ func main() {
 				},
 			}},
 		},
-		Pebble: replicateddb.DefaultPebbleConfig(),
-		Encryption: replicateddb.EncryptionConfig{
+		Pebble: murmur.DefaultPebbleConfig(),
+		Encryption: murmur.EncryptionConfig{
 			Key:   []byte("0123456789abcdef0123456789abcdef"),
 			KeyID: "observability-key",
 		},
 		Logger: slogLogger{slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelInfo,
 		}))},
-	})
+	}))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
 	for i := 0; i < 5; i++ {
-		id := replicateddb.NewRowID()
+		id := murmur.NewRowID()
 		if _, err := db.ExecContext(ctx,
 			`INSERT INTO events (id, body) VALUES (?, ?)`,
 			id[:], fmt.Sprintf("event-%d", i)); err != nil {

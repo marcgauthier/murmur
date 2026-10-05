@@ -23,6 +23,9 @@ coverage.txt
 tests-live/bin/
 tests-live/runtime/
 tests-live/failures/
+tests-live/abuse/abuse-report-*.md
+tests-live/endurance-chaos/endurance-report-*.md
 tests-benchmark/bin/
 tests-benchmark/runtime/
 tests-benchmark/failures/
+tests-benchmark/benchmark/perf-report-*.json

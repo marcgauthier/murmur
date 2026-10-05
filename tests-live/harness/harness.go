@@ -2,13 +2,17 @@ package harness
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -26,11 +30,12 @@ import (
 	"github.com/marcgauthier/murmur/transport"
 )
 
-// Node represents a running spedsql daemon instance in the test cluster.
+// Node represents a running murmur daemon instance in the test cluster.
 type Node struct {
-	Index  int
-	Label  string
-	NodeID db.NodeID
+	OriginKey ed25519.PrivateKey
+	Index     int
+	Label     string
+	NodeID    db.NodeID
 	// BinaryPath is the daemon executable this node starts. It
 	// defaults to the cluster binary; SetNodeBinary switches it
 	// while the node is stopped (rolling-upgrade tests).
@@ -57,6 +62,8 @@ type Node struct {
 
 // Cluster manages multiple discrete node instances in their own directories.
 type Cluster struct {
+	originMu   sync.Mutex
+	originKeys map[db.NodeID]ed25519.PrivateKey
 	T          *testing.T
 	Name       string
 	RuntimeDir string
@@ -64,24 +71,28 @@ type Cluster struct {
 	DBID       db.DBID
 	CA         *transport.CA
 	Nodes      []*Node
+	nodeEnv    map[int][]string
 	failed     bool
 }
 
 // ClusterOptions configure the live test cluster.
 type ClusterOptions struct {
-	Name                  string
-	NumNodes              int
-	AwaitUnlock           bool
-	Schema                *db.SchemaConfig
-	SchemaSQL             string
-	BaseReplPort          int
-	BaseAPIPort           int
-	AllowedNetworks       []string
-	AllowedNetworksByNode map[int][]string
-	AllowedPeersByNode    map[int][]db.NodeID
-	NodeIDs               []db.NodeID
-	Files                 *FilesOptions
-	Bridge                *BridgeOptions
+	// TrustedSnapshotSourcesByNode overrides the explicit all-node fixture policy.
+	// An explicitly empty entry disables snapshots for that receiver.
+	TrustedSnapshotSourcesByNode map[int][]int
+	Name                         string
+	NumNodes                     int
+	AwaitUnlock                  bool
+	Schema                       *db.SchemaConfig
+	SchemaSQL                    string
+	BaseReplPort                 int
+	BaseAPIPort                  int
+	AllowedNetworks              []string
+	AllowedNetworksByNode        map[int][]string
+	AllowedPeersByNode           map[int][]db.NodeID
+	NodeIDs                      []db.NodeID
+	Files                        *FilesOptions
+	Bridge                       *BridgeOptions
 	// ManualPeers omits the automatic full-mesh peer list so the test can
 	// establish peering later via AddPeer (delayed-mesh scenarios).
 	ManualPeers bool
@@ -93,6 +104,18 @@ type ClusterOptions struct {
 	// scenarios that must deterministically trip budget rejection.
 	// Nil selects production defaults.
 	Limits *LimitsOptions
+	// Pebble carries optional storage overrides for scenarios that
+	// must shrink the cache/memtables or stall compactions. Nil
+	// selects production defaults.
+	Pebble *PebbleOptions
+	// PebbleByNode replaces the pebble section per node. Nodes with
+	// no entry fall back to opts.Pebble; a nil entry and nil base
+	// omit the section.
+	PebbleByNode map[int]*PebbleOptions
+	// NodeEnv appends KEY=VALUE pairs to the daemon process
+	// environment per node (resource-pressure scenarios, e.g.
+	// GOMEMLIMIT). Entries replace same-key inherited variables.
+	NodeEnv map[int][]string
 	// DisseminationByNode overrides the dissemination mode per node
 	// (mixed-mode capability tests). Empty entries inherit
 	// Replication.Dissemination (or the default when unset).
@@ -140,6 +163,18 @@ type LimitsOptions struct {
 	MaxBatchMutations   int
 }
 
+// PebbleOptions mirrors the daemon's pebble config section (storage
+// sizing and compaction control). Zero values select production
+// defaults; per-node entries replace the cluster-wide section.
+type PebbleOptions struct {
+	CacheBytes                  int64
+	MemTableBytes               uint64
+	MemTableCount               int
+	MaxOpenFiles                int
+	MaxConcurrentCompactions    int
+	DisableAutomaticCompactions bool
+}
+
 var liveHTTPClient = &http.Client{Timeout: 15 * time.Second}
 
 type liveAPITransport struct {
@@ -178,20 +213,20 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 		opts.BaseAPIPort = 18080
 	}
 
-	// Locate spedsql binary, build if not found. SPEDSQL_BIN overrides
+	// Locate testnode binary, build if not found. MURMUR_BIN overrides
 	// the shared binary so experimental daemon builds can be exercised
 	// without disturbing parallel suites.
 	var binPath string
-	if override := os.Getenv("SPEDSQL_BIN"); override != "" {
+	if override := getEnv("MURMUR_BIN"); override != "" {
 		binPath = override
 	} else {
-		binPath = findOrBuildSpedSQL(t)
+		binPath = findOrBuildTestNode(t)
 	}
 
 	// Runtime root: the override env names a root shared by concurrent
 	// runs, so each cluster still nests under its own name (as does the
 	// default) to keep multi-cluster scenarios from clobbering each other.
-	runtimeRoot := os.Getenv("SPEDSQL_LIVE_RUNTIME")
+	runtimeRoot := getEnv("MURMUR_LIVE_RUNTIME")
 	if runtimeRoot == "" {
 		runtimeRoot = filepath.Join(repoRoot(t), "tests-live", "runtime", opts.Name)
 	} else {
@@ -207,12 +242,14 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 
 	dbID := db.NewDBID()
 	cluster := &Cluster{
+		originKeys: make(map[db.NodeID]ed25519.PrivateKey),
 		T:          t,
 		Name:       opts.Name,
 		RuntimeDir: runtimeRoot,
 		BinaryPath: binPath,
 		DBID:       dbID,
 		CA:         ca,
+		nodeEnv:    opts.NodeEnv,
 	}
 
 	t.Cleanup(func() {
@@ -296,6 +333,18 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 		cluster.Nodes = append(cluster.Nodes, node)
 	}
 
+	for _, node := range cluster.Nodes {
+		_, key, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		node.OriginKey = key
+		cluster.originKeys[node.NodeID] = key
+		if err := os.WriteFile(filepath.Join(node.TLSDir, "origin.key"), key, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	// Live API requests use HTTPS and the first node's CA-issued certificate.
 	apiRoots := x509.NewCertPool()
 	if !apiRoots.AppendCertsFromPEM(ca.CertPEM) {
@@ -338,22 +387,37 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 		for _, peerID := range opts.AllowedPeersByNode[i] {
 			allowedPeers = append(allowedPeers, peerID.String())
 		}
+		originKeys := make(map[string]string)
+		var snapshotSources []string
+		for _, peer := range cluster.Nodes {
+			originKeys[peer.NodeID.String()] = hex.EncodeToString(peer.OriginKey.Public().(ed25519.PublicKey))
+			snapshotSources = append(snapshotSources, peer.NodeID.String())
+		}
+		if indices, ok := opts.TrustedSnapshotSourcesByNode[i]; ok {
+			snapshotSources = nil
+			for _, idx := range indices {
+				snapshotSources = append(snapshotSources, cluster.Nodes[idx].NodeID.String())
+			}
+		}
 		cfgJSON := map[string]any{
-			"node_id":            node.NodeID.String(),
-			"db_id":              cluster.DBID.String(),
-			"data_dir":           node.Dir,
-			"listen_addr":        node.ReplAddr,
-			"api_addr":           node.APIAddr,
-			"await_unlock":       opts.AwaitUnlock,
-			"key_hex":            node.KeyHex,
-			"key_id":             node.KeyID,
-			"schema_path":        node.SchemaDir,
-			"tls_ca_cert_file":   filepath.Join(node.TLSDir, "ca.crt"),
-			"tls_node_cert_file": filepath.Join(node.TLSDir, "node.crt"),
-			"tls_node_key_file":  filepath.Join(node.TLSDir, "node.key"),
-			"peers":              peerConfigs,
-			"allowed_networks":   allowedNetworks,
-			"allowed_peers":      allowedPeers,
+			"origin_signing_key_file":  filepath.Join(node.TLSDir, "origin.key"),
+			"origin_public_keys":       originKeys,
+			"trusted_snapshot_sources": snapshotSources,
+			"node_id":                  node.NodeID.String(),
+			"db_id":                    cluster.DBID.String(),
+			"data_dir":                 node.Dir,
+			"listen_addr":              node.ReplAddr,
+			"api_addr":                 node.APIAddr,
+			"await_unlock":             opts.AwaitUnlock,
+			"key_hex":                  node.KeyHex,
+			"key_id":                   node.KeyID,
+			"schema_path":              node.SchemaDir,
+			"tls_ca_cert_file":         filepath.Join(node.TLSDir, "ca.crt"),
+			"tls_node_cert_file":       filepath.Join(node.TLSDir, "node.crt"),
+			"tls_node_key_file":        filepath.Join(node.TLSDir, "node.key"),
+			"peers":                    peerConfigs,
+			"allowed_networks":         allowedNetworks,
+			"allowed_peers":            allowedPeers,
 		}
 		if len(opts.BootstrapSeeds) > 0 {
 			cfgJSON["membership_enabled"] = true
@@ -407,6 +471,20 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 				"max_value_bytes":       opts.Limits.MaxValueBytes,
 				"max_transaction_bytes": opts.Limits.MaxTransactionBytes,
 				"max_batch_mutations":   opts.Limits.MaxBatchMutations,
+			}
+		}
+		pebOpts := opts.Pebble
+		if perNode, ok := opts.PebbleByNode[i]; ok {
+			pebOpts = perNode
+		}
+		if pebOpts != nil {
+			cfgJSON["pebble"] = map[string]any{
+				"cache_bytes":                   pebOpts.CacheBytes,
+				"memtable_bytes":                pebOpts.MemTableBytes,
+				"memtable_count":                pebOpts.MemTableCount,
+				"max_open_files":                pebOpts.MaxOpenFiles,
+				"max_concurrent_compactions":    pebOpts.MaxConcurrentCompactions,
+				"disable_automatic_compactions": pebOpts.DisableAutomaticCompactions,
 			}
 		}
 		if opts.Files != nil {
@@ -511,6 +589,9 @@ func (c *Cluster) StartNode(idx int) {
 	cmd := exec.Command(bin, "agent", "--config", node.ConfigFile)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	if extra := c.nodeEnv[idx]; len(extra) > 0 {
+		cmd.Env = mergeEnv(os.Environ(), extra)
+	}
 
 	if err := cmd.Start(); err != nil {
 		c.T.Fatalf("start node %s: %v", node.Label, err)
@@ -519,6 +600,30 @@ func (c *Cluster) StartNode(idx int) {
 	node.pidMu.Lock()
 	node.Pids = append(node.Pids, cmd.Process.Pid)
 	node.pidMu.Unlock()
+}
+
+// mergeEnv overlays KEY=VALUE pairs onto a base environment, replacing
+// same-key entries. Malformed entries (no '=') are ignored.
+func mergeEnv(base, overlay []string) []string {
+	out := append([]string(nil), base...)
+	for _, kv := range overlay {
+		key, _, ok := strings.Cut(kv, "=")
+		if !ok || key == "" {
+			continue
+		}
+		replaced := false
+		for i, existing := range out {
+			if ek, _, ok := strings.Cut(existing, "="); ok && ek == key {
+				out[i] = kv
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 func (c *Cluster) StopNode(idx int) {
@@ -555,10 +660,17 @@ func (c *Cluster) KillNode(idx int) {
 }
 
 func (c *Cluster) UnlockNode(idx int, keyHex string) {
+	c.UnlockNodeWithKeyID(idx, "", keyHex)
+}
+
+// UnlockNodeWithKeyID unlocks with explicit key identity: required
+// after a rotation, when the registry only honors the new key ID.
+func (c *Cluster) UnlockNodeWithKeyID(idx int, keyID, keyHex string) {
 	c.T.Helper()
 	node := c.Nodes[idx]
 
 	payload, _ := json.Marshal(map[string]string{
+		"key_id":  keyID,
 		"key_hex": keyHex,
 		"cipher":  "chacha20",
 	})
@@ -737,7 +849,7 @@ func (c *Cluster) Cleanup() {
 	// its suite to collide with the next run.
 	c.reapStragglers()
 	if c.T.Failed() || c.failed {
-		failuresDir := os.Getenv("SPEDSQL_LIVE_FAILURES")
+		failuresDir := getEnv("MURMUR_LIVE_FAILURES")
 		if failuresDir == "" {
 			failuresDir = filepath.Join(repoRoot(c.T), "tests-live", "failures")
 		}
@@ -751,24 +863,58 @@ func (c *Cluster) Cleanup() {
 	}
 }
 
-func findOrBuildSpedSQL(t *testing.T) string {
+// GetEnv returns the environment variable for name.
+func GetEnv(name string) string {
+	return os.Getenv(name)
+}
+
+// EnvInt reads an integer environment variable with fallback.
+func EnvInt(name string, fallback int) int {
+	if val := GetEnv(name); val != "" {
+		if v, err := strconv.Atoi(val); err == nil && v > 0 {
+			return v
+		}
+	}
+	return fallback
+}
+
+// EnvSeconds reads a seconds-duration environment variable with fallback.
+func EnvSeconds(name string, fallback int) time.Duration {
+	return time.Duration(EnvInt(name, fallback)) * time.Second
+}
+
+// EnvMillis reads a milliseconds-duration environment variable with fallback.
+func EnvMillis(name string, fallback int) time.Duration {
+	return time.Duration(EnvInt(name, fallback)) * time.Millisecond
+}
+
+func getEnv(name string) string {
+	return GetEnv(name)
+}
+
+func findOrBuildTestNode(t *testing.T) string {
 	t.Helper()
 	root := repoRoot(t)
 	bin := filepath.Join(root, "tests-live", "bin", "testnode")
-	if _, err := os.Stat(bin); err == nil {
-		return bin
-	}
-	// The default CGO build requires the SQLite feature tags; SPEDSQL_TAGS
-	// overrides them (e.g. SPEDSQL_TAGS=modernc for the pure-Go backend).
+	// The default CGO build requires the SQLite feature tags; MURMUR_TAGS
+	// overrides them (e.g. MURMUR_TAGS=modernc for the pure-Go backend).
 	// Without an override, a CGO-disabled environment implies the
 	// pure-Go backend so bare `CGO_ENABLED=0 go test -tags modernc`
 	// runs build a working daemon instead of a mattn/modernc mix.
-	tags := os.Getenv("SPEDSQL_TAGS")
+	tags := getEnv("MURMUR_TAGS")
 	if tags == "" {
 		tags = "sqlite_preupdate_hook sqlite_fts5"
 		if os.Getenv("CGO_ENABLED") == "0" {
 			tags = "modernc"
 		}
+	}
+	// A bare `go test ./tests-live/<scenario>` must never silently reuse a
+	// binary built from older sources: rebuild when any build input is
+	// newer than the binary or the tags stamp disagrees.
+	if reason := testNodeStaleReason(bin, root, tags); reason == "" {
+		return bin
+	} else {
+		t.Logf("rebuilding testnode binary: %s", reason)
 	}
 	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
 		t.Fatalf("create test bin dir: %v", err)
@@ -779,7 +925,73 @@ func findOrBuildSpedSQL(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("build testnode binary: %v, output: %s", err, string(out))
 	}
+	if err := os.WriteFile(bin+".tags", []byte(tags), 0o644); err != nil {
+		t.Fatalf("write testnode tags stamp: %v", err)
+	}
 	return bin
+}
+
+// testNodeStaleReason returns "" when bin exists, was built with tags, and is
+// newer than every build input under root. Otherwise it returns a
+// human-readable reason so the caller can log why a rebuild happens.
+func testNodeStaleReason(bin, root, tags string) string {
+	st, err := os.Stat(bin)
+	if err != nil {
+		return "binary missing"
+	}
+	stamp, err := os.ReadFile(bin + ".tags")
+	if err != nil || strings.TrimSpace(string(stamp)) != tags {
+		return "build tags changed or unknown"
+	}
+	newer, err := newestSourceAfter(root, st.ModTime())
+	if err != nil {
+		return "source scan failed, rebuilding to be safe"
+	}
+	if newer != "" {
+		rel, rerr := filepath.Rel(root, newer)
+		if rerr == nil {
+			newer = rel
+		}
+		return "source newer than binary: " + newer
+	}
+	return ""
+}
+
+var errFoundNewer = errors.New("found source newer than binary")
+
+// newestSourceAfter returns the first build input under root (.go files plus
+// go.mod/go.sum, which pin external module versions) modified after t, or ""
+// when the tree is older. Only metadata is read, so the scan costs ~1s.
+func newestSourceAfter(root string, t time.Time) (string, error) {
+	found := ""
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		name := d.Name()
+		if !strings.HasSuffix(name, ".go") && name != "go.mod" && name != "go.sum" {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if info.ModTime().After(t) {
+			found = path
+			return errFoundNewer
+		}
+		return nil
+	})
+	if err == errFoundNewer {
+		return found, nil
+	}
+	return "", err
 }
 
 func repoRoot(t *testing.T) string {
@@ -886,7 +1098,7 @@ func sweepPortClaims(dir string) {
 func getFreePort(t *testing.T) int {
 	t.Helper()
 	if portSweepCount.Add(1)%256 == 0 {
-		sweepPortClaims(filepath.Join(os.TempDir(), "spedsql-portclaims"))
+		sweepPortClaims(filepath.Join(os.TempDir(), "murmur-portclaims"))
 	}
 	// Retry a bounded number of draws: under ephemeral-port pressure the
 	// kernel recycles aggressively and repeats are likely.
@@ -903,4 +1115,36 @@ func getFreePort(t *testing.T) int {
 	}
 	t.Fatal("could not draw an unclaimed ephemeral port after 50 attempts")
 	return 0
+}
+
+// MergeOperation invokes an explicit transaction operation on a live daemon.
+func (c *Cluster) MergeOperation(node int, request map[string]string) error {
+	raw, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	response, err := liveHTTPClient.Post(fmt.Sprintf("https://%s/v1/crdt", c.Nodes[node].APIAddr), "application/json", bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 204 {
+		body, _ := io.ReadAll(response.Body)
+		return fmt.Errorf("merge operation HTTP %d: %s", response.StatusCode, body)
+	}
+	return nil
+}
+func (c *Cluster) MergeState(node int, table, row string) (map[string]string, error) {
+	response, err := liveHTTPClient.Get(fmt.Sprintf("https://%s/v1/crdt/state?table=%s&row=%s", c.Nodes[node].APIAddr, table, row))
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 200 {
+		body, _ := io.ReadAll(response.Body)
+		return nil, fmt.Errorf("state HTTP %d: %s", response.StatusCode, body)
+	}
+	var state map[string]string
+	err = json.NewDecoder(response.Body).Decode(&state)
+	return state, err
 }

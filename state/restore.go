@@ -146,6 +146,14 @@ func (s *Store) adoptRestoreIdentity(b *pebble.Batch, fresh ids.NodeID, stored [
 	var dbSwap ids.DBID
 	if !adoption.NewDBID.IsZero() {
 		mode = "reseed"
+		for _, prefix := range []byte{prefixLog, prefixTxnStage} {
+			if err := b.DeleteRange([]byte{prefix}, []byte{prefix + 1}, nil); err != nil {
+				return err
+			}
+		}
+		if err := b.Set(SysKey("origin_trusted_baseline"), encodeU64(s.clock.Max()), nil); err != nil {
+			return err
+		}
 		storedDB, err := s.getDirect(SysKey(sysDBID))
 		if err != nil {
 			if isNotFound(err) {

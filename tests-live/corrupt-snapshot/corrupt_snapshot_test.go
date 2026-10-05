@@ -7,6 +7,7 @@
 package corruptsnapshot_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -90,13 +91,32 @@ func TestStaleNodeDiscardsCorruptSnapshotThenConverges(t *testing.T) {
 	// Phase 3: node3 restarts peerless; the attacker's inbound session is
 	// its only source. The attacker induces a snapshot pull, then serves
 	// bit-flipped chunks.
+	atk := newAttacker(t, cluster)
+	// This integrity scenario deliberately authorizes the hostile source;
+	// untrusted-source rejection is covered by origin-signatures.
+	cfgRaw, err := os.ReadFile(cluster.Nodes[stale].ConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(cfgRaw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	sources, _ := cfg["trusted_snapshot_sources"].([]any)
+	cfg["trusted_snapshot_sources"] = append(sources, atk.id.String())
+	cfgRaw, err = json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cluster.Nodes[stale].ConfigFile, cfgRaw, 0600); err != nil {
+		t.Fatal(err)
+	}
 	cluster.StartNode(stale)
 	cluster.UnlockNode(stale, cluster.Nodes[stale].KeyHex)
 	cluster.WaitNodeReady(stale)
 	victimAPI := cluster.Nodes[stale].APIAddr
 	genBeforeAttack := metricValue(t, victimAPI, "spedsql_state_generation")
 
-	atk := newAttacker(t, cluster)
 	mal := atk.dialMismatch(t, cluster.Nodes[stale].ReplAddr, cluster.Nodes[stale].NodeID)
 	defer mal.close()
 	// Prove the "only available source" premise: exactly one connected peer.
@@ -182,9 +202,9 @@ func serveCorrupt(t *testing.T, mal *evilSession, forged *corruptSnapshot) {
 }
 
 // gcWait mirrors snapshot-resync's expiry window; overridable for
-// faster development runs via SPEDSQL_CORRUPT_SNAPSHOT_GC_WAIT_SECONDS.
+// faster development runs via MURMUR_CORRUPT_SNAPSHOT_GC_WAIT_SECONDS.
 func gcWait() time.Duration {
-	if v := os.Getenv("SPEDSQL_CORRUPT_SNAPSHOT_GC_WAIT_SECONDS"); v != "" {
+	if v := harness.GetEnv("MURMUR_CORRUPT_SNAPSHOT_GC_WAIT_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return time.Duration(n) * time.Second
 		}

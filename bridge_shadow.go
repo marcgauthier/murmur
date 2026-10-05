@@ -24,7 +24,7 @@
 // file scans. The shadow column of app column c is c^0x80000000 (invertible,
 // schema-independent); schema validation rejects ambiguous pairs so a stored
 // column is never both an app column and a shadow.
-package replicateddb
+package murmur
 
 import (
 	"fmt"
@@ -92,22 +92,22 @@ func encodeBridgeShadowClear() codec.Value {
 // closed, matching corrupt-cell handling elsewhere.
 func decodeBridgeShadow(cell codec.CellState, lim codec.Limits) (set bool, v codec.Value, err error) {
 	if cell.Value.Type != codec.TypeBlob || len(cell.Value.B) == 0 {
-		return false, codec.Value{}, fmt.Errorf("replicateddb: malformed bridge shadow value")
+		return false, codec.Value{}, fmt.Errorf("murmur: malformed bridge shadow value")
 	}
 	switch cell.Value.B[0] {
 	case bridgeShadowClear:
 		if len(cell.Value.B) != 1 {
-			return false, codec.Value{}, fmt.Errorf("replicateddb: malformed bridge shadow clear")
+			return false, codec.Value{}, fmt.Errorf("murmur: malformed bridge shadow clear")
 		}
 		return false, codec.Value{}, nil
 	case bridgeShadowSet:
 		inner, err := codec.DecodeCellState(cell.Value.B[1:], lim)
 		if err != nil {
-			return false, codec.Value{}, fmt.Errorf("replicateddb: malformed bridge shadow payload: %w", err)
+			return false, codec.Value{}, fmt.Errorf("murmur: malformed bridge shadow payload: %w", err)
 		}
 		return true, inner.Value, nil
 	default:
-		return false, codec.Value{}, fmt.Errorf("replicateddb: malformed bridge shadow tag")
+		return false, codec.Value{}, fmt.Errorf("murmur: malformed bridge shadow tag")
 	}
 }
 
@@ -116,7 +116,7 @@ func decodeBridgeShadow(cell codec.CellState, lim codec.Limits) (set bool, v cod
 func bridgeShadowMutation(table uint32, row ids.RowID, column uint32, set bool, v codec.Value) (codec.Mutation, error) {
 	s, ok := bridgeShadowColumn(column)
 	if !ok {
-		return codec.Mutation{}, fmt.Errorf("replicateddb: column %d has no shadow mapping", column)
+		return codec.Mutation{}, fmt.Errorf("murmur: column %d has no shadow mapping", column)
 	}
 	val := encodeBridgeShadowClear()
 	if set {

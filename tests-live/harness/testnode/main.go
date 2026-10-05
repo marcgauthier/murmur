@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -27,6 +28,7 @@ import (
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/crypto"
 	"github.com/marcgauthier/murmur/metrics"
+	"github.com/marcgauthier/murmur/origin"
 	"github.com/marcgauthier/murmur/schema"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -34,29 +36,33 @@ import (
 
 // NodeConfigFile represents the JSON configuration file for a node instance.
 type NodeConfigFile struct {
-	NodeID          string                 `json:"node_id"`
-	DBID            string                 `json:"db_id,omitempty"`
-	DataDir         string                 `json:"data_dir"`
-	ListenAddr      string                 `json:"listen_addr"`
-	APIAddr         string                 `json:"api_addr"`
-	MetricsAddr     string                 `json:"metrics_addr,omitempty"`
-	Bootstrap         []string               `json:"bootstrap,omitempty"`
-	MembershipEnabled bool                   `json:"membership_enabled,omitempty"`
-	Peers             []PeerConfig           `json:"peers,omitempty"`
-	AllowedPeers    []string               `json:"allowed_peers,omitempty"`
-	AllowedNetworks []string               `json:"allowed_networks,omitempty"`
-	AwaitUnlock     bool                   `json:"await_unlock"`
-	KeyHex          string                 `json:"key_hex,omitempty"`
-	KeyID           string                 `json:"key_id,omitempty"`
-	SchemaPath      string                 `json:"schema_path,omitempty"`
-	TLSCACertFile   string                 `json:"tls_ca_cert_file,omitempty"`
-	TLSNodeCertFile string                 `json:"tls_node_cert_file,omitempty"`
-	TLSNodeKeyFile  string                 `json:"tls_node_key_file,omitempty"`
-	Schema          *db.SchemaConfig       `json:"schema,omitempty"`
-	Files           *FilesConfigFile       `json:"files,omitempty"`
-	Bridge          *BridgeConfigFile      `json:"bridge,omitempty"`
-	Replication     *ReplicationConfigFile `json:"replication,omitempty"`
-	Limits          *LimitsConfigFile      `json:"limits,omitempty"`
+	OriginSigningKeyFile   string                 `json:"origin_signing_key_file"`
+	OriginPublicKeys       map[string]string      `json:"origin_public_keys"`
+	TrustedSnapshotSources []string               `json:"trusted_snapshot_sources"`
+	NodeID                 string                 `json:"node_id"`
+	DBID                   string                 `json:"db_id,omitempty"`
+	DataDir                string                 `json:"data_dir"`
+	ListenAddr             string                 `json:"listen_addr"`
+	APIAddr                string                 `json:"api_addr"`
+	MetricsAddr            string                 `json:"metrics_addr,omitempty"`
+	Bootstrap              []string               `json:"bootstrap,omitempty"`
+	MembershipEnabled      bool                   `json:"membership_enabled,omitempty"`
+	Peers                  []PeerConfig           `json:"peers,omitempty"`
+	AllowedPeers           []string               `json:"allowed_peers,omitempty"`
+	AllowedNetworks        []string               `json:"allowed_networks,omitempty"`
+	AwaitUnlock            bool                   `json:"await_unlock"`
+	KeyHex                 string                 `json:"key_hex,omitempty"`
+	KeyID                  string                 `json:"key_id,omitempty"`
+	SchemaPath             string                 `json:"schema_path,omitempty"`
+	TLSCACertFile          string                 `json:"tls_ca_cert_file,omitempty"`
+	TLSNodeCertFile        string                 `json:"tls_node_cert_file,omitempty"`
+	TLSNodeKeyFile         string                 `json:"tls_node_key_file,omitempty"`
+	Schema                 *db.SchemaConfig       `json:"schema,omitempty"`
+	Files                  *FilesConfigFile       `json:"files,omitempty"`
+	Bridge                 *BridgeConfigFile      `json:"bridge,omitempty"`
+	Replication            *ReplicationConfigFile `json:"replication,omitempty"`
+	Limits                 *LimitsConfigFile      `json:"limits,omitempty"`
+	Pebble                 *PebbleConfigFile      `json:"pebble,omitempty"`
 }
 
 // ReplicationConfigFile carries optional retention overrides. Zero values
@@ -82,6 +88,18 @@ type LimitsConfigFile struct {
 	MaxBatchMutations   int   `json:"max_batch_mutations,omitempty"`
 }
 
+// PebbleConfigFile carries optional Pebble storage overrides. Zero values
+// select production defaults; positive values override them (used by live
+// scenarios that must shrink the cache/memtables or stall compactions).
+type PebbleConfigFile struct {
+	CacheBytes                  int64  `json:"cache_bytes,omitempty"`
+	MemTableBytes               uint64 `json:"memtable_bytes,omitempty"`
+	MemTableCount               int    `json:"memtable_count,omitempty"`
+	MaxOpenFiles                int    `json:"max_open_files,omitempty"`
+	MaxConcurrentCompactions    int    `json:"max_concurrent_compactions,omitempty"`
+	DisableAutomaticCompactions bool   `json:"disable_automatic_compactions,omitempty"`
+}
+
 type PeerConfig struct {
 	NodeID string   `json:"node_id"`
 	Addrs  []string `json:"addrs"`
@@ -95,6 +113,8 @@ func main() {
 
 	subcmd := os.Args[1]
 	switch subcmd {
+	case "migrate-origin-baseline":
+		runOriginMigration(os.Args[2:])
 	case "agent":
 		runAgent(os.Args[2:])
 	case "unlock":
@@ -215,7 +235,7 @@ func runAgent(args []string) {
 		dbID = id
 	}
 
-	log.Printf("[SPEDSQL] Starting node %s on repl=%s api=%s data=%s await-unlock=%v",
+	log.Printf("[MURMUR] Starting node %s on repl=%s api=%s data=%s await-unlock=%v",
 		nodeID, cfg.ListenAddr, cfg.APIAddr, cfg.DataDir, cfg.AwaitUnlock)
 
 	daemon := &NodeDaemon{
@@ -225,26 +245,28 @@ func runAgent(args []string) {
 	}
 
 	if err := daemon.Start(); err != nil {
-		log.Fatalf("[SPEDSQL] Failed to start node: %v", err)
+		log.Fatalf("[MURMUR] Failed to start node: %v", err)
 	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
-	log.Printf("[SPEDSQL] Received signal %v, shutting down...", sig)
+	log.Printf("[MURMUR] Received signal %v, shutting down...", sig)
 	daemon.Close()
-	log.Printf("[SPEDSQL] Node shutdown complete.")
+	log.Printf("[MURMUR] Node shutdown complete.")
 }
 
 type NodeDaemon struct {
-	cfg        NodeConfigFile
-	nodeID     db.NodeID
-	dbID       db.DBID
-	mu         sync.Mutex
-	database   *db.DB
-	httpServer *http.Server
-	promReg    *prometheus.Registry
-	bridge     *bridgeRuntime
+	originRegistry  *origin.KeyRegistry
+	originMigration bool
+	cfg             NodeConfigFile
+	nodeID          db.NodeID
+	dbID            db.DBID
+	mu              sync.Mutex
+	database        *db.DB
+	httpServer      *http.Server
+	promReg         *prometheus.Registry
+	bridge          *bridgeRuntime
 }
 
 func (d *NodeDaemon) apiTLSConfig() (*tls.Config, error) {
@@ -329,11 +351,14 @@ func (d *NodeDaemon) Start() error {
 	mux.HandleFunc("/v1/admin/status", d.handleAdminStatus)
 	mux.HandleFunc("/v1/admin/lock", d.handleAdminLock)
 	mux.HandleFunc("/v1/admin/add_peer", d.handleAdminAddPeer)
+	mux.HandleFunc("/v1/admin/authorize_origin", d.handleAuthorizeOrigin)
 	mux.HandleFunc("/v1/admin/remove_peer", d.handleAdminRemovePeer)
 
 	mux.HandleFunc("/v1/status", d.handleServiceStatus)
 	mux.HandleFunc("/v1/query", d.handleServiceQuery)
 	mux.HandleFunc("/v1/exec", d.handleServiceExec)
+	mux.HandleFunc("/v1/crdt", d.handleMerge)
+	mux.HandleFunc("/v1/crdt/state", d.handleMergeState)
 	mux.HandleFunc("/v1/subscribe", d.handleServiceSubscribe)
 
 	mux.HandleFunc("/v1/files/upload", d.handleFilesUpload)
@@ -352,6 +377,7 @@ func (d *NodeDaemon) Start() error {
 	mux.HandleFunc("/v1/admin/rotate-key", d.handleAdminRotateKey)
 	mux.HandleFunc("/v1/admin/encryption-status", d.handleAdminEncryptionStatus)
 	mux.HandleFunc("/v1/debug/peers", d.handleDebugPeers)
+	mux.HandleFunc("/v1/debug/receipt", d.handleDebugReceipt)
 	mux.HandleFunc("/v1/debug/stacks", d.handleDebugStacks)
 
 	// Fallback health check
@@ -377,7 +403,7 @@ func (d *NodeDaemon) Start() error {
 
 	go func() {
 		if err := d.httpServer.ServeTLS(ln, "", ""); err != nil && err != http.ErrServerClosed {
-			log.Printf("[SPEDSQL] HTTPS API server error: %v", err)
+			log.Printf("[MURMUR] HTTPS API server error: %v", err)
 		}
 	}()
 
@@ -434,6 +460,36 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 				AdvertiseAddr: d.cfg.ListenAddr,
 			},
 		},
+	}
+	signingKey, err := os.ReadFile(d.cfg.OriginSigningKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("read origin signing key: %w", err)
+	}
+	trusted, err := origin.NewKeyRegistry(nil)
+	if err != nil {
+		return nil, err
+	}
+	for node, raw := range d.cfg.OriginPublicKeys {
+		id, err := db.ParseNodeID(node)
+		if err != nil {
+			return nil, err
+		}
+		pub, err := hex.DecodeString(raw)
+		if err != nil {
+			return nil, err
+		}
+		if err := trusted.Add(id, ed25519.PublicKey(pub)); err != nil {
+			return nil, err
+		}
+	}
+	d.originRegistry = trusted
+	dbCfg.OriginSigning = db.OriginSigningConfig{PrivateKey: ed25519.PrivateKey(signingKey), TrustedKeys: trusted}
+	for _, node := range d.cfg.TrustedSnapshotSources {
+		id, err := db.ParseNodeID(node)
+		if err != nil {
+			return nil, err
+		}
+		dbCfg.Replication.TrustedSnapshotSources = append(dbCfg.Replication.TrustedSnapshotSources, id)
 	}
 	for _, peerID := range d.cfg.AllowedPeers {
 		id, err := db.ParseNodeID(peerID)
@@ -556,6 +612,26 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 			dbCfg.MaxBatchMutations = lc.MaxBatchMutations
 		}
 	}
+	if pc := d.cfg.Pebble; pc != nil {
+		if pc.CacheBytes > 0 {
+			dbCfg.Pebble.CacheBytes = pc.CacheBytes
+		}
+		if pc.MemTableBytes > 0 {
+			dbCfg.Pebble.MemTableBytes = pc.MemTableBytes
+		}
+		if pc.MemTableCount > 0 {
+			dbCfg.Pebble.MemTableCount = pc.MemTableCount
+		}
+		if pc.MaxOpenFiles > 0 {
+			dbCfg.Pebble.MaxOpenFiles = pc.MaxOpenFiles
+		}
+		if pc.MaxConcurrentCompactions > 0 {
+			dbCfg.Pebble.MaxConcurrentCompactions = pc.MaxConcurrentCompactions
+		}
+		if pc.DisableAutomaticCompactions {
+			dbCfg.Pebble.DisableAutomaticCompactions = true
+		}
+	}
 
 	// Configure initial peers
 	for _, p := range d.cfg.Peers {
@@ -597,6 +673,9 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 		}
 	}
 
+	if d.originMigration {
+		return nil, db.MigrateOriginBaseline(ctx, dbCfg)
+	}
 	instance, err := db.Open(ctx, dbCfg)
 	if err != nil {
 		return nil, fmt.Errorf("db.Open: %w", err)
@@ -646,7 +725,7 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 		return nil, fmt.Errorf("init bridge: %w", err)
 	}
 
-	log.Printf("[SPEDSQL] Database unlocked and online. NodeID: %s", instance.NodeID())
+	log.Printf("[MURMUR] Database unlocked and online. NodeID: %s", instance.NodeID())
 	return instance, nil
 }
 
@@ -818,16 +897,17 @@ func (d *NodeDaemon) handleServiceStatus(w http.ResponseWriter, r *http.Request)
 	st := database.Status()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"state":           st.State.String(),
-		"node_id":         st.NodeID.String(),
-		"db_id":           st.DBID.String(),
-		"hlc":             st.HLC,
-		"local_seq":       st.LocalSeq,
-		"schema_epoch":    st.SchemaEpoch,
-		"peer_count":      st.PeerCount,
-		"connected_peers": st.ConnectedPeers,
-		"selected_peers":  st.SelectedPeers,
-		"uptime_millis":   st.Uptime.Milliseconds(),
+		"state":            st.State.String(),
+		"node_id":          st.NodeID.String(),
+		"db_id":            st.DBID.String(),
+		"hlc":              st.HLC,
+		"state_generation": st.StateGeneration,
+		"local_seq":        st.LocalSeq,
+		"schema_epoch":     st.SchemaEpoch,
+		"peer_count":       st.PeerCount,
+		"connected_peers":  st.ConnectedPeers,
+		"selected_peers":   st.SelectedPeers,
+		"uptime_millis":    st.Uptime.Milliseconds(),
 	})
 }
 

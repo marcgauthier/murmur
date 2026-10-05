@@ -240,3 +240,31 @@ func TestAllowList(t *testing.T) {
 		t.Fatal("unauthorized connection stayed open")
 	}
 }
+
+// TestListenerCloseReleasesPort pins synchronous UDP bind release:
+// quic.Listener.Close alone never frees the socket (its internal
+// Transport is unreachable, so release waits for GC), which raced
+// same-port restarts into silent EADDRINUSE replication death.
+func TestListenerCloseReleasesPort(t *testing.T) {
+	ca, err := GenerateCA(time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	creds := testCreds(t, ca, ids.NewNodeID(), nil)
+	for i := 0; i < 5; i++ {
+		ln, err := Listen("127.0.0.1:0", creds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr()
+		if err := ln.Close(); err != nil {
+			t.Fatal(err)
+		}
+		// Immediate rebind must succeed: no GC dependence, no retry.
+		ln2, err := Listen(addr, creds)
+		if err != nil {
+			t.Fatalf("iteration %d: rebind %s after Close: %v", i, addr, err)
+		}
+		_ = ln2.Close()
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"github.com/marcgauthier/murmur/internal/testdb"
 	"testing"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
@@ -27,7 +28,7 @@ func openHighDBAt(t *testing.T, dir string, node db.NodeID, fs vfs.FS) *db.DB {
 	if fs != nil {
 		pebbleCfg.BaseFS = fs
 	}
-	database, err := db.Open(context.Background(), db.Config{
+	database, err := db.Open(context.Background(), testdb.Configure(db.Config{
 		Path:   dir,
 		NodeID: node,
 		Schema: db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
@@ -40,7 +41,7 @@ func openHighDBAt(t *testing.T, dir string, node db.NodeID, fs vfs.FS) *db.DB {
 		}}},
 		Pebble:     pebbleCfg,
 		Encryption: db.EncryptionConfig{Key: bytes.Repeat([]byte{0x44}, 32), KeyID: "test-key"},
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}

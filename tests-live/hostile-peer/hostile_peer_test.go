@@ -5,13 +5,8 @@
 // must receive no data frames on its data-gated session, and the honest
 // pair must stay converged and responsive throughout.
 //
-// NOTE on far-future HLC: the product has no far-future-HLC rejection path
-// by design (LWW accepts the maximum HLC; the clock-skew suite proves
-// skewed writes win deterministically, and state/store.go Observe() applies
-// no upper bound). The suite therefore does NOT fake a rejection assertion
-// for it; instead the far-future probe documents current behavior (the
-// batch applies and replicates) and asserts the mesh still converges.
-// See the unresolved report for this workstream.
+// Unsigned input from an unprovisioned origin is rejected before schema or
+// HLC processing. Authorized origins still use the existing HLC/LWW rules.
 package hostilepeer_test
 
 import (
@@ -61,7 +56,7 @@ func TestHostilePeerAttacksRejected(t *testing.T) {
 	waitConverged(t, cluster, "hostile_rows", 2, 30*time.Second)
 	preAttack := nodeDigest(t, cluster, target, "hostile_rows")
 
-	baseDeferred := metricValue(t, cluster.Nodes[target].APIAddr, "spedsql_repl_batches_deferred_total")
+	baseOriginUnknown := metricValue(t, cluster.Nodes[target].APIAddr, "spedsql_repl_origin_unknown_total")
 	baseInvalid := metricValue(t, cluster.Nodes[target].APIAddr, "spedsql_repl_batches_invalid_total")
 	baseReceived := metricValue(t, cluster.Nodes[target].APIAddr, "spedsql_repl_batches_received_total")
 	baseSessions := metricValue(t, cluster.Nodes[target].APIAddr, "spedsql_repl_sessions_opened_total")
@@ -78,8 +73,8 @@ func TestHostilePeerAttacksRejected(t *testing.T) {
 	var seen []*replication.Frame
 
 	// Forged batch: well-framed and structurally valid, but carrying a
-	// writer schema the node never published. Must be deferred (unknown
-	// schema), never applied.
+	// writer schema the node never published. Origin trust rejects it before
+	// schema synchronization, so it must never apply.
 	forged := &codec.MutationBatch{
 		ProtocolVersion: replication.ProtocolVersion,
 		TxID:            ids.NewTxID(),
@@ -94,7 +89,7 @@ func TestHostilePeerAttacksRejected(t *testing.T) {
 	}
 	forgedPayload := replication.EncodeBatches(nil, []*codec.MutationBatch{forged})
 	// Non-vacuous guard: the forged payload decodes cleanly, so the live
-	// rejection below is semantic (unknown schema), not a parse failure.
+	// rejection below is origin authorization, not a parse failure.
 	if _, err := replication.DecodeBatches(forgedPayload, codec.DefaultLimits()); err != nil {
 		t.Fatalf("forged batch does not decode locally: %v", err)
 	}
@@ -122,7 +117,7 @@ func TestHostilePeerAttacksRejected(t *testing.T) {
 	replayHello := replication.EncodeHello(nil, &replication.Hello{
 		ProtocolVersion: replication.ProtocolVersion, MinProtocolVersion: replication.MinProtocolVersion,
 		NodeID: atk.id, DBID: atk.dbid, SchemaEpoch: 9999, SchemaHash: randomHash(),
-		Capabilities: replication.CapZstd, MaxTransactionBytes: 64 << 20,
+		Capabilities: replication.CapMergePolicies | replication.CapZstd | replication.CapOriginSignatures, MaxTransactionBytes: 64 << 20,
 	})
 	watched.send(t, replication.MsgHello, 0, replayHello)
 	errFrames := watched.collectUntil(10*time.Second, func(fr *replication.Frame) bool {
@@ -151,7 +146,7 @@ func TestHostilePeerAttacksRejected(t *testing.T) {
 	assertNoDataFrames(t, seen)
 
 	// Rejection counters must have moved; no attack batch may have applied.
-	waitMetricDelta(t, cluster.Nodes[target].APIAddr, "spedsql_repl_batches_deferred_total", baseDeferred, 1, 15*time.Second)
+	waitMetricDelta(t, cluster.Nodes[target].APIAddr, "spedsql_repl_origin_unknown_total", baseOriginUnknown, 1, 15*time.Second)
 	waitMetricDelta(t, cluster.Nodes[target].APIAddr, "spedsql_repl_batches_invalid_total", baseInvalid, 4, 15*time.Second)
 	if got := metricValue(t, cluster.Nodes[target].APIAddr, "spedsql_repl_batches_received_total"); got != baseReceived {
 		t.Fatalf("batches_received moved %v -> %v during attacks (an attack batch applied)", baseReceived, got)
@@ -237,9 +232,8 @@ func TestHostilePeerAttacksRejected(t *testing.T) {
 	// Every attack handshake attached (and the node is still counting).
 	waitMetricDelta(t, cluster.Nodes[target].APIAddr, "spedsql_repl_sessions_opened_total", baseSessions, float64(handshakes), 15*time.Second)
 
-	// --- P-HLC: far-future-HLC batch (resilience, NOT rejection: the
-	// product accepts max-HLC by design). The batch applies and replicates;
-	// the mesh must still converge with identical digests.
+	// --- P-HLC: unsigned far-future input from an untrusted origin must be
+	// rejected before HLC observation; the mesh stays responsive.
 	hlcSess := atk.dialMismatch(t, nodeAddr, nodeID)
 	handshakes++
 	hlcSess.send(t, replication.MsgSchemaRequest, 0,
@@ -306,8 +300,8 @@ func TestHostilePeerAttacksRejected(t *testing.T) {
 		t.Fatalf("no pong after far-future batch send")
 	}
 	hlcSess.close()
-	// Accepted by design: both honest nodes must converge WITH the row.
-	waitConverged(t, cluster, "hostile_rows", 3, 30*time.Second)
+	// The unprovisioned origin is rejected before HLC observation; the honest pair stays unchanged.
+	waitConverged(t, cluster, "hostile_rows", 2, 30*time.Second)
 
 	// --- Positive control (post-attack): the pair stays responsive and
 	// converged; schema identity untouched by the attacks.
@@ -317,11 +311,11 @@ func TestHostilePeerAttacksRejected(t *testing.T) {
 	if err := cluster.ExecSQL(1, "INSERT INTO hostile_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 4), "post-attack-1"); err != nil {
 		t.Fatalf("post-attack insert node2: %v", err)
 	}
-	waitConverged(t, cluster, "hostile_rows", 4, 30*time.Second)
+	waitConverged(t, cluster, "hostile_rows", 3, 30*time.Second)
 	if err := cluster.ExecSQL(0, "INSERT INTO hostile_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 5), "post-attack-2"); err != nil {
 		t.Fatalf("post-attack insert node1: %v", err)
 	}
-	waitConverged(t, cluster, "hostile_rows", 5, 30*time.Second)
+	waitConverged(t, cluster, "hostile_rows", 4, 30*time.Second)
 }
 
 func mkBatch(origin ids.NodeID, seq, hlc uint64, proto uint16, epoch uint64) *codec.MutationBatch {

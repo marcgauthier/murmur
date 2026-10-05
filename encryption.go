@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"fmt"
@@ -95,17 +95,17 @@ func (c EncryptionConfig) validate() error {
 	hasKey := len(c.Key) > 0
 	hasProvider := c.Provider != nil
 	if hasKey == hasProvider {
-		return fmt.Errorf("replicateddb: exactly one of Encryption.Key or Encryption.Provider is required")
+		return fmt.Errorf("murmur: exactly one of Encryption.Key or Encryption.Provider is required")
 	}
 	if c.KeyID == "" {
-		return fmt.Errorf("replicateddb: Encryption.KeyID is required")
+		return fmt.Errorf("murmur: Encryption.KeyID is required")
 	}
 	alg := c.Algorithm
 	if alg == "" {
 		alg = AES256GCM
 	}
 	if _, err := parseAlgorithm(alg); err != nil {
-		return fmt.Errorf("replicateddb: Encryption.Algorithm: %w", err)
+		return fmt.Errorf("murmur: Encryption.Algorithm: %w", err)
 	}
 	keyAlg := c.KeyAlgorithm
 	if keyAlg == "" {
@@ -113,7 +113,7 @@ func (c EncryptionConfig) validate() error {
 	}
 	keyAlgID, err := parseAlgorithm(keyAlg)
 	if err != nil {
-		return fmt.Errorf("replicateddb: Encryption.KeyAlgorithm: %w", err)
+		return fmt.Errorf("murmur: Encryption.KeyAlgorithm: %w", err)
 	}
 	if hasKey {
 		want, err := keyAlgID.KeySize()
@@ -121,12 +121,12 @@ func (c EncryptionConfig) validate() error {
 			return err
 		}
 		if len(c.Key) != want {
-			return fmt.Errorf("replicateddb: Encryption.Key must be %d bytes for %s, got %d",
+			return fmt.Errorf("murmur: Encryption.Key must be %d bytes for %s, got %d",
 				want, keyAlg, len(c.Key))
 		}
 	}
 	if c.DataKeyRotation <= 0 {
-		return fmt.Errorf("replicateddb: Encryption.DataKeyRotation must be positive")
+		return fmt.Errorf("murmur: Encryption.DataKeyRotation must be positive")
 	}
 	return nil
 }
@@ -193,24 +193,24 @@ func checkOpenKeyMaterial(mat KeyMaterial) error {
 // algorithm, matching length.
 func validateKeyMaterial(currentID string, m KeyMaterial) error {
 	if m.ID == "" {
-		return fmt.Errorf("replicateddb: rotation requires a new application-key ID")
+		return fmt.Errorf("murmur: rotation requires a new application-key ID")
 	}
 	if m.ID == currentID {
-		return fmt.Errorf("replicateddb: rotation requires a new application-key ID (got current %q)", currentID)
+		return fmt.Errorf("murmur: rotation requires a new application-key ID (got current %q)", currentID)
 	}
 	if m.Algorithm == "" {
-		return fmt.Errorf("replicateddb: rotation requires an explicit supported algorithm")
+		return fmt.Errorf("murmur: rotation requires an explicit supported algorithm")
 	}
 	algID, err := crypto.ParseAlgorithm(m.Algorithm)
 	if err != nil {
-		return fmt.Errorf("replicateddb: rotation algorithm: %w", err)
+		return fmt.Errorf("murmur: rotation algorithm: %w", err)
 	}
 	want, err := algID.KeySize()
 	if err != nil {
-		return fmt.Errorf("replicateddb: rotation algorithm: %w", err)
+		return fmt.Errorf("murmur: rotation algorithm: %w", err)
 	}
 	if len(m.Key) != want {
-		return fmt.Errorf("replicateddb: rotation key must be %d bytes for %s, got %d",
+		return fmt.Errorf("murmur: rotation key must be %d bytes for %s, got %d",
 			want, m.Algorithm, len(m.Key))
 	}
 	return nil

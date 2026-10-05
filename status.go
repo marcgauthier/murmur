@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"log/slog"

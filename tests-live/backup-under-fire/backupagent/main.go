@@ -17,6 +17,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -28,6 +29,7 @@ import (
 
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/origin"
 )
 
 var out = bufio.NewWriter(os.Stdout)
@@ -54,6 +56,8 @@ func main() {
 	caFile := flag.String("ca", "", "cluster CA PEM file")
 	certFile := flag.String("cert", "", "agent node cert PEM file")
 	keyFile := flag.String("key", "", "agent node key PEM file")
+	originKeyFile := flag.String("origin-key", "", "Ed25519 private key file")
+	originKeysFile := flag.String("origin-public-keys", "", "explicit NodeID/public key JSON registry")
 	table := flag.String("table", "", "table for WAIT/COUNT readiness")
 	flag.Parse()
 
@@ -105,20 +109,54 @@ func main() {
 		}
 		peers = append(peers, db.Peer{NodeID: id, Addrs: []string{addr}})
 	}
+	originKey, err := os.ReadFile(*originKeyFile)
+	if err != nil {
+		fail("read signing key: %v", err)
+	}
+	originKeysRaw, err := os.ReadFile(*originKeysFile)
+	if err != nil {
+		fail("read origin keys: %v", err)
+	}
+	var encodedKeys map[string]string
+	if err := json.Unmarshal(originKeysRaw, &encodedKeys); err != nil {
+		fail("parse origin keys: %v", err)
+	}
+	keys := make(map[db.NodeID]ed25519.PublicKey)
+	for textID, textKey := range encodedKeys {
+		id, err := db.ParseNodeID(textID)
+		if err != nil {
+			fail("parse origin: %v", err)
+		}
+		key, err := hex.DecodeString(textKey)
+		if err != nil {
+			fail("parse origin key: %v", err)
+		}
+		keys[id] = key
+	}
+	registry, err := origin.NewKeyRegistry(keys)
+	if err != nil {
+		fail("origin registry: %v", err)
+	}
+	var snapshotSources []db.NodeID
+	for _, peer := range peers {
+		snapshotSources = append(snapshotSources, peer.NodeID)
+	}
 
 	ctx := context.Background()
 	handle, err := db.Open(ctx, db.Config{
-		Path:   *pebbleDir,
-		NodeID: nodeID,
-		DBID:   dbID,
-		Schema: schemaCfg,
-		Pebble: db.DefaultPebbleConfig(),
+		OriginSigning: db.OriginSigningConfig{PrivateKey: originKey, TrustedKeys: registry},
+		Path:          *pebbleDir,
+		NodeID:        nodeID,
+		DBID:          dbID,
+		Schema:        schemaCfg,
+		Pebble:        db.DefaultPebbleConfig(),
 		Encryption: db.EncryptionConfig{
 			Key:   key,
 			KeyID: *keyID,
 		},
 		Replication: db.ReplicationConfig{
-			ListenAddr: *replAddr,
+			TrustedSnapshotSources: snapshotSources,
+			ListenAddr:             *replAddr,
 			TLS: &db.TLSCredential{
 				CertPEM: certPEM,
 				KeyPEM:  keyPEM,

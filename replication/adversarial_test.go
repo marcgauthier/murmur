@@ -56,7 +56,7 @@ func (f *fakeApplier) count() int {
 }
 
 func TestOnBatchesUsesBoundedAtomicApplyGroups(t *testing.T) {
-	store, err := state.Open(t.TempDir(), ids.NewNodeID(), ids.NewDBID(), state.Options{Limits: codec.DefaultLimits()})
+	store, err := openSignedFixture(t.TempDir(), ids.NewNodeID(), fixtureDBID, state.Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestOnBatchesUsesBoundedAtomicApplyGroups(t *testing.T) {
 		{ProtocolVersion: ProtocolVersion, TxID: ids.NewTxID(), OriginNode: origin, Sequence: 1, HLC: 10, SchemaEpoch: 1, Mutations: []codec.Mutation{{TableID: 1, RowID: ids.NewRowID(), ColumnID: 1, Value: codec.Int(1)}}},
 		{ProtocolVersion: ProtocolVersion, TxID: ids.NewTxID(), OriginNode: origin, Sequence: 2, HLC: 20, SchemaEpoch: 1, Mutations: []codec.Mutation{{TableID: 1, RowID: ids.NewRowID(), ColumnID: 1, Value: codec.Int(2)}}},
 	}
-	if err := m.onBatches(p, nil, EncodeBatches(nil, batches)); err != nil {
+	if err := m.onBatches(p, nil, encodeBatchesFixture(nil, batches)); err != nil {
 		t.Fatal(err)
 	}
 	if len(applier.groups) != 1 || len(applier.groups[0]) != 2 {
@@ -100,7 +100,7 @@ func newTestCluster(t *testing.T) *testCluster {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &testCluster{ca: ca, dbid: ids.NewDBID()}
+	return &testCluster{ca: ca, dbid: fixtureDBID}
 }
 
 func (c *testCluster) creds(t *testing.T, id ids.NodeID) *transport.Credentials {
@@ -119,7 +119,7 @@ func (c *testCluster) creds(t *testing.T, id ids.NodeID) *transport.Credentials 
 // testManager starts a manager with a live listener and returns its address.
 func (c *testCluster) testManager(t *testing.T, node ids.NodeID, epoch uint64) (*Manager, *fakeApplier, string) {
 	t.Helper()
-	st, err := state.Open(t.TempDir(), node, c.dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
+	st, err := openSignedFixture(t.TempDir(), node, c.dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func (c *testCluster) rawClient(t *testing.T, ctx context.Context, addr string,
 	if err := WriteFrame(stream, MsgHello, 0, EncodeHello(nil, &Hello{
 		ProtocolVersion: ProtocolVersion, MinProtocolVersion: MinProtocolVersion,
 		NodeID: self, DBID: c.dbid, SchemaEpoch: epoch, SchemaHash: hash,
-		Capabilities: CapZstd,
+		Capabilities: CapMergePolicies | CapOriginSignatures | (CapZstd),
 	})); err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestAdversarialUnknownMessageSurvived(t *testing.T) {
 	}
 	// Session still live: a valid batch applies.
 	if err := WriteFrame(stream, MsgBatches, 0,
-		EncodeBatches(nil, []*codec.MutationBatch{validTestBatch(peer, 1)})); err != nil {
+		encodeBatchesFixture(nil, []*codec.MutationBatch{validTestBatch(peer, 1)})); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -258,7 +258,7 @@ func TestAdversarialBadBatchEncodingClosesSession(t *testing.T) {
 	// The manager itself survives: a fresh session replicates fine.
 	_, stream2 := c.rawClient(t, ctx, addr, peer, server, 1)
 	if err := WriteFrame(stream2, MsgBatches, 0,
-		EncodeBatches(nil, []*codec.MutationBatch{validTestBatch(peer, 1)})); err != nil {
+		encodeBatchesFixture(nil, []*codec.MutationBatch{validTestBatch(peer, 1)})); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -281,7 +281,7 @@ func TestAdversarialOversizeValueSkipped(t *testing.T) {
 
 	big := validTestBatch(peer, 1)
 	big.Mutations[0].Value = codec.Text(string(make([]byte, 1024)))
-	if err := WriteFrame(stream, MsgBatches, 0, EncodeBatches(nil, []*codec.MutationBatch{big})); err != nil {
+	if err := WriteFrame(stream, MsgBatches, 0, encodeBatchesFixture(nil, []*codec.MutationBatch{big})); err != nil {
 		t.Fatal(err)
 	}
 	// Oversize decode fails the frame: session ends, nothing applied.
@@ -373,7 +373,7 @@ func TestAdversarialInvalidBatchesSkippedSessionLives(t *testing.T) {
 		mkbatch(func(b *codec.MutationBatch) { b.ProtocolVersion = 99 }),
 		mkbatch(func(b *codec.MutationBatch) { b.OriginNode = ids.NodeID{} }),
 	}
-	if err := WriteFrame(stream, MsgBatches, 0, EncodeBatches(nil, cases)); err != nil {
+	if err := WriteFrame(stream, MsgBatches, 0, encodeBatchesFixture(nil, cases)); err != nil {
 		t.Fatal(err)
 	}
 	// Session alive: ping/pong round-trips.
@@ -415,7 +415,7 @@ func TestHandshakeWrongDBIDRejected(t *testing.T) {
 	hash[0] = 1
 	if err := WriteFrame(stream, MsgHello, 0, EncodeHello(nil, &Hello{
 		ProtocolVersion: ProtocolVersion, MinProtocolVersion: MinProtocolVersion,
-		NodeID: peer, DBID: ids.NewDBID(), SchemaEpoch: 1, SchemaHash: hash,
+		NodeID: peer, DBID: ids.DBID{0xff}, SchemaEpoch: 1, SchemaHash: hash,
 	})); err != nil {
 		t.Fatal(err)
 	}

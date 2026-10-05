@@ -18,7 +18,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -42,7 +41,7 @@ type attempt struct {
 }
 
 func TestFileCrashLeavesNoPartialOrPhantom(t *testing.T) {
-	bigMB := envInt("SPEDSQL_FILES_CRASH_BIG_MB", 3)
+	bigMB := envInt("MURMUR_FILES_CRASH_BIG_MB", 3)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:     "files-crash",
 		NumNodes: 2,
@@ -488,7 +487,7 @@ func hexOf(data []byte) string {
 }
 
 func envInt(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {
 		return v
 	}
 	return fallback

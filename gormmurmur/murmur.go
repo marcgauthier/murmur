@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"strconv"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	core "github.com/marcgauthier/murmur"
 	"gorm.io/gorm"
 	"gorm.io/gorm/callbacks"
 	"gorm.io/gorm/clause"
@@ -29,11 +29,11 @@ type Dialector struct {
 type Config struct {
 	// DB is the embedded engine. It must already be open (which
 	// requires at least one table; see GenesisTables).
-	DB *replicateddb.DB
+	DB *core.DB
 }
 
 // Open builds the dialect on an open engine handle.
-func Open(db *replicateddb.DB) gorm.Dialector {
+func Open(db *core.DB) gorm.Dialector {
 	return Dialector{Config: Config{DB: db}}
 }
 
@@ -52,7 +52,7 @@ func (d Dialector) Initialize(db *gorm.DB) error {
 	if d.Config.DB == nil {
 		return fmt.Errorf("murmur: Config.DB is required (open the engine first)")
 	}
-	db.ConnPool = sql.OpenDB(replicateddb.NewConnector(d.Config.DB))
+	db.ConnPool = sql.OpenDB(core.NewConnector(d.Config.DB))
 
 	var version string
 	if err := db.ConnPool.QueryRowContext(context.Background(), "select sqlite_version()").Scan(&version); err != nil {

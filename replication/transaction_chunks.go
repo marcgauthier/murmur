@@ -22,6 +22,10 @@ func (m *Manager) onTransactionChunk(p *peerState, raw []byte) error {
 	if err != nil {
 		return err
 	}
+	if err := m.cfg.Store.VerifyOriginChunk(chunk); err != nil {
+		m.recordOriginFailure(err)
+		return err
+	}
 	if err := m.waitTransfer(p, len(raw)); err != nil {
 		if errors.Is(err, overload.ErrOverloaded) {
 			m.queueRetryError(p, ErrOverloadedCode, retryHint(chunk.Origin, chunk.Sequence))

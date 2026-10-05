@@ -32,6 +32,8 @@ The current state must be sufficient to rebuild SQLite without replaying histori
 
 ## 14. Pebble Key Layout
 
+Signed transactions persist their complete origin proof. Fresh stores use format/minimum reader/minimum writer 5; signed format-4 stores require offline merge-policy migration and unsigned legacy stores require trusted-baseline migration. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
+
 Use binary prefixes.
 
 Suggested layout:
@@ -347,3 +349,5 @@ Current `/state/...` values remain untouched.
 If D stays offline beyond log retention and logs through its needed sequence are removed, D is required to snapshot-resync.
 
 ---
+
+Current schema-level counter, set and extrema behavior, causal storage, signed wire formats, bridge ownership and upgrade requirements are specified in [merge policies](merge-policies.md). LWW remains the default.

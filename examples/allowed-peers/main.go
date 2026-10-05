@@ -10,12 +10,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"net"
 	"os"
 	"time"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/transport"
 )
@@ -29,7 +30,7 @@ func freePort() int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-func count(ctx context.Context, db *replicateddb.DB) int {
+func count(ctx context.Context, db *murmur.DB) int {
 	var n int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM notes`).Scan(&n); err != nil {
 		log.Fatal(err)
@@ -37,7 +38,7 @@ func count(ctx context.Context, db *replicateddb.DB) int {
 	return n
 }
 
-func waitCount(ctx context.Context, db *replicateddb.DB, want int, timeout time.Duration) {
+func waitCount(ctx context.Context, db *murmur.DB, want int, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if count(ctx, db) == want {
@@ -50,7 +51,7 @@ func waitCount(ctx context.Context, db *replicateddb.DB, want int, timeout time.
 
 func main() {
 	ctx := context.Background()
-	base, err := os.MkdirTemp("", "spedsql-allowlist-*")
+	base, err := os.MkdirTemp("", "murmur-allowlist-*")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -60,21 +61,21 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	dbid := replicateddb.NewDBID()
+	dbid := murmur.NewDBID()
 
 	const nodes = 3
-	ids := make([]replicateddb.NodeID, nodes)
+	ids := make([]murmur.NodeID, nodes)
 	addrs := make([]string, nodes)
-	dbs := make([]*replicateddb.DB, nodes)
+	dbs := make([]*murmur.DB, nodes)
 	for i := range ids {
-		ids[i] = replicateddb.NewNodeID()
+		ids[i] = murmur.NewNodeID()
 		addrs[i] = fmt.Sprintf("127.0.0.1:%d", freePort())
 	}
 	for i := range dbs {
-		var peers []replicateddb.Peer
+		var peers []murmur.Peer
 		for j := range ids {
 			if i != j {
-				peers = append(peers, replicateddb.Peer{NodeID: ids[j], Addrs: []string{addrs[j]}})
+				peers = append(peers, murmur.Peer{NodeID: ids[j], Addrs: []string{addrs[j]}})
 			}
 		}
 		certPEM, keyPEM, err := ca.IssueNode(ids[i], 24*time.Hour)
@@ -83,19 +84,19 @@ func main() {
 		}
 		// Nodes 1 and 2 admit only each other; node 3 admits
 		// everyone but nobody admits node 3.
-		var allowed []replicateddb.NodeID
+		var allowed []murmur.NodeID
 		if i < 2 {
-			allowed = []replicateddb.NodeID{ids[1-i]}
+			allowed = []murmur.NodeID{ids[1-i]}
 		}
 		dir, err := os.MkdirTemp(base, fmt.Sprintf("node%d-", i+1))
 		if err != nil {
 			log.Fatal(err)
 		}
-		dbs[i], err = replicateddb.Open(ctx, replicateddb.Config{
+		dbs[i], err = murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 			Path:   dir,
 			NodeID: ids[i],
 			DBID:   dbid,
-			Schema: replicateddb.SchemaConfig{
+			Schema: murmur.SchemaConfig{
 				Version: 1,
 				Tables: []schema.TableSchema{{
 					Name: "notes",
@@ -105,20 +106,20 @@ func main() {
 					},
 				}},
 			},
-			Pebble: replicateddb.DefaultPebbleConfig(),
-			Encryption: replicateddb.EncryptionConfig{
+			Pebble: murmur.DefaultPebbleConfig(),
+			Encryption: murmur.EncryptionConfig{
 				Key:   []byte("0123456789abcdef0123456789abcdef"),
 				KeyID: "allowlist-key",
 			},
-			Replication: replicateddb.ReplicationConfig{
+			Replication: murmur.ReplicationConfig{
 				ListenAddr: addrs[i],
-				TLS: &replicateddb.TLSCredential{
+				TLS: &murmur.TLSCredential{
 					CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: ca.CertPEM,
 				},
 				Peers:        peers,
 				AllowedPeers: allowed,
 			},
-		})
+		}))
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -126,7 +127,7 @@ func main() {
 	}
 
 	for r := 0; r < 2; r++ {
-		id := replicateddb.NewRowID()
+		id := murmur.NewRowID()
 		if _, err := dbs[0].ExecContext(ctx,
 			`INSERT INTO notes (id, body) VALUES (?, ?)`, id[:], fmt.Sprintf("mesh-%d", r)); err != nil {
 			log.Fatal(err)
@@ -142,7 +143,7 @@ func main() {
 	}
 	fmt.Println("mesh converged on nodes 1-2; node 3 received nothing")
 
-	id := replicateddb.NewRowID()
+	id := murmur.NewRowID()
 	if _, err := dbs[2].ExecContext(ctx,
 		`INSERT INTO notes (id, body) VALUES (?, ?)`, id[:], "stranded"); err != nil {
 		log.Fatal(err)

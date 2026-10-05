@@ -11,7 +11,7 @@
 // constants (same package, but the bridge needs a stable contract), so the
 // Bridge-prefixed names below are the contract; they alias the file
 // subsystem's single source of truth.
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -56,7 +56,7 @@ func (db *DB) BridgeFileObjects() *objectstore.Store {
 func (db *DB) bridgeFileIDs() (fileIDs, error) {
 	fids, err := resolveFileIDs()
 	if err != nil {
-		return fileIDs{}, fmt.Errorf("replicateddb: file metadata schema: %w", err)
+		return fileIDs{}, fmt.Errorf("murmur: file metadata schema: %w", err)
 	}
 	return fids, nil
 }
@@ -164,7 +164,7 @@ func (db *DB) ReleaseBridgeFileOwnership(ctx context.Context, row ids.RowID, col
 		return err
 	}
 	if !ok || policy.Owner != BridgeOwnerHigh || policy.SourceDomain.IsZero() {
-		return fmt.Errorf("replicateddb: file field has no releasable Low ownership")
+		return fmt.Errorf("murmur: file field has no releasable Low ownership")
 	}
 	fids, err := db.bridgeFileIDs()
 	if err != nil {
@@ -192,7 +192,7 @@ func (db *DB) ReleaseBridgeFileRowOwnership(ctx context.Context, row ids.RowID) 
 		return err
 	}
 	if !ok || policy.Owner != BridgeOwnerHigh || policy.SourceDomain.IsZero() {
-		return fmt.Errorf("replicateddb: file row has no releasable Low ownership")
+		return fmt.Errorf("murmur: file row has no releasable Low ownership")
 	}
 	fids, err := db.bridgeFileIDs()
 	if err != nil {
@@ -246,7 +246,7 @@ func bridgeFileColumnID(fids fileIDs, columnName string) (uint32, error) {
 	case strings.EqualFold(columnName, BridgeFileColSize):
 		return fids.size, nil
 	default:
-		return 0, fmt.Errorf("replicateddb: unknown file column %q", columnName)
+		return 0, fmt.Errorf("murmur: unknown file column %q", columnName)
 	}
 }
 
@@ -264,7 +264,7 @@ type BridgeFilePut struct {
 // Object bytes install separately; metadata without bytes stays pending.
 func (db *DB) BridgeApplyFileMetadata(ctx context.Context, source ids.DBID, stream string, bundle ids.TxID, first, last uint64, allowHighDelete bool, puts []BridgeFilePut, deletes []ids.RowID) error {
 	if source.IsZero() || stream == "" || len(stream) > 1024 || first == 0 || last < first {
-		return fmt.Errorf("replicateddb: invalid bridge import provenance")
+		return fmt.Errorf("murmur: invalid bridge import provenance")
 	}
 	if len(puts) == 0 && len(deletes) == 0 {
 		return nil
@@ -275,7 +275,7 @@ func (db *DB) BridgeApplyFileMetadata(ctx context.Context, source ids.DBID, stre
 	}
 	for _, p := range puts {
 		if p.Name == "" {
-			return fmt.Errorf("replicateddb: bridge file put has no name")
+			return fmt.Errorf("murmur: bridge file put has no name")
 		}
 		if len(p.Name) > db.cfg.MaxReplicatedValueBytes {
 			return fmt.Errorf("%w: bridge file name %d bytes", ErrValueTooLarge, len(p.Name))
@@ -301,7 +301,7 @@ func (db *DB) BridgeApplyFileMetadata(ctx context.Context, source ids.DBID, stre
 	info := &bridgeImportInfo{SourceDomain: source, Stream: stream, BundleID: bundle, FirstSeq: first, LastSeq: last, AllowHighDelete: allowHighDelete}
 	policyMutations, err := policyMutationsForTx(db, &Tx{txID: txID, bridgeImport: info}, mutations)
 	if err != nil {
-		return fmt.Errorf("replicateddb: bridge policy: %w", err)
+		return fmt.Errorf("murmur: bridge policy: %w", err)
 	}
 	mutations = append(mutations, policyMutations...)
 	// The shared policy builder releases High-owned columns through the
@@ -310,7 +310,7 @@ func (db *DB) BridgeApplyFileMetadata(ctx context.Context, source ids.DBID, stre
 	if allowHighDelete {
 		released, err := bridgeFileDeleteReleases(db, fs.ids, deletes, last)
 		if err != nil {
-			return fmt.Errorf("replicateddb: bridge policy: %w", err)
+			return fmt.Errorf("murmur: bridge policy: %w", err)
 		}
 		mutations = append(mutations, released...)
 	}
@@ -356,7 +356,7 @@ func (db *DB) BridgePutFileObject(ctx context.Context, src io.Reader) (objectsto
 		return zero, 0, err
 	}
 	if src == nil {
-		return zero, 0, fmt.Errorf("replicateddb: file content reader is required")
+		return zero, 0, fmt.Errorf("murmur: file content reader is required")
 	}
 	maxBytes := db.cfg.Files.MaxFileBytes
 	info, err := fs.objects.Put(ctx, io.LimitReader(src, maxBytes+1))

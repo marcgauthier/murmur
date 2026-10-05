@@ -10,10 +10,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
 )
 
@@ -21,16 +22,16 @@ func main() {
 	ctx := context.Background()
 
 	// Every node needs a directory for its durable Pebble store.
-	dir, err := os.MkdirTemp("", "spedsql-basic-*")
+	dir, err := os.MkdirTemp("", "murmur-basic-*")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
-	db, err := replicateddb.Open(ctx, replicateddb.Config{
+	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path:   dir,
-		NodeID: replicateddb.NewNodeID(),
-		Schema: replicateddb.SchemaConfig{
+		NodeID: murmur.NewNodeID(),
+		Schema: murmur.SchemaConfig{
 			Version: 1,
 			Tables: []schema.TableSchema{{
 				Name: "contacts",
@@ -42,21 +43,21 @@ func main() {
 				},
 			}},
 		},
-		Pebble: replicateddb.DefaultPebbleConfig(),
-		Encryption: replicateddb.EncryptionConfig{
+		Pebble: murmur.DefaultPebbleConfig(),
+		Encryption: murmur.EncryptionConfig{
 			// Demo key. Production deployments load key material
 			// from a file, environment, or KMS via a KeyProvider.
 			Key:   []byte("0123456789abcdef0123456789abcdef"),
 			KeyID: "basic-key",
 		},
-	})
+	}))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
 	for _, name := range []string{"ann", "bob"} {
-		id := replicateddb.NewRowID()
+		id := murmur.NewRowID()
 		if _, err := db.ExecContext(ctx,
 			`INSERT INTO contacts (id, name) VALUES (?, ?)`,
 			id[:], name); err != nil {

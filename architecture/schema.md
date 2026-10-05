@@ -295,3 +295,5 @@ adoptions. Call `DB.LiveSchema` after each `DB.Migrate` and before
 the next `Open` call.
 
 ---
+
+Current schema-level counter, set and extrema behavior, causal storage, signed wire formats, bridge ownership and upgrade requirements are specified in [merge policies](merge-policies.md). LWW remains the default.

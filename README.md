@@ -69,13 +69,29 @@ material to `Open` directly or through a `KeyProvider`. Murmur provides no
 HTTP unlock endpoint. See
 [runtime and diagnostics](architecture/runtime-and-diagnostics.md#optional-service-adapter).
 
+Replication requires Ed25519 origin signatures and protocol v5. Signed format-4 databases need offline `MigrateMergePolicies`; unsigned legacy
+databases need `MigrateOriginBaseline`. Remote snapshots require
+separately trusted source nodes. See [origin signatures](architecture/origin-signatures.md)
+for provisioning, migration, restore and security boundaries.
+
 ## Quick start
 
+The application loads a persisted Ed25519 private key and provisions public
+bindings independently of TLS. `origin` below is
+`github.com/marcgauthier/murmur/origin`; `ed25519` is `crypto/ed25519`.
+
 ```go
-db, err := replicateddb.Open(ctx, replicateddb.Config{
+nodeID := murmur.MustNodeID("00000000-0000-4000-8000-000000000001")
+originKeys, err := origin.NewKeyRegistry(map[murmur.NodeID]ed25519.PublicKey{
+    nodeID: signingPrivateKey.Public().(ed25519.PublicKey),
+    peerID: peerSigningPublicKey,
+})
+if err != nil { return err }
+db, err := murmur.Open(ctx, murmur.Config{
     Path:   "./node-data",
-    NodeID: replicateddb.MustNodeID("..."),
-    Schema: replicateddb.SchemaConfig{
+    NodeID: nodeID,
+    OriginSigning: murmur.OriginSigningConfig{PrivateKey: signingPrivateKey, TrustedKeys: originKeys},
+    Schema: murmur.SchemaConfig{
         Version: 1,
         Tables: []schema.TableSchema{{
             Name: "contacts",
@@ -86,16 +102,17 @@ db, err := replicateddb.Open(ctx, replicateddb.Config{
             },
         }},
     },
-    Pebble: replicateddb.DefaultPebbleConfig(),
-    Encryption: replicateddb.EncryptionConfig{
+    Pebble: murmur.DefaultPebbleConfig(),
+    Encryption: murmur.EncryptionConfig{
         Key:             key32, // or Provider for KMS/file/env sourcing
         KeyID:           "app-key-1",
         DataKeyRotation: 24 * time.Hour,
     },
-    Replication: replicateddb.ReplicationConfig{
+    Replication: murmur.ReplicationConfig{
         ListenAddr: "127.0.0.1:7443",
-        TLS:        &replicateddb.TLSCredential{CertPEM: cert, KeyPEM: key, CAPEM: ca},
-        Peers:      []replicateddb.Peer{{NodeID: peerID, Addrs: []string{"127.0.0.1:7444"}}},
+        TLS:        &murmur.TLSCredential{CertPEM: cert, KeyPEM: key, CAPEM: ca},
+        Peers:      []murmur.Peer{{NodeID: peerID, Addrs: []string{"127.0.0.1:7444"}}},
+        TrustedSnapshotSources: []murmur.NodeID{peerID}, // explicitly trusted for merged recovery
     },
 })
 if err != nil {
@@ -103,19 +120,31 @@ if err != nil {
 }
 defer db.Close()
 
-id := replicateddb.NewRowID()
+id := murmur.NewRowID()
 _, err = db.ExecContext(ctx,
     `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
     id[:], "ann", "613-555-0100")
 ```
 
 For local applications that accept a short loss window after a crash, set
-`Durability: replicateddb.DurabilityConfig{Mode: replicateddb.DurabilityAsync,
+`Durability: murmur.DurabilityConfig{Mode: murmur.DurabilityAsync,
 SyncInterval: time.Second}` in `Config`. Individual commits return without a
 disk sync; the database syncs Pebble about once per second and also syncs on
 graceful close. The default remains a disk sync before each write acknowledgement.
 Pebble still appends to its WAL on each commit, so this setting controls sync
 frequency rather than the exact number of physical disk writes.
+Set `MaxUnsyncedBytes` (for example `10 << 20`) to also sync once roughly
+that many bytes have been written without one; with both triggers set,
+whichever is reached first fires.
+
+Write concurrency comes from the application: run one goroutine per writer
+loop calling `Exec`/`BeginTx` concurrently. A single writer is fsync-bound
+(a few hundred durable tx/s); concurrent writers share one fsync per group
+via synchronous group commit (on by default), so throughput grows with
+writer count — about 3.6x at 4 writers and 5.6x at 8 writers for single-row
+sync inserts on an i5-6500. See [Synchronous group
+commit](architecture/transactions.md#16-local-sql-commit-ordering) and the
+[benchmarks](architecture/benchmarks.md#62-running-the-matrix).
 
 Run the runnable example (the SQLite feature tags are required):
 
@@ -132,12 +161,12 @@ reopen recovery, then a 3-node replicated mesh — lives in `examples/`
 Set `Config.OnOpenProgress` before calling `Open`:
 
 ```go
-cfg.OnOpenProgress = func(p replicateddb.OpenProgress) {
+cfg.OnOpenProgress = func(p murmur.OpenProgress) {
     fmt.Printf("%s: %d cells processed, %d rows loaded, elapsed %s\n",
         p.Phase, p.ProcessedItems, p.RowsInserted,
         p.Elapsed.Round(time.Second))
 }
-db, err := replicateddb.Open(ctx, cfg)
+db, err := murmur.Open(ctx, cfg)
 ```
 
 Callbacks run serially on a dedicated goroutine; forward snapshots to your
@@ -151,7 +180,7 @@ See [startup progress details](architecture/runtime-and-diagnostics.md#startup-p
 ## Schema rules (v1)
 
 Every replicated table must have an explicit `BLOB(16)` primary key
-(generated by the application, e.g. `replicateddb.NewRowID()` — never SQLite
+(generated by the application, e.g. `murmur.NewRowID()` — never SQLite
 rowid/autoincrement). Tables/columns get stable numeric IDs for replication;
 derived deterministically unless set explicitly. Additive evolution only:
 `DB.Migrate` adds tables/columns (never renames/removes); the schema manifest
@@ -161,42 +190,31 @@ or strict refusal). Secondary `UNIQUE` constraints, virtual tables, and
 non-additive DDL are out of scope for v1. Foreign keys are
 application-level (not enforced during remote apply/rebuild).
 
+LWW remains the default. Set `ColumnSchema.MergePolicy` to `schema.PN_COUNTER`
+(TEXT), `schema.OR_SET` (TEXT), or `schema.MAX`/`schema.MIN` (INTEGER or REAL)
+for columns that need different concurrent merge semantics.
+
+Counters use exact arbitrary precision decimal TEXT; sets use typed canonical
+JSON. Update them with `Tx.CounterAdd`, `Tx.SetAdd`, and `Tx.SetRemove`; read them
+with `Tx.CounterValue` and `Tx.SetValues`. Ordinary SQL assignments to counter/set
+columns are rejected, except neutral initialization (`'0'`, `'[]'`, or nullable
+NULL). MAX/MIN accept ordinary numeric SQL writes. Policies are immutable;
+add a new column to introduce different semantics.
+
+```go
+// In SchemaConfig.Tables[].Columns:
+{Name: "count", Type: schema.ColText, MergePolicy: schema.PN_COUNTER},
+{Name: "tags", Type: schema.ColText, MergePolicy: schema.OR_SET},
+```
+
+See [merge policies](architecture/merge-policies.md) for transaction examples,
+High/Low ownership, retained history, limits and the explicit offline
+`MigrateMergePolicies` upgrade from signed format 4 to format 5.
+
 > [!WARNING]
-> **JSON columns are unsafe for multi-value data under replication.**
->
-> SQLite has no native set or array type. JSON values (e.g. `tags TEXT DEFAULT '[]'`)
-> are stored as a single opaque TEXT cell. Murmur uses **per-cell last-writer-wins
-> (LWW)** conflict resolution: when two nodes concurrently modify the same cell,
-> the write with the higher hybrid logical clock timestamp wins and the other is
-> **silently discarded**.
->
-> This means concurrent JSON mutations from different nodes will lose one side:
->
-> ```
-> Node A writes: tags = ["red"]          -- HLC 100
-> Node B writes: tags = ["blue"]         -- HLC 101  ← wins
-> Result after convergence: tags = ["blue"]  ← "red" is lost
-> ```
->
-> **Do not use JSON columns to represent sets, counters, or any multi-value
-> data that may be written concurrently on different nodes.**
->
-> **Safe alternative — normalize into a join table:**
-> ```sql
-> -- Instead of:  posts.tags TEXT  (JSON array)
-> -- Use:
-> CREATE TABLE post_tags (
->     post_id BLOB(16),
->     tag     TEXT,
->     PRIMARY KEY (post_id, tag)
-> );
-> ```
-> Each tag becomes its own row with its own LWW version. Adding `"red"` on Node A
-> and `"blue"` on Node B are independent writes that both survive replication with
-> no conflict.
->
-> The same rule applies to SQLite's `json_*` functions: they operate on a TEXT cell
-> and the cell is what replication sees — not the individual JSON fields inside it.
+> JSON arrays in ordinary LWW TEXT columns still lose concurrent updates.
+> SQLite's `json_*` functions update an opaque scalar cell. Use OR_SET with
+> explicit set operations when concurrent additions/removals must survive.
 
 ### Local-only tables, indexes, views, and FTS
 
@@ -208,7 +226,7 @@ these objects are always consistent with the current replicated state but
 carry zero replication overhead:
 
 ```go
-Schema: replicateddb.SchemaConfig{
+Schema: murmur.SchemaConfig{
     Version: 1,
     Tables: []schema.TableSchema{{
         Name: "contacts",
@@ -251,8 +269,47 @@ MURMUR-SQL/               public API (db.go, transaction.go, config.go, ...)
   example/               runnable single-node example
   examples/              graduated examples: single node → 3-node mesh
   gormmurmur/            GORM dialect for the embedded engine (models, migrator)
+  tool/                  operational CLI utility, REPL shell, diagnostics, and backup manager
   tests-live/             live multi-process integration test scenarios
 ```
+
+## Operational CLI (`murmur`)
+
+The repository includes a standalone, pure-Go CLI tool under `tool/` that provides an interactive SQL REPL shell, offline storage inspection, database verification and repair, cryptographic key inspection, backup/restore lifecycle management, and online cluster diagnostics over mTLS.
+
+### Building the CLI (CGO-Free)
+
+The CLI can be compiled without a C compiler (`CGO_ENABLED=0`):
+
+```sh
+CGO_ENABLED=0 go build -tags modernc -o bin/murmur ./tool
+```
+
+### Quick Commands
+
+```sh
+# Start interactive SQL shell
+./bin/murmur /var/lib/murmur/data
+
+# Run health check scorecard
+./bin/murmur doctor /var/lib/murmur/data
+
+# Verify storage and SQLite materialization integrity
+./bin/murmur verify /var/lib/murmur/data --quick
+
+# Rebuild corrupted SQLite materialization from Pebble
+./bin/murmur repair /var/lib/murmur/data --force
+
+# Create and verify an encrypted backup snapshot
+./bin/murmur backup create /var/lib/murmur/data /backups/backup.tar.gz
+./bin/murmur backup verify /backups/backup.tar.gz
+
+# Inspect remote cluster lag and SWIM membership over mTLS
+./bin/murmur cluster https://node1:8443 --cert=client.crt --key=client.key --ca=ca.crt
+./bin/murmur lag https://node1:8443 --cert=client.crt --key=client.key --ca=ca.crt
+```
+
+See [tool/USAGE.md](tool/USAGE.md) and [architecture/18-operational-tooling.md](architecture/18-operational-tooling.md) for full documentation.
 
 > **Planned:** A standalone `murmurd` daemon (MySQL + PostgreSQL wire frontends,
 > `config.toml`) is deferred and not yet part of this repository.
@@ -296,8 +353,8 @@ The `tests-live/files-soak` scenario repeatedly uploads encrypted file objects
 over a two-node QUIC mesh, checks metadata/search and peer-fetched content
 digests, and records latency SLOs. Run a short pass with
 `go test -count=1 ./tests-live/files-soak`; configure the ten-minute soak with
-`SPEDSQL_FILES_SOAK_DURATION_SECONDS=600` and
-`SPEDSQL_FILES_SOAK_INTERVAL_SECONDS=60`, passing `-timeout=12m` to `go test`.
+`MURMUR_FILES_SOAK_DURATION_SECONDS=600` and
+`MURMUR_FILES_SOAK_INTERVAL_SECONDS=60`, passing `-timeout=12m` to `go test`.
 
 The `tests-live/files-bridge` scenario checks encrypted file transfer from a
 two-node Low mesh through a recipient-sealed bridge into a two-node High mesh,
@@ -307,6 +364,15 @@ delete cascade). Run it with `go test -count=1 ./tests-live/files-bridge`.
 The `tests-live/soak-slo` scenario measures continuous writes and convergence
 on three encrypted replicas. Both have short smoke commands in their local
 READMEs and environment-configurable longer acceptance runs.
+
+The `tests-live/endurance-chaos` scenario overlaps every fault at once
+(writes, restarts, packet loss, latency, disk pressure, clock skew, key
+rotation, snapshots, GC) over one chaos window — 10 minutes by default,
+24–72 hours via `MURMUR_ENDURANCE_DURATION_SECONDS` — and verdicts on
+exact cross-node convergence. Run it with
+`bash tests-live/run.sh endurance-chaos`; see
+[the suite README](tests-live/endurance-chaos/README.md) for the 24h/72h
+profiles and degraded-mode notes.
 
 ## Build, vet, test
 
@@ -327,7 +393,7 @@ go test -tags "$TAGS" ./... -short  # skip soak + 100K benchmarks
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags modernc ./...
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags modernc ./...
 
-# Live multi-process scenarios (applies SPEDSQL_TAGS automatically)
+# Live multi-process scenarios (applies MURMUR_TAGS automatically)
 bash tests-live/run.sh three-node-sync
 bash tests-live/run.sh all   # full live matrix (long)
 ```
@@ -370,11 +436,11 @@ or `-tags modernc` for the pure-Go backend):
 ```sh
 go test ./tests-benchmark/benchmark/ -bench . -short -benchtime 1s   # fast pass, 10K rows
 go test ./tests-benchmark/benchmark/ -bench . -benchtime 1s          # 10K + 100K datasets
-REPLICATEDDB_BENCH_ROWS=1000000 go test ./tests-benchmark/benchmark/ -bench .  # 1M rows
-SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./tests-benchmark/benchmark/ -run '^TestLocalWriterThroughput$' -v -count=1 -timeout=90s  # direct local API, 1 vs 4 writers
-SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./tests-benchmark/benchmark/ -run '^TestLocalPeriodicSyncThroughput$' -v -count=1 -timeout=90s  # one-second disk sync, 1 vs 4 writers
-SPEDSQL_LOCAL_BATCH_BENCH_SECONDS=5 go test ./tests-benchmark/benchmark/ -run '^TestLocalTransactionBatchThroughput$' -v -count=1 -timeout=300s  # 1/10/100/1000 inserts per transaction
-SPEDSQL_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-benchmark/replication/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s  # live multi-process cluster, 1 vs 4 writers
+MURMUR_BENCH_ROWS=1000000 go test ./tests-benchmark/benchmark/ -bench .  # 1M rows
+MURMUR_LOCAL_WRITE_BENCH_SECONDS=10 go test ./tests-benchmark/benchmark/ -run '^TestLocalWriterThroughput$' -v -count=1 -timeout=90s  # direct local API, 1 vs 4 writers
+MURMUR_LOCAL_WRITE_BENCH_SECONDS=10 go test ./tests-benchmark/benchmark/ -run '^TestLocalPeriodicSyncThroughput$' -v -count=1 -timeout=90s  # one-second disk sync, 1 vs 4 writers
+MURMUR_LOCAL_BATCH_BENCH_SECONDS=5 go test ./tests-benchmark/benchmark/ -run '^TestLocalTransactionBatchThroughput$' -v -count=1 -timeout=300s  # 1/10/100/1000 inserts per transaction
+MURMUR_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-benchmark/replication/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s  # live multi-process cluster, 1 vs 4 writers
 ```
 
 The direct local writer benchmark reports acknowledged SQL inserts per second
@@ -411,11 +477,13 @@ No verified release revision is recorded; the static inventory does not certify
 the latest commit or working tree.
 
 Working: local durable engine, pre-update capture, transaction coalescing,
- per-cell LWW + row tombstones, encrypted Pebble, startup rebuild, two-node
+ schema-level LWW/PN_COUNTER/OR_SET/MAX/MIN + row tombstones, encrypted Pebble, startup rebuild, two-node
  QUIC replication with mTLS, conflicting-write convergence, log GC,
  snapshot resync, storage/data-key rotation, maintenance file rewrite, FTS5,
  adaptive remote apply groups (up to 64 contiguous transactions / 64 MiB in one
  synced state commit while preserving per-transaction receipts and sequences),
+ synchronous local group commit (concurrent transactions share one synced
+ Pebble batch, each acknowledged after the shared fsync),
  crash-recoverable prepare records for single remote applies, finalized
  atomically with winners, logs, receipts, watermarks, HLC, and state generation,
  prepared-statement cache, online additive schema migration (`DB.Migrate`)
@@ -518,3 +586,8 @@ recipient-sealed encrypted file object transfer with High-local
 re-encryption, and reordered-delivery reconciliation between Low values and
 High ownership records via same-row shadow cells (all High peers converge
 on High-owned state regardless of arrival order).
+
+## License
+
+Murmur is MIT licensed. See [LICENSE.md](LICENSE.md), which also lists every
+dependency module and its license.

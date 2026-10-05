@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"github.com/marcgauthier/murmur/schema"
+	"math/big"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -152,7 +154,7 @@ func (s *Store) ExportSnapshotContext(ctx context.Context, chunkCells int, fn fu
 }
 
 func (s *Store) snapshotManifest(snap *pebble.Snapshot) (*codec.SnapshotManifest, error) {
-	m := &codec.SnapshotManifest{FormatVersion: 1, SnapshotID: ids.NewTxID(), DBID: s.dbID}
+	m := &codec.SnapshotManifest{FormatVersion: 2, SnapshotID: ids.NewTxID(), DBID: s.dbID}
 	var err error
 	if m.CreatedHLC, err = readU64Snap(snap, sysHLC); err != nil {
 		return nil, err
@@ -249,6 +251,52 @@ func (s *Store) mergeSnapshotChunkWithSet(set func(key, value []byte) error, raw
 	lastKey = prevKey
 	for i := range cells {
 		c := &cells[i]
+		if len(c.RecordKey) > 0 {
+			key := crdtKey(c.TableID, c.RowID, c.ColumnID, c.RecordKey)
+			if lastKey != nil && bytes.Compare(lastKey, key) >= 0 {
+				return nil, false, fmt.Errorf("state: noncanonical causal record order")
+			}
+			lastKey = key
+			policy := s.columnPolicy(c.TableID, c.ColumnID)
+			r := codec.CRDTRecord{Key: c.RecordKey, Data: c.Value.B}
+			if c.Value.Type != codec.TypeBlob {
+				return nil, false, fmt.Errorf("state: invalid causal snapshot record")
+			}
+			if err := validateRecord(policy, r, s.limits.MaxValueBytes); err != nil {
+				return nil, false, err
+			}
+			old, err := s.getDirect(key)
+			take := isNotFound(err)
+			var st codec.CellState
+			if err == nil {
+				st, err = codec.DecodeCellState(old, s.limits)
+				if err != nil {
+					return nil, false, err
+				}
+				if policy == schema.PN_COUNTER {
+					take = new(big.Int).SetBytes(r.Data).Cmp(new(big.Int).SetBytes(st.Value.B)) > 0
+				} else if !bytes.Equal(r.Data, st.Value.B) {
+					return nil, false, fmt.Errorf("state: conflicting snapshot set tag")
+				}
+			} else if !isNotFound(err) {
+				return nil, false, err
+			}
+			if crdt.CompareVersion(c.Version, st.Version) > 0 {
+				st.Version = c.Version
+				take = true
+			}
+			if take {
+				value := c.Value
+				if policy == schema.PN_COUNTER && new(big.Int).SetBytes(st.Value.B).Cmp(new(big.Int).SetBytes(value.B)) > 0 {
+					value = st.Value
+				}
+				if err := set(key, codec.EncodeCellState(nil, codec.CellState{Version: st.Version, Value: value})); err != nil {
+					return nil, false, err
+				}
+				changed = true
+			}
+			continue
+		}
 		if c.ColumnID == codec.ColumnTombstone {
 			key := TombKey(c.TableID, c.RowID)
 			if lastKey != nil && bytes.Compare(lastKey, key) >= 0 {
@@ -276,9 +324,19 @@ func (s *Store) mergeSnapshotChunkWithSet(set func(key, value []byte) error, raw
 		if err != nil {
 			return nil, false, err
 		}
-		if crdt.MergeCell(c.Version, stored.Version, present) == crdt.MergeTake {
+		policy := s.columnPolicy(c.TableID, c.ColumnID)
+		take := crdt.MergeCell(c.Version, stored.Version, present) == crdt.MergeTake
+		value := c.Value
+		if policy != schema.LWW {
+			value, take, err = s.joinSnapshotPolicyCell(c, stored, present)
+			if err != nil {
+				return nil, false, err
+			}
+		}
+
+		if take {
 			changed = true
-			st := codec.CellState{Version: c.Version, Value: c.Value}
+			st := codec.CellState{Version: c.Version, Value: value}
 			if err := set(CellKey(c.TableID, c.RowID, c.ColumnID), codec.EncodeCellState(nil, st)); err != nil {
 				return nil, false, err
 			}
@@ -308,7 +366,7 @@ func (s *Store) ImportSnapshotChunk(ctx context.Context, manifest *codec.Snapsho
 	var res MergeResult
 	s.gate.RLock()
 	defer s.gate.RUnlock()
-	if manifest.FormatVersion != 1 || manifest.SnapshotID.IsZero() || manifest.DBID != s.dbID || manifest.ChunkCount == 0 || manifest.ChunkCount > 65_536 || index >= manifest.ChunkCount || last != (index+1 == manifest.ChunkCount) {
+	if manifest.FormatVersion != 2 || manifest.SnapshotID.IsZero() || manifest.DBID != s.dbID || manifest.ChunkCount == 0 || manifest.ChunkCount > 65_536 || index >= manifest.ChunkCount || last != (index+1 == manifest.ChunkCount) {
 		return res, false, fmt.Errorf("state: invalid snapshot chunk position")
 	}
 	for i, w := range manifest.Watermarks {
@@ -455,7 +513,7 @@ func (s *Store) publishSnapshotAtomic(manifest *codec.SnapshotManifest, chunks [
 	if err := s.checkSnapshotActive(manifest, manifestKey, activeKey); err != nil {
 		return res, false, err
 	}
-	b := s.db.NewBatch()
+	b := s.db.NewIndexedBatch()
 	defer b.Close()
 	changed := false
 	var previousKey []byte
@@ -589,6 +647,9 @@ func (s *Store) readMergeProgress(progressKey []byte) (mergeProgress, error) {
 // crash-safe publication boundary. progressKey is nil for atomic merges.
 func (s *Store) commitSnapshotPublication(b *pebble.Batch, manifest *codec.SnapshotManifest, changed bool, stagePrefix string, manifestKey, activeKey, progressKey []byte) (MergeResult, bool, error) {
 	var res MergeResult
+	if err := s.reprojectSnapshot(b, progressKey == nil); err != nil {
+		return res, false, err
+	}
 	for _, w := range manifest.Watermarks {
 		cur, err := s.recvWatermarkDirect(w.Origin)
 		if err != nil {

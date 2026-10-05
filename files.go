@@ -11,7 +11,7 @@
 // Deletes are row tombstones: a re-upload (newer cell versions) resurrects
 // the file, and concurrent upload/delete pairs resolve deterministically
 // under the standard last-writer-wins visibility rule.
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -125,10 +125,10 @@ type fileStore struct {
 func openFileStore(db *DB) (*fileStore, error) {
 	fids, err := resolveFileIDs()
 	if err != nil {
-		return nil, fmt.Errorf("replicateddb: file metadata schema: %w", err)
+		return nil, fmt.Errorf("murmur: file metadata schema: %w", err)
 	}
 	if t := db.reg.TableByID(fids.table); t != nil {
-		return nil, fmt.Errorf("replicateddb: application table %q collides with the reserved file metadata table %q",
+		return nil, fmt.Errorf("murmur: application table %q collides with the reserved file metadata table %q",
 			t.Name, fileTableName)
 	}
 	filesRoot := filepath.Join(db.cfg.Path, "files")
@@ -139,7 +139,7 @@ func openFileStore(db *DB) (*fileStore, error) {
 		objects, err = objectstore.New(filesRoot, db.cfg.Files.ObjectKey)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("replicateddb: file object store: %w", err)
+		return nil, fmt.Errorf("murmur: file object store: %w", err)
 	}
 	fs := &fileStore{db: db, objects: objects, ids: fids}
 	if err := fs.openFetch(); err != nil {
@@ -155,7 +155,7 @@ func (fs *fileStore) openFetch() error {
 	db := fs.db
 	staging := filepath.Join(db.cfg.Path, "files", "staging")
 	if err := os.MkdirAll(staging, 0700); err != nil {
-		return fmt.Errorf("replicateddb: file staging: %w", err)
+		return fmt.Errorf("murmur: file staging: %w", err)
 	}
 	fetch := &fetchState{
 		staging: staging,
@@ -166,14 +166,14 @@ func (fs *fileStore) openFetch() error {
 	if db.cfg.Files.FetchAddr != "" || len(db.cfg.Files.FetchPeers) > 0 {
 		creds, err := db.meshCreds()
 		if err != nil {
-			return fmt.Errorf("replicateddb: file fetch: %w", err)
+			return fmt.Errorf("murmur: file fetch: %w", err)
 		}
 		fetch.client = filefetch.NewClient(creds)
 	}
 	if db.cfg.Files.FetchAddr != "" {
 		creds, err := db.meshCreds()
 		if err != nil {
-			return fmt.Errorf("replicateddb: file fetch: %w", err)
+			return fmt.Errorf("murmur: file fetch: %w", err)
 		}
 		server, err := filefetch.NewServer(filefetch.ServerConfig{
 			Objects:        fs.objects,
@@ -187,6 +187,14 @@ func (fs *fileStore) openFetch() error {
 			return err
 		}
 		fetch.server = server
+		// Advertise the bound (possibly ephemeral) fetch endpoint via SWIM
+		// so peers discover this source dynamically. Without a membership
+		// service only static FetchPeers apply, as before.
+		if repl := db.replManager(); repl != nil {
+			if ms := repl.Membership(); ms != nil {
+				ms.SetFetchEndpoint(server.Addr())
+			}
+		}
 	}
 	fs.fetch = fetch
 	return nil
@@ -270,7 +278,7 @@ func (db *DB) UploadFile(ctx context.Context, name string, src io.Reader) (FileI
 		return FileInfo{}, err
 	}
 	if name == "" {
-		return FileInfo{}, fmt.Errorf("replicateddb: file name is required")
+		return FileInfo{}, fmt.Errorf("murmur: file name is required")
 	}
 	if len(name) > db.cfg.MaxReplicatedValueBytes {
 		return FileInfo{}, fmt.Errorf("%w: file name %d bytes", ErrValueTooLarge, len(name))
@@ -280,14 +288,14 @@ func (db *DB) UploadFile(ctx context.Context, name string, src io.Reader) (FileI
 		return FileInfo{}, fmt.Errorf("%w: uploads disabled", ErrFileTooLarge)
 	}
 	if src == nil {
-		return FileInfo{}, fmt.Errorf("replicateddb: file content reader is required")
+		return FileInfo{}, fmt.Errorf("murmur: file content reader is required")
 	}
 	// Cap the stream so an unbounded reader cannot fill the disk before
 	// the size check runs. A rejected oversize object is left
 	// unreferenced; FilesGC reclaims it.
 	info, err := fs.objects.Put(ctx, io.LimitReader(src, maxBytes+1))
 	if err != nil {
-		return FileInfo{}, fmt.Errorf("replicateddb: upload %q: %w", name, err)
+		return FileInfo{}, fmt.Errorf("murmur: upload %q: %w", name, err)
 	}
 	if info.Length > maxBytes {
 		return FileInfo{}, fmt.Errorf("%w: %q exceeds %d bytes", ErrFileTooLarge, name, maxBytes)
@@ -300,7 +308,7 @@ func (db *DB) UploadFile(ctx context.Context, name string, src io.Reader) (FileI
 		{TableID: fs.ids.table, RowID: row, ColumnID: fs.ids.size, Value: codec.Int(info.Length)},
 	}
 	if err := fs.commit(mutations); err != nil {
-		return FileInfo{}, fmt.Errorf("replicateddb: upload %q: %w", name, err)
+		return FileInfo{}, fmt.Errorf("murmur: upload %q: %w", name, err)
 	}
 	return FileInfo{Name: name, Digest: info.Digest, Size: info.Length, Chunks: chunkCount(info.Length)}, nil
 }
@@ -315,7 +323,7 @@ func (db *DB) DeleteFile(ctx context.Context, name string) error {
 		return err
 	}
 	if name == "" {
-		return fmt.Errorf("replicateddb: file name is required")
+		return fmt.Errorf("murmur: file name is required")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -324,7 +332,7 @@ func (db *DB) DeleteFile(ctx context.Context, name string) error {
 		{TableID: fs.ids.table, RowID: fileRowID(name), ColumnID: codec.ColumnTombstone, Flags: codec.FlagTombstone},
 	}
 	if err := fs.commit(mutations); err != nil {
-		return fmt.Errorf("replicateddb: delete %q: %w", name, err)
+		return fmt.Errorf("murmur: delete %q: %w", name, err)
 	}
 	return nil
 }
@@ -349,7 +357,7 @@ func (fs *fileStore) commit(mutations []codec.Mutation) error {
 	// writes, so later Low imports protect High-uploaded files.
 	localPolicy, err := policyMutationsForTx(db, &Tx{txID: batch.TxID}, mutations)
 	if err != nil {
-		return fmt.Errorf("replicateddb: bridge policy: %w", err)
+		return fmt.Errorf("murmur: bridge policy: %w", err)
 	}
 	batch.Mutations = append(batch.Mutations, localPolicy...)
 	db.applyMu.Lock()
@@ -399,7 +407,7 @@ func (db *DB) FileStatus(ctx context.Context, name string) (FileStatus, error) {
 		return FileStatus{}, err
 	}
 	if name == "" {
-		return FileStatus{}, fmt.Errorf("replicateddb: file name is required")
+		return FileStatus{}, fmt.Errorf("murmur: file name is required")
 	}
 	if err := ctx.Err(); err != nil {
 		return FileStatus{}, err
@@ -441,15 +449,15 @@ func (fs *fileStore) decode(cells map[uint32]codec.CellState) (string, objectsto
 	var digest objectstore.Digest
 	nameCell, ok := cells[fs.ids.name]
 	if !ok || nameCell.Value.Type != codec.TypeText {
-		return "", digest, 0, fmt.Errorf("replicateddb: file metadata missing name")
+		return "", digest, 0, fmt.Errorf("murmur: file metadata missing name")
 	}
 	digestCell, ok := cells[fs.ids.digest]
 	if !ok || digestCell.Value.Type != codec.TypeBlob || len(digestCell.Value.B) != len(digest) {
-		return "", digest, 0, fmt.Errorf("replicateddb: file metadata missing digest")
+		return "", digest, 0, fmt.Errorf("murmur: file metadata missing digest")
 	}
 	sizeCell, ok := cells[fs.ids.size]
 	if !ok || sizeCell.Value.Type != codec.TypeInteger || sizeCell.Value.I < 0 {
-		return "", digest, 0, fmt.Errorf("replicateddb: file metadata missing size")
+		return "", digest, 0, fmt.Errorf("murmur: file metadata missing size")
 	}
 	copy(digest[:], digestCell.Value.B)
 	return nameCell.Value.S, digest, sizeCell.Value.I, nil
@@ -517,7 +525,7 @@ func (db *DB) scanFiles(ctx context.Context, arg string, limit int, match func(n
 }
 
 // errScanDone aborts a metadata scan once the caller limit is reached.
-var errScanDone = errors.New("replicateddb: file scan limit reached")
+var errScanDone = errors.New("murmur: file scan limit reached")
 
 // FileReader streams verified object bytes. Reads fail closed on any
 // integrity error. Close releases the retention pin; the reader must be
@@ -559,7 +567,7 @@ func (db *DB) OpenFile(ctx context.Context, name string) (*FileReader, error) {
 		return nil, err
 	}
 	if name == "" {
-		return nil, fmt.Errorf("replicateddb: file name is required")
+		return nil, fmt.Errorf("murmur: file name is required")
 	}
 	st, err := fs.status(fileRowID(name))
 	if err != nil {
@@ -578,7 +586,7 @@ func (db *DB) OpenFile(ctx context.Context, name string) (*FileReader, error) {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("%w: %q has no local object bytes", ErrFileUnavailable, name)
 		}
-		return nil, fmt.Errorf("replicateddb: open %q: %w", name, err)
+		return nil, fmt.Errorf("murmur: open %q: %w", name, err)
 	}
 	if err := ctx.Err(); err != nil {
 		_ = pin.Close()
@@ -605,7 +613,7 @@ func mapFileReadErr(name string, err error) error {
 	if os.IsNotExist(err) {
 		return fmt.Errorf("%w: %q has no local object bytes", ErrFileUnavailable, name)
 	}
-	return fmt.Errorf("replicateddb: read %q: %w", name, err)
+	return fmt.Errorf("murmur: read %q: %w", name, err)
 }
 
 // FilesGC removes node-local objects that are older than grace, unpinned,
@@ -642,10 +650,10 @@ func (db *DB) FilesGC(ctx context.Context, grace time.Duration) ([]objectstore.D
 	}
 	removed, err := fs.objects.Collect(referenced, grace)
 	if err != nil {
-		return removed, fmt.Errorf("replicateddb: file GC: %w", err)
+		return removed, fmt.Errorf("murmur: file GC: %w", err)
 	}
 	if err := fs.sweepStaging(grace); err != nil {
-		return removed, fmt.Errorf("replicateddb: file GC: %w", err)
+		return removed, fmt.Errorf("murmur: file GC: %w", err)
 	}
 	return removed, nil
 }
@@ -664,10 +672,10 @@ func (db *DB) RotateFileObjectKey(ctx context.Context, newKey []byte, progress f
 		return err
 	}
 	if len(newKey) != 32 {
-		return fmt.Errorf("replicateddb: replacement object key must be 32 bytes")
+		return fmt.Errorf("murmur: replacement object key must be 32 bytes")
 	}
 	if err := fs.objects.RotateKey(ctx, newKey, progress); err != nil {
-		return fmt.Errorf("replicateddb: rotate object key: %w", err)
+		return fmt.Errorf("murmur: rotate object key: %w", err)
 	}
 	return nil
 }

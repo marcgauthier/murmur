@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"bytes"
@@ -11,7 +11,7 @@ import (
 )
 
 func TestBridgeFileResolver(t *testing.T) {
-	db, err := Open(context.Background(), fileTestConfig(t.TempDir()))
+	db, err := openSignedFixture(context.Background(), fileTestConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestBridgeFileResolver(t *testing.T) {
 
 func TestBridgeFileUploadOwnership(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, fileTestConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, fileTestConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestBridgeFileUploadOwnership(t *testing.T) {
 
 func TestBridgeApplyFileMetadata(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, fileTestConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, fileTestConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestBridgeApplyFileMetadata(t *testing.T) {
 
 func TestBridgePutFileObject(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, fileTestConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, fileTestConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestBridgePutFileObject(t *testing.T) {
 		t.Fatalf("read back: %v", err)
 	}
 	// Disabled files refuse.
-	db2, err := Open(ctx, testConfig(t.TempDir()))
+	db2, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}

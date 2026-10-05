@@ -62,10 +62,11 @@ func ParseColumnType(s string) (ColumnType, error) {
 
 // ColumnSchema describes one replicated column.
 type ColumnSchema struct {
-	ID       uint32
-	Name     string
-	Type     ColumnType
-	Nullable bool
+	MergePolicy MergePolicy
+	ID          uint32
+	Name        string
+	Type        ColumnType
+	Nullable    bool
 }
 
 // TableSchema describes one replicated table.
@@ -164,6 +165,9 @@ func BuildRegistry(epoch uint64, tables []TableSchema) (*Registry, error) {
 			if c.Type == 0 {
 				return nil, fmt.Errorf("schema: table %q column %q has no type: %w", t.Name, c.Name, ErrUnsupportedSchema)
 			}
+			if err := c.validateMergePolicy(); err != nil {
+				return nil, err
+			}
 		}
 		// Primary key rules: explicit, single, BLOB(16)-compatible, NOT NULL.
 		pk := t.ColumnByID(t.PK)
@@ -190,6 +194,9 @@ func BuildRegistry(epoch uint64, tables []TableSchema) (*Registry, error) {
 		}
 		if pk.Nullable {
 			return nil, fmt.Errorf("schema: table %q primary key must be NOT NULL: %w", t.Name, ErrUnsupportedSchema)
+		}
+		if pk.MergePolicy != LWW {
+			return nil, fmt.Errorf("schema: primary key cannot use %s: %w", pk.MergePolicy, ErrUnsupportedSchema)
 		}
 		tp := &TableSchema{
 			ID:      t.ID,
@@ -242,6 +249,32 @@ func (r *Registry) canonicalHash() [32]byte {
 		}
 	}
 	var out [32]byte
+	// Preserve the identity of historical all-LWW schemas exactly.
+	hasPolicies := false
+	for _, table := range tables {
+		for _, column := range table.Columns {
+			if column.MergePolicy != LWW {
+				hasPolicies = true
+				break
+			}
+		}
+		if hasPolicies {
+			break
+		}
+	}
+	if hasPolicies {
+		h.Write([]byte("murmur/schema/merge-policies/v1"))
+		for _, t := range tables {
+			cols := append([]ColumnSchema(nil), t.Columns...)
+			sort.Slice(cols, func(i, j int) bool { return cols[i].ID < cols[j].ID })
+			for _, c := range cols {
+				binary.BigEndian.PutUint32(buf[:4], t.ID)
+				binary.BigEndian.PutUint32(buf[4:], c.ID)
+				h.Write(buf[:])
+				h.Write([]byte{byte(c.MergePolicy)})
+			}
+		}
+	}
 	copy(out[:], h.Sum(nil))
 	return out
 }

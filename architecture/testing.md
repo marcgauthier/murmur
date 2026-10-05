@@ -6,7 +6,7 @@ Crash/convergence/network/encryption tests and alpha acceptance criteria.
 
 CI runs a live acceptance smoke with both the Go test process and the separately
 built `tests-live/harness/testnode` instrumented using `-race`. Enable the same
-path locally with `SPEDSQL_RACE=1 bash tests-live/run.sh <scenario>`; this is
+path locally with `MURMUR_RACE=1 bash tests-live/run.sh <scenario>`; this is
 necessary because a race-instrumented test binary does not instrument a child
 node built separately. The per-PR live gate (`run.sh gate`) covers smoke,
 encryption, backup/restore, partitions, version skew, schema and release
@@ -34,6 +34,8 @@ complement, but do not replace, the deployment rehearsals in
 
 ## 55. Crash-Recovery Tests
 
+The `origin-signatures` live scenario is a release gate: an offline origin's transaction must forward successfully, while a trusted hostile relay cannot modify or fabricate that origin's transactions. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
+
 For a large clean-restart performance baseline, the explicit
 [reload benchmark](../tests-live/reload-benchmark/README.md) creates ten
 realistic log tables through the SQL API and reconstructs them from encrypted
@@ -50,7 +52,7 @@ callback ordering,
 cancellation, an index-build failure, and subsequent successful reopens. Run
 `bash tests-live/run.sh open-progress`; it is included in `all` and `gate`.
 The reload benchmark can additionally record startup snapshots with
-`SPEDSQL_RELOAD_PROGRESS=1`; see its README for measurement details.
+`MURMUR_RELOAD_PROGRESS=1`; see its README for measurement details.
 
 Inject crashes/failures after every important boundary.
 
@@ -141,7 +143,7 @@ Run them with `go test ./state ./replication`.
 > build tags: use `go test -tags "sqlite_preupdate_hook sqlite_fts5"
 > -count=1 ./tests-live/<scenario>` (or `-tags modernc` for the pure-Go
 > backend), or run `bash tests-live/run.sh <scenario>`, which applies
-> `SPEDSQL_TAGS` (defaulting to the CGO set) automatically.
+> `MURMUR_TAGS` (defaulting to the CGO set) automatically.
 
 The live integration port at `tests-live/crdt-contention/` runs three encrypted
 QUIC nodes and verifies that concurrent updates to disjoint columns all
@@ -188,7 +190,7 @@ concurrent application writes, kills two nodes with `SIGKILL` while their SQL
 requests are in flight, restarts their existing encrypted stores, and verifies
 acknowledged rows and ordered digests converge. It then commits a new write.
 Each write window defaults to 12 seconds and can be adjusted with
-`SPEDSQL_CRASH_WRITE_SECONDS`; `SPEDSQL_CRASH_SETTLE_SECONDS` controls the final
+`MURMUR_CRASH_WRITE_SECONDS`; `MURMUR_CRASH_SETTLE_SECONDS` controls the final
 convergence deadline. Run it with
 `go test -count=1 ./tests-live/crash-recovery`.
 
@@ -202,8 +204,8 @@ The `tests-live/long-running-five-node/` scenario keeps five encrypted daemon
 processes writing over a full mesh, restarts two node directories during load,
 and verifies retained rows, common logical-state digests, materialized
 generations, and persistent-store capacity. Its smoke run is 30 seconds; use
-`SPEDSQL_FIVE_NODE_DURATION_SECONDS=3600
-SPEDSQL_FIVE_NODE_SETTLE_SECONDS=300 go test -count=1 -timeout=75m
+`MURMUR_FIVE_NODE_DURATION_SECONDS=3600
+MURMUR_FIVE_NODE_SETTLE_SECONDS=300 go test -count=1 -timeout=75m
 ./tests-live/long-running-five-node` for the one-hour acceptance profile.
 
 The four-node partition smoke test at `tests-live/partition/` splits a full
@@ -224,7 +226,7 @@ while node3 is partitioned from node1/node2, checks group row counts and
 divergent digests, then re-admits peers while writes continue and verifies
 convergence plus a post-heal write. The partition and healing windows default
 to 12 seconds each and can be configured with
-`SPEDSQL_CHAOS_PARTITION_SECONDS` and `SPEDSQL_CHAOS_HEAL_SECONDS`. Run it with
+`MURMUR_CHAOS_PARTITION_SECONDS` and `MURMUR_CHAOS_HEAL_SECONDS`. Run it with
 `go test -count=1 ./tests-live/chaos-load`. Abrupt process death is covered by
 the separate crash-recovery test.
 
@@ -233,8 +235,8 @@ encrypted two-node QUIC mesh, checks metadata replication and search, fetches
 each payload from its peer, validates SHA-256, and reports upload/fetch p95
 latencies against broad smoke SLO bounds. Run the short form with
 `go test -count=1 ./tests-live/files-soak`; set
-`SPEDSQL_FILES_SOAK_DURATION_SECONDS=600` and
-`SPEDSQL_FILES_SOAK_INTERVAL_SECONDS=60` with `-timeout=12m` for the
+`MURMUR_FILES_SOAK_DURATION_SECONDS=600` and
+`MURMUR_FILES_SOAK_INTERVAL_SECONDS=60` with `-timeout=12m` for the
 ten-minute acceptance run.
 
 The `tests-live/files-bridge/` scenario covers two Low peers, a recipient-sealed
@@ -321,13 +323,12 @@ at the end. Run it with `go test -count=1 ./tests-live/gc-balance`.
 
 The `tests-live/release-upgrade/` scenario checks out the pinned
 previous release into a scratch worktree, builds its daemon, and proves
-three upgrade paths against the current build: a rolling upgrade of a
-three-daemon mesh under continuous writes (zero failed writes outside
-upgrade windows, mixed old-write/new-read replication mid-roll,
-identical digests at the end), a current-binary open of a
-previous-release store with a byte-identical digest, and a
-fresh-identity restore by the current library of a backup taken by the
-previous release's writer. Run it with
+three upgrade paths against the current build: a coordinated shutdown,
+offline trusted-baseline migration, and signed restart of a three-daemon mesh;
+migration and current-binary open of a previous-release store with a
+byte-identical digest; and migration after a fresh-identity restore of a backup
+taken by the previous release's writer. Legacy and signed peers cannot
+interoperate during this strict cutover. Run it with
 `bash tests-live/run.sh release-upgrade` (or
 `go test -count=1 ./tests-live/release-upgrade` after building the
 current test-node binary); it needs a git checkout containing the
@@ -338,7 +339,7 @@ processes and their HTTP SQL endpoints, then gates logical digest convergence,
 writer p95/max latency, service readiness, materialized generation, queue
 depth, and disk size. The five-second smoke command is
 `go test -count=1 ./tests-live/soak-slo`; the two-hour acceptance run is
-`SPEDSQL_SLO_DURATION_SECONDS=7200 SPEDSQL_SLO_SETTLE_SECONDS=300 go test
+`MURMUR_SLO_DURATION_SECONDS=7200 MURMUR_SLO_SETTLE_SECONDS=300 go test
 -count=1 -timeout=3h ./tests-live/soak-slo`.
 
 Recorded acceptance on 2026-09-27: the ten-minute file run completed 10
@@ -375,7 +376,7 @@ The `tests-live/allow-nodes/` scenario launches three daemon processes with
 valid certificates from one CA. Node2 allows only node1, while node1 and node3
 accept all peers. Concurrent writes run for three minutes by default; the test
 keeps node2's direct peer count at one, then checks row-count and ordered digest
-convergence through node1. Set `SPEDSQL_ALLOW_NODES_WRITE_SECONDS` to adjust
+convergence through node1. Set `MURMUR_ALLOW_NODES_WRITE_SECONDS` to adjust
 the workload duration. Run it with `go test -count=1 ./tests-live/allow-nodes`.
 
 The `tests-live/subscribe/` scenario holds a live subscription across a
@@ -421,7 +422,7 @@ Run it with `go test -count=1 ./tests-live/swim-discovery`.
 The `tests-live/impaired-network/` scenario applies tc/netem latency,
 loss, and a bandwidth-capped snapshot resync on loopback, each with a
 p95-visibility bound. It skips without `CAP_NET_ADMIN`;
-`SPEDSQL_IMPAIRED_NETWORK_FORCE=1` runs the workload unimpaired as a
+`MURMUR_IMPAIRED_NETWORK_FORCE=1` runs the workload unimpaired as a
 smoke path. Run it with
 `go test -count=1 ./tests-live/impaired-network`.
 
@@ -593,6 +594,20 @@ log-GC on every node (counter-observed, failures flat), then
 requires exact convergence plus a post-maintenance write that
 replicates everywhere. Run it with
 `go test -count=1 ./tests-live/maintenance-under-load`.
+
+The `tests-live/endurance-chaos/` scenario overlaps every fault at
+once — continuous bounded writes plus rolling restarts, tc/netem
+packet loss and latency (logical peer flaps when unprivileged), disk
+pressure, a libfaketime clock-skew window (skipped loudly without the
+library), online storage-key rotation, snapshot-forcing offline
+windows, and sustained log GC — over one chaos window (default 10
+minutes; 24–72 hours via `MURMUR_ENDURANCE_DURATION_SECONDS`). The
+verdict is exact cross-node convergence with counter-proven GC on
+every node, at least one observed snapshot resync, executed
+restart/rotation/impairment/disk legs, a full peer mesh, and a
+post-chaos write. Run it with
+`go test -count=1 ./tests-live/endurance-chaos` (short runs fit the
+default timeout; 24h/72h profiles need `-timeout=26h`/`-timeout=76h`).
 
 Invariant:
 
@@ -772,3 +787,7 @@ Use isolated directories, node identities, and ports for live scenarios. Check
 canonical logical state digests and file content digests rather than encrypted
 container bytes. Retain failed scenario artifacts with secrets redacted. Document
 which scenarios ran; available test files are not evidence of a passing run.
+
+Current schema-level counter, set and extrema behavior, causal storage, signed wire formats, bridge ownership and upgrade requirements are specified in [merge policies](merge-policies.md). LWW remains the default.
+
+The merge-policy suite has passed on modernc and mattn SQLite, with targeted race checks and the real three-daemon disconnected/forwarding/restart scenario on both backends. The kernel benchmark measures fixed causal cardinalities, not end-to-end throughput; see [benchmarks](benchmarks.md#crdt-join-cost).

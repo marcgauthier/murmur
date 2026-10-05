@@ -147,7 +147,7 @@ func TestTransactionChunkRejectsMalformedAndOverBudgetFrames(t *testing.T) {
 		t.Fatal("chunk with trailing payload accepted")
 	}
 	malformed := append([]byte(nil), frames[0]...)
-	malformed[transactionChunkHeaderSize-4] ^= 0x80 // corrupt declared payload length
+	malformed[134] ^= 0x80 // corrupt declared payload length
 	if _, err := DecodeTransactionChunk(malformed, 1<<20); err == nil {
 		t.Fatal("payload length mismatch accepted")
 	}

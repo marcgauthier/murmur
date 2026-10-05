@@ -17,6 +17,8 @@ Encrypted VFS, key providers/caches, registry rotation, and maintenance rewrites
 
 ## 39. Encrypted Pebble VFS
 
+Transaction signing uses a separately provisioned Ed25519 key. Do not reuse encryption, TLS or bridge signing keys for this identity. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
+
 Default package encryption is **AES-256-GCM**, with a 32-byte application key. Encryption is mandatory. Implement it below Pebble in a reusable `crypto` package providing cipher adapters, a key registry, and an encrypted `vfs.FS`/`vfs.File` wrapper supplied as `pebble.Options.FS`. Remove the prior native Badger encryption and per-value envelope design; Pebble compression must run before VFS encryption.
 
 ### Supported authenticated ciphers

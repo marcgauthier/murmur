@@ -7,23 +7,29 @@
 // set with no duplicates and PRAGMA integrity_check is clean.
 //
 // Design notes (from studying the product path):
-//   - FTS DDL/DML goes through the normal ExecSQL write path as
-//     local-only objects: capture skips non-registry tables
-//     (sqlengine/capture_modernc.go), so nothing replicates.
-//   - CREATE TRIGGER cannot go through ExecSQL: the trigger body carries
+//   - The FTS table definition is config LocalDDL (schema carried by the
+//     node, re-applied on every open/rebuild, never replicated). Exec
+//     rejects all schema changes by design (sqlengine/guard.go), so the
+//     suite declares docs_fts in SchemaConfig.LocalDDL.
+//   - FTS content is app-maintained local state: capture skips
+//     non-registry tables, so dual writes (base row + FTS row) through
+//     the normal ExecSQL path replicate the base row and index locally.
+//     CREATE TRIGGER cannot go through ExecSQL: the trigger body carries
 //     a second statement and the engine rejects multi-statement queries
-//     (sqlengine/singlestmt.go). The suite therefore maintains the index
-//     with explicit dual writes (base row + FTS row), which also keeps a
-//     runtime FTS5 capability probe: absent FTS5 skips honestly instead
-//     of failing cluster setup.
-//   - After the crash the suite asserts the in-memory FTS table is
-//     actually gone, recreates it, rebuilds content from the base table,
-//     and only then asserts MATCH/base equivalence.
+//     (sqlengine/singlestmt.go).
+//   - A scratch-engine FTS5 capability probe runs before cluster setup:
+//     absent FTS5 skips honestly instead of failing daemon startup (the
+//     config LocalDDL would not apply).
+//   - After the crash the suite asserts the definition survived (config
+//     re-applied at open) while the in-memory content is actually gone,
+//     rebuilds content from the base table, and only then asserts
+//     MATCH/base equivalence.
 package ftscrash_test
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -32,6 +38,7 @@ import (
 
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/sqlengine"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -42,7 +49,13 @@ var tokens = []string{"tokalpha", "tokbravo", "tokcharlie", "tokdelta"}
 const commonToken = "tokcommon"
 
 func TestFTSCrashRebuildMatchesBase(t *testing.T) {
-	seedDocs := envInt("SPEDSQL_FTS_CRASH_SEED", 200)
+	seedDocs := envInt("MURMUR_FTS_CRASH_SEED", 200)
+	// Capability probe before cluster setup: the FTS definition ships
+	// as config LocalDDL, which would fail daemon startup outright on
+	// a backend without FTS5.
+	if !fts5Available() {
+		t.Skip("FTS5 unavailable on this backend, skipping")
+	}
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:     "fts-crash",
 		NumNodes: 1,
@@ -53,16 +66,14 @@ func TestFTSCrashRebuildMatchesBase(t *testing.T) {
 				{Name: "title", Type: schema.ColText, Nullable: true},
 				{Name: "body", Type: schema.ColText, Nullable: true},
 			},
-		}}},
+		}},
+			LocalDDL: []string{`CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(id UNINDEXED, title, body)`},
+		},
 	})
 
-	// Capability probe: absent FTS5 skips honestly instead of failing.
-	if err := cluster.ExecSQL(0, `CREATE VIRTUAL TABLE docs_fts USING fts5(id UNINDEXED, title, body)`); err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "fts5") ||
-			strings.Contains(strings.ToLower(err.Error()), "no such module") {
-			t.Skipf("FTS5 unavailable on this backend, skipping: %v", err)
-		}
-		t.Fatalf("create FTS table: %v", err)
+	// The config LocalDDL applied at open: definition present, empty.
+	if n := countQuery(t, cluster, "SELECT count(*) FROM sqlite_master WHERE name = 'docs_fts'"); n != 1 {
+		t.Fatalf("docs_fts missing after open with config LocalDDL (count=%d)", n)
 	}
 
 	// Seed known docs with dual writes (base + FTS row each).
@@ -149,15 +160,17 @@ func TestFTSCrashRebuildMatchesBase(t *testing.T) {
 		t.Fatal("no valid mid-write kill in 3 rounds")
 	}
 
-	// The crash wiped the in-memory FTS table: prove it (no silent
-	// persistence assumption), then recreate and rebuild from base.
-	if n := countQuery(t, cluster, "SELECT count(*) FROM sqlite_master WHERE name = 'docs_fts'"); n != 0 {
-		t.Fatalf("post-crash sqlite_master still lists docs_fts; expected in-memory loss")
+	// The crash wiped the in-memory FTS content while the definition
+	// survived via config LocalDDL (re-applied at open): prove both
+	// (no silent persistence assumption either way), then rebuild the
+	// content from the base table.
+	if n := countQuery(t, cluster, "SELECT count(*) FROM sqlite_master WHERE name = 'docs_fts'"); n != 1 {
+		t.Fatalf("post-crash sqlite_master lists docs_fts %d times, want 1 (config LocalDDL must re-apply at open)", n)
 	}
-	t.Log("post-crash: FTS table gone with the in-memory engine, as designed")
-	if err := cluster.ExecSQL(0, `CREATE VIRTUAL TABLE docs_fts USING fts5(id UNINDEXED, title, body)`); err != nil {
-		t.Fatalf("recreate FTS table: %v", err)
+	if n := countQuery(t, cluster, "SELECT count(*) FROM docs_fts"); n != 0 {
+		t.Fatalf("post-crash FTS content = %d rows, want 0 (in-memory loss)", n)
 	}
+	t.Log("post-crash: FTS definition restored from config, content gone with the in-memory engine, as designed")
 	if err := cluster.ExecSQL(0,
 		`INSERT INTO docs_fts(id, title, body) SELECT id, title, body FROM docs`); err != nil {
 		t.Fatalf("rebuild FTS from base: %v", err)
@@ -308,8 +321,27 @@ func waitInflight(inFlight *atomic.Int64, timeout time.Duration) bool {
 }
 
 func envInt(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {
 		return v
 	}
 	return fallback
+}
+
+// fts5Available probes the linked SQLite backend (same driver the
+// daemons use) for FTS5 via a scratch in-memory engine.
+func fts5Available() bool {
+	reg, err := schema.BuildRegistry(1, nil)
+	if err != nil {
+		return false
+	}
+	eng, err := sqlengine.Open(reg, nil, nil, 0)
+	if err != nil {
+		return false
+	}
+	defer eng.Close()
+	used := 0
+	err = eng.QueryRowContext(context.Background(),
+		"SELECT sqlite_compileoption_used('ENABLE_FTS5')", nil,
+		func(r *sql.Row) error { return r.Scan(&used) })
+	return err == nil && used == 1
 }

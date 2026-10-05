@@ -13,7 +13,7 @@ keep its status summaries consistent when checklist items are completed or chang
 ## Current foundation
 
 Implemented foundations include encrypted authoritative Pebble state, an in-memory
-SQL materializer, HLC/per-cell LWW and row tombstones, offline writes, authenticated
+SQL materializer, schema-level LWW/PN_COUNTER/OR_SET/MAX/MIN and row tombstones, offline writes, authenticated
 QUIC replication, memberlist SWIM discovery over QUIC, a bounded shared connection
 pool, separate control/data/snapshot streams, log GC, snapshot merging,
 key rotation, FTS, and checkpoint backup transports. The default SQL engine uses
@@ -46,7 +46,7 @@ are tracked separately. Their acceptance criteria live with each subsystem.
 | [High/Low replication](high-low-replication.md) | Roles, sealed bundles, encrypted journals, atomic export/import obligations and progress, aggregate capacity, definition-level schema validation, schema holds, and status/replay controls are implemented |
 | High ownership and provenance | Implemented source stream/sequence tracking with High-owned field protection against subsequent Low updates (including reordered policy/value reconciliation via same-row shadow cells), protected deletes with explicit resolution, and policy/shadow state in High-domain durability and replication; file ownership release APIs exist |
 | [Writer scheduling](synchronization-and-overload.md#local-and-replication-write-scheduling) | Implemented configurable local/replication writer-time shares, bounded maintenance, idle borrowing, and cancellation-aware admission; sustained workload acceptance remains tracked |
-| [Encrypted file replication](file-replication.md) | Local authenticated immutable objects plus replicated metadata with streaming upload/read, search/list, delete tombstones, availability status, grace-based collection, bounded mesh fetch from static peers, recipient-sealed High/Low file artifacts with High-local re-encryption, object key rotation with generations, and object-inclusive versus metadata-only backup/restore exist; SWIM fetch discovery remains pending |
+| [Encrypted file replication](file-replication.md) | Local authenticated immutable objects plus replicated metadata with streaming upload/read, search/list, delete tombstones, availability status, grace-based collection, bounded mesh fetch from static peers plus SWIM-discovered serving members, recipient-sealed High/Low file artifacts with High-local re-encryption, object key rotation with generations, and object-inclusive versus metadata-only backup/restore exist |
 | [Address policy](membership-and-transport.md#ip-and-cidr-admission-policy) | Implemented IP/CIDR filtering alongside certificate/NodeID authorization |
 | [Query subscriptions](query-and-search.md#reactive-query-subscriptions) | Implemented bounded subscriptions to committed SQL-visible changes with explicit resume/reset behavior |
 | [Optional service adapter](runtime-and-diagnostics.md#optional-service-adapter) | Removed: no HTTP handler or client SDK ships with the library; the embedded Go API is the interface and any HTTP is the hosting process's own; the internal test-node HTTPS routes remain test tooling |
@@ -95,3 +95,5 @@ current evidence.
 
 Update the [TODO list](../TODO.md) and project status only when the
 corresponding implementation and acceptance checks exist.
+
+Column policies and the explicit counter/set API are implemented; see [merge policies](merge-policies.md) for retained-history costs and supported element types.

@@ -8,19 +8,19 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/replication"
 )
 
 // TestCollectorSeries proves node, counter, and per-peer series expose the
 // snapshot values with no global registration.
 func TestCollectorSeries(t *testing.T) {
-	node := replicateddb.NewNodeID()
-	dbid := replicateddb.NewDBID()
-	peer := replicateddb.NewNodeID()
-	retired := replicateddb.NewNodeID()
-	st := replicateddb.Status{
-		State:           replicateddb.StateReady,
+	node := murmur.NewNodeID()
+	dbid := murmur.NewDBID()
+	peer := murmur.NewNodeID()
+	retired := murmur.NewNodeID()
+	st := murmur.Status{
+		State:           murmur.StateReady,
 		NodeID:          node,
 		DBID:            dbid,
 		StateGeneration: 7,
@@ -29,19 +29,19 @@ func TestCollectorSeries(t *testing.T) {
 		MembershipCount: 2,
 		SelectedPeers:   1,
 		QUICConnections: 1,
-		Metrics: replicateddb.MetricsSnapshot{
+		Metrics: murmur.MetricsSnapshot{
 			LocalCommits:            3,
 			LocalCommitMutations:    12,
 			LocalCommitLatencyNanos: uint64(time.Second),
 			StmtCacheHits:           9,
 			StmtCacheMisses:         2,
-			Scheduler: replicateddb.SchedulerSnapshot{
-				Local:     replicateddb.SchedulerClassStats{Acquisitions: 5, ServiceNanos: uint64(2 * time.Second), DualServiceNanos: uint64(1500 * time.Millisecond)},
-				Remote:    replicateddb.SchedulerClassStats{Acquisitions: 2, Waiters: 1, DualServiceNanos: uint64(200 * time.Millisecond)},
+			Scheduler: murmur.SchedulerSnapshot{
+				Local:     murmur.SchedulerClassStats{Acquisitions: 5, ServiceNanos: uint64(2 * time.Second), DualServiceNanos: uint64(1500 * time.Millisecond)},
+				Remote:    murmur.SchedulerClassStats{Acquisitions: 2, Waiters: 1, DualServiceNanos: uint64(200 * time.Millisecond)},
 				DebtNanos: uint64(100 * time.Millisecond),
 			},
 		},
-		Pool: replicateddb.PoolStats{
+		Pool: murmur.PoolStats{
 			ActiveConnections: 1,
 			SelectedTargets:   1,
 			TotalSessions:     2,
@@ -52,7 +52,7 @@ func TestCollectorSeries(t *testing.T) {
 			DialsCoalesced:    4,
 			DialsReused:       5,
 		},
-		Membership: replicateddb.MembershipStats{
+		Membership: murmur.MembershipStats{
 			NumMembers:             2,
 			NumAlive:               2,
 			NumSuspect:             0,
@@ -88,7 +88,7 @@ func TestCollectorSeries(t *testing.T) {
 			SnapshotsBusyDeferred: 3,
 			SnapshotBusyReceived:  1,
 		},
-		Peers: []replicateddb.PeerDiagnostics{{
+		Peers: []murmur.PeerDiagnostics{{
 			NodeID:                 peer,
 			Connected:              true,
 			Selected:               true,
@@ -99,7 +99,7 @@ func TestCollectorSeries(t *testing.T) {
 			MembershipState:        "alive",
 			RetirementDeadline:     time.Unix(1800000000, 0),
 			BytesSent:              100,
-			LagByOrigin:            map[replicateddb.NodeID]uint64{node: 4},
+			LagByOrigin:            map[murmur.NodeID]uint64{node: 4},
 		}, {
 			NodeID:          retired,
 			Retired:         true,
@@ -107,7 +107,7 @@ func TestCollectorSeries(t *testing.T) {
 			MembershipState: "unknown",
 		}},
 	}
-	c := NewCollector(func() replicateddb.Status { return st })
+	c := NewCollector(func() murmur.Status { return st })
 
 	want := fmt.Sprintf(`
 # HELP spedsql_info Node identity and lifecycle state.

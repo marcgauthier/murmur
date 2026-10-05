@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -20,7 +20,7 @@ func TestOpenProgressEmptyAndDisabled(t *testing.T) {
 		if enabled {
 			cfg.OnOpenProgress = func(p OpenProgress) { events = append(events, p) }
 		}
-		db, err := Open(context.Background(), cfg)
+		db, err := openSignedFixture(context.Background(), cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -65,7 +65,7 @@ func TestOpenProgressStorageFailure(t *testing.T) {
 	}
 	var events []OpenProgress
 	cfg.OnOpenProgress = func(p OpenProgress) { events = append(events, p) }
-	live, err := Open(context.Background(), cfg)
+	live, err := openSignedFixture(context.Background(), cfg)
 	if live != nil || err == nil {
 		if live != nil {
 			live.Close()
@@ -85,7 +85,7 @@ func TestOpenProgressStorageFailure(t *testing.T) {
 func TestOpenProgressDeletedAndIncompleteRows(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.Schema.Tables[0].Columns[1].Nullable = false
-	live, err := Open(context.Background(), cfg)
+	live, err := openSignedFixture(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestOpenProgressDeletedAndIncompleteRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.OnOpenProgress = func(OpenProgress) {}
-	live, err = Open(context.Background(), cfg)
+	live, err = openSignedFixture(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestOpenProgressTerminalFailures(t *testing.T) {
 		}
 		var events []OpenProgress
 		cfg.OnOpenProgress = func(p OpenProgress) { events = append(events, p) }
-		live, err := Open(ctx, cfg)
+		live, err := openSignedFixture(ctx, cfg)
 		if err == nil || live != nil {
 			t.Fatal("expected open error")
 		}

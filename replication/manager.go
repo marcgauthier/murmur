@@ -125,9 +125,10 @@ type PeerInfo struct {
 
 // ManagerConfig configures replication.
 type ManagerConfig struct {
-	Store   *state.Store
-	Applier Applier
-	Creds   *transport.Credentials
+	TrustedSnapshotSources []ids.NodeID
+	Store                  *state.Store
+	Applier                Applier
+	Creds                  *transport.Credentials
 
 	Local       ids.NodeID
 	DBID        ids.DBID
@@ -642,6 +643,13 @@ type Manager struct {
 	transferLimiter  *overload.RateLimiter
 	applyGroupTarget atomic.Uint32
 	closed           bool // set by closeSessions under mu; attach refuses past it
+	// snapshotSource is the sole peer whose inbound snapshot frames
+	// are accepted while set. Concurrent sources preempt each other in
+	// staging (every new SnapshotID wipes staged chunks) and livelock,
+	// so the first manifest wins and the rest are ignored until the
+	// active transfer completes or the stall watchdog fails over.
+	snapshotSource    ids.NodeID
+	snapshotSourceSet bool
 
 	notifyCh chan struct{}
 	wg       sync.WaitGroup
@@ -1231,16 +1239,38 @@ func (m *Manager) retryStalledSnapshots() {
 	for _, p := range peers {
 		p.mu.Lock()
 		sess := p.session
-		stalled := p.awaiting && sess != nil && !p.lastSnapProgress.IsZero() &&
+		awaiting := p.awaiting
+		progressStale := !p.lastSnapProgress.IsZero() &&
 			now.Sub(p.lastSnapProgress) >= timeout &&
 			!now.Before(p.snapRetryAfter)
-		if stalled {
-			p.lastSnapProgress = now
-		}
 		p.mu.Unlock()
-		if !stalled || sess.isClosed() {
+		if !awaiting {
 			continue
 		}
+		if sess == nil || sess.isClosed() {
+			// A dead source can never serve: release it so a live
+			// peer takes over. No re-request until reconnected.
+			m.releaseSnapshotSource(p)
+			continue
+		}
+		if !progressStale {
+			continue
+		}
+		// Single active source: peers suppressed in favor of a
+		// moving transfer must not pile on re-requests of their own.
+		m.mu.Lock()
+		activeElsewhere := m.snapshotSourceSet && m.snapshotSource != p.id
+		if !activeElsewhere {
+			m.snapshotSourceSet = false
+			m.snapshotSource = ids.NodeID{}
+		}
+		m.mu.Unlock()
+		if activeElsewhere {
+			continue
+		}
+		p.mu.Lock()
+		p.lastSnapProgress = now
+		p.mu.Unlock()
 		m.log.Info("snapshot stalled; re-requesting", slog.String("peer", p.id.String()))
 		m.queueCtrl(p, MsgSnapshotRequest, 0, nil)
 		m.st.snapshotRequestsSent.Add(1)
@@ -1513,7 +1543,7 @@ func (m *Manager) ourHello() (*Hello, error) {
 		wms = wms[:ProgressPageEntries]
 	}
 	id := m.currentSchema()
-	caps := CapZstd | CapProgressPages | CapTransactionChunks
+	caps := CapMergePolicies | CapZstd | CapProgressPages | CapTransactionChunks | CapOriginSignatures
 	if m.cfg.EnablePlumtree {
 		caps |= CapPlumtree | CapRequiredMask
 	}
@@ -1552,6 +1582,9 @@ func (m *Manager) effectiveVersions() (ver, minVer uint16) {
 // protocol overlap. Schema agreement is handled separately so mismatched
 // peers can synchronize instead of always refusing.
 func (m *Manager) validateIdentity(h *Hello, sessPeer ids.NodeID) error {
+	if h.Capabilities&(CapOriginSignatures|CapMergePolicies) != (CapOriginSignatures|CapMergePolicies) || h.ProtocolVersion < MinProtocolVersion {
+		return fmt.Errorf("replication: signed origin protocol required")
+	}
 	if h.NodeID != sessPeer {
 		return fmt.Errorf("hello node %s != TLS identity %s", h.NodeID, sessPeer)
 	}
@@ -2447,13 +2480,14 @@ func (m *Manager) validateBatch(b *codec.MutationBatch) error {
 	if b.OriginNode.IsZero() {
 		return fmt.Errorf("zero origin")
 	}
-	if b.ProtocolVersion < MinProtocolVersion || b.ProtocolVersion > ProtocolVersion {
+	// Historical signed format-4 logs remain immutable after offline upgrade.
+	if b.ProtocolVersion < 4 || b.ProtocolVersion > ProtocolVersion {
 		return fmt.Errorf("batch protocol %d unsupported", b.ProtocolVersion)
 	}
 	if b.Sequence == 0 || b.HLC == 0 {
 		return fmt.Errorf("batch has zero sequence/hlc")
 	}
-	return nil
+	return m.verifyOrigin(b)
 }
 
 // batchSchemaKnown reports whether a batch's schema provenance is the
@@ -3409,6 +3443,13 @@ var errSnapshotInFlight = errors.New("snapshot already in flight")
 // one was already outstanding. Repeat requests never extend the stall
 // deadline. Callers must not hold p.mu.
 func (m *Manager) markSnapshotRequested(p *peerState) (already bool) {
+	if !m.snapshotSourceTrusted(p.id) {
+		m.st.snapshotSourcesDenied.Add(1)
+		if m.log != nil {
+			m.log.Warn("resync requires an explicitly trusted snapshot source", slog.String("peer", p.id.String()))
+		}
+		return true
+	}
 	now := time.Now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -3428,6 +3469,39 @@ func (m *Manager) markSnapshotProgress(p *peerState) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.lastSnapProgress = time.Now()
+}
+
+// claimSnapshotSource records p as the active snapshot source,
+// first-claimant-wins, and reports whether p's frames are accepted.
+// Callers must not hold m.mu.
+func (m *Manager) claimSnapshotSource(p *peerState) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.snapshotSourceSet {
+		return m.snapshotSource == p.id
+	}
+	m.snapshotSource = p.id
+	m.snapshotSourceSet = true
+	return true
+}
+
+// snapshotSourceIs reports whether p is the active snapshot source,
+// without claiming. Callers must not hold m.mu.
+func (m *Manager) snapshotSourceIs(p *peerState) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.snapshotSourceSet && m.snapshotSource == p.id
+}
+
+// releaseSnapshotSource clears the active source when it is p (transfer
+// complete or stalled out). Callers must not hold m.mu.
+func (m *Manager) releaseSnapshotSource(p *peerState) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.snapshotSourceSet && m.snapshotSource == p.id {
+		m.snapshotSourceSet = false
+		m.snapshotSource = ids.NodeID{}
+	}
 }
 
 func (m *Manager) sendSnapshot(p *peerState, ps *peerSession) {
@@ -3526,12 +3600,24 @@ type snapRecvState struct {
 }
 
 func (m *Manager) onSnapshotManifest(p *peerState, _ *peerSession, payload []byte) error {
+	if !m.snapshotSourceTrusted(p.id) {
+		m.st.snapshotManifestsRejected.Add(1)
+		return fmt.Errorf("replication: snapshot source %s is not explicitly trusted", p.id)
+	}
+	if !m.claimSnapshotSource(p) {
+		// Another source is already serving: its transfer owns
+		// staging, and interleaving a second SnapshotID would
+		// preempt it. The suppressed source goes idle; the stall
+		// watchdog fails over to it if the active one dies.
+		m.st.snapshotFramesSuppressed.Add(1)
+		return nil
+	}
 	manifest, rest, err := codec.DecodeManifest(payload)
 	if err != nil {
 		return err
 	}
 	m.st.snapshotManifestsReceived.Add(1)
-	if len(rest) != 0 || manifest.FormatVersion != 1 || manifest.ChunkCount == 0 || manifest.ChunkCount > 65_536 || manifest.EncodedBytes > m.cfg.MaxSnapshotBytes {
+	if len(rest) != 0 || manifest.FormatVersion != 2 || manifest.ChunkCount == 0 || manifest.ChunkCount > 65_536 || manifest.EncodedBytes > m.cfg.MaxSnapshotBytes {
 		m.st.snapshotManifestsRejected.Add(1)
 		return fmt.Errorf("invalid snapshot manifest bounds or format")
 	}
@@ -3555,6 +3641,17 @@ func (m *Manager) onSnapshotManifest(p *peerState, _ *peerSession, payload []byt
 }
 
 func (m *Manager) onSnapshotChunk(p *peerState, _ *peerSession, f *Frame) error {
+	if !m.snapshotSourceTrusted(p.id) {
+		m.st.snapshotManifestsRejected.Add(1)
+		return fmt.Errorf("replication: snapshot source %s is not explicitly trusted", p.id)
+	}
+	if !m.snapshotSourceIs(p) {
+		// Not the active source (a suppressed concurrent transfer,
+		// or a stale tail after failover): staging it would preempt
+		// the accepted transfer.
+		m.st.snapshotFramesSuppressed.Add(1)
+		return nil
+	}
 	payload := f.Payload
 	if f.Flags&FlagZstd != 0 {
 		dec, err := zstd.NewReader(bytes.NewReader(payload))
@@ -3610,12 +3707,24 @@ func (m *Manager) onSnapshotChunk(p *peerState, _ *peerSession, f *Frame) error 
 		// snapshot from the send loop (the read loop never sends).
 		p.forceAck = true
 		p.mu.Unlock()
+		m.releaseSnapshotSource(p)
 		m.NotifyLocal()
 	}
 	return nil
 }
 
 func (m *Manager) onSnapshotDone(p *peerState, _ *peerSession) error {
+	if !m.snapshotSourceTrusted(p.id) {
+		m.st.snapshotManifestsRejected.Add(1)
+		return fmt.Errorf("replication: snapshot source %s is not explicitly trusted", p.id)
+	}
+	if !m.snapshotSourceIs(p) {
+		// Not the active source: ignore. In particular, never
+		// re-request here — that would resurrect a suppressed
+		// transfer into an endless serve loop.
+		m.st.snapshotFramesSuppressed.Add(1)
+		return nil
+	}
 	st := m.snapRecvFor(p)
 	st.mu.Lock()
 	pending := st.manifest != nil

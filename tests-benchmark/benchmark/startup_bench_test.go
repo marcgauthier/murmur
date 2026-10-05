@@ -7,9 +7,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crypto"
+	"github.com/marcgauthier/murmur/internal/testidentity"
 	"github.com/marcgauthier/murmur/state"
 )
 
@@ -46,7 +47,7 @@ func BenchmarkStartupComponents(b *testing.B) {
 			}
 			start = time.Now()
 			st, err := state.Open(filepath.Join(dir1, "data"), tmpl.node, tmpl.dbid,
-				state.Options{FS: efs, Limits: codec.DefaultLimits()})
+				state.Options{FS: efs, Limits: codec.DefaultLimits(), OriginSigning: testidentity.Config(tmpl.node)})
 			storeOpen := time.Since(start)
 			if err != nil {
 				reg.Close()
@@ -61,7 +62,7 @@ func BenchmarkStartupComponents(b *testing.B) {
 				b.Fatal(err)
 			}
 			start = time.Now()
-			db, err := replicateddb.Open(ctx, benchConfig(dir2, tmpl.node, tmpl.dbid))
+			db, err := murmur.Open(ctx, benchConfig(dir2, tmpl.node, tmpl.dbid))
 			fullOpen := time.Since(start)
 			if err != nil {
 				b.Fatal(err)
@@ -95,8 +96,8 @@ func BenchmarkStartupComponents(b *testing.B) {
 func BenchmarkReplicationReady(b *testing.B) {
 	ctx := context.Background()
 	mesh := newBenchMesh(b)
-	nodeA := replicateddb.NewNodeID()
-	dbA, err := replicateddb.Open(ctx, mesh.config(b, b.TempDir(), nodeA, benchPortA, nil))
+	nodeA := murmur.NewNodeID()
+	dbA, err := murmur.Open(ctx, mesh.config(b, b.TempDir(), nodeA, benchPortA, nil))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -104,11 +105,11 @@ func BenchmarkReplicationReady(b *testing.B) {
 	b.ResetTimer()
 	var total time.Duration
 	for i := 0; i < b.N; i++ {
-		nodeB := replicateddb.NewNodeID()
+		nodeB := murmur.NewNodeID()
 		cfgB := mesh.config(b, b.TempDir(), nodeB, "127.0.0.1:0",
-			[]replicateddb.Peer{{NodeID: nodeA, Addrs: []string{benchPortA}}})
+			[]murmur.Peer{{NodeID: nodeA, Addrs: []string{benchPortA}}})
 		start := time.Now()
-		dbB, err := replicateddb.Open(ctx, cfgB)
+		dbB, err := murmur.Open(ctx, cfgB)
 		if err != nil {
 			b.Fatal(err)
 		}

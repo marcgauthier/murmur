@@ -13,7 +13,7 @@ import (
 func stagedBatch(t *testing.T, origin ids.NodeID) (*codec.MutationBatch, [][]byte) {
 	t.Helper()
 	b := &codec.MutationBatch{ProtocolVersion: 3, TxID: ids.NewTxID(), OriginNode: origin, Sequence: 1, HLC: 100, SchemaEpoch: 1, Mutations: []codec.Mutation{{TableID: 1, RowID: ids.NewRowID(), ColumnID: 1, Value: codec.Text(strings.Repeat("x", 150<<10))}}}
-	chunks, err := codec.EncodeTransactionChunks(b, 1<<20)
+	chunks, err := encodeChunksFixture(b, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,9 +26,9 @@ func stagedBatch(t *testing.T, origin ids.NodeID) (*codec.MutationBatch, [][]byt
 func TestTransactionChunkStageSurvivesRestartAndAppliesOnlyCompleteBatch(t *testing.T) {
 	dir := t.TempDir()
 	node, origin := ids.NewNodeID(), ids.NewNodeID()
-	dbID := ids.NewDBID()
+	dbID := fixtureDBID
 	open := func() *Store {
-		s, err := Open(dir, node, dbID, Options{Limits: codec.DefaultLimits()})
+		s, err := openSignedFixture(dir, node, dbID, Options{Limits: codec.DefaultLimits()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -36,7 +36,7 @@ func TestTransactionChunkStageSurvivesRestartAndAppliesOnlyCompleteBatch(t *test
 	}
 	s := open()
 	batch := &codec.MutationBatch{ProtocolVersion: 3, TxID: ids.NewTxID(), OriginNode: origin, Sequence: 1, HLC: 100, SchemaEpoch: 1, Mutations: []codec.Mutation{{TableID: 1, RowID: ids.NewRowID(), ColumnID: 1, Value: codec.Text(strings.Repeat("x", 150<<10))}}}
-	chunks, err := codec.EncodeTransactionChunks(batch, 1<<20)
+	chunks, err := encodeChunksFixture(batch, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestTransactionChunkStageSurvivesRestartAndAppliesOnlyCompleteBatch(t *test
 	if wm, _ := s.ReceiveWatermark(origin); wm != 0 {
 		t.Fatalf("assembled but unapplied transaction advanced watermark to %d", wm)
 	}
-	if _, err := s.CommitRemote(context.Background(), assembled); err != nil {
+	if _, err := commitRemoteFixture(s, context.Background(), assembled); err != nil {
 		t.Fatal(err)
 	}
 	if wm, _ := s.ReceiveWatermark(origin); wm != 1 {
@@ -100,9 +100,9 @@ func TestTransactionChunkStageSurvivesRestartAndAppliesOnlyCompleteBatch(t *test
 }
 
 func TestTransactionChunkStageInterruptedBeforeCommitIsRetryable(t *testing.T) {
-	dir, node, origin, dbID := t.TempDir(), ids.NewNodeID(), ids.NewNodeID(), ids.NewDBID()
+	dir, node, origin, dbID := t.TempDir(), ids.NewNodeID(), ids.NewNodeID(), fixtureDBID
 	open := func() *Store {
-		s, err := Open(dir, node, dbID, Options{Limits: codec.DefaultLimits()})
+		s, err := openSignedFixture(dir, node, dbID, Options{Limits: codec.DefaultLimits()})
 		if err != nil {
 			t.Fatal(err)
 		}

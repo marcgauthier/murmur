@@ -299,11 +299,12 @@ func offlineConfig(t *testing.T, pebbleDir string, cluster *harness.Cluster, nod
 		t.Fatal(err)
 	}
 	return db.Config{
-		Path:   pebbleDir,
-		NodeID: node,
-		DBID:   cluster.DBID,
-		Schema: *schemaConfig(),
-		Pebble: db.DefaultPebbleConfig(),
+		OriginSigning: cluster.OriginSigning(node),
+		Path:          pebbleDir,
+		NodeID:        node,
+		DBID:          cluster.DBID,
+		Schema:        *schemaConfig(),
+		Pebble:        db.DefaultPebbleConfig(),
 		// The daemon unlocks with key_id "remote-unlock-key" (see
 		// handleAdminUnlock); the offline open must use the same ID.
 		Encryption: db.EncryptionConfig{Key: keyBytes(t, cluster.Nodes[0].KeyHex), KeyID: "remote-unlock-key"},

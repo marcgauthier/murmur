@@ -52,7 +52,7 @@ func BenchmarkSnapshotChunkMergeEncrypted(batch *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			s, err := Open(dir+"/data", node, dbID, Options{FS: encFS, Limits: codec.DefaultLimits()})
+			s, err := openSignedFixture(dir+"/data", node, dbID, Options{FS: encFS, Limits: codec.DefaultLimits()})
 			if err != nil {
 				b.Fatal(err)
 			}

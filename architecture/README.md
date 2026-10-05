@@ -36,8 +36,10 @@ outstanding. The query materialization is in-memory only.
 | [GORM dialect](gorm-dialect.md) | Embedded GORM dialect contract: schema mapping, migration rules, and transaction semantics. | New topic |
 | [Schema and migrations](schema.md) | Schema restrictions, stable identities, concurrent additive migrations, and local-only objects. | 6, 7, 50, 51 |
 | [Transactions and change capture](transactions.md) | Change capture, transaction coalescing, commit/apply ordering, and idempotency. | 8, 9, 15, 16, 17, 18, 19, 49, 81 |
+| [Merge policies](merge-policies.md) | Distributed counters, typed observed-remove sets, numeric extrema, API, bridge and upgrade contract. | New topic |
 | [Conflict resolution](conflict-resolution.md) | Mutation model, HLC/LWW ordering, tombstones, and conflict examples. | 10, 11, 12, 82 |
 | [Storage and materialization](storage.md) | Pebble layout, startup/rebuild, caching, compaction, and a log-GC example. | 13, 14, 20, 21, 22, 25, 47, 83 |
+| [Origin signatures](origin-signatures.md) | Ed25519 transaction identities, origin trust, snapshots and strict migration. | New topic |
 | [Membership and transport](membership-and-transport.md) | SWIM/memberlist over QUIC, discovery, authentication, and IP/CIDR admission. | 26, 27 |
 | [Replication and dissemination](replication-and-dissemination.md) | Bounded peer connections, handshakes, multi-origin forwarding, and optional Plumtree. | 28, 29, 30 |
 | [Synchronization and overload](synchronization-and-overload.md) | Gap/range repair, transaction chunks, budgets, writer scheduling, wire encoding, acknowledgements, and large values. | 31, 32, 33, 34, 35, 48 |
@@ -52,6 +54,7 @@ outstanding. The query materialization is in-memory only.
 | Implementation roadmap (removed; content now in [TODO list](../TODO.md) and [Release status](release-status.md)) | Implementation phases, MVP boundaries, active and future tasks. | 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 87, 91 |
 | [Invariants, risks, and security](invariants-and-risks.md) | Design risks, non-negotiable architecture invariants, and security review requirements. | 78, 79, 85 |
 | [Versioning, release, and references](versioning-and-release.md) | Compatibility/versioning, packaging, platform support, and architecture sources. | 84, 86, 90 |
+| [Operational tooling](18-operational-tooling.md) | Standalone CLI utility (`murmur`), REPL shell, storage diagnostics, backup lifecycle, and cluster operations. | New topic |
 | [Release status](release-status.md) | Implementation inventory, historical test results, configured platform checks, and release evidence requirements. | New topic |
 
 Keep these documents, their links, and the project README current when behavior, APIs, configuration, storage formats, or implementation status change. Repository guidance is in [AGENTS.md](../AGENTS.md).

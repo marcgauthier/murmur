@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -112,7 +112,7 @@ func TestTwoNodeReplication(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
-	dbA, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestTwoNodeReplication(t *testing.T) {
 
 	cfgB := replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
-	dbB, err := Open(ctx, cfgB)
+	dbB, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,14 +164,14 @@ func TestOfflineConflictConverges(t *testing.T) {
 
 	// Same row created on both while disconnected (offline writes).
 	id := NewRowID()
-	dbA, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
 	addrA := waitForAddr(t, dbA, 5*time.Second)
 
-	dbB, err := Open(ctx, replConfig(t.TempDir(), nodeB, dbid, creds[nodeB], nil))
+	dbB, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeB, dbid, creds[nodeB], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestReplicationSchemaMismatchRejected(t *testing.T) {
 	strict := false
 	cfgA := replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil)
 	cfgA.Schema.AcceptRemoteSchema = &strict
-	dbA, err := Open(ctx, cfgA)
+	dbA, err := openSignedFixture(ctx, cfgA)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,7 @@ func TestReplicationSchemaMismatchRejected(t *testing.T) {
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
 	cfgB.Schema.Version = 2
 	cfgB.Schema.AcceptRemoteSchema = &strict
-	dbB, err := Open(ctx, cfgB)
+	dbB, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +269,7 @@ func TestSnapshotJoinAfterLogGC(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeC)
 
-	dbA, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +291,7 @@ func TestSnapshotJoinAfterLogGC(t *testing.T) {
 
 	cfgC := replConfig(t.TempDir(), nodeC, dbid, creds[nodeC],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
-	dbC, err := Open(ctx, cfgC)
+	dbC, err := openSignedFixture(ctx, cfgC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +319,7 @@ func TestSnapshotTailRepairConcurrentWritesAndGC(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeC)
 
-	dbA, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +366,7 @@ func TestSnapshotTailRepairConcurrentWritesAndGC(t *testing.T) {
 
 	cfgC := replConfig(t.TempDir(), nodeC, dbid, creds[nodeC],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
-	dbC, err := Open(ctx, cfgC)
+	dbC, err := openSignedFixture(ctx, cfgC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ func TestBidirectionalBulkConverges(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
-	dbA, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +405,7 @@ func TestBidirectionalBulkConverges(t *testing.T) {
 	addrA := waitForAddr(t, dbA, 5*time.Second)
 	cfgB := replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
-	dbB, err := Open(ctx, cfgB)
+	dbB, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}

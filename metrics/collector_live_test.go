@@ -3,12 +3,13 @@ package metrics
 import (
 	"bytes"
 	"context"
+	"github.com/marcgauthier/murmur/internal/testdb"
 	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
 )
 
@@ -16,29 +17,29 @@ import (
 // no global registration and no HTTP listener.
 func TestCollectorLiveDB(t *testing.T) {
 	ctx := context.Background()
-	cfg := replicateddb.Config{
+	cfg := testdb.Configure(murmur.Config{
 		Path:   t.TempDir(),
-		NodeID: replicateddb.NewNodeID(),
-		Schema: replicateddb.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
+		NodeID: murmur.NewNodeID(),
+		Schema: murmur.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
 			Name: "contacts",
 			Columns: []schema.ColumnSchema{
 				{Name: "id", Type: schema.ColBlob},
 				{Name: "name", Type: schema.ColText, Nullable: true},
 			},
 		}}},
-		Pebble: replicateddb.DefaultPebbleConfig(),
-		Encryption: replicateddb.EncryptionConfig{
+		Pebble: murmur.DefaultPebbleConfig(),
+		Encryption: murmur.EncryptionConfig{
 			Key:   bytes.Repeat([]byte{0x3a}, 32),
 			KeyID: "test-key",
 		},
-	}
-	db, err := replicateddb.Open(ctx, cfg)
+	})
+	db, err := murmur.Open(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
-	id := replicateddb.NewRowID()
+	id := murmur.NewRowID()
 	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "ann"); err != nil {
 		t.Fatal(err)
 	}

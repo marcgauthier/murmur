@@ -6,7 +6,6 @@ package filessoak_test
 import (
 	"crypto/sha256"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"testing"
@@ -19,7 +18,7 @@ const soakObjectKey = "515151515151515151515151515151515151515151515151515151515
 
 func envSeconds(t *testing.T, key string, fallback int) time.Duration {
 	t.Helper()
-	value := os.Getenv(key)
+	value := harness.GetEnv(key)
 	if value == "" {
 		return time.Duration(fallback) * time.Second
 	}
@@ -31,8 +30,8 @@ func envSeconds(t *testing.T, key string, fallback int) time.Duration {
 }
 
 func TestEncryptedFileFetchSoak(t *testing.T) {
-	duration := envSeconds(t, "SPEDSQL_FILES_SOAK_DURATION_SECONDS", 5)
-	interval := envSeconds(t, "SPEDSQL_FILES_SOAK_INTERVAL_SECONDS", 1)
+	duration := envSeconds(t, "MURMUR_FILES_SOAK_DURATION_SECONDS", 5)
+	interval := envSeconds(t, "MURMUR_FILES_SOAK_INTERVAL_SECONDS", 1)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:     "files-soak",
 		NumNodes: 2,

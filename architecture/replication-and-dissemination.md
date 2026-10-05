@@ -130,6 +130,8 @@ Do not exchange the Pebble at-rest encryption key.
 
 ## 30. Multi-Origin Replication
 
+Protocol v4 requires Ed25519 origin signatures independently of the relay's mTLS identity. Forwarding and repair preserve complete signed transactions. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
+
 Every node keeps mutation logs by original creator:
 
 ```text
@@ -189,3 +191,5 @@ The `plumtree` package implements the bounded eager/lazy state machine and `repl
 - Prefer retaining locally originated pending notifications over redundant forwarding or optimization messages during shedding. Accepted local mutations remain durable in Pebble regardless of dissemination-cache eviction. Rotation and periodic anti-entropy continue to repair missed announcements and broken eager routes.
 
 ---
+
+Current schema-level counter, set and extrema behavior, causal storage, signed wire formats, bridge ownership and upgrade requirements are specified in [merge policies](merge-policies.md). LWW remains the default.

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -87,7 +86,7 @@ func TestAbruptProcessDeathRecoversCommittedRows(t *testing.T) {
 		}
 	}
 
-	writeBurst := time.Duration(envSeconds("SPEDSQL_CRASH_WRITE_SECONDS", 12)) * time.Second
+	writeBurst := time.Duration(envSeconds("MURMUR_CRASH_WRITE_SECONDS", 12)) * time.Second
 	time.Sleep(writeBurst)
 	killDuringWrites(t, cluster, 1, &active)
 	time.Sleep(writeBurst)
@@ -106,7 +105,7 @@ func TestAbruptProcessDeathRecoversCommittedRows(t *testing.T) {
 	waitForPeers(t, cluster, []int{2, 2, 2}, 90*time.Second)
 
 	stopWriters()
-	waitForConvergence(t, cluster, time.Duration(envSeconds("SPEDSQL_CRASH_SETTLE_SECONDS", 60))*time.Second)
+	waitForConvergence(t, cluster, time.Duration(envSeconds("MURMUR_CRASH_SETTLE_SECONDS", 60))*time.Second)
 	assertAcknowledgedPresent(t, cluster, acknowledged)
 	assertConverged(t, cluster)
 	t.Logf("all acknowledged application writes survived two SIGKILL restarts (%d acknowledged rows)", len(acknowledged))
@@ -116,7 +115,7 @@ func TestAbruptProcessDeathRecoversCommittedRows(t *testing.T) {
 		t.Fatalf("post-recovery SQL write: %v", err)
 	}
 	acknowledged[postCrashValue] = struct{}{}
-	waitForConvergence(t, cluster, time.Duration(envSeconds("SPEDSQL_CRASH_SETTLE_SECONDS", 20))*time.Second)
+	waitForConvergence(t, cluster, time.Duration(envSeconds("MURMUR_CRASH_SETTLE_SECONDS", 20))*time.Second)
 	assertAcknowledgedPresent(t, cluster, acknowledged)
 	assertConverged(t, cluster)
 }
@@ -181,7 +180,7 @@ func connectedPeers(apiAddr string) int {
 }
 
 func envSeconds(name string, fallback int) int {
-	if value, err := strconv.Atoi(os.Getenv(name)); err == nil && value > 0 {
+	if value, err := strconv.Atoi(harness.GetEnv(name)); err == nil && value > 0 {
 		return value
 	}
 	return fallback

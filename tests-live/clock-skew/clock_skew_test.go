@@ -216,7 +216,7 @@ func startNodeWithEnv(t *testing.T, c *harness.Cluster, idx int, env []string) {
 
 func effectiveBinary(t *testing.T) string {
 	t.Helper()
-	if override := os.Getenv("SPEDSQL_BIN"); override != "" {
+	if override := harness.GetEnv("MURMUR_BIN"); override != "" {
 		return override
 	}
 	// Same default the harness resolves (tests-live/bin/testnode).

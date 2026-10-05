@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -105,7 +106,7 @@ func (im *Importer) applyBundleResolved(ctx context.Context, b *Bundle, resoluti
 			allRecorded = false
 			break
 		}
-		has, err := im.db.HasTransactionReceipt(batch.TxID)
+		has, err := im.db.HasTransactionReceipt(sourceReceiptID(b, batch))
 		if err != nil {
 			return err
 		}
@@ -186,6 +187,11 @@ func (im *Importer) applyBundleResolved(ctx context.Context, b *Bundle, resoluti
 			}
 		}
 
+		for _, batch := range rowBatches {
+			if err := tx.RecordBridgeSourceReceipt(sourceReceiptID(b, batch), batch.Origin, batch.Sequence); err != nil {
+				return err
+			}
+		}
 		if err := tx.Commit(); err != nil {
 			return err
 		}
@@ -204,7 +210,7 @@ func (im *Importer) applyBundleResolved(ctx context.Context, b *Bundle, resoluti
 	}
 	for _, batch := range b.Batches {
 		if !batch.TxID.IsZero() {
-			_ = im.db.RecordTransactionReceipt(batch.TxID)
+			_ = im.db.RecordTransactionReceipt(sourceReceiptID(b, batch))
 		}
 	}
 
@@ -244,7 +250,7 @@ func (im *Importer) prepareBundle(ctx context.Context, b *Bundle, resolution str
 				return nil, err
 			}
 			if hasProvenance {
-				if rowPolicy.Owner == db.BridgeOwnerHigh || rowPolicy.SourceDomain != b.Manifest.SourceDomain || rowPolicy.Stream != b.Manifest.Stream {
+				if rowPolicy.Owner == db.BridgeOwnerHigh || rowPolicy.SourceDomain != b.Manifest.SourceDomain || rowPolicy.Stream != b.Manifest.Stream && !bundleHasCRDT(b) {
 					return nil, fmt.Errorf("%w: %s row %s", ErrIdentityCollision, rec.Table, rec.Row)
 				}
 			} else if exists {
@@ -284,7 +290,7 @@ func (im *Importer) prepareBundle(ctx context.Context, b *Bundle, resolution str
 					if err != nil {
 						return nil, err
 					}
-					if ok && policy.Owner == db.BridgeOwnerHigh {
+					if ok && policy.Owner == db.BridgeOwnerHigh && column.Policy == schema.LWW {
 						continue
 					}
 					filtered.Columns = append(filtered.Columns, column)
@@ -518,7 +524,24 @@ func (im *Importer) checkSchema(ctx context.Context, b *Bundle) error {
 					vts = make(map[codec.ValueType]bool)
 					cols[c.Column] = vts
 				}
-				vts[c.Value.Type] = true
+				vt := c.Value.Type
+				if c.Policy == schema.PN_COUNTER || c.Policy == schema.OR_SET {
+					vt = codec.TypeText
+				}
+				vts[vt] = true
+			}
+		}
+	}
+	for _, batch := range b.Batches {
+		for _, record := range batch.Records {
+			if record.Table == db.BridgeFileTableName {
+				continue
+			}
+			for _, column := range record.Columns {
+				p, err := im.db.ColumnMergePolicy(record.Table, column.Column)
+				if err == nil && p != column.Policy {
+					return &HoldError{Missing: []string{fmt.Sprintf("merge policy %s.%s requires %s", record.Table, column.Column, column.Policy)}}
+				}
 			}
 		}
 	}
@@ -611,6 +634,25 @@ func (im *Importer) applyRecord(ctx context.Context, tx *db.Tx, rec Record) erro
 		_, err := tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE %s = ?", table, pkQ), rec.Row[:])
 		return err
 	case RecordPut:
+		originalColumns := rec.Columns
+		rec.Columns = append([]ColumnValue(nil), rec.Columns...)
+		for i := range rec.Columns {
+			if rec.Columns[i].Policy == schema.PN_COUNTER {
+				rec.Columns[i].Value = codec.Text("0")
+			} else if rec.Columns[i].Policy == schema.OR_SET {
+				rec.Columns[i].Value = codec.Text("[]")
+			}
+		}
+		deferApply := func() error {
+			for _, column := range originalColumns {
+				if column.Policy != schema.LWW {
+					if err := tx.ImportMergeColumn(ctx, rec.Table, column.Column, rec.Row, column.Policy, column.Value, column.Records); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}
 		if len(rec.Columns) == 0 {
 			return fmt.Errorf("bridge: import: upsert of %s has no columns", rec.Table)
 		}
@@ -634,7 +676,7 @@ func (im *Importer) applyRecord(ctx context.Context, tx *db.Tx, rec Record) erro
 			return err
 		}
 		if n, _ := res.RowsAffected(); n > 0 {
-			return nil
+			return deferApply()
 		}
 		cols := make([]string, len(rec.Columns)+1)
 		holders := make([]string, len(rec.Columns)+1)
@@ -654,7 +696,10 @@ func (im *Importer) applyRecord(ctx context.Context, tx *db.Tx, rec Record) erro
 			insArgs = append(insArgs, v)
 		}
 		_, err = tx.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(cols, ", "), strings.Join(holders, ", ")), insArgs...)
-		return err
+		if err != nil {
+			return err
+		}
+		return deferApply()
 	default:
 		return fmt.Errorf("bridge: import: unknown record op %d", int(rec.Op))
 	}
@@ -798,4 +843,31 @@ func valueArg(v codec.Value) (any, error) {
 	default:
 		return nil, fmt.Errorf("bridge: import: unsupported value type %d", int(v.Type))
 	}
+}
+
+func bundleHasCRDT(b *Bundle) bool {
+	for _, batch := range b.Batches {
+		for _, record := range batch.Records {
+			for _, column := range record.Columns {
+				if column.Policy != schema.LWW {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+func sourceReceiptID(bundle *Bundle, batch Batch) ids.TxID {
+	if !bundleHasCRDT(bundle) {
+		return batch.TxID
+	}
+	h := sha256.New()
+	h.Write([]byte("murmur/bridge/source-receipt/v2"))
+	h.Write(bundle.Manifest.SourceDomain[:])
+	h.Write([]byte(bundle.Manifest.Stream))
+	h.Write([]byte{0})
+	h.Write(batch.TxID[:])
+	var id ids.TxID
+	copy(id[:], h.Sum(nil))
+	return id
 }

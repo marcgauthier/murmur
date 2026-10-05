@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	replicateddb "github.com/marcgauthier/murmur"
+	core "github.com/marcgauthier/murmur"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/schema"
@@ -40,7 +40,7 @@ type ID [16]byte
 
 // NewID returns a random ID.
 func NewID() ID {
-	return ID(replicateddb.NewRowID())
+	return ID(core.NewRowID())
 }
 
 // String renders the UUID text form.

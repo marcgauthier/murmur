@@ -43,7 +43,10 @@ path does not create the service. Transport/service initialization errors are
 currently not propagated from this block, so a successful database open alone
 does not prove discovery started. The seed-only live discovery acceptance gap
 is recorded in [release status](release-status.md#1-verified-feature-matrix).
-File-object fetch sources remain separately configured static peers.
+Serving file-object nodes advertise their bound fetch endpoint as an optional
+suffix in the same SWIM metadata (version 1 decoders ignore trailing bytes,
+so no version bump was needed); fetch sources are the union of static
+`Files.FetchPeers` and live members advertising an endpoint.
 
 ### 26.2 Memberlist transport over QUIC
 
@@ -107,6 +110,8 @@ Default top-level `Config.MaxTransactionBytes` to 64 MiB; validate it against th
 ---
 
 ## 27. Peer Identity and Authentication
+
+Transport identity does not authorize a forwarded transaction's claimed origin. Protocol v4 additionally verifies administrator-provisioned Ed25519 origin keys. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
 
 Default to mutual certificate authentication.
 

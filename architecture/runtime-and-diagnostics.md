@@ -117,6 +117,8 @@ Run `go test -race` continuously.
 
 ## 52. Metrics and Diagnostics
 
+Origin verification counters expose unsigned inputs, unknown origins, invalid signatures, digest mismatches and denied snapshot sources without key material. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
+
 No standalone HTTP server is required.
 
 Expose a Go metrics/status API.
@@ -402,3 +404,5 @@ keys in status/logging.
 
 Acceptance is an embedded application running with no HTTP listener, which
 is the default: the core library starts no listener.
+
+`DB.MergePolicyStats(ctx)` provides on-demand causal metadata sizes and counts, merge timings and policy rejection counts; see [merge policies](merge-policies.md#5-upgrade-and-operational-limits) for scope and scan cost.

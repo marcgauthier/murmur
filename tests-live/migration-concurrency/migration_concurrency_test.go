@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -45,7 +44,7 @@ func evolvedTables() []schema.TableSchema {
 }
 
 func TestSimultaneousMigrationConverges(t *testing.T) {
-	seedRows := envInt("SPEDSQL_MIGRATION_CONCURRENCY_SEED", 60)
+	seedRows := envInt("MURMUR_MIGRATION_CONCURRENCY_SEED", 60)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:        "migration-concurrency",
 		NumNodes:    3,
@@ -281,6 +280,41 @@ func waitNamesConverged(t *testing.T, c *harness.Cluster, want int, timeout time
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+	sets := make([]map[string]bool, len(c.Nodes))
+	for i := range c.Nodes {
+		res, err := c.QuerySQL(i, "SELECT name FROM mg_rows ORDER BY name")
+		if err != nil {
+			t.Logf("node %d at timeout: query err=%v", i+1, err)
+			continue
+		}
+		t.Logf("node %d at timeout: names=%d", i+1, len(res.Rows))
+		sets[i] = make(map[string]bool, len(res.Rows))
+		for _, r := range res.Rows {
+			if s, _ := r[0].(string); s != "" {
+				sets[i][s] = true
+			}
+		}
+	}
+	union := map[string]bool{}
+	for _, s := range sets {
+		for n := range s {
+			union[n] = true
+		}
+	}
+	for i, s := range sets {
+		if s == nil {
+			continue
+		}
+		var missing []string
+		for n := range union {
+			if !s[n] {
+				missing = append(missing, n)
+			}
+		}
+		if len(missing) > 0 {
+			t.Logf("node %d at timeout: missing %d names: %v", i+1, len(missing), missing)
+		}
+	}
 	t.Fatalf("nodes did not converge on %d names within %v", want, timeout)
 }
 
@@ -335,7 +369,7 @@ func assertScore(t *testing.T, c *harness.Cluster, idx int, idHex string, want i
 }
 
 func envInt(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {
 		return v
 	}
 	return fallback

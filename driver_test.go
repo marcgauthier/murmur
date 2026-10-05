@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 
 func openDriverTestDB(t *testing.T) *DB {
 	t.Helper()
-	db, err := Open(context.Background(), testConfig(t.TempDir()))
+	db, err := openSignedFixture(context.Background(), testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,6 +82,7 @@ func TestDriverRegisteredOpen(t *testing.T) {
 	RegisterDriverDB(handle, db)
 	defer UnregisterDriverDB(handle)
 
+	// Test opening with DriverName ("murmur")
 	sqldb, err := sql.Open(DriverName, handle)
 	if err != nil {
 		t.Fatal(err)
@@ -100,6 +101,16 @@ func TestDriverRegisteredOpen(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("want 1 row, got %d", count)
+	}
+
+	// Test opening with LegacyDriverName ("replicateddb")
+	sqldbLegacy, err := sql.Open(LegacyDriverName, handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldbLegacy.Close()
+	if err := sqldbLegacy.PingContext(ctx); err != nil {
+		t.Fatal(err)
 	}
 
 	// sql.Open resolves the connector eagerly, so an unknown handle fails here.

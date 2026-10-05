@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	core "github.com/marcgauthier/murmur"
 	murmurSchema "github.com/marcgauthier/murmur/schema"
 	"gorm.io/gorm"
 	gormmigrator "gorm.io/gorm/migrator"
@@ -22,7 +22,7 @@ import (
 // defaults, autoincrement, checks, constraints) fails loudly.
 type Migrator struct {
 	gormmigrator.Migrator
-	murmur *replicateddb.DB
+	murmur *core.DB
 }
 
 var _ gorm.Migrator = (*Migrator)(nil)
@@ -620,7 +620,7 @@ func isMurmurTypeSpelling(typ string) bool {
 // GORM-first applications derive that genesis from their models:
 //
 //	tables, err := murmur.GenesisTables(&User{}, &Order{})
-//	db, err := replicateddb.Open(ctx, cfgWithTables(tables))
+//	db, err := murmur.Open(ctx, cfgWithTables(tables))
 //	gdb, err := gorm.Open(murmur.Open(db))
 //
 // Models use the default naming strategy; use

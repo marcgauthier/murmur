@@ -48,16 +48,13 @@ const (
 	sysRestoreMarker = "restore_marker"
 )
 
-// FormatVersion is the persistent Pebble format version written by this
-// binary. It exceeds the previous release's format (2), whose opener
-// requires strict equality, so older binaries refuse stores first
-// written here: the downgrade guard.
-const FormatVersion uint64 = 3
+// FormatVersion records origin-signed transactions and the local signing-key
+// fingerprint. Older binaries must refuse signed stores.
+const FormatVersion uint64 = 5
 
 // MinFormatVersion is the oldest persistent format this binary still
-// opens (downgrade-guard floor): v2 stores from the previous release
-// open read-write with their markers left untouched, while v1 (Badger)
-// and anything newer than FormatVersion fail closed.
+// recognizes for explicit offline migration. Ordinary Open requires signed
+// format 4; v1 (Badger) and future formats always fail closed.
 const MinFormatVersion uint64 = 2
 
 // MinReaderVersion and MinWriterVersion are the newest store minimum
@@ -66,8 +63,8 @@ const MinFormatVersion uint64 = 2
 // all three markers at FormatVersion; pre-marker stores default
 // missing minima to their own stored format version on open.
 const (
-	MinReaderVersion uint64 = 3
-	MinWriterVersion uint64 = 3
+	MinReaderVersion uint64 = 5
+	MinWriterVersion uint64 = 5
 )
 
 // CellKey builds 01 | tableID:u32 | rowUUID:16 | columnID:u32.

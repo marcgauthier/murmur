@@ -72,7 +72,7 @@ func (fs *errFS) Create(name string, cat vfs.DiskWriteCategory) (vfs.File, error
 	return fs.wrap(f, err)
 }
 
-func (fs *errFS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
+func (fs *errFS) openSignedFixture(name string, opts ...vfs.OpenOption) (vfs.File, error) {
 	f, err := fs.FS.Open(name, opts...)
 	return fs.wrap(f, err)
 }

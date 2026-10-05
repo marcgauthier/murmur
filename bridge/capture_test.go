@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/marcgauthier/murmur/internal/testdb"
 	"testing"
 
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/schema"
-	"github.com/marcgauthier/murmur/state"
 )
 
 type stubLogSource struct {
@@ -240,7 +240,7 @@ func TestCaptureFailsLoud(t *testing.T) {
 }
 
 func testLowDBConfig(dir string, nodeID ids.NodeID, dbid ids.DBID) db.Config {
-	return db.Config{
+	return testdb.Configure(db.Config{
 		Path:   dir,
 		NodeID: nodeID,
 		DBID:   dbid,
@@ -262,7 +262,7 @@ func testLowDBConfig(dir string, nodeID ids.NodeID, dbid ids.DBID) db.Config {
 			Key:   []byte("0123456789abcdef0123456789abcdef"),
 			KeyID: "bridge-test-key",
 		},
-	}
+	})
 }
 
 func TestBridgeExportProtectUncapturedFromGC(t *testing.T) {
@@ -302,9 +302,7 @@ func TestBridgeExportProtectUncapturedFromGC(t *testing.T) {
 	}
 
 	// Delayed polling: GC runs aggressively BEFORE CaptureOnce is called.
-	store, err := state.Open(dir+"/data", node, dbid, state.Options{})
-	// Note: lowDB is open so we can verify through lowDB's BridgeLogSource.
-	_ = store
+	// lowDB is already open; verify retention through its BridgeLogSource.
 
 	// Run GC on lowDB via lowDB.BridgeLogSource / CollectLog.
 	// Since 0 batches were captured into the outbox, resume is 0, so GC must not delete uncaptured batches!

@@ -1,8 +1,9 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
 	"database/sql"
+	"github.com/marcgauthier/murmur/codec"
 	"sync"
 
 	"github.com/marcgauthier/murmur/sqlengine"
@@ -15,22 +16,23 @@ type TxOptions struct{}
 // Tx is one explicit local transaction. It holds the serialized write
 // coordinator until Commit or Rollback and is not safe for concurrent use.
 type Tx struct {
-	db           *DB
-	stx          *sqlengine.Tx
-	txID         TxID
-	done         bool
-	mu           sync.Mutex
-	ticket       *Ticket
-	bridgeImport *bridgeImportInfo
-	stopHook     func() bool
+	mergeMutations []codec.Mutation
+	mergeEvents    map[int]uint32
+	db             *DB
+	stx            *sqlengine.Tx
+	txID           TxID
+	done           bool
+	mu             sync.Mutex
+	ticket         *Ticket
+	bridgeImport   *bridgeImportInfo
+	stopHook       func() bool
 }
 
 // ExecContext executes a statement inside the transaction.
 func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	tx.mu.Lock()
-	done := tx.done
-	tx.mu.Unlock()
-	if done {
+	defer tx.mu.Unlock()
+	if tx.done {
 		return nil, ErrTxDone
 	}
 	return tx.stx.ExecContext(ctx, query, args...)
@@ -40,9 +42,8 @@ func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.R
 // before Commit.
 func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	tx.mu.Lock()
-	done := tx.done
-	tx.mu.Unlock()
-	if done {
+	defer tx.mu.Unlock()
+	if tx.done {
 		return nil, ErrTxDone
 	}
 	return tx.stx.QueryContext(ctx, query, args...)
@@ -51,9 +52,8 @@ func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql
 // QueryRowContext runs a single-row query inside the transaction.
 func (tx *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *TxRow {
 	tx.mu.Lock()
-	done := tx.done
-	tx.mu.Unlock()
-	if done {
+	defer tx.mu.Unlock()
+	if tx.done {
 		return &TxRow{err: ErrTxDone}
 	}
 	row, err := tx.stx.QueryRowContext(ctx, query, args...)
@@ -64,7 +64,9 @@ func (tx *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *T
 func (tx *Tx) TxID() TxID { return tx.txID }
 
 // Commit commits: SQL COMMIT then one atomic Pebble commit. Success is
-// reported only after Pebble durability.
+// reported only after Pebble durability. With group commit the Pebble
+// commit is shared with concurrent transactions; the acknowledgement still
+// follows the shared fsync.
 func (tx *Tx) Commit() error {
 	tx.mu.Lock()
 	if tx.done {
@@ -77,7 +79,6 @@ func (tx *Tx) Commit() error {
 		tx.stopHook = nil
 	}
 	tx.mu.Unlock()
-	defer tx.db.writeMu.Unlock()
 	defer tx.ticket.Release()
 	return tx.db.commitTx(tx)
 }

@@ -37,7 +37,7 @@ func schemaConfig() *db.SchemaConfig {
 }
 
 func tmpfsMB() int {
-	if v := os.Getenv("SPEDSQL_DISKFULL_TMPFS_MB"); v != "" {
+	if v := harness.GetEnv("MURMUR_DISKFULL_TMPFS_MB"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 32 {
 			return n
 		}
@@ -46,7 +46,7 @@ func tmpfsMB() int {
 }
 
 func fillRowCap() int {
-	if v := os.Getenv("SPEDSQL_DISKFULL_FILL_ROWS"); v != "" {
+	if v := harness.GetEnv("MURMUR_DISKFULL_FILL_ROWS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}

@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"fmt"
@@ -6,6 +6,7 @@ import (
 
 	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/origin"
 	"github.com/marcgauthier/murmur/replication"
 	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/transport"
@@ -33,6 +34,23 @@ const (
 	DurabilityAsync
 )
 
+// GroupCommitConfig configures synchronous group commit for local writes.
+// Concurrent transactions briefly queue after their SQL commit and share one
+// Pebble batch with one fsync; each transaction is still acknowledged only
+// after that shared fsync, so the DurabilitySynchronous contract is unchanged.
+type GroupCommitConfig struct {
+	// MaxDelay bounds how long a group leader waits for concurrent
+	// transactions before committing. Zero selects the one-millisecond
+	// default in DurabilitySynchronous mode. A negative value disables
+	// group commit (every transaction commits alone, as before). The
+	// setting is ignored in DurabilityAsync mode.
+	MaxDelay time.Duration
+	// MaxTransactions caps transactions per group. Zero selects 64.
+	MaxTransactions int
+	// MaxBytes caps the total encoded size per group. Zero selects 4 MiB.
+	MaxBytes int64
+}
+
 // DurabilityConfig configures the durability contract.
 type DurabilityConfig struct {
 	Mode DurabilityMode
@@ -41,6 +59,17 @@ type DurabilityConfig struct {
 	// One second limits the usual unsynced window to about one second;
 	// a blocked or failed sync can extend it.
 	SyncInterval time.Duration
+	// MaxUnsyncedBytes triggers a durability sync once approximately this
+	// many bytes have been written without one. It is only valid with
+	// DurabilityAsync; zero disables the size trigger. When both
+	// SyncInterval and MaxUnsyncedBytes are set, whichever threshold is
+	// reached first triggers the sync, bounding the loss window under
+	// bursty load that a pure time interval would leave wide open.
+	MaxUnsyncedBytes int64
+	// GroupCommit configures synchronous group commit. It is ignored in
+	// DurabilityAsync mode, which already acknowledges without waiting
+	// for fsync.
+	GroupCommit GroupCommitConfig
 }
 
 // BackupScheduleConfig configures the automated online backup worker.
@@ -91,8 +120,11 @@ type FilesConfig struct {
 	// same ObjectKey: receivers verify containers with the local key.
 	FetchAddr string
 	// FetchPeers statically lists fetch sources (NodeID plus fetch
-	// endpoint addresses). Empty disables background and on-demand
-	// fetching; the node serves (when FetchAddr is set) but never pulls.
+	// endpoint addresses). Serving members discovered through SWIM
+	// membership are additional sources; on a NodeID conflict the static
+	// entry wins. Empty with no membership service disables background
+	// and on-demand fetching; the node serves (when FetchAddr is set)
+	// but never pulls.
 	FetchPeers []Peer
 	// FetchInterval is the background scan period for missing objects.
 	// Zero selects 30 seconds. Negative disables the background worker
@@ -169,6 +201,9 @@ type PebbleConfig struct {
 	MaxOpenFiles int
 	// MaxConcurrentCompactions caps background compactions. Default 1.
 	MaxConcurrentCompactions int
+	// DisableAutomaticCompactions stops automatic compactions (flushes
+	// still run). Default false; used to simulate stalled compaction.
+	DisableAutomaticCompactions bool
 	// Compression selects block compression. Default zstd level 3.
 	Compression CompressionConfig
 	// BaseFS is the filesystem under the encrypted VFS. Nil means
@@ -201,6 +236,9 @@ type SchemaConfig struct {
 	DDL []string
 	// LocalDDL holds local-only objects (indexes, views, FTS) applied after
 	// replicated tables on every open/rebuild. Never replicated.
+	// Statements must be idempotent (IF NOT EXISTS): they re-run
+	// whenever the materializer rebuilds, and local objects (which may
+	// hold app data) are never dropped for them.
 	LocalDDL []string
 	// AcceptRemoteSchema controls schema synchronization from peers during
 	// replication (architecture/schema.md section 50). Nil (the default)
@@ -223,7 +261,10 @@ type MembershipConfig = replication.MembershipConfig
 // ReplicationConfig configures QUIC replication. A zero ListenAddr disables
 // replication (single-node mode); peers may still be added later.
 type ReplicationConfig struct {
-	ListenAddr string
+	// TrustedSnapshotSources authorizes merged-state recovery independently
+	// of transport and transaction-origin trust. Empty disables remote snapshots.
+	TrustedSnapshotSources []NodeID
+	ListenAddr             string
 	// TLS holds node certificate material. Required when replication is used.
 	TLS *TLSCredential
 	// Peers are statically configured peers.
@@ -266,6 +307,9 @@ type ReplicationConfig struct {
 	// DefaultSnapshotAtomicMergeBytes) merge chunk by chunk with durable
 	// resume progress and publish watermarks/generation atomically last.
 	MaxSnapshotBytes int64
+	// SnapshotAtomicMergeBytes chooses the snapshot atomic merge threshold.
+	// Zero uses the state default; larger snapshots use resumable SST ingestion.
+	SnapshotAtomicMergeBytes uint64
 	// SnapshotTransferTimeout bounds how long the source holds its consistent read cut.
 	// Default 10 minutes.
 	SnapshotTransferTimeout time.Duration
@@ -327,7 +371,13 @@ type Peer struct {
 }
 
 // Config is the complete DB configuration.
+// OriginSigningConfig supplies a separate Ed25519 identity and explicit origin trust.
+type OriginSigningConfig = origin.Config
+
 type Config struct {
+	OriginSigning           OriginSigningConfig
+	originBaselineMigration bool
+	mergePolicyMigration    bool
 	// Path is the Pebble data directory (content files plus key registry).
 	Path string
 	// NodeID is this node's identity. Required.
@@ -505,39 +555,69 @@ func (c *Config) withDefaults() {
 	if c.Logger == nil {
 		c.Logger = DiscardLogger{}
 	}
+	g := &c.Durability.GroupCommit
+	if g.MaxDelay == 0 && c.Durability.Mode == DurabilitySynchronous {
+		g.MaxDelay = time.Millisecond
+	}
+	if g.MaxTransactions == 0 {
+		g.MaxTransactions = 64
+	}
+	if g.MaxBytes == 0 {
+		g.MaxBytes = 4 << 20
+	}
 	c.Scheduling.withDefaults()
 }
 
 func (c *Config) validate() error {
+	if err := c.OriginSigning.Validate(c.NodeID); err != nil {
+		return err
+	}
 	if c.Path == "" {
-		return fmt.Errorf("replicateddb: Path is required: %w", ErrUnsupportedSchema)
+		return fmt.Errorf("murmur: Path is required: %w", ErrUnsupportedSchema)
 	}
 	if c.NodeID.IsZero() {
-		return fmt.Errorf("replicateddb: NodeID is required: %w", ErrUnsupportedSchema)
+		return fmt.Errorf("murmur: NodeID is required: %w", ErrUnsupportedSchema)
 	}
 	if c.Durability.Mode != DurabilitySynchronous && c.Durability.Mode != DurabilityAsync {
-		return fmt.Errorf("replicateddb: unsupported durability mode %d: %w", c.Durability.Mode, ErrUnsupportedSchema)
+		return fmt.Errorf("murmur: unsupported durability mode %d: %w", c.Durability.Mode, ErrUnsupportedSchema)
 	}
 	if c.Durability.SyncInterval < 0 || (c.Durability.SyncInterval > 0 && c.Durability.Mode != DurabilityAsync) {
-		return fmt.Errorf("replicateddb: durability SyncInterval requires DurabilityAsync and must be non-negative: %w", ErrUnsupportedSchema)
+		return fmt.Errorf("murmur: durability SyncInterval requires DurabilityAsync and must be non-negative: %w", ErrUnsupportedSchema)
+	}
+	if c.Durability.MaxUnsyncedBytes < 0 || (c.Durability.MaxUnsyncedBytes > 0 && c.Durability.Mode != DurabilityAsync) {
+		return fmt.Errorf("murmur: durability MaxUnsyncedBytes requires DurabilityAsync and must be non-negative: %w", ErrUnsupportedSchema)
+	}
+	g := c.Durability.GroupCommit
+	// Group commit is inactive in asynchronous mode (acknowledgement never
+	// waits for fsync there); its settings are validated but ignored.
+	if g.MaxDelay > time.Second {
+		return fmt.Errorf("murmur: durability GroupCommit MaxDelay must not exceed one second: %w", ErrUnsupportedSchema)
+	}
+	// Zero caps mean "use defaults" (withDefaults fills them before Open
+	// validates); only explicit out-of-range values are rejected.
+	if g.MaxTransactions < 0 || g.MaxTransactions > 512 {
+		return fmt.Errorf("murmur: durability GroupCommit MaxTransactions must be within 0..512: %w", ErrUnsupportedSchema)
+	}
+	if g.MaxBytes < 0 || g.MaxBytes > 64<<20 {
+		return fmt.Errorf("murmur: durability GroupCommit MaxBytes must be within 0..64MiB: %w", ErrUnsupportedSchema)
 	}
 	if c.MaxTransactionBytes <= 0 {
-		return fmt.Errorf("replicateddb: MaxTransactionBytes must be positive: %w", ErrUnsupportedSchema)
+		return fmt.Errorf("murmur: MaxTransactionBytes must be positive: %w", ErrUnsupportedSchema)
 	}
 	if int64(c.MaxReplicatedValueBytes) > c.MaxTransactionBytes {
-		return fmt.Errorf("replicateddb: MaxReplicatedValueBytes (%d) cannot exceed MaxTransactionBytes (%d): %w", c.MaxReplicatedValueBytes, c.MaxTransactionBytes, ErrUnsupportedSchema)
+		return fmt.Errorf("murmur: MaxReplicatedValueBytes (%d) cannot exceed MaxTransactionBytes (%d): %w", c.MaxReplicatedValueBytes, c.MaxTransactionBytes, ErrUnsupportedSchema)
 	}
 	if c.Subscription.MaxSubscribers < 0 || c.Subscription.EventBufferSize < 0 || c.Subscription.MaxRetainedEvents < 0 {
-		return fmt.Errorf("replicateddb: subscription limits must be non-negative: %w", ErrUnsupportedSchema)
+		return fmt.Errorf("murmur: subscription limits must be non-negative: %w", ErrUnsupportedSchema)
 	}
 	if c.QueryStore.RemoteApplyInterval <= 0 {
-		return fmt.Errorf("replicateddb: query-store RemoteApplyInterval must be positive: %w", ErrUnsupportedSchema)
+		return fmt.Errorf("murmur: query-store RemoteApplyInterval must be positive: %w", ErrUnsupportedSchema)
 	}
 	if c.QueryStore.RemoteApplyMaxTransactions <= 0 {
-		return fmt.Errorf("replicateddb: query-store RemoteApplyMaxTransactions must be positive: %w", ErrUnsupportedSchema)
+		return fmt.Errorf("murmur: query-store RemoteApplyMaxTransactions must be positive: %w", ErrUnsupportedSchema)
 	}
 	if len(c.Schema.Tables) == 0 {
-		return fmt.Errorf("replicateddb: at least one replicated table is required: %w", ErrUnsupportedSchema)
+		return fmt.Errorf("murmur: at least one replicated table is required: %w", ErrUnsupportedSchema)
 	}
 	if _, err := schema.BuildRegistry(c.Schema.Version, c.Schema.Tables); err != nil {
 		return err
@@ -549,44 +629,44 @@ func (c *Config) validate() error {
 		return err
 	}
 	if c.Replication.MaxSnapshotBytes <= 0 {
-		return fmt.Errorf("replicateddb: Replication.MaxSnapshotBytes must be positive")
+		return fmt.Errorf("murmur: Replication.MaxSnapshotBytes must be positive")
 	}
 	if c.Replication.SnapshotTransferTimeout <= 0 {
-		return fmt.Errorf("replicateddb: Replication.SnapshotTransferTimeout must be positive")
+		return fmt.Errorf("murmur: Replication.SnapshotTransferTimeout must be positive")
 	}
 	if c.Replication.SnapshotRequestTimeout <= 0 {
-		return fmt.Errorf("replicateddb: Replication.SnapshotRequestTimeout must be positive")
+		return fmt.Errorf("murmur: Replication.SnapshotRequestTimeout must be positive")
 	}
 	if c.Replication.Fanout <= 0 {
-		return fmt.Errorf("replicateddb: Replication.Fanout must be positive")
+		return fmt.Errorf("murmur: Replication.Fanout must be positive")
 	}
 	if c.Replication.Dissemination != "" && c.Replication.Dissemination != DisseminationGossip && c.Replication.Dissemination != DisseminationPlumtree {
-		return fmt.Errorf("replicateddb: unsupported replication dissemination mode %q", c.Replication.Dissemination)
+		return fmt.Errorf("murmur: unsupported replication dissemination mode %q", c.Replication.Dissemination)
 	}
 	if c.Replication.Dissemination == DisseminationPlumtree && c.Replication.Fanout < 2 {
-		return fmt.Errorf("replicateddb: Replication.Fanout must be at least 2 for Plumtree")
+		return fmt.Errorf("murmur: Replication.Fanout must be at least 2 for Plumtree")
 	}
 	if v, m := c.Replication.ProtocolVersionOverride, c.Replication.MinProtocolVersionOverride; v != 0 && m > v {
-		return fmt.Errorf("replicateddb: Replication.MinProtocolVersionOverride must not exceed ProtocolVersionOverride")
+		return fmt.Errorf("murmur: Replication.MinProtocolVersionOverride must not exceed ProtocolVersionOverride")
 	}
 	if c.Replication.PeerRotationInterval <= 0 {
-		return fmt.Errorf("replicateddb: Replication.PeerRotationInterval must be positive")
+		return fmt.Errorf("murmur: Replication.PeerRotationInterval must be positive")
 	}
 	if c.Replication.AntiEntropyInterval <= 0 {
-		return fmt.Errorf("replicateddb: Replication.AntiEntropyInterval must be positive")
+		return fmt.Errorf("murmur: Replication.AntiEntropyInterval must be positive")
 	}
 	if c.Replication.MaxConcurrentRepairs <= 0 {
-		return fmt.Errorf("replicateddb: Replication.MaxConcurrentRepairs must be positive")
+		return fmt.Errorf("murmur: Replication.MaxConcurrentRepairs must be positive")
 	}
 	if c.Replication.MaxReplicationSessions <= 0 {
-		return fmt.Errorf("replicateddb: Replication.MaxReplicationSessions must be positive")
+		return fmt.Errorf("murmur: Replication.MaxReplicationSessions must be positive")
 	}
 	if c.Replication.Fanout+c.Replication.MaxConcurrentRepairs > c.Replication.MaxReplicationSessions {
-		return fmt.Errorf("replicateddb: Replication.Fanout + MaxConcurrentRepairs (%d) cannot exceed MaxReplicationSessions (%d)",
+		return fmt.Errorf("murmur: Replication.Fanout + MaxConcurrentRepairs (%d) cannot exceed MaxReplicationSessions (%d)",
 			c.Replication.Fanout+c.Replication.MaxConcurrentRepairs, c.Replication.MaxReplicationSessions)
 	}
 	if c.Replication.MaxQUICConnections < c.Replication.MaxReplicationSessions+8 {
-		return fmt.Errorf("replicateddb: Replication.MaxQUICConnections (%d) must be at least MaxReplicationSessions + 8 (%d)",
+		return fmt.Errorf("murmur: Replication.MaxQUICConnections (%d) must be at least MaxReplicationSessions + 8 (%d)",
 			c.Replication.MaxQUICConnections, c.Replication.MaxReplicationSessions+8)
 	}
 	if _, err := transport.ParseAddressPolicy(c.Replication.AllowedNetworks); err != nil {
@@ -596,20 +676,20 @@ func (c *Config) validate() error {
 		return err
 	}
 	if c.Files.Enabled && len(c.Files.ObjectKey) != 32 {
-		return fmt.Errorf("replicateddb: Files.ObjectKey must be 32 bytes when Files.Enabled")
+		return fmt.Errorf("murmur: Files.ObjectKey must be 32 bytes when Files.Enabled")
 	}
 	if len(c.Files.PrevObjectKey) != 0 && len(c.Files.PrevObjectKey) != 32 {
-		return fmt.Errorf("replicateddb: Files.PrevObjectKey must be 32 bytes when set")
+		return fmt.Errorf("murmur: Files.PrevObjectKey must be 32 bytes when set")
 	}
 	if c.Files.Enabled && (c.Files.FetchAddr != "" || len(c.Files.FetchPeers) > 0) && c.Replication.TLS == nil {
-		return fmt.Errorf("replicateddb: Files fetch requires Replication.TLS credentials")
+		return fmt.Errorf("murmur: Files fetch requires Replication.TLS credentials")
 	}
 	for i, p := range c.Files.FetchPeers {
 		if p.NodeID.IsZero() {
-			return fmt.Errorf("replicateddb: Files.FetchPeers[%d] needs a NodeID", i)
+			return fmt.Errorf("murmur: Files.FetchPeers[%d] needs a NodeID", i)
 		}
 		if len(p.Addrs) == 0 {
-			return fmt.Errorf("replicateddb: Files.FetchPeers[%d] needs at least one address", i)
+			return fmt.Errorf("murmur: Files.FetchPeers[%d] needs at least one address", i)
 		}
 	}
 	return nil
@@ -617,30 +697,30 @@ func (c *Config) validate() error {
 
 func (p PebbleConfig) validate() error {
 	if p.CacheBytes <= 0 {
-		return fmt.Errorf("replicateddb: Pebble.CacheBytes is required and must be positive (use DefaultPebbleConfig)")
+		return fmt.Errorf("murmur: Pebble.CacheBytes is required and must be positive (use DefaultPebbleConfig)")
 	}
 	if p.MemTableBytes == 0 {
-		return fmt.Errorf("replicateddb: Pebble.MemTableBytes must be positive")
+		return fmt.Errorf("murmur: Pebble.MemTableBytes must be positive")
 	}
 	if p.MemTableCount <= 0 {
-		return fmt.Errorf("replicateddb: Pebble.MemTableCount must be positive")
+		return fmt.Errorf("murmur: Pebble.MemTableCount must be positive")
 	}
 	if p.MaxOpenFiles <= 0 {
-		return fmt.Errorf("replicateddb: Pebble.MaxOpenFiles must be positive")
+		return fmt.Errorf("murmur: Pebble.MaxOpenFiles must be positive")
 	}
 	if p.MaxConcurrentCompactions <= 0 {
-		return fmt.Errorf("replicateddb: Pebble.MaxConcurrentCompactions must be positive")
+		return fmt.Errorf("murmur: Pebble.MaxConcurrentCompactions must be positive")
 	}
 	switch p.Compression.Algorithm {
 	case CompressionZstd, CompressionSnappy, CompressionNone:
 	default:
-		return fmt.Errorf("replicateddb: unknown Pebble compression %q", p.Compression.Algorithm)
+		return fmt.Errorf("murmur: unknown Pebble compression %q", p.Compression.Algorithm)
 	}
 	if p.Compression.Algorithm == CompressionZstd {
 		switch p.Compression.ZstdLevel {
 		case 3, 9, 12:
 		default:
-			return fmt.Errorf("replicateddb: Pebble Zstd supports only levels 3, 9, and 12 (got %d)", p.Compression.ZstdLevel)
+			return fmt.Errorf("murmur: Pebble Zstd supports only levels 3, 9, and 12 (got %d)", p.Compression.ZstdLevel)
 		}
 	}
 	return nil

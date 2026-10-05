@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -28,8 +27,8 @@ import (
 )
 
 func TestCrashLoopNodeConvergesWithoutLoss(t *testing.T) {
-	rounds := envInt("SPEDSQL_CRASH_LOOP_ROUNDS", 5)
-	uptime := time.Duration(envInt("SPEDSQL_CRASH_LOOP_UPTIME_MS", 1000)) * time.Millisecond
+	rounds := envInt("MURMUR_CRASH_LOOP_ROUNDS", 5)
+	uptime := time.Duration(envInt("MURMUR_CRASH_LOOP_UPTIME_MS", 1000)) * time.Millisecond
 	const victim = 2
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:        "crash-loop",
@@ -266,7 +265,7 @@ func assertAcknowledgedPresent(t *testing.T, c *harness.Cluster, acknowledged ma
 }
 
 func envInt(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {
 		return v
 	}
 	return fallback

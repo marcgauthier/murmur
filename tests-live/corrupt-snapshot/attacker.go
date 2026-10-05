@@ -84,7 +84,7 @@ func (a *attacker) dialMismatch(t *testing.T, addr string, expect ids.NodeID) *e
 		DBID:                a.dbid,
 		SchemaEpoch:         9999,
 		SchemaHash:          randomHash(),
-		Capabilities:        replication.CapZstd,
+		Capabilities:        replication.CapMergePolicies | replication.CapZstd | replication.CapOriginSignatures,
 		MaxTransactionBytes: 64 << 20,
 	}
 	if err := replication.WriteFrame(stream, replication.MsgHello, 0, replication.EncodeHello(nil, hello)); err != nil {
@@ -191,7 +191,7 @@ func buildCorruptSnapshot(t *testing.T, a *attacker, welcome *replication.Hello)
 	sort.Slice(wms, func(i, j int) bool { return bytes.Compare(wms[i].Origin[:], wms[j].Origin[:]) < 0 })
 
 	manifest := &codec.SnapshotManifest{
-		FormatVersion:   1,
+		FormatVersion:   2,
 		SnapshotID:      ids.NewTxID(),
 		DBID:            a.dbid,
 		SchemaEpoch:     welcome.SchemaEpoch,
@@ -214,7 +214,17 @@ func buildCorruptSnapshot(t *testing.T, a *attacker, welcome *replication.Hello)
 	}
 	wire0 := replication.EncodeSnapshotChunk(nil, &replication.SnapshotChunk{Index: 0, Last: false, Cells: cells0})
 	wire1 := replication.EncodeSnapshotChunk(nil, &replication.SnapshotChunk{Index: 1, Last: true, Cells: cells1})
-	wire1[len(wire1)-1] ^= 0xFF // flip a value byte; lengths preserved
+	// Flip a byte inside the last cell's value plaintext. The wire
+	// encoding ends with framing (record key), not value bytes, so a
+	// trailing flip breaks structural decoding instead of the content
+	// digest. An ASCII-to-ASCII flip preserves lengths, framing, and
+	// value validity; only the digest differs.
+	tag := []byte("corrupt-b2")
+	at := bytes.LastIndex(wire1, tag)
+	if at < 0 {
+		t.Fatalf("value plaintext %q not found in encoded chunk; fixture is broken", tag)
+	}
+	wire1[at] ^= 0x01 // 'c' -> 'b'
 	bad, err := replication.DecodeSnapshotChunk(mustDecompress(t, wire1), codec.DefaultLimits(), 1<<20)
 	if err != nil {
 		t.Fatalf("corrupted chunk does not decode locally: %v", err)

@@ -8,6 +8,7 @@ import (
 
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 // RecordOp distinguishes row upserts from row deletes.
@@ -22,8 +23,10 @@ const (
 
 // ColumnValue is one logical column effect.
 type ColumnValue struct {
-	Column string
-	Value  codec.Value
+	Policy  schema.MergePolicy
+	Records []codec.CRDTRecord
+	Column  string
+	Value   codec.Value
 }
 
 // Record is one logical row effect. Records carry replication-level values,
@@ -73,6 +76,9 @@ func (b Batch) Validate(limits Limits) error {
 				return fmt.Errorf("bridge: record %d upsert has no columns", i)
 			}
 			for _, c := range r.Columns {
+				if c.Policy > schema.MIN || c.Policy == schema.LWW && len(c.Records) != 0 {
+					return fmt.Errorf("bridge: invalid column policy payload")
+				}
 				if c.Column == "" {
 					return fmt.Errorf("bridge: record %d has an unnamed column", i)
 				}
@@ -144,7 +150,7 @@ type ArtifactSource interface {
 }
 
 // Database is the minimal surface the bridge needs from either domain's DB.
-// The concrete *replicateddb.DB satisfies it.
+// The concrete *murmur.DB satisfies it.
 type Database interface {
 	DBID() ids.DBID
 }

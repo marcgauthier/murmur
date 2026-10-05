@@ -17,7 +17,7 @@ func snapshotTestManager(t *testing.T, timeout time.Duration) *Manager {
 	t.Helper()
 	cluster := newTestCluster(t)
 	localID := ids.NewNodeID()
-	st, err := state.Open(t.TempDir(), localID, cluster.dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
+	st, err := openSignedFixture(t.TempDir(), localID, cluster.dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestStalledSnapshotReRequested(t *testing.T) {
 	p.session = liveTestSession()
 	p.mu.Unlock()
 
-	if already := mgr.markSnapshotRequested(p); already {
+	if already := markSnapshotRequestedFixture(mgr, p); already {
 		t.Fatal("first request reported already-waiting")
 	}
 	p.mu.Lock()
@@ -105,7 +105,7 @@ func TestMovingSnapshotNotReRequested(t *testing.T) {
 	p.mu.Lock()
 	p.session = liveTestSession()
 	p.mu.Unlock()
-	mgr.markSnapshotRequested(p)
+	markSnapshotRequestedFixture(mgr, p)
 	mgr.markSnapshotProgress(p)
 
 	mgr.retryStalledSnapshots()
@@ -129,7 +129,7 @@ func TestSnapshotBusyBackoffHonored(t *testing.T) {
 	p.mu.Lock()
 	p.session = liveTestSession()
 	p.mu.Unlock()
-	mgr.markSnapshotRequested(p)
+	markSnapshotRequestedFixture(mgr, p)
 
 	mgr.onError(p, nil, EncodeError(nil, ErrSnapshotBusy, "snapshot already in flight"))
 	if got := mgr.Stats().SnapshotBusyReceived; got != 1 {
@@ -167,7 +167,7 @@ func TestStalledSnapshotWithoutSessionNotReRequested(t *testing.T) {
 	mgr.mu.Lock()
 	p := mgr.peers[peer]
 	mgr.mu.Unlock()
-	mgr.markSnapshotRequested(p)
+	markSnapshotRequestedFixture(mgr, p)
 	p.mu.Lock()
 	p.lastSnapProgress = time.Now().Add(-time.Hour)
 	p.mu.Unlock()
@@ -214,7 +214,7 @@ func TestMarkSnapshotRequestedIdempotent(t *testing.T) {
 	p := mgr.peers[peer]
 	mgr.mu.Unlock()
 
-	if already := mgr.markSnapshotRequested(p); already {
+	if already := markSnapshotRequestedFixture(mgr, p); already {
 		t.Fatal("first request reported already-waiting")
 	}
 	p.mu.Lock()
@@ -224,7 +224,7 @@ func TestMarkSnapshotRequestedIdempotent(t *testing.T) {
 		t.Fatal("first request did not stamp the wait start")
 	}
 	time.Sleep(5 * time.Millisecond)
-	if already := mgr.markSnapshotRequested(p); !already {
+	if already := markSnapshotRequestedFixture(mgr, p); !already {
 		t.Fatal("repeat request did not report already-waiting")
 	}
 	p.mu.Lock()
@@ -244,7 +244,7 @@ func TestSnapshotProgressDiagnostics(t *testing.T) {
 	mgr.mu.Lock()
 	p := mgr.peers[peer]
 	mgr.mu.Unlock()
-	mgr.markSnapshotRequested(p)
+	markSnapshotRequestedFixture(mgr, p)
 	p.mu.Lock()
 	p.snapRecv = &snapRecvState{
 		manifest:       &codec.SnapshotManifest{ChunkCount: 7},

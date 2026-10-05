@@ -4,12 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"github.com/marcgauthier/murmur/internal/testdb"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	core "github.com/marcgauthier/murmur"
 	murmurSchema "github.com/marcgauthier/murmur/schema"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -69,7 +70,7 @@ type preflightInvalid struct {
 
 func (preflightInvalid) TableName() string { return "preflight_invalid" }
 
-func openEngine(t *testing.T, models ...interface{}) *replicateddb.DB {
+func openEngine(t *testing.T, models ...interface{}) *core.DB {
 	t.Helper()
 	genesis, err := GenesisTables(models...)
 	if err != nil {
@@ -78,16 +79,16 @@ func openEngine(t *testing.T, models ...interface{}) *replicateddb.DB {
 	return openEngineWithTables(t, genesis)
 }
 
-func openEngineWithTables(t *testing.T, tables []murmurSchema.TableSchema) *replicateddb.DB {
+func openEngineWithTables(t *testing.T, tables []murmurSchema.TableSchema) *core.DB {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := replicateddb.Open(context.Background(), replicateddb.Config{
+	db, err := core.Open(context.Background(), testdb.Configure(core.Config{
 		Path:       filepath.Join(dir, "data"),
-		NodeID:     replicateddb.NewNodeID(),
-		DBID:       replicateddb.NewDBID(),
-		Encryption: replicateddb.EncryptionConfig{Key: append([]byte(nil), testKey...), KeyID: "test"},
-		Schema:     replicateddb.SchemaConfig{Version: 1, Tables: tables},
-	})
+		NodeID:     core.NewNodeID(),
+		DBID:       core.NewDBID(),
+		Encryption: core.EncryptionConfig{Key: append([]byte(nil), testKey...), KeyID: "test"},
+		Schema:     core.SchemaConfig{Version: 1, Tables: tables},
+	}))
 	if err != nil {
 		t.Fatalf("open engine: %v", err)
 	}
@@ -95,7 +96,7 @@ func openEngineWithTables(t *testing.T, tables []murmurSchema.TableSchema) *repl
 	return db
 }
 
-func openGorm(t *testing.T, db *replicateddb.DB, models ...interface{}) *gorm.DB {
+func openGorm(t *testing.T, db *core.DB, models ...interface{}) *gorm.DB {
 	t.Helper()
 	gdb, err := gorm.Open(Open(db), &gorm.Config{})
 	if err != nil {
@@ -389,15 +390,15 @@ func TestGormMurmurReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("genesis: %v", err)
 	}
-	nodeID, dbID := replicateddb.NewNodeID(), replicateddb.NewDBID()
-	cfg := replicateddb.Config{
+	nodeID, dbID := core.NewNodeID(), core.NewDBID()
+	cfg := testdb.Configure(core.Config{
 		Path:       filepath.Join(dir, "data"),
 		NodeID:     nodeID,
 		DBID:       dbID,
-		Encryption: replicateddb.EncryptionConfig{Key: append([]byte(nil), testKey...), KeyID: "test"},
-		Schema:     replicateddb.SchemaConfig{Version: 1, Tables: genesis},
-	}
-	db, err := replicateddb.Open(context.Background(), cfg)
+		Encryption: core.EncryptionConfig{Key: append([]byte(nil), testKey...), KeyID: "test"},
+		Schema:     core.SchemaConfig{Version: 1, Tables: genesis},
+	})
+	db, err := core.Open(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -425,8 +426,8 @@ func TestGormMurmurReopen(t *testing.T) {
 	}
 
 	// Reopen from the live export and prove data + idempotent migrate.
-	cfg.Schema = replicateddb.SchemaConfig{Version: epoch, Tables: live}
-	db2, err := replicateddb.Open(context.Background(), cfg)
+	cfg.Schema = core.SchemaConfig{Version: epoch, Tables: live}
+	db2, err := core.Open(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

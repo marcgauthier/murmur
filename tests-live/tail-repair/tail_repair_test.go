@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -22,7 +21,7 @@ import (
 )
 
 func TestPartitionedNodeRepairsTailFromPeerLogs(t *testing.T) {
-	burstRows := envInt("SPEDSQL_TAIL_REPAIR_BURST_ROWS", 100)
+	burstRows := envInt("MURMUR_TAIL_REPAIR_BURST_ROWS", 100)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:        "tail-repair",
 		NumNodes:    3,
@@ -238,7 +237,7 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 }
 
 func envInt(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {
 		return v
 	}
 	return fallback

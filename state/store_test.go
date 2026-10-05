@@ -17,7 +17,7 @@ import (
 
 func openTestStore(t *testing.T, node ids.NodeID) *Store {
 	t.Helper()
-	s, err := Open(t.TempDir(), node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
+	s, err := openSignedFixture(t.TempDir(), node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestRemoteLWWAndResurrect(t *testing.T) {
 		t.Helper()
 		wm, _ := to.ReceiveWatermark(origin)
 		_, err := from.LogScan(origin, wm+1, 100, 1<<20, func(batch *codec.MutationBatch) error {
-			_, err := to.CommitRemote(ctx, batch)
+			_, err := commitRemoteFixture(to, ctx, batch)
 			return err
 		})
 		if err != nil {
@@ -183,18 +183,18 @@ func TestRemoteGapAndDuplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Deliver b2 first: gap.
-	if _, err := b.CommitRemote(ctx, b2); !errors.Is(err, ErrGap) {
+	if _, err := commitRemoteFixture(b, ctx, b2); !errors.Is(err, ErrGap) {
 		t.Fatalf("expected gap, got %v", err)
 	}
 	// Deliver b1, then b2 again: both apply.
-	if _, err := b.CommitRemote(ctx, b1); err != nil {
+	if _, err := commitRemoteFixture(b, ctx, b1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.CommitRemote(ctx, b2); err != nil {
+	if _, err := commitRemoteFixture(b, ctx, b2); err != nil {
 		t.Fatal(err)
 	}
 	// Redeliver b1: duplicate, no new winners.
-	res, err := b.CommitRemote(ctx, b1)
+	res, err := commitRemoteFixture(b, ctx, b1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestSnapshotExportImport(t *testing.T) {
 	ctx := context.Background()
 	a := openTestStore(t, ids.NewNodeID())
 	bPath, bNode := t.TempDir(), ids.NewNodeID()
-	b, err := Open(bPath, bNode, a.DBID(), Options{Limits: codec.DefaultLimits()})
+	b, err := openSignedFixture(bPath, bNode, a.DBID(), Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +244,7 @@ func TestSnapshotExportImport(t *testing.T) {
 			if err := b.Close(); err != nil {
 				return err
 			}
-			b, err = Open(path, node, dbid, Options{Limits: codec.DefaultLimits()})
+			b, err = openSignedFixture(path, node, dbid, Options{Limits: codec.DefaultLimits()})
 			if err != nil {
 				return err
 			}
@@ -284,7 +284,7 @@ func TestSnapshotExportImport(t *testing.T) {
 		t.Fatal(err)
 	}
 	badPath := t.TempDir()
-	bad, err := Open(badPath, ids.NewNodeID(), a.DBID(), Options{Limits: codec.DefaultLimits()})
+	bad, err := openSignedFixture(badPath, ids.NewNodeID(), a.DBID(), Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -699,7 +699,7 @@ func TestConvergenceProperty(t *testing.T) {
 		// Pending buffers one out-of-order batch per origin (simple retry).
 		pending := make(map[ids.NodeID][]*codec.MutationBatch)
 		apply := func(b *codec.MutationBatch) {
-			_, err := s.CommitRemote(ctx, b)
+			_, err := commitRemoteFixture(s, ctx, b)
 			if errors.Is(err, ErrGap) {
 				pending[b.OriginNode] = append(pending[b.OriginNode], b)
 				return
@@ -713,7 +713,7 @@ func TestConvergenceProperty(t *testing.T) {
 				for origin, list := range pending {
 					rest := list[:0]
 					for _, pb := range list {
-						_, err := s.CommitRemote(ctx, pb)
+						_, err := commitRemoteFixture(s, ctx, pb)
 						if errors.Is(err, ErrGap) {
 							rest = append(rest, pb)
 							continue
@@ -748,7 +748,7 @@ func TestConvergenceProperty(t *testing.T) {
 		// Drain stragglers in origin order.
 		for o := 0; o < origins; o++ {
 			for _, b := range logs[o].batches {
-				_, err := s.CommitRemote(ctx, b)
+				_, err := commitRemoteFixture(s, ctx, b)
 				if err != nil && !errors.Is(err, ErrGap) {
 					t.Fatalf("drain: %v", err)
 				}
@@ -781,7 +781,7 @@ func TestConvergenceProperty(t *testing.T) {
 func TestFormatVersionTamperFailsOpen(t *testing.T) {
 	dir := t.TempDir()
 	node := ids.NewNodeID()
-	s, err := Open(dir, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
+	s, err := openSignedFixture(dir, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -790,7 +790,7 @@ func TestFormatVersionTamperFailsOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = s.Close()
-	if _, err := Open(dir, node, ids.DBID{}, Options{}); err == nil {
+	if _, err := openSignedFixture(dir, node, ids.DBID{}, Options{}); err == nil {
 		t.Fatal("expected open with format 999 to fail")
 	}
 }
@@ -882,7 +882,7 @@ func TestAsyncDurabilityMode(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	node := ids.NewNodeID()
-	s, err := Open(dir, node, ids.DBID{}, Options{
+	s, err := openSignedFixture(dir, node, ids.DBID{}, Options{
 		Limits:          codec.DefaultLimits(),
 		AsyncDurability: true,
 	})
@@ -925,7 +925,7 @@ func TestAsyncDurabilityMode(t *testing.T) {
 	}
 
 	// Reopen and ensure data persisted.
-	s2, err := Open(dir, node, s.DBID(), Options{
+	s2, err := openSignedFixture(dir, node, s.DBID(), Options{
 		Limits:          codec.DefaultLimits(),
 		AsyncDurability: true,
 	})

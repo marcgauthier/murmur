@@ -9,6 +9,9 @@ are retained for reuse.
 
 Run `bash tests-live/run.sh all` or an individual scenario runner:
 
+- `bash tests-live/run.sh abuse`
+- `bash tests-live/run.sh resource-exhaustion`
+- `bash tests-live/run.sh endurance-chaos`
 - `bash tests-live/run.sh open-progress`
 - `bash tests-live/run.sh encryption`
 - `bash tests-live/run.sh api-mtls`
@@ -23,7 +26,7 @@ Run `bash tests-live/run.sh all` or an individual scenario runner:
 - `bash tests-live/run.sh long-running-five-node`
 
 The allow-nodes scenario writes concurrently for three minutes by default; use
-`SPEDSQL_ALLOW_NODES_WRITE_SECONDS` to select a shorter development run.
+`MURMUR_ALLOW_NODES_WRITE_SECONDS` to select a shorter development run.
 
 Or run via standard Go test (tags required):
 ```sh
@@ -31,13 +34,15 @@ go test -tags "sqlite_preupdate_hook sqlite_fts5" -v ./tests-live/...
 ```
 
 `run.sh` and the test harness build the Murmur-SQL daemon with
-`SPEDSQL_TAGS` (default `"sqlite_preupdate_hook sqlite_fts5"`; use
-`SPEDSQL_TAGS=modernc` with `CGO_ENABLED=0` for the pure-Go backend).
+`MURMUR_TAGS` (default `"sqlite_preupdate_hook sqlite_fts5"`; use
+`MURMUR_TAGS=modernc` with `CGO_ENABLED=0` for the pure-Go backend).
 For daemon scenarios, `run.sh` rebuilds `tests-live/bin/testnode` on every invocation; bare
-`go test` reuses the existing `tests-live/bin/testnode` as-is, so
-rebuild it (or delete it and let the harness rebuild) after changing
-product code, or a stale daemon will silently test old behavior.
-Set `SPEDSQL_RACE=1` with `run.sh` to build the child node with `go build -race`
+`go test` reuses the existing `tests-live/bin/testnode` only while it is
+fresh (a `testnode.tags` stamp records the build tags, and the harness
+rebuilds when any `.go`/`go.mod`/`go.sum` input is newer than the
+binary, logging the reason). A stale daemon can no longer silently test
+old behavior.
+Set `MURMUR_RACE=1` with `run.sh` to build the child node with `go build -race`
 and run scenario tests with `go test -race`; instrumenting only the test process
 does not instrument the separately built node.
 
@@ -56,7 +61,7 @@ absent.
 `bash tests-live/run.sh soak` (ten-minute file soak, two-hour write SLO,
 one-hour five-node mesh) and `bash tests-live/run.sh stress`
 (repeated restart/discovery/crash/partition/snapshot runs plus a race
-leg; `SPEDSQL_STRESS_COUNT` overrides the repeat count) run on a
+leg; `MURMUR_STRESS_COUNT` overrides the repeat count) run on a
 weekly schedule plus manual dispatch.
 
 Do not run two `run.sh`/`go test ./tests-live/...` invocations against
@@ -64,8 +69,8 @@ the same checkout at the same time: suites share `tests-live/runtime/`
 and `tests-live/bin/testnode`, so concurrent runs corrupt each other's
 node configs and fail with misleading startup/unlock errors. To run
 suites while another invocation is active, isolate both the runtime
-root and the daemon binary with a private `SPEDSQL_LIVE_RUNTIME`
-directory and a private `SPEDSQL_BIN` path. Ephemeral ports need no isolation:
+root and the daemon binary with a private `MURMUR_LIVE_RUNTIME`
+directory and a private `MURMUR_BIN` path. Ephemeral ports need no isolation:
 the harness coordinates them across processes (and checkouts) with
 claim files under `${TMPDIR:-/tmp}/spedsql-portclaims` (4h TTL).
 
@@ -100,3 +105,8 @@ find leftovers with `pgrep -af 'testnode agent --config <root>'`.
 processes to validate progress callbacks, processed cells without a counting pass, committed rows,
 indexes, cancellation, failure reporting, and recovery through later reopens.
 It is included in `all` and `gate` and uses its own test worker binary.
+
+The `origin-signatures` scenario verifies Ed25519 proofs through a live relay,
+rejection of origin impersonation, and restart/idempotency. The shared harness
+provisions independent random signing keys and explicit snapshot sources.
+See [scenario details](origin-signatures/README.md).

@@ -9,26 +9,27 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 	"strings"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
 )
 
 func main() {
 	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "spedsql-limits-*")
+	dir, err := os.MkdirTemp("", "murmur-limits-*")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
-	db, err := replicateddb.Open(ctx, replicateddb.Config{
+	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path:   dir,
-		NodeID: replicateddb.NewNodeID(),
-		Schema: replicateddb.SchemaConfig{
+		NodeID: murmur.NewNodeID(),
+		Schema: murmur.SchemaConfig{
 			Version: 1,
 			Tables: []schema.TableSchema{{
 				Name: "blobs",
@@ -38,8 +39,8 @@ func main() {
 				},
 			}},
 		},
-		Pebble: replicateddb.DefaultPebbleConfig(),
-		Encryption: replicateddb.EncryptionConfig{
+		Pebble: murmur.DefaultPebbleConfig(),
+		Encryption: murmur.EncryptionConfig{
 			Key:   []byte("0123456789abcdef0123456789abcdef"),
 			KeyID: "limits-key",
 		},
@@ -49,14 +50,14 @@ func main() {
 		// so 128 still rejects the 1 KiB probe below.
 		MaxReplicatedValueBytes: 128,
 		MaxBatchMutations:       10,
-	})
+	}))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
 	// A 1 KiB value exceeds the 64-byte cap: rejected, nothing stored.
-	id := replicateddb.NewRowID()
+	id := murmur.NewRowID()
 	_, err = db.ExecContext(ctx,
 		`INSERT INTO blobs (id, payload) VALUES (?, ?)`, id[:], strings.Repeat("x", 1024))
 	fmt.Printf("oversized value -> err=%v\n", err != nil)
@@ -73,7 +74,7 @@ func main() {
 	}
 	rejected := false
 	for i := 0; i < 20 && !rejected; i++ {
-		mid := replicateddb.NewRowID()
+		mid := murmur.NewRowID()
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO blobs (id, payload) VALUES (?, ?)`, mid[:], "ok"); err != nil {
 			rejected = true
@@ -92,7 +93,7 @@ func main() {
 	}
 
 	// Normal writes still pass and the rejects left no trace.
-	id = replicateddb.NewRowID()
+	id = murmur.NewRowID()
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO blobs (id, payload) VALUES (?, ?)`, id[:], "small"); err != nil {
 		log.Fatal(err)

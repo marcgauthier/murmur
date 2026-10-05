@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -14,11 +14,12 @@ func TestDurabilityConfigValidation(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.withDefaults()
 	cfg.Durability = DurabilityConfig{Mode: DurabilitySynchronous}
+	cfg.withDefaults()
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("expected DurabilitySynchronous to be valid, got: %v", err)
 	}
 
-	cfg.Durability.Mode = DurabilityAsync
+	cfg.Durability = DurabilityConfig{Mode: DurabilityAsync}
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("expected DurabilityAsync to be valid, got: %v", err)
 	}
@@ -26,12 +27,11 @@ func TestDurabilityConfigValidation(t *testing.T) {
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("expected async periodic sync to be valid, got: %v", err)
 	}
-	cfg.Durability.Mode = DurabilitySynchronous
+	cfg.Durability = DurabilityConfig{Mode: DurabilitySynchronous, SyncInterval: time.Second}
 	if err := cfg.validate(); err == nil {
 		t.Fatal("expected periodic sync with synchronous mode to fail validation")
 	}
-	cfg.Durability.Mode = DurabilityAsync
-	cfg.Durability.SyncInterval = -time.Second
+	cfg.Durability = DurabilityConfig{Mode: DurabilityAsync, SyncInterval: -time.Second}
 	if err := cfg.validate(); err == nil {
 		t.Fatal("expected negative sync interval to fail validation")
 	}
@@ -47,7 +47,7 @@ func TestDurabilityPeriodicSync(t *testing.T) {
 	ctx := context.Background()
 	cfg := testConfig(filepath.Join(t.TempDir(), "node1"))
 	cfg.Durability = DurabilityConfig{Mode: DurabilityAsync, SyncInterval: 20 * time.Millisecond}
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestDurabilityPeriodicSync(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(ctx, cfg)
+	db, err = openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func TestDurabilityPeriodicSyncFailureFailsClosed(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.Pebble.BaseFS = fsys
 	cfg.Durability = DurabilityConfig{Mode: DurabilityAsync, SyncInterval: 20 * time.Millisecond}
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestDurabilityAsyncTransactionsAndSync(t *testing.T) {
 	cfg := testConfig(dir)
 	cfg.Durability = DurabilityConfig{Mode: DurabilityAsync}
 
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestDurabilityAsyncTransactionsAndSync(t *testing.T) {
 	}
 
 	// Reopen with DurabilityAsync and verify state is intact
-	db2, err := Open(ctx, cfg)
+	db2, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatalf("reopen failed: %v", err)
 	}

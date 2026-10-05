@@ -8,22 +8,22 @@ import (
 	"log"
 	"os"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
 )
 
 func main() {
 	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "replicateddb-example-*")
+	dir, err := os.MkdirTemp("", "murmur-example-*")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
-	db, err := replicateddb.Open(ctx, replicateddb.Config{
+	db, err := murmur.Open(ctx, murmur.Config{
 		Path:   dir,
-		NodeID: replicateddb.NewNodeID(),
-		Schema: replicateddb.SchemaConfig{
+		NodeID: murmur.NewNodeID(),
+		Schema: murmur.SchemaConfig{
 			Version: 1,
 			Tables: []schema.TableSchema{{
 				Name: "contacts",
@@ -34,8 +34,8 @@ func main() {
 				},
 			}},
 		},
-		Pebble: replicateddb.DefaultPebbleConfig(),
-		Encryption: replicateddb.EncryptionConfig{
+		Pebble: murmur.DefaultPebbleConfig(),
+		Encryption: murmur.EncryptionConfig{
 			// Demo key. Production deployments load key material from a
 			// file, environment, or KMS via crypto providers.
 			Key:   []byte("0123456789abcdef0123456789abcdef"),
@@ -48,7 +48,7 @@ func main() {
 	defer db.Close()
 
 	for _, c := range [][2]string{{"ann", "111"}, {"bob", "222"}} {
-		id := replicateddb.NewRowID()
+		id := murmur.NewRowID()
 		if _, err := db.ExecContext(ctx,
 			`INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
 			id[:], c[0], c[1]); err != nil {

@@ -9,14 +9,15 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
 )
 
-func count(ctx context.Context, db *replicateddb.DB) int {
+func count(ctx context.Context, db *murmur.DB) int {
 	var n int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM ledger`).Scan(&n); err != nil {
 		log.Fatal(err)
@@ -26,16 +27,16 @@ func count(ctx context.Context, db *replicateddb.DB) int {
 
 func main() {
 	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "spedsql-transactions-*")
+	dir, err := os.MkdirTemp("", "murmur-transactions-*")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
-	db, err := replicateddb.Open(ctx, replicateddb.Config{
+	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path:   dir,
-		NodeID: replicateddb.NewNodeID(),
-		Schema: replicateddb.SchemaConfig{
+		NodeID: murmur.NewNodeID(),
+		Schema: murmur.SchemaConfig{
 			Version: 1,
 			Tables: []schema.TableSchema{{
 				Name: "ledger",
@@ -45,12 +46,12 @@ func main() {
 				},
 			}},
 		},
-		Pebble: replicateddb.DefaultPebbleConfig(),
-		Encryption: replicateddb.EncryptionConfig{
+		Pebble: murmur.DefaultPebbleConfig(),
+		Encryption: murmur.EncryptionConfig{
 			Key:   []byte("0123456789abcdef0123456789abcdef"),
 			KeyID: "transactions-key",
 		},
-	})
+	}))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -63,7 +64,7 @@ func main() {
 	}
 	fmt.Printf("tx id: %s\n", tx.TxID())
 	for _, entry := range []string{"debit", "credit", "fee"} {
-		id := replicateddb.NewRowID()
+		id := murmur.NewRowID()
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO ledger (id, entry) VALUES (?, ?)`, id[:], entry); err != nil {
 			_ = tx.Rollback()
@@ -80,7 +81,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	id := replicateddb.NewRowID()
+	id := murmur.NewRowID()
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO ledger (id, entry) VALUES (?, ?)`, id[:], "abandoned"); err != nil {
 		_ = tx.Rollback()

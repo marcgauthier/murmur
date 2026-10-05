@@ -108,7 +108,7 @@ func open(reg *schema.Registry, ddl, localDDL []string, stmtCacheEntries int) (*
 	if _, err := rand.Read(randSuffix[:]); err != nil {
 		return nil, fmt.Errorf("sqlengine: rand: %w", err)
 	}
-	dsn := fmt.Sprintf("file:replicateddb_%x?mode=memory&cache=shared", randSuffix)
+	dsn := fmt.Sprintf("file:murmur_%x?mode=memory&cache=shared", randSuffix)
 	db, err := sql.Open(sqlDriverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sqlengine: open: %w", err)

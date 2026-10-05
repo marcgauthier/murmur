@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 )
 
 // benchTemplate is one populated, closed store per dataset size, built
@@ -19,9 +19,9 @@ import (
 // after that starts from a fast directory copy.
 type benchTemplate struct {
 	dir  string
-	node replicateddb.NodeID
-	dbid replicateddb.DBID
-	ids  []replicateddb.RowID
+	node murmur.NodeID
+	dbid murmur.DBID
+	ids  []murmur.RowID
 }
 
 var (
@@ -56,8 +56,8 @@ func templateFor(b testing.TB, n int) *benchTemplate {
 		b.Fatal(err)
 	}
 	templateDirs = append(templateDirs, dir)
-	node := replicateddb.NewNodeID()
-	db, err := replicateddb.Open(context.Background(), benchConfig(dir, node, replicateddb.NewDBID()))
+	node := murmur.NewNodeID()
+	db, err := murmur.Open(context.Background(), benchConfig(dir, node, murmur.NewDBID()))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -75,14 +75,14 @@ func templateFor(b testing.TB, n int) *benchTemplate {
 // openTemplateDB copies the n-row template to a fresh dir and opens it.
 // The copy keeps the template's node identity (single-node benchmarks
 // only); multi-node benchmarks populate live with distinct identities.
-func openTemplateDB(b testing.TB, n int) (*replicateddb.DB, []replicateddb.RowID) {
+func openTemplateDB(b testing.TB, n int) (*murmur.DB, []murmur.RowID) {
 	b.Helper()
 	tmpl := templateFor(b, n)
 	dest := b.TempDir()
 	if err := copyDir(tmpl.dir, dest); err != nil {
 		b.Fatal(err)
 	}
-	db, err := replicateddb.Open(context.Background(), benchConfig(dest, tmpl.node, tmpl.dbid))
+	db, err := murmur.Open(context.Background(), benchConfig(dest, tmpl.node, tmpl.dbid))
 	if err != nil {
 		b.Fatal(err)
 	}

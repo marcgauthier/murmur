@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"bytes"
@@ -60,7 +60,7 @@ func TestDBOnlineBackupAndRestoreIntegration(t *testing.T) {
 	}
 
 	// 1. Open primary database
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatalf("Open primary DB failed: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestDBOnlineBackupAndRestoreIntegration(t *testing.T) {
 		Encryption: EncryptionConfig{KeyID: "k1", Provider: restoredProvider},
 	}
 
-	restoredDB, err := Open(ctx, restoredCfg)
+	restoredDB, err := openSignedFixture(ctx, restoredCfg)
 	if err != nil {
 		t.Fatalf("Open restored DB failed: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestDBRestoreWrongKeyFails(t *testing.T) {
 		Encryption: EncryptionConfig{KeyID: "k1", Provider: testEncryptionProvider(masterKey)},
 	}
 
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -303,7 +303,7 @@ func TestDBRestoreWrongKeyFails(t *testing.T) {
 		Encryption: EncryptionConfig{KeyID: "k1", Provider: testEncryptionProvider(wrongKey)},
 	}
 
-	_, err = Open(ctx, wrongCfg)
+	_, err = openSignedFixture(ctx, wrongCfg)
 	if err == nil {
 		t.Fatal("expected Open with wrong key to fail, but it succeeded!")
 	}
@@ -316,7 +316,7 @@ func TestRestoreCloneIdentityEnforcement(t *testing.T) {
 	dbDir := filepath.Join(dir, "primary_db")
 
 	cfg := testConfig(dbDir)
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +359,7 @@ func TestRestoreCloneIdentityEnforcement(t *testing.T) {
 	openAs := func(node NodeID) (*DB, error) {
 		rcfg := testConfig(restoredDir)
 		rcfg.NodeID = node
-		return Open(ctx, rcfg)
+		return openSignedFixture(ctx, rcfg)
 	}
 	// Same-identity rollback and wrong-identity opens are rejected.
 	if rdb, err := openAs(cfg.NodeID); err == nil {
@@ -439,7 +439,7 @@ func TestReseedFlowRejectsOldCluster(t *testing.T) {
 	_, creds := testClusterCA(t, nodeA, nodeC)
 
 	// Node A runs the old cluster and takes the baseline backup.
-	dbA, err := Open(ctx, replConfig(filepath.Join(dir, "node_a"), nodeA, oldDB, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(filepath.Join(dir, "node_a"), nodeA, oldDB, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +470,7 @@ func TestReseedFlowRejectsOldCluster(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfgC := replConfig(restoredDir, nodeC, newDB, creds[nodeC], nil)
-	dbC, err := Open(ctx, cfgC)
+	dbC, err := openSignedFixture(ctx, cfgC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,7 +488,7 @@ func TestReseedFlowRejectsOldCluster(t *testing.T) {
 	}
 
 	// Reopen A on the old DBID and point the clusters at each other.
-	dbA, err = Open(ctx, replConfig(filepath.Join(dir, "node_a"), nodeA, oldDB, creds[nodeA], nil))
+	dbA, err = openSignedFixture(ctx, replConfig(filepath.Join(dir, "node_a"), nodeA, oldDB, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +536,7 @@ func TestReseedAbortedRebindRetries(t *testing.T) {
 	oldDB, newDB := NewDBID(), NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeC)
 
-	dbA, err := Open(ctx, replConfig(filepath.Join(dir, "node_a"), nodeA, oldDB, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(filepath.Join(dir, "node_a"), nodeA, oldDB, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,7 +592,7 @@ func TestReseedAbortedRebindRetries(t *testing.T) {
 	}
 	// Normal open converges the rebind; data and identity hold.
 	cfgC := replConfig(restoredDir, nodeC, newDB, creds[nodeC], nil)
-	dbC, err := Open(ctx, cfgC)
+	dbC, err := openSignedFixture(ctx, cfgC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -606,7 +606,7 @@ func TestReseedAbortedRebindRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Reopen is an ordinary stable open (intent consumed).
-	dbC, err = Open(ctx, cfgC)
+	dbC, err = openSignedFixture(ctx, cfgC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -627,7 +627,7 @@ func TestReplicationCertMustMatchNode(t *testing.T) {
 	// Certificate issued to B but configured as A: Open must fail before
 	// any replication starts.
 	cfg := replConfig(t.TempDir(), nodeA, NewDBID(), creds[nodeB], nil)
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err == nil {
 		_ = db.Close()
 		t.Fatal("Open with mismatched certificate succeeded")

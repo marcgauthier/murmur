@@ -13,8 +13,8 @@ both peers after the write phase.
 ## Run
 
 ```sh
-SPEDSQL_LIVE_BENCHMARK_WRITE_SECONDS=10 \
-SPEDSQL_LIVE_BENCHMARK_SYNC_TIMEOUT_SECONDS=120 \
+MURMUR_LIVE_BENCHMARK_WRITE_SECONDS=10 \
+MURMUR_LIVE_BENCHMARK_SYNC_TIMEOUT_SECONDS=120 \
 go test ./tests-benchmark/replication/ -run TestTwoNodeReplicationBenchmark -v -count=1
 ```
 
@@ -48,7 +48,7 @@ of acknowledged inserts. The two runs use fresh databases, so rates are
 comparable without rows from the first run affecting the second.
 
 ```sh
-SPEDSQL_LIVE_WRITER_BENCH_SECONDS=10 \
+MURMUR_LIVE_WRITER_BENCH_SECONDS=10 \
 go test ./tests-benchmark/replication/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s
 ```
 

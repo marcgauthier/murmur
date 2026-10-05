@@ -16,7 +16,7 @@ import (
 // TestWriterThroughput measures application-visible, acknowledged SQL inserts
 // against one encrypted daemon. Each insert is its own transaction.
 func TestWriterThroughput(t *testing.T) {
-	writeFor := envSeconds(t, "SPEDSQL_LIVE_WRITER_BENCH_SECONDS", 10)
+	writeFor := envSeconds(t, "MURMUR_LIVE_WRITER_BENCH_SECONDS", 10)
 	for _, writers := range []int{1, 4} {
 		t.Run(fmt.Sprintf("%d_writers", writers), func(t *testing.T) {
 			cluster := harness.NewCluster(t, harness.ClusterOptions{

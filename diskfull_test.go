@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -33,7 +33,7 @@ func (fs *failFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File,
 	return fs.wrap(fs.FS.Create(name, category))
 }
 
-func (fs *failFS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
+func (fs *failFS) openSignedFixture(name string, opts ...vfs.OpenOption) (vfs.File, error) {
 	return fs.wrap(fs.FS.Open(name, opts...))
 }
 
@@ -101,7 +101,7 @@ func TestDiskFullFailsClosed(t *testing.T) {
 
 	cfg := testConfig(path)
 	cfg.Pebble.BaseFS = fsys
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestDiskFullFailsClosed(t *testing.T) {
 	// Restart on a healthy filesystem (space freed): Pebble-authoritative
 	// state serves again, with only the pre-failure write present.
 	fsys.armed.Store(false)
-	db2, err := Open(ctx, cfg)
+	db2, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestDiskFullFailsClosed(t *testing.T) {
 // instead of losing its GC obligation on restart.
 func TestLegacyAckPeersAdmitted(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}

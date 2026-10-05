@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -14,13 +14,13 @@ import (
 
 // TestSoakTwoNodes runs random operations against two replicating nodes and
 // requires final convergence. Skipped with -short. Duration defaults to 30s
-// (REPLICATEDDB_SOAK_SECONDS overrides).
+// (MURMUR_SOAK_SECONDS overrides).
 func TestSoakTwoNodes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("soak test skipped in short mode")
 	}
 	seconds := 30
-	if v := os.Getenv("REPLICATEDDB_SOAK_SECONDS"); v != "" {
+	if v := os.Getenv("MURMUR_SOAK_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			seconds = n
 		}
@@ -30,13 +30,13 @@ func TestSoakTwoNodes(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
-	dbA, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
 	addrA := waitForAddr(t, dbA, 5*time.Second)
-	dbB, err := Open(ctx, replConfig(t.TempDir(), nodeB, dbid, creds[nodeB], nil))
+	dbB, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeB, dbid, creds[nodeB], nil))
 	if err != nil {
 		t.Fatal(err)
 	}

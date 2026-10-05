@@ -56,7 +56,7 @@ func (f *failFirstApplier) ApplyRemote(ctx context.Context, b *codec.MutationBat
 	if f.calls <= f.failCalls {
 		return errors.New("injected transient apply failure")
 	}
-	if _, err := f.store.CommitRemote(ctx, b); err != nil {
+	if _, err := commitRemoteFixture(f.store, ctx, b); err != nil {
 		return err
 	}
 	f.succeeded++
@@ -84,7 +84,7 @@ func TestFirstDeliveryLossHealsViaUnknownOriginPull(t *testing.T) {
 
 	start := func(t *testing.T, node ids.NodeID, applier Applier) (*Manager, *state.Store, string) {
 		t.Helper()
-		st, err := state.Open(t.TempDir(), node, cluster.dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
+		st, err := openSignedFixture(t.TempDir(), node, cluster.dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
 		if err != nil {
 			t.Fatal(err)
 		}

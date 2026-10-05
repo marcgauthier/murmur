@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -39,10 +39,10 @@ func TestLocalTransactionMaxTransactionBytesEnforced(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir)
 	// Allow one encoded contact while rejecting the multi-row transaction.
-	cfg.MaxTransactionBytes = 400
+	cfg.MaxTransactionBytes = 600
 	cfg.MaxReplicatedValueBytes = 300
 
-	db, err := Open(context.Background(), cfg)
+	db, err := openSignedFixture(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestStoreCommitRemoteEnforcesMaxTransactionBytes(t *testing.T) {
 	cfg.MaxTransactionBytes = 200
 	cfg.MaxReplicatedValueBytes = 150
 
-	db, err := Open(context.Background(), cfg)
+	db, err := openSignedFixture(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestStoreCommitRemoteEnforcesMaxTransactionBytes(t *testing.T) {
 		"phone": codec.Text(strings.Repeat("b", 150)),
 	})
 
-	err = db.ApplyRemote(ctx, batch)
+	err = applyRemoteFixture(db, ctx, batch)
 	if err == nil {
 		t.Fatal("expected ApplyRemote to reject batch exceeding MaxTransactionBytes")
 	}

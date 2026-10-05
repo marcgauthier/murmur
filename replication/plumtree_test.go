@@ -159,7 +159,7 @@ func TestPlumtreeNegotiatedThreeNodeForwarding(t *testing.T) {
 	cluster := newTestCluster(t)
 	start := func(node ids.NodeID, fanout int) (*Manager, *state.Store, *fakeApplier) {
 		t.Helper()
-		st, err := state.Open(t.TempDir(), node, cluster.dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
+		st, err := openSignedFixture(t.TempDir(), node, cluster.dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
 		if err != nil {
 			t.Fatal(err)
 		}

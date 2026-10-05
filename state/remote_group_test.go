@@ -26,7 +26,7 @@ func TestCommitRemoteGroupPreservesReceiptsAndCommitsAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := target.CommitRemoteGroup(ctx, []*codec.MutationBatch{first, second})
+	result, err := commitRemoteGroupFixture(target, ctx, []*codec.MutationBatch{first, second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestCommitRemoteGroupPreservesReceiptsAndCommitsAtomically(t *testing.T) {
 	if err != nil || !ok || cell.Value.S != "second" {
 		t.Fatalf("group winner = %+v, present=%v, err=%v", cell, ok, err)
 	}
-	duplicate, err := target.CommitRemoteGroup(ctx, []*codec.MutationBatch{first, second})
+	duplicate, err := commitRemoteGroupFixture(target, ctx, []*codec.MutationBatch{first, second})
 	if err != nil || duplicate.Applied || duplicate.Generation != result.Generation {
 		t.Fatalf("duplicate group = %+v, err=%v", duplicate, err)
 	}
@@ -65,7 +65,7 @@ func TestCommitRemoteGroupGapLeavesNoPartialProgress(t *testing.T) {
 	}
 	first.Sequence++ // sequence 2 is a gap at the receiver
 	before, _ := target.StateGeneration()
-	if _, err := target.CommitRemoteGroup(ctx, []*codec.MutationBatch{first, second}); !errors.Is(err, ErrGap) {
+	if _, err := commitRemoteGroupFixture(target, ctx, []*codec.MutationBatch{first, second}); !errors.Is(err, ErrGap) {
 		t.Fatalf("expected gap, got %v", err)
 	}
 	if wm, _ := target.ReceiveWatermark(source.NodeID()); wm != 0 {

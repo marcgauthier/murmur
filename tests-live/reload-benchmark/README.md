@@ -12,25 +12,25 @@ small overshoot is expected. This is not a target for compressed disk bytes.
 bash tests-live/run.sh reload-benchmark
 
 # Development run: 32 MiB, same schema and validation.
-SPEDSQL_RELOAD_TARGET_BYTES=33554432 bash tests-live/run.sh reload-benchmark
+MURMUR_RELOAD_TARGET_BYTES=33554432 bash tests-live/run.sh reload-benchmark
 
 # Reuse a completed full-size dataset without generating it again.
-SPEDSQL_RELOAD_REUSE=/media/marc/2TB/TEST/reload-benchmark/<run-id> \
+MURMUR_RELOAD_REUSE=/media/marc/2TB/TEST/reload-benchmark/<run-id> \
   bash tests-live/run.sh reload-benchmark
 
 # Record embedded startup progress (uses the existing rebuild scan).
-SPEDSQL_RELOAD_PROGRESS=1 SPEDSQL_RELOAD_REUSE=/home/marc/TEST/reload-benchmark/<run-id> \
+MURMUR_RELOAD_PROGRESS=1 MURMUR_RELOAD_REUSE=/home/marc/TEST/reload-benchmark/<run-id> \
   bash tests-live/run.sh reload-benchmark
 
 # Optional pure-Go backend.
-CGO_ENABLED=0 SPEDSQL_TAGS=modernc bash tests-live/run.sh reload-benchmark
+CGO_ENABLED=0 MURMUR_TAGS=modernc bash tests-live/run.sh reload-benchmark
 ```
 
 The benchmark is explicit: routine `all`, `gate`, and unconfigured
 `go test ./tests-live/...` do not run it. Direct Go invocation requires:
 
 ```sh
-SPEDSQL_RELOAD_BENCH=1 go test -tags 'sqlite_preupdate_hook sqlite_fts5' \
+MURMUR_RELOAD_BENCH=1 go test -tags 'sqlite_preupdate_hook sqlite_fts5' \
   -v -count=1 -timeout=6h ./tests-live/reload-benchmark
 ```
 
@@ -119,12 +119,12 @@ kept in Go. The six-hour timeout includes generation, hashing, and reloads.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SPEDSQL_RELOAD_ROOT` | `/media/marc/2TB/TEST` | Existing writable destination for new runs. |
-| `SPEDSQL_RELOAD_TARGET_BYTES` | `10000000000` | Positive SQLite page-byte target. |
-| `SPEDSQL_RELOAD_SEED` | `42` | Positive deterministic generator seed. |
-| `SPEDSQL_RELOAD_REPETITIONS` | `1` | Measurements of each reload path. |
-| `SPEDSQL_RELOAD_REUSE` | unset | Completed run directory to measure again. |
-| `SPEDSQL_RELOAD_PROGRESS` | unset | Set to `1` to record embedded progress during full open, without an extra counting pass. |
+| `MURMUR_RELOAD_ROOT` | `/media/marc/2TB/TEST` | Existing writable destination for new runs. |
+| `MURMUR_RELOAD_TARGET_BYTES` | `10000000000` | Positive SQLite page-byte target. |
+| `MURMUR_RELOAD_SEED` | `42` | Positive deterministic generator seed. |
+| `MURMUR_RELOAD_REPETITIONS` | `1` | Measurements of each reload path. |
+| `MURMUR_RELOAD_REUSE` | unset | Completed run directory to measure again. |
+| `MURMUR_RELOAD_PROGRESS` | unset | Set to `1` to record embedded progress during full open, without an extra counting pass. |
 
 ## Recorded 10 GB baseline
 

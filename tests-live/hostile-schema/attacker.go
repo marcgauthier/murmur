@@ -76,7 +76,7 @@ func (a *attacker) dialMismatch(t *testing.T, addr string, expect ids.NodeID) *e
 		DBID:                a.dbid,
 		SchemaEpoch:         9999,
 		SchemaHash:          randomHash(),
-		Capabilities:        replication.CapZstd,
+		Capabilities:        replication.CapMergePolicies | replication.CapZstd | replication.CapOriginSignatures,
 		MaxTransactionBytes: 64 << 20,
 	}
 	if err := replication.WriteFrame(stream, replication.MsgHello, 0, replication.EncodeHello(nil, hello)); err != nil {

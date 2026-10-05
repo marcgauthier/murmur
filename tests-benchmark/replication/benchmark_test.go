@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -25,7 +24,7 @@ import (
 
 func envSeconds(t *testing.T, key string, fallback int) time.Duration {
 	t.Helper()
-	value := os.Getenv(key)
+	value := harness.GetEnv(key)
 	if value == "" {
 		return time.Duration(fallback) * time.Second
 	}
@@ -37,8 +36,8 @@ func envSeconds(t *testing.T, key string, fallback int) time.Duration {
 }
 
 func TestTwoNodeReplicationBenchmark(t *testing.T) {
-	writeFor := envSeconds(t, "SPEDSQL_LIVE_BENCHMARK_WRITE_SECONDS", 10)
-	syncTimeout := envSeconds(t, "SPEDSQL_LIVE_BENCHMARK_SYNC_TIMEOUT_SECONDS", 120)
+	writeFor := envSeconds(t, "MURMUR_LIVE_BENCHMARK_WRITE_SECONDS", 10)
+	syncTimeout := envSeconds(t, "MURMUR_LIVE_BENCHMARK_SYNC_TIMEOUT_SECONDS", 120)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:     "benchmark",
 		NumNodes: 2,

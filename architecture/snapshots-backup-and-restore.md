@@ -99,6 +99,8 @@ Retirement/exclusion surface per peer in `Status` and the
 
 ## 37. Snapshot / Full Seed
 
+Merged snapshots require `Replication.TrustedSnapshotSources`; empty disables remote snapshot ingestion. Same-DBID clones preserve origin proofs, while new-DBID reseeds establish a trusted baseline and discard old replication logs. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
+
 A snapshot is a logical copy of current replicated state, not a copy of the SQLite materialization.
 
 ### Current implementation and remaining gap
@@ -209,7 +211,7 @@ An empty node has no local state to merge. A stale existing node must never repl
 
 For an origin represented in both consistent cuts, the merged watermark may use the maximum of their contiguous covered prefixes only after all corresponding state/tombstones are merged. Never promote a staged/observed head to a watermark. Keep out-of-order pending transactions separately until gaps or snapshot-covered prefixes resolve them. Snapshot watermarks provide state coverage, not permission to fabricate missing historical log entries; track retained-log availability independently.
 
-The final publication uses a single bounded Pebble batch rather than swapping database directories. Pebble's synced batch is the durable publication boundary: a crash exposes either the complete old state or the complete merged state, never a partial set of chunks or watermarks. Startup rebuilds SQL from that authoritative state. Cancellation, bad hashes, incompatible schema, or staging budget exhaustion leave applied cells and watermarks untouched. Larger snapshots merge chunk by chunk with durable resume progress (see above) and publish through the same single-batch boundary, so the configured bound no longer depends on fitting the whole merge in one batch. Repair admission follows [Section 32](synchronization-and-overload.md#32-mutation-batching) limits. Snapshot progress/deferral diagnostics are implemented: the receiver tracks per-peer transfer progress (`PeerStatus.SnapshotChunksReceived/Total`, Prometheus `spedsql_peer_snapshot_chunks_*`), a source with a transfer in flight answers concurrent requests with an explicit `ErrSnapshotBusy` deferral (counter `repl_snapshots_busy_deferred_total`), and a stall watchdog re-requests waits with no progress within `Replication.SnapshotRequestTimeout` (default 30 s; re-requests counted in `repl_snapshot_rerequested_total`).
+The final publication uses a single bounded Pebble batch rather than swapping database directories. Pebble's synced batch is the durable publication boundary: a crash exposes either the complete old state or the complete merged state, never a partial set of chunks or watermarks. Startup rebuilds SQL from that authoritative state. Cancellation, bad hashes, incompatible schema, or staging budget exhaustion leave applied cells and watermarks untouched. Larger snapshots merge chunk by chunk with durable resume progress (see above) and publish through the same single-batch boundary, so the configured bound no longer depends on fitting the whole merge in one batch. Repair admission follows [Section 32](synchronization-and-overload.md#32-mutation-batching) limits. Snapshot progress/deferral diagnostics are implemented: the receiver tracks per-peer transfer progress (`PeerStatus.SnapshotChunksReceived/Total`, Prometheus `spedsql_peer_snapshot_chunks_*`), a source with a transfer in flight answers concurrent requests with an explicit `ErrSnapshotBusy` deferral (counter `repl_snapshots_busy_deferred_total`), and a stall watchdog re-requests waits with no progress within `Replication.SnapshotRequestTimeout` (default 30 s; re-requests counted in `repl_snapshot_rerequested_total`). When several peers serve one receiver concurrently, the receiver accepts a single active source (first manifest wins) and suppresses the rest (`repl_snapshot_frames_suppressed_total`): concurrent SnapshotIDs preempt each other in staging and would otherwise livelock. Completion or a stall releases the active source; the watchdog then fails over to the next waiter.
 
 ---
 
@@ -271,9 +273,9 @@ For an online, zero-downtime backup of a 10–20+ GB dataset, executing a raw Ke
    - Delete temporary staging directory via `os.RemoveAll(stagingDir)`. Unlinking hard links takes milliseconds and does not touch live SSTables.
 
 ### 38.4 Restore & Deterministic Rebuild
-- **Extraction:** `replicateddb.Restore(ctx, cfg)` pulls the backup stream from the destination (Local, HTTPS, or FTP), verifies `backup-metadata.json`, and extracts `keys/` and `data/` into target directories.
+- **Extraction:** `murmur.Restore(ctx, cfg)` pulls the backup stream from the destination (Local, HTTPS, or FTP), verifies `backup-metadata.json`, and extracts `keys/` and `data/` into target directories.
 - **Fail-Closed Verification:** Validates `NMC1` container magic and `NMKR` key registry magic. Restoring into a non-empty directory without `Overwrite=true` is rejected.
-- **Autonomous Query Store Rebuild:** When `replicateddb.Open` is invoked with the master key:
+- **Autonomous Query Store Rebuild:** When `murmur.Open` is invoked with the master key:
   1. `crypto.OpenRegistry` authenticates and unwraps data keys.
   2. Pebble mounts the restored data directory via `crypto.EncryptedFS`.
   3. `sqlengine.Engine.Rebuild(store)` scans Pebble's authoritative state and reconstructs the in-memory SQLite query store.
@@ -298,3 +300,5 @@ Implemented (reseed): `Restore` with `Mode: RestoreReseed` requires `NewDBID` (m
 - Automatically prunes expired backups on the destination based on `MaxBackups` (retaining the N latest archives) and `RetentionDays` (deleting backups older than a cutoff date).
 
 ---
+
+Current schema-level counter, set and extrema behavior, causal storage, signed wire formats, bridge ownership and upgrade requirements are specified in [merge policies](merge-policies.md). LWW remains the default.

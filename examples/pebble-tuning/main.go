@@ -10,32 +10,33 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
 )
 
 func main() {
 	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "spedsql-pebble-*")
+	dir, err := os.MkdirTemp("", "murmur-pebble-*")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	nodeID := replicateddb.NewNodeID()
+	nodeID := murmur.NewNodeID()
 
-	pebble := replicateddb.DefaultPebbleConfig()
+	pebble := murmur.DefaultPebbleConfig()
 	pebble.CacheBytes = 8 << 20 // 8 MiB block cache instead of 256 MiB
-	pebble.Compression = replicateddb.CompressionConfig{
-		Algorithm: replicateddb.CompressionNone,
+	pebble.Compression = murmur.CompressionConfig{
+		Algorithm: murmur.CompressionNone,
 	}
-	open := func() *replicateddb.DB {
-		db, err := replicateddb.Open(ctx, replicateddb.Config{
+	open := func() *murmur.DB {
+		db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 			Path:   dir,
 			NodeID: nodeID,
-			Schema: replicateddb.SchemaConfig{
+			Schema: murmur.SchemaConfig{
 				Version: 1,
 				Tables: []schema.TableSchema{{
 					Name: "items",
@@ -46,11 +47,11 @@ func main() {
 				}},
 			},
 			Pebble: pebble,
-			Encryption: replicateddb.EncryptionConfig{
+			Encryption: murmur.EncryptionConfig{
 				Key:   []byte("0123456789abcdef0123456789abcdef"),
 				KeyID: "pebble-key",
 			},
-		})
+		}))
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -59,7 +60,7 @@ func main() {
 
 	db := open()
 	for i := 0; i < 20; i++ {
-		id := replicateddb.NewRowID()
+		id := murmur.NewRowID()
 		if _, err := db.ExecContext(ctx,
 			`INSERT INTO items (id, body) VALUES (?, ?)`,
 			id[:], fmt.Sprintf("item-%d", i)); err != nil {

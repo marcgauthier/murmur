@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 )
 
 // BenchmarkCipherMatrix measures single-cell update throughput across
@@ -21,18 +21,18 @@ import (
 func BenchmarkCipherMatrix(b *testing.B) {
 	ciphers := []struct {
 		name string
-		alg  replicateddb.EncryptionAlgorithm
+		alg  murmur.EncryptionAlgorithm
 	}{
-		{"aes256gcm", replicateddb.AES256GCM},
-		{"chacha20", replicateddb.ChaCha20Poly1305},
-		{"aegis256", replicateddb.AEGIS256},
+		{"aes256gcm", murmur.AES256GCM},
+		{"chacha20", murmur.ChaCha20Poly1305},
+		{"aegis256", murmur.AEGIS256},
 	}
 	compression := []struct {
 		name string
-		cfg  replicateddb.CompressionConfig
+		cfg  murmur.CompressionConfig
 	}{
-		{"zstd3", replicateddb.CompressionConfig{Algorithm: replicateddb.CompressionZstd, ZstdLevel: 3}},
-		{"none", replicateddb.CompressionConfig{Algorithm: replicateddb.CompressionNone}},
+		{"zstd3", murmur.CompressionConfig{Algorithm: murmur.CompressionZstd, ZstdLevel: 3}},
+		{"none", murmur.CompressionConfig{Algorithm: murmur.CompressionNone}},
 	}
 	values := []struct {
 		name string
@@ -48,10 +48,10 @@ func BenchmarkCipherMatrix(b *testing.B) {
 				name := fmt.Sprintf("%s/%s/%s", c.name, comp.name, v.name)
 				b.Run(name, func(b *testing.B) {
 					ctx := context.Background()
-					cfg := benchConfig(b.TempDir(), replicateddb.NewNodeID(), replicateddb.NewDBID())
+					cfg := benchConfig(b.TempDir(), murmur.NewNodeID(), murmur.NewDBID())
 					cfg.Encryption.Algorithm = c.alg
 					cfg.Pebble.Compression = comp.cfg
-					db, err := replicateddb.Open(ctx, cfg)
+					db, err := murmur.Open(ctx, cfg)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -81,10 +81,10 @@ func BenchmarkCipherMatrix(b *testing.B) {
 
 // populateValues inserts n contacts with compressible text or random
 // 64-byte hex values, returning row IDs.
-func populateValues(b *testing.B, db *replicateddb.DB, n int, blob bool) []replicateddb.RowID {
+func populateValues(b *testing.B, db *murmur.DB, n int, blob bool) []murmur.RowID {
 	b.Helper()
 	ctx := context.Background()
-	ids := make([]replicateddb.RowID, 0, n)
+	ids := make([]murmur.RowID, 0, n)
 	const perTx = 1000
 	for base := 0; base < n; base += perTx {
 		tx, err := db.BeginTx(ctx, nil)
@@ -96,7 +96,7 @@ func populateValues(b *testing.B, db *replicateddb.DB, n int, blob bool) []repli
 			end = n
 		}
 		for i := base; i < end; i++ {
-			id := replicateddb.NewRowID()
+			id := murmur.NewRowID()
 			ids = append(ids, id)
 			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO contacts (id, name, phone, score) VALUES (?, ?, ?, ?)`,

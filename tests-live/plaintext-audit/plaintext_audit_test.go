@@ -7,6 +7,7 @@ package plaintextaudit_test
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/origin"
 	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
@@ -46,7 +48,7 @@ func TestPlaintextAuditMarkersAndKeysAbsentOnDisk(t *testing.T) {
 	// positive from another run is impossible.
 	markers := make([]string, 8)
 	for i := range markers {
-		markers[i] = "SPEDSQL-AUDIT-" + randHex(t, 32) + fmt.Sprintf("-ROW%d", i)
+		markers[i] = "MURMUR-AUDIT-" + randHex(t, 32) + fmt.Sprintf("-ROW%d", i)
 		if err := cluster.ExecSQL(0, "INSERT INTO audit_rows (id, value) VALUES (?, ?)",
 			fmt.Sprintf("%032x", 7000+i), markers[i]); err != nil {
 			t.Fatalf("insert marker %d: %v", i, err)
@@ -273,13 +275,22 @@ func openNodeDir(t *testing.T, ctx context.Context, cluster *harness.Cluster, no
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The store pins the origin signing key under the NodeID; the
+	// offline open must present the same identity as the daemon.
+	// NOTE: no testdb.Configure — it overwrites OriginSigning with
+	// deterministic fixture keys.
+	registry, _ := origin.NewKeyRegistry(nil)
+	for _, n := range cluster.Nodes {
+		_ = registry.Add(n.NodeID, n.OriginKey.Public().(ed25519.PublicKey))
+	}
 	handle, err := db.Open(ctx, db.Config{
-		Path:       node.PebbleDir,
-		NodeID:     node.NodeID,
-		DBID:       cluster.DBID,
-		Schema:     *schemaConfig(),
-		Pebble:     db.DefaultPebbleConfig(),
-		Encryption: db.EncryptionConfig{Key: raw, KeyID: "remote-unlock-key"},
+		Path:          node.PebbleDir,
+		NodeID:        node.NodeID,
+		DBID:          cluster.DBID,
+		OriginSigning: db.OriginSigningConfig{PrivateKey: node.OriginKey, TrustedKeys: registry},
+		Schema:        *schemaConfig(),
+		Pebble:        db.DefaultPebbleConfig(),
+		Encryption:    db.EncryptionConfig{Key: raw, KeyID: "remote-unlock-key"},
 	})
 	if err != nil {
 		t.Fatalf("open node dir: %v", err)

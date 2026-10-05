@@ -13,7 +13,7 @@ import (
 
 func openStoreAt(t *testing.T, path string, node ids.NodeID, db ids.DBID, restore *RestoreAdoption) *Store {
 	t.Helper()
-	s, err := Open(path, node, db, Options{Limits: codec.DefaultLimits(), Restore: restore})
+	s, err := openSignedFixture(path, node, db, Options{Limits: codec.DefaultLimits(), Restore: restore})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestRestoreAdoptionResetsWriterIdentity(t *testing.T) {
 		Sequence: 1, HLC: a.ClockNow(), SchemaEpoch: 1,
 		Mutations: []codec.Mutation{{TableID: 1, RowID: ids.NewRowID(), ColumnID: 2, Value: codec.Text("x")}},
 	}
-	if _, err := a.CommitRemote(ctx, xb); err != nil {
+	if _, err := commitRemoteFixture(a, ctx, xb); err != nil {
 		t.Fatal(err)
 	}
 	// Incomplete snapshot staging and peer acks the fresh node must shed.
@@ -168,7 +168,7 @@ func TestRestoreAdoptionRejectsMismatch(t *testing.T) {
 		Sequence: 1, HLC: a.ClockNow(), SchemaEpoch: 1,
 		Mutations: []codec.Mutation{{TableID: 1, RowID: ids.NewRowID(), ColumnID: 2, Value: codec.Text("x")}},
 	}
-	if _, err := a.CommitRemote(ctx, xb); err != nil {
+	if _, err := commitRemoteFixture(a, ctx, xb); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.Close(); err != nil {
@@ -177,7 +177,7 @@ func TestRestoreAdoptionRejectsMismatch(t *testing.T) {
 
 	nodeB, nodeC := ids.NewNodeID(), ids.NewNodeID()
 	open := func(node ids.NodeID, r *RestoreAdoption) error {
-		s, err := Open(path, node, dbID, Options{Limits: codec.DefaultLimits(), Restore: r})
+		s, err := openSignedFixture(path, node, dbID, Options{Limits: codec.DefaultLimits(), Restore: r})
 		if err == nil {
 			_ = s.Close()
 		}
@@ -233,7 +233,7 @@ func TestRestoreAdoptionReseedsDBID(t *testing.T) {
 	closeStore(t, a)
 
 	// Wrong source DBID: intent does not match the stored data.
-	bad, err := Open(path, nodeB, newDB, Options{Limits: codec.DefaultLimits(), Restore: &RestoreAdoption{
+	bad, err := openSignedFixture(path, nodeB, newDB, Options{Limits: codec.DefaultLimits(), Restore: &RestoreAdoption{
 		Source: nodeA, Fresh: nodeB, SourceDBID: ids.NewDBID(), NewDBID: newDB, BackupID: "b1",
 	}})
 	if err == nil {
@@ -245,7 +245,7 @@ func TestRestoreAdoptionReseedsDBID(t *testing.T) {
 	}
 
 	// Reseed to the same DBID is not a reseed.
-	same, err := Open(path, nodeB, oldDB, Options{Limits: codec.DefaultLimits(), Restore: &RestoreAdoption{
+	same, err := openSignedFixture(path, nodeB, oldDB, Options{Limits: codec.DefaultLimits(), Restore: &RestoreAdoption{
 		Source: nodeA, Fresh: nodeB, SourceDBID: oldDB, NewDBID: oldDB, BackupID: "b1",
 	}})
 	if err == nil {
@@ -279,7 +279,7 @@ func TestRestoreAdoptionReseedsDBID(t *testing.T) {
 	closeStore(t, b)
 
 	// The old cluster identity stays unusable on this data.
-	s, err := Open(path, nodeB, oldDB, Options{Limits: codec.DefaultLimits()})
+	s, err := openSignedFixture(path, nodeB, oldDB, Options{Limits: codec.DefaultLimits()})
 	if err == nil {
 		_ = s.Close()
 		t.Fatal("reopen with old DBID succeeded")
@@ -322,7 +322,7 @@ func TestRestoreAdoptionIsIdempotent(t *testing.T) {
 		t.Fatalf("marker = %+v, %v, %v", marker, ok, err)
 	}
 	// The retired identity stays unusable.
-	s, err := Open(path, nodeA, dbID, Options{Limits: codec.DefaultLimits()})
+	s, err := openSignedFixture(path, nodeA, dbID, Options{Limits: codec.DefaultLimits()})
 	if err == nil {
 		_ = s.Close()
 		t.Fatal("reopen as retired A succeeded")

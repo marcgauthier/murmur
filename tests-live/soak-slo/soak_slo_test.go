@@ -8,7 +8,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,7 +25,7 @@ var scenarioHTTP = &http.Client{Timeout: 3 * time.Second}
 
 func seconds(t *testing.T, name string, fallback int) time.Duration {
 	t.Helper()
-	if raw := os.Getenv(name); raw != "" {
+	if raw := harness.GetEnv(name); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 1 {
 			t.Fatalf("%s must be a positive number of seconds", name)
@@ -37,8 +36,8 @@ func seconds(t *testing.T, name string, fallback int) time.Duration {
 }
 
 func TestThreeNodeEncryptedSustainedWriteSLO(t *testing.T) {
-	duration := seconds(t, "SPEDSQL_SLO_DURATION_SECONDS", 5)
-	settle := seconds(t, "SPEDSQL_SLO_SETTLE_SECONDS", 30)
+	duration := seconds(t, "MURMUR_SLO_DURATION_SECONDS", 5)
+	settle := seconds(t, "MURMUR_SLO_SETTLE_SECONDS", 30)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:        "soak-slo",
 		NumNodes:    3,

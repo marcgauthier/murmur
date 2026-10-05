@@ -6,10 +6,11 @@ import (
 
 	"github.com/marcgauthier/murmur/crdt"
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 // CodecVersion versions the mutation/snapshot binary encoding.
-const CodecVersion uint16 = 1
+const CodecVersion uint16 = 3
 
 // MutationFlags qualifies a Mutation.
 type MutationFlags uint32
@@ -18,6 +19,12 @@ const (
 	// FlagTombstone marks a row delete. The value payload is ignored and
 	// ColumnID must be ColumnTombstone.
 	FlagTombstone MutationFlags = 1 << 0
+	// FlagCRDTImport carries an administrator-authorized bridge causal payload.
+	FlagCRDTImport MutationFlags = 1 << 1
+	// FlagBridgeReceipt records an import receipt in the same durable transaction.
+	FlagBridgeReceipt MutationFlags = 1 << 3
+	// FlagCounterDelta is local-only and is finalized before signing.
+	FlagCounterDelta MutationFlags = 1 << 2
 )
 
 // ColumnTombstone is the sentinel ColumnID for row-delete mutations.
@@ -26,6 +33,8 @@ const ColumnTombstone uint32 = 0xFFFFFFFF
 // Mutation is one replicated cell write or row delete. Batch-level metadata
 // (origin, sequence, HLC, schema epoch/hash) lives in MutationBatch.
 type Mutation struct {
+	Policy   schema.MergePolicy
+	Records  []CRDTRecord
 	TableID  uint32
 	RowID    ids.RowID
 	ColumnID uint32
@@ -39,6 +48,11 @@ func (m *Mutation) IsTombstone() bool { return m.Flags&FlagTombstone != 0 }
 // MutationBatch is one committed transaction's replication unit.
 type MutationBatch struct {
 	ProtocolVersion uint16
+
+	DBID             ids.DBID
+	SignatureVersion uint16
+	MutationDigest   [32]byte
+	OriginSignature  [64]byte
 
 	TxID       ids.TxID
 	OriginNode ids.NodeID
@@ -75,8 +89,8 @@ func DefaultLimits() Limits {
 	}
 }
 
-// BatchHeaderSize is the constant header size for a MutationBatch encoding (94 bytes).
-const BatchHeaderSize = 2 + 16 + 16 + 8 + 8 + 8 + 32 + 4
+// BatchHeaderSize is the constant header size for a MutationBatch signed encoding (208 bytes).
+const BatchHeaderSize = 2 + 16 + 16 + 8 + 8 + 8 + 32 + 4 + originEnvelopeSize
 
 // MutationHeaderSize is the per-mutation fixed header size (28 bytes).
 const MutationHeaderSize = 4 + 16 + 4 + 4
@@ -86,14 +100,26 @@ const MutationHeaderSize = 4 + 16 + 4 + 4
 func EncodedMutationsSize(mutations []Mutation) int {
 	sz := BatchHeaderSize
 	for i := range mutations {
-		sz += MutationHeaderSize + mutations[i].Value.EncodedSize()
+		sz += MutationHeaderSize + mutations[i].Value.EncodedSize() + 5
+		for _, r := range mutations[i].Records {
+			sz += Blob(r.Key).EncodedSize() + Blob(r.Data).EncodedSize()
+		}
 	}
 	return sz
 }
 
 // EncodedBatchSize returns the total encoded byte size of b.
 func EncodedBatchSize(b *MutationBatch) int {
-	return EncodedMutationsSize(b.Mutations)
+	size := EncodedMutationsSize(b.Mutations)
+	if b.ProtocolVersion < 5 {
+		for _, m := range b.Mutations {
+			size -= 5
+			for _, r := range m.Records {
+				size -= Blob(r.Key).EncodedSize() + Blob(r.Data).EncodedSize()
+			}
+		}
+	}
+	return size
 }
 
 // EncodeBatch appends the binary encoding of b to dst.
@@ -106,6 +132,7 @@ func EncodeBatch(dst []byte, b *MutationBatch) []byte {
 	dst = binary.BigEndian.AppendUint64(dst, b.SchemaEpoch)
 	dst = append(dst, b.SchemaHash[:]...)
 	dst = binary.BigEndian.AppendUint32(dst, uint32(len(b.Mutations)))
+	dst = appendOriginEnvelope(dst, b)
 	for i := range b.Mutations {
 		m := &b.Mutations[i]
 		dst = binary.BigEndian.AppendUint32(dst, m.TableID)
@@ -113,13 +140,29 @@ func EncodeBatch(dst []byte, b *MutationBatch) []byte {
 		dst = binary.BigEndian.AppendUint32(dst, m.ColumnID)
 		dst = binary.BigEndian.AppendUint32(dst, uint32(m.Flags))
 		dst = AppendValue(dst, m.Value)
+		if b.ProtocolVersion >= 5 {
+			dst = append(dst, byte(m.Policy))
+			dst = EncodeCRDTRecords(dst, m.Records)
+		}
 	}
 	return dst
 }
 
 // DecodeBatch decodes one batch from the front of src.
 func DecodeBatch(src []byte, lim Limits) (*MutationBatch, []byte, error) {
-	const hdrLen = 2 + 16 + 16 + 8 + 8 + 8 + 32 + 4
+	return decodeBatch(src, lim, true)
+}
+
+// DecodeLegacyBatch is exclusively for explicit offline baseline migration.
+func DecodeLegacyBatch(src []byte, lim Limits) (*MutationBatch, []byte, error) {
+	return decodeBatch(src, lim, false)
+}
+
+func decodeBatch(src []byte, lim Limits, signed bool) (*MutationBatch, []byte, error) {
+	hdrLen := 94
+	if signed {
+		hdrLen = BatchHeaderSize
+	}
 	if len(src) < hdrLen {
 		return nil, nil, fmt.Errorf("codec: truncated batch header")
 	}
@@ -134,6 +177,9 @@ func DecodeBatch(src []byte, lim Limits) (*MutationBatch, []byte, error) {
 	n := binary.BigEndian.Uint32(src[90:94])
 	if n > uint32(lim.MaxMutations) {
 		return nil, nil, fmt.Errorf("codec: batch of %d mutations exceeds limit %d", n, lim.MaxMutations)
+	}
+	if signed {
+		consumeOriginEnvelope(src[94:hdrLen], b)
 	}
 	rest := src[hdrLen:]
 	b.Mutations = make([]Mutation, 0, min(n, 1024))
@@ -154,6 +200,17 @@ func DecodeBatch(src []byte, lim Limits) (*MutationBatch, []byte, error) {
 		}
 		m.Value = v
 		rest = r
+		if b.ProtocolVersion >= 5 {
+			if len(rest) < 1 {
+				return nil, nil, fmt.Errorf("codec: missing mutation policy")
+			}
+			m.Policy = schema.MergePolicy(rest[0])
+			rest = rest[1:]
+			m.Records, rest, err = ConsumeCRDTRecords(rest, lim)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
 		if m.IsTombstone() && m.ColumnID != ColumnTombstone {
 			return nil, nil, fmt.Errorf("codec: mutation %d: tombstone with bad column id", i)
 		}
@@ -187,7 +244,7 @@ func DecodeCellState(src []byte, lim Limits) (CellState, error) {
 	var s CellState
 	s.Version.HLC = binary.BigEndian.Uint64(src[0:8])
 	copy(s.Version.NodeID[:], src[8:24])
-	v, rest, err := ConsumeValue(src[24:], lim.MaxValueBytes)
+	v, rest, err := ConsumeValue(src[24:], max(lim.MaxValueBytes, len(src)))
 	if err != nil {
 		return CellState{}, err
 	}
@@ -293,11 +350,12 @@ func DecodeManifest(src []byte) (*SnapshotManifest, []byte, error) {
 
 // SnapshotCell is one versioned cell or tombstone in a snapshot chunk.
 type SnapshotCell struct {
-	TableID  uint32
-	RowID    ids.RowID
-	ColumnID uint32 // ColumnTombstone for tombstones
-	Version  crdt.Version
-	Value    Value // ignored for tombstones
+	TableID   uint32
+	RowID     ids.RowID
+	ColumnID  uint32 // ColumnTombstone for tombstones
+	Version   crdt.Version
+	Value     Value  // ignored for tombstones
+	RecordKey []byte // nonempty for a causal metadata record
 }
 
 // EncodeSnapshotCells appends cells.
@@ -311,6 +369,7 @@ func EncodeSnapshotCells(dst []byte, cells []SnapshotCell) []byte {
 		dst = binary.BigEndian.AppendUint64(dst, c.Version.HLC)
 		dst = append(dst, c.Version.NodeID[:]...)
 		dst = AppendValue(dst, c.Value)
+		dst = AppendValue(dst, Blob(c.RecordKey))
 	}
 	return dst
 }
@@ -342,7 +401,12 @@ func DecodeSnapshotCells(src []byte, lim Limits, maxCells int) ([]SnapshotCell, 
 			return nil, nil, fmt.Errorf("codec: snapshot cell %d: %w", i, err)
 		}
 		c.Value = v
-		rest = r
+		key, next, err := ConsumeValue(r, lim.MaxValueBytes)
+		if err != nil || key.Type != TypeBlob {
+			return nil, nil, fmt.Errorf("codec: invalid snapshot record key")
+		}
+		c.RecordKey = key.B
+		rest = next
 		cells = append(cells, c)
 	}
 	return cells, rest, nil

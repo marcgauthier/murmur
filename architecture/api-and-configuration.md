@@ -14,6 +14,8 @@ Public Go API, configuration example, and internal interfaces.
 
 ## 5. Public Package API
 
+`Config.OriginSigning` is mandatory, including offline writers. It supplies a separate Ed25519 private key and explicit origin key registry. `Replication.TrustedSnapshotSources` controls merged-state recovery; `MigrateOriginBaseline` provides strict offline cutover and `ScanReplicationLog` returns complete signed transactions. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
+
 Keep the public API small.
 
 Initial concept:
@@ -102,12 +104,13 @@ func (db *DB) Close() error
 `Peers` and `AddPeer` supply bootstrap candidates, not permanent replication links. Discovery and the bounded scheduler select actual connections. `RemovePeer` explicitly retires and persistently excludes a NodeID locally, including from subsequent discovery; `AddPeer` clears that exclusion. This is local administrative policy, not a cluster-wide revocation. `ForceSync` schedules immediate synchronization subject to the same session and connection limits as background work. See [Sections 26](membership-and-transport.md#26-replication-transport)–[28](replication-and-dissemination.md#28-quic-connection-model) for membership configuration and connection budgets.
 
 A `database/sql/driver.Driver` is implemented (`driver.go`, registered as
-`replicateddb`) so applications can do:
+`murmur`, with legacy alias `replicateddb`) so applications can do:
 
 ```go
-replicateddb.RegisterDriverDB("primary", db)
-sqldb, err := sql.Open("replicateddb", "primary")
-// or: sqldb := sql.OpenDB(replicateddb.NewConnector(db))
+murmur.RegisterDriverDB("primary", db)
+sqldb, err := sql.Open("murmur", "primary")
+// or: sqldb, err := sql.Open("replicateddb", "primary")
+// or: sqldb := sql.OpenDB(murmur.NewConnector(db))
 ```
 
 Exec runs through implicit transactions, Query through reads, and Begin maps
@@ -143,6 +146,24 @@ and is valid only with `DurabilityAsync`; zero keeps manual `DB.Sync` behavior.
 results. See [Section 17](transactions.md#17-alternative-write-optimization)
 for the durability contract.
 
+`DurabilityConfig.MaxUnsyncedBytes` adds a size trigger beside the time
+trigger: once approximately that many bytes have been written without a sync,
+a durability sync runs. It is only valid with `DurabilityAsync`; zero
+disables it. When both triggers are set, whichever is reached first fires,
+bounding the loss window under bursty load. With both zero, asynchronous
+commits sync only on explicit `DB.Sync` and graceful close.
+
+`DurabilityConfig.GroupCommit` configures synchronous group commit, enabled by
+default in `DurabilitySynchronous` mode and ignored in `DurabilityAsync` mode.
+`MaxDelay` (default one millisecond; negative disables grouping) bounds the
+leader's wait for concurrent transactions, `MaxTransactions` (default 64,
+maximum 512) caps transactions per group, and `MaxBytes` (default 4 MiB,
+maximum 64 MiB) caps the group's total encoded size. Grouped transactions
+share one synced Pebble batch and are each acknowledged after that shared
+fsync, so the synchronous durability contract is unchanged. See
+[Section 16](transactions.md#16-local-sql-commit-ordering) for the commit
+path and failure semantics.
+
 ```go
 type PebbleConfig struct {
     CacheBytes              int64
@@ -150,6 +171,7 @@ type PebbleConfig struct {
     MemTableCount           int
     MaxOpenFiles            int
     MaxConcurrentCompactions int
+    DisableAutomaticCompactions bool // default false; stalled-compaction simulation
     Compression             CompressionConfig
 }
 
@@ -198,19 +220,19 @@ Target developer experience:
 `Schema`, `Pebble`, and `Encryption` are mandatory. `Open` validates them before materialization or replication starts. `storageKey` below is an application-supplied 32-byte secret.
 
 ```go
-db, err := replicateddb.Open(ctx, replicateddb.Config{
+db, err := murmur.Open(ctx, murmur.Config{
     Path:   "./node-data",
-    NodeID: replicateddb.MustNodeID("..."),
+    NodeID: murmur.MustNodeID("..."),
     DBID:   clusterDBID, // shared configured/persisted ID for joining this cluster
 
-    Pebble: replicateddb.DefaultPebbleConfig(), // includes Zstd level 3
+    Pebble: murmur.DefaultPebbleConfig(), // includes Zstd level 3
 
-    QueryStore: replicateddb.QueryStoreConfig{
+    QueryStore: murmur.QueryStoreConfig{
         RemoteApplyInterval: 1 * time.Second,
         RemoteApplyMaxTransactions: 1000,
     },
 
-    Schema: replicateddb.SchemaConfig{
+    Schema: murmur.SchemaConfig{
         Version: 7,
         Tables:  schema,
         // AcceptRemoteSchema nil (default) auto-adopts higher schema versions
@@ -219,21 +241,21 @@ db, err := replicateddb.Open(ctx, replicateddb.Config{
 
     MaxTransactionBytes: 64 << 20, // default pre-commit cap (top-level Config field)
 
-    Encryption: replicateddb.EncryptionConfig{
-        Algorithm:       replicateddb.AES256GCM,
+    Encryption: murmur.EncryptionConfig{
+        Algorithm:       murmur.AES256GCM,
         Key:             storageKey,
         KeyID:           "storage-key-v1",
         DataKeyRotation: 24 * time.Hour,
     },
 
-    Cache: replicateddb.CacheConfig{
+    Cache: murmur.CacheConfig{
         StatementCacheEntries: 256,
     },
 
-    Replication: replicateddb.ReplicationConfig{
+    Replication: murmur.ReplicationConfig{
         ListenAddr: ":7443",
         TLS: tlsConfig,
-        Membership: replicateddb.MembershipConfig{
+        Membership: murmur.MembershipConfig{
             AdvertiseAddr: "192.0.2.10:7443", // this node's reachable endpoint
             Bootstrap: []string{"seed-a.example:7443", "seed-b.example:7443"},
         },
@@ -242,7 +264,7 @@ db, err := replicateddb.Open(ctx, replicateddb.Config{
         AntiEntropyInterval:    10 * time.Second,
         MaxReplicationSessions: 8,
         MaxQUICConnections:     32,
-        Dissemination:          replicateddb.DisseminationGossip, // optional: DisseminationPlumtree
+        Dissemination:          murmur.DisseminationGossip, // optional: DisseminationPlumtree
         MaxSnapshotBytes:       512 << 20, // default staging/publication bound
         SnapshotTransferTimeout: 10 * time.Minute, // source read-cut lease
         // Overload's zero fields select the bounded defaults in Section 32.
@@ -338,3 +360,5 @@ Keep storage and transport interfaces internal until real alternate implementati
 The internal membership adapter implements `memberlist.NodeAwareTransport` on the shared QUIC pool and publishes a membership view/events to the scheduler. The scheduler owns target selection and work admission; the replication manager retains durable batch/acknowledgement processing. Keep memberlist and QUIC implementation types internal rather than exposing them through configuration or status.
 
 ---
+
+Current schema-level counter, set and extrema behavior, causal storage, signed wire formats, bridge ownership and upgrade requirements are specified in [merge policies](merge-policies.md). LWW remains the default.

@@ -39,7 +39,7 @@ func snapshotFixture(t *testing.T) (*Store, *codec.SnapshotManifest, [][]codec.S
 
 func snapshotReceiver(t *testing.T, source *Store) *Store {
 	t.Helper()
-	receiver, err := Open(t.TempDir(), ids.NewNodeID(), source.DBID(), Options{Limits: codec.DefaultLimits()})
+	receiver, err := openSignedFixture(t.TempDir(), ids.NewNodeID(), source.DBID(), Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -26,11 +26,11 @@ Or via the benchmark runner: `bash tests-benchmark/run.sh sqlite-bench`.
 
 ## Knobs
 
-- `SPEDSQL_SQLITE_BENCH_ROWS` (default 100000): rows per table.
-- `SPEDSQL_SQLITE_BENCH_POINT_ITERS` (default 20000): point lookups.
-- `SPEDSQL_SQLITE_BENCH_JOIN_ITERS` (default 10000): join lookups.
-- `SPEDSQL_SQLITE_BENCH_SCAN_ITERS` (default 10): full-scan repeats.
-- `SPEDSQL_SQLITE_BENCH_JOIN_SCAN_ITERS` (default 5): join-scan repeats.
+- `MURMUR_SQLITE_BENCH_ROWS` (default 100000): rows per table.
+- `MURMUR_SQLITE_BENCH_POINT_ITERS` (default 20000): point lookups.
+- `MURMUR_SQLITE_BENCH_JOIN_ITERS` (default 10000): join lookups.
+- `MURMUR_SQLITE_BENCH_SCAN_ITERS` (default 10): full-scan repeats.
+- `MURMUR_SQLITE_BENCH_JOIN_SCAN_ITERS` (default 5): join-scan repeats.
 
 ## Notes
 

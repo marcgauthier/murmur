@@ -1,7 +1,7 @@
 // Release and upgrade acceptance: previous-release binaries must
 // interoperate with the current build.
 //
-// The suite checks out the pinned previous release (SPEDSQL_PREV_REF)
+// The suite checks out the pinned previous release (MURMUR_PREV_REF)
 // into a scratch worktree, builds its daemon, and proves three
 // upgrade paths against the current binary: a rolling upgrade with
 // continuous writes, a current-binary open of a previous-release
@@ -11,6 +11,7 @@ package releaseupgrade_test
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -34,18 +35,18 @@ import (
 
 // defaultPrevRef is the previous release the current build must
 // upgrade from. Bump it to the last release commit whenever a new
-// release is cut; SPEDSQL_PREV_REF overrides it per run.
+// release is cut; MURMUR_PREV_REF overrides it per run.
 const defaultPrevRef = "4bdd2974766786865c6222bb4843cab79e41e5c5"
 
 func prevRef() string {
-	if ref := os.Getenv("SPEDSQL_PREV_REF"); ref != "" {
+	if ref := harness.GetEnv("MURMUR_PREV_REF"); ref != "" {
 		return ref
 	}
 	return defaultPrevRef
 }
 
 func prevTags() string {
-	if tags := os.Getenv("SPEDSQL_TAGS"); tags != "" {
+	if tags := harness.GetEnv("MURMUR_TAGS"); tags != "" {
 		return tags
 	}
 	if os.Getenv("CGO_ENABLED") == "0" {
@@ -287,105 +288,56 @@ func schemaConfig() *db.SchemaConfig {
 	}}}
 }
 
-// Rolling upgrade: three nodes start on the previous release and flip
-// to the current build one at a time while every node keeps accepting
-// writes. Any failed write outside a restart window aborts the
-// release, a mixed-version pair must replicate mid-roll, and the mesh
-// must converge with identical digests at the end.
-func TestRollingUpgradeLosesNoWrites(t *testing.T) {
+// Signed replication requires a coordinated offline cutover. Every legacy
+// node converges first, then all writers stop before baseline migration.
+func TestCoordinatedSignedCutoverLosesNoWrites(t *testing.T) {
 	oldBin := prevDaemon(t)
-	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:         "release-upgrade",
-		NumNodes:     3,
-		AwaitUnlock:  true,
-		Schema:       schemaConfig(),
-		BinaryByNode: map[int]string{0: oldBin, 1: oldBin, 2: oldBin},
-	})
-	newBin := cluster.BinaryPath
-	t.Logf("rolling previous %s -> current %s", shortHash(t, oldBin), shortHash(t, newBin))
-
-	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("%032x", i)
-		if err := cluster.ExecSQL(0, "INSERT INTO ru_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("base-%d", i)); err != nil {
-			t.Fatalf("baseline write: %v", err)
+	cluster := harness.NewCluster(t, harness.ClusterOptions{Name: "release-upgrade", NumNodes: 3, AwaitUnlock: true, Schema: schemaConfig(), BinaryByNode: map[int]string{0: oldBin, 1: oldBin, 2: oldBin}})
+	for node := range cluster.Nodes {
+		for i := 0; i < 5; i++ {
+			if err := cluster.ExecSQL(node, "INSERT INTO ru_rows (id,name) VALUES (?,?)", fmt.Sprintf("%032x", node*100+i), fmt.Sprintf("old-%d-%d", node, i)); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
-	waitCounts(t, cluster, 5, 60*time.Second)
-
-	var failed atomic.Int64
-	var paused [3]atomic.Bool
-	stop := make(chan struct{})
-	stopWriters := sync.OnceFunc(func() { close(stop) })
-	defer stopWriters()
-	var wg sync.WaitGroup
-	for n := 0; n < 3; n++ {
-		wg.Add(1)
-		go func(node int) {
-			defer wg.Done()
-			ticker := time.NewTicker(50 * time.Millisecond)
-			defer ticker.Stop()
-			seq := 0
-			for {
-				select {
-				case <-stop:
-					return
-				case <-ticker.C:
-					if paused[node].Load() {
-						continue
-					}
-					id := fmt.Sprintf("ff%02x%028x", node, seq)
-					seq++
-					if err := cluster.ExecSQL(node, "INSERT INTO ru_rows (id, name) VALUES (?, ?)", id, "flow"); err != nil {
-						failed.Add(1)
-						t.Logf("node%d write failed outside its upgrade: %v", node+1, err)
-					}
-				}
-			}
-		}(n)
-	}
-
-	for i := 0; i < 3; i++ {
-		paused[i].Store(true)
-		time.Sleep(300 * time.Millisecond)
-		cluster.StopNode(i)
-		time.Sleep(time.Second)
-		cluster.SetNodeBinary(i, newBin)
-		cluster.StartNode(i)
-		cluster.UnlockNode(i, cluster.Nodes[i].KeyHex)
-		cluster.WaitNodeReady(i)
-		paused[i].Store(false)
-		if i == 0 {
-			// Mixed-version proof: an old node writes, the
-			// upgraded node must replicate it.
-			marker := fmt.Sprintf("%032x", 0xbeef)
-			if err := cluster.ExecSQL(1, "INSERT INTO ru_rows (id, name) VALUES (?, ?)", marker, "mixed"); err != nil {
-				t.Fatalf("mixed-version write on old node: %v", err)
-			}
-			waitRowOnNode(t, cluster, 0, marker, 30*time.Second)
-		}
-		time.Sleep(3 * time.Second)
-		quiesce(t, cluster, &paused, 60*time.Second)
-	}
-
-	stopWriters()
-	wg.Wait()
-	if got := failed.Load(); got != 0 {
-		t.Fatalf("%d writes failed outside upgrade windows, want zero-downtime", got)
-	}
-	waitConvergedCounts(t, cluster, 60*time.Second)
-	want, err := cluster.ComputeTableDigest(0, "ru_rows", "id")
+	waitCounts(t, cluster, 15, 60*time.Second)
+	before, err := cluster.ComputeTableDigest(0, "ru_rows", "id")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for idx := 1; idx < 3; idx++ {
-		d, err := cluster.ComputeTableDigest(idx, "ru_rows", "id")
-		if err != nil {
+	for i := range cluster.Nodes {
+		cluster.StopNode(i)
+	}
+	for i := range cluster.Nodes {
+		migrateNodeBaseline(t, cluster, i)
+		cluster.SetNodeBinary(i, cluster.BinaryPath)
+	}
+	for i := range cluster.Nodes {
+		cluster.StartNode(i)
+		cluster.UnlockNode(i, cluster.Nodes[i].KeyHex)
+		cluster.WaitNodeReady(i)
+	}
+	waitCounts(t, cluster, 15, 30*time.Second)
+	for i := range cluster.Nodes {
+		got, err := cluster.ComputeTableDigest(i, "ru_rows", "id")
+		if err != nil || got != before {
+			t.Fatalf("baseline changed: %s %v", got, err)
+		}
+	}
+	for i := range cluster.Nodes {
+		if err := cluster.ExecSQL(i, "INSERT INTO ru_rows (id,name) VALUES (?,?)", fmt.Sprintf("%032x", 1000+i), "signed"); err != nil {
 			t.Fatal(err)
 		}
-		if d != want {
-			dumpIDDiff(t, cluster)
-			t.Fatalf("node%d digest %s != node1 %s after rolling upgrade", idx+1, d, want)
-		}
+	}
+	waitCounts(t, cluster, 18, 30*time.Second)
+	waitConvergedCounts(t, cluster, 30*time.Second)
+}
+
+func migrateNodeBaseline(t *testing.T, c *harness.Cluster, idx int) {
+	t.Helper()
+	cmd := exec.Command(c.BinaryPath, "migrate-origin-baseline", "--config", c.Nodes[idx].ConfigFile)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("offline origin baseline migration: %v: %s", err, out)
 	}
 }
 
@@ -413,6 +365,7 @@ func TestNewBinaryOpensOldStore(t *testing.T) {
 	}
 	cluster.StopNode(0)
 
+	migrateNodeBaseline(t, cluster, 0)
 	cluster.SetNodeBinary(0, cluster.BinaryPath)
 	cluster.StartNode(0)
 	cluster.UnlockNode(0, cluster.Nodes[0].KeyHex)
@@ -487,6 +440,7 @@ func TestOldBackupRestoresOnNewBinary(t *testing.T) {
 	rewriteNodeConfig(t, node, fresh.String())
 	reissueNodeCert(t, cluster, node, fresh.String())
 
+	migrateNodeBaseline(t, cluster, 0)
 	cluster.SetNodeBinary(0, cluster.BinaryPath)
 	cluster.StartNode(0)
 	cluster.UnlockNode(0, node.KeyHex)
@@ -692,7 +646,18 @@ func rewriteNodeConfig(t *testing.T, node *harness.Node, freshNodeID string) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		t.Fatal(err)
 	}
+	_, freshKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.OriginKey = freshKey
+	if err := os.WriteFile(filepath.Join(node.TLSDir, "origin.key"), freshKey, 0600); err != nil {
+		t.Fatal(err)
+	}
 	cfg["node_id"] = freshNodeID
+	if registry, ok := cfg["origin_public_keys"].(map[string]any); ok {
+		registry[freshNodeID] = hex.EncodeToString(node.OriginKey.Public().(ed25519.PublicKey))
+	}
 	out, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		t.Fatal(err)
@@ -704,6 +669,7 @@ func rewriteNodeConfig(t *testing.T, node *harness.Node, freshNodeID string) {
 }
 
 func reissueNodeCert(t *testing.T, cluster *harness.Cluster, node *harness.Node, freshNodeID string) {
+	cluster.ProvisionOrigin(node.NodeID, node.OriginKey)
 	t.Helper()
 	id := mustParseNodeID(t, freshNodeID)
 	certPEM, keyPEM, err := cluster.CA.IssueNode(id, 24*time.Hour)

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	_ "modernc.org/sqlite"
 )
 
@@ -23,7 +23,7 @@ func BenchmarkQueryMaterialization(b *testing.B) {
 				b.Fatal(err)
 			}
 			cfg := benchConfig(dest, tmpl.node, tmpl.dbid)
-			db, err := replicateddb.Open(context.Background(), cfg)
+			db, err := murmur.Open(context.Background(), cfg)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -35,7 +35,7 @@ func BenchmarkQueryMaterialization(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				start := time.Now()
-				var rows *replicateddb.Rows
+				var rows *murmur.Rows
 				var err error
 				if i%2 == 0 {
 					rows, err = db.QueryContext(ctx,

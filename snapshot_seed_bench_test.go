@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -17,7 +17,7 @@ func BenchmarkSnapshotSeed(b *testing.B) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(b, nodeA, nodeC)
 
-	dbA, err := Open(ctx, replConfig(b.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(b.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func BenchmarkSnapshotSeed(b *testing.B) {
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
 	b.ResetTimer()
 	start := time.Now()
-	dbC, err := Open(ctx, cfgC)
+	dbC, err := openSignedFixture(ctx, cfgC)
 	if err != nil {
 		b.Fatal(err)
 	}

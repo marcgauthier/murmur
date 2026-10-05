@@ -1,8 +1,9 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -57,7 +58,7 @@ func TestMigrateAdditive(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir()
 	cfg := testConfig(path)
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,12 +85,12 @@ func TestMigrateAdditive(t *testing.T) {
 	_ = db.Close()
 
 	// Reopen requires the migrated declaration, then serves all data.
-	if _, err := Open(ctx, cfg); err == nil {
+	if _, err := openSignedFixture(ctx, cfg); err == nil {
 		t.Fatal("old config opened a migrated store")
 	}
 	cfg.Schema.Version = 2
 	cfg.Schema.Tables = migrateTestTables()
-	db2, err := Open(ctx, cfg)
+	db2, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,6 +104,99 @@ func TestMigrateAdditive(t *testing.T) {
 	}
 	if got := db2.Status().SchemaEpoch; got != 2 {
 		t.Fatalf("epoch after no-op = %d", got)
+	}
+}
+
+// TestMigrateGroupMemberStraddle pins the phase-2 visibility hole: a
+// group member SQL-committed before a migration must be repaired after
+// the rebuild discards its inline apply. The wide group window makes
+// the straddle deterministic (no timing luck): the member cannot reach
+// phase 2 before the migration rebuilds.
+func TestMigrateGroupMemberStraddle(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir()
+	cfg := testConfig(path)
+	cfg.Durability.GroupCommit.MaxDelay = time.Second
+	db, err := openSignedFixture(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	id := NewRowID()
+	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "base"); err != nil {
+		t.Fatal(err)
+	}
+	repairsBefore := db.Metrics().Repairs
+	// The racing insert blocks in phase 2 for up to the group window.
+	type execResult struct{ err error }
+	done := make(chan execResult, 1)
+	raceID := NewRowID()
+	go func() {
+		_, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, raceID[:], "straddler")
+		done <- execResult{err}
+	}()
+	// Generous margin for the SQL phase + enqueue; the 1s group window
+	// guarantees phase 2 still pends when the migration rebuilds.
+	time.Sleep(100 * time.Millisecond)
+	if err := db.Migrate(ctx, migrateTestTables()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("straddling insert: %v", r.err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("straddling insert never acknowledged")
+	}
+	rows := queryAll(t, db, `SELECT name FROM contacts ORDER BY name`)
+	if len(rows) != 2 {
+		t.Fatalf("want 2 visible rows after straddled migration, got %d", len(rows))
+	}
+	if got := db.Metrics().Repairs; got <= repairsBefore {
+		t.Fatalf("repairs counter did not advance (straddle unexercised?)")
+	}
+}
+
+// TestMigrateGroupMemberUpdateStraddle pins the update half of the
+// phase-2 visibility hole: a straddled UPDATE replays its pre-commit
+// value (present but stale), and repair must refresh values, not just
+// insert absent rows.
+func TestMigrateGroupMemberUpdateStraddle(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir()
+	cfg := testConfig(path)
+	cfg.Durability.GroupCommit.MaxDelay = time.Second
+	db, err := openSignedFixture(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	id := NewRowID()
+	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "base"); err != nil {
+		t.Fatal(err)
+	}
+	type execResult struct{ err error }
+	done := make(chan execResult, 1)
+	go func() {
+		_, err := db.ExecContext(ctx, `UPDATE contacts SET name = ? WHERE id = ?`, "straddled", id[:])
+		done <- execResult{err}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if err := db.Migrate(ctx, migrateTestTables()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("straddling update: %v", r.err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("straddling update never acknowledged")
+	}
+	rows := queryAll(t, db, `SELECT name FROM contacts WHERE id = ?`, id[:])
+	if len(rows) != 1 || fmt.Sprint(rows[0][0]) != "straddled" {
+		t.Fatalf("want straddled value visible, got %v", rows)
 	}
 }
 
@@ -134,7 +228,7 @@ func TestMigrateRejectsDestructive(t *testing.T) {
 	}
 	for name, fn := range cases {
 		t.Run(name, func(t *testing.T) {
-			db, err := Open(ctx, testConfig(t.TempDir()))
+			db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -151,7 +245,7 @@ func TestMigrateRejectsDestructive(t *testing.T) {
 
 func TestMigrateRejectsNonNullOnRows(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +261,7 @@ func TestMigrateRejectsNonNullOnRows(t *testing.T) {
 		t.Fatalf("err = %v, want ErrUnsupportedSchema", err)
 	}
 	// Same migration on an empty table succeeds.
-	db2, err := Open(ctx, testConfig(t.TempDir()))
+	db2, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,13 +277,13 @@ func TestSchemaAutoAdopt(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
-	dbA, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
 	addrA := waitForAddr(t, dbA, 5*time.Second)
-	dbB, err := Open(ctx, replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
+	dbB, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}}))
 	if err != nil {
 		t.Fatal(err)
@@ -243,7 +337,7 @@ func TestSchemaStrictAncestorApplies(t *testing.T) {
 	_, creds := testClusterCA(t, nodeA, nodeB)
 	strict := false
 
-	dbA, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +346,7 @@ func TestSchemaStrictAncestorApplies(t *testing.T) {
 	cfgB := replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
 	cfgB.Schema.AcceptRemoteSchema = &strict
-	dbB, err := Open(ctx, cfgB)
+	dbB, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,13 +386,13 @@ func TestSchemaAncestorBatchApplies(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
-	dbA, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
 	addrA := waitForAddr(t, dbA, 5*time.Second)
-	dbB, err := Open(ctx, replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
+	dbB, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}}))
 	if err != nil {
 		t.Fatal(err)
@@ -355,13 +449,13 @@ func TestSchemaConcurrentMerge(t *testing.T) {
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
 	// Offline branches: same epoch, disjoint additive content.
-	dbA, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
 	addrA := waitForAddr(t, dbA, 5*time.Second)
-	dbB, err := Open(ctx, replConfig(t.TempDir(), nodeB, dbid, creds[nodeB], nil))
+	dbB, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeB, dbid, creds[nodeB], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -473,7 +567,7 @@ func TestLiveSchemaExport(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir()
 	cfg := testConfig(path)
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +605,7 @@ func TestLiveSchemaExport(t *testing.T) {
 	// The exported declaration reopens the migrated store exactly.
 	cfg.Schema.Version = epoch
 	cfg.Schema.Tables = tables2
-	db2, err := Open(ctx, cfg)
+	db2, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatalf("reopen with LiveSchema declaration: %v", err)
 	}

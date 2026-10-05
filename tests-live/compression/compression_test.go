@@ -10,6 +10,7 @@
 package compression_test
 
 import (
+ "github.com/marcgauthier/murmur/internal/testdb"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -26,6 +27,7 @@ import (
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 type compMode struct {
@@ -160,13 +162,13 @@ type cellResult struct {
 
 func envScale(t *testing.T) int {
 	t.Helper()
-	raw := os.Getenv("SPEDSQL_LIVE_COMPRESSION_SCALE")
+	raw := harness.GetEnv("MURMUR_LIVE_COMPRESSION_SCALE")
 	if raw == "" {
 		return 1
 	}
 	n, err := strconv.Atoi(raw)
 	if err != nil || n < 1 {
-		t.Fatalf("SPEDSQL_LIVE_COMPRESSION_SCALE must be a positive integer")
+		t.Fatalf("MURMUR_LIVE_COMPRESSION_SCALE must be a positive integer")
 	}
 	return n
 }
@@ -174,7 +176,7 @@ func envScale(t *testing.T) int {
 func runCell(t *testing.T, ctx context.Context, mode compMode, prof trafficProfile, scale int, seed int64) cellResult {
 	t.Helper()
 	dir := t.TempDir()
-	cfg := db.Config{
+	cfg := testdb.Configure(db.Config{
 		Path:   filepath.Join(dir, "node"),
 		NodeID: ids.NewNodeID(),
 		Schema: db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{prof.table}},
@@ -183,7 +185,7 @@ func runCell(t *testing.T, ctx context.Context, mode compMode, prof trafficProfi
 			Key:   bytes.Repeat([]byte{0x3a}, 32),
 			KeyID: "compression-bench",
 		},
-	}
+	})
 	// Small memtables force real flushes/compactions so the comparison
 	// measures SST bytes, not memtable residency.
 	cfg.Pebble.MemTableBytes = 256 << 10

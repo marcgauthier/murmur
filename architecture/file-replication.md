@@ -118,10 +118,15 @@ cluster mTLS credentials (a deliberate deviation from bulk streams on the
 shared replication endpoint: bulk bytes never head-of-line-block membership or
 control traffic, at the cost of a second listen address; multiplexing fetch
 streams onto replication sessions remains possible future work).
-`Files.FetchPeers` statically lists sources; SWIM advertisement of fetch
-endpoints is future work. Fetching peers must run the same object-key
-generation: receivers verify containers with the local key, so a generation
-mismatch fails closed as a corrupt source until the lagging node rotates.
+`Files.FetchPeers` statically lists sources, and serving nodes additionally
+advertise their bound fetch endpoint in SWIM membership metadata, so SQL
+replication and object replication share the same dynamic membership model:
+fetch sources are the union of static peers and live SWIM members advertising
+a fetch endpoint (static entries win conflicts; discovered members honor peer
+exclusion; dead members disappear with the membership view). Fetching peers
+must run the same object-key generation: receivers verify containers with the
+local key, so a generation mismatch fails closed as a corrupt source until
+the lagging node rotates.
 
 The background worker scans visible metadata for locally missing objects
 (woken early whenever remote file metadata applies) and pulls each with

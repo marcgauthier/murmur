@@ -14,6 +14,7 @@ package filepermissions_test
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -23,6 +24,7 @@ import (
 
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/origin"
 	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
@@ -232,13 +234,24 @@ func openNodeDir(t *testing.T, ctx context.Context, cluster *harness.Cluster, no
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The store pins the origin signing key under the NodeID; the
+	// offline open must present the same identity as the daemon.
+	registry, _ := origin.NewKeyRegistry(nil)
+	for _, n := range cluster.Nodes {
+		_ = registry.Add(n.NodeID, n.OriginKey.Public().(ed25519.PublicKey))
+	}
+	// NOTE: no testdb.Configure here — it overwrites OriginSigning with
+	// deterministic fixture keys, but this store pinned the daemon's
+	// real key. Offline opens carry no replication peers, so Configure
+	// would contribute nothing else.
 	handle, err := db.Open(ctx, db.Config{
-		Path:       node.PebbleDir,
-		NodeID:     node.NodeID,
-		DBID:       cluster.DBID,
-		Schema:     *schemaConfig(),
-		Pebble:     db.DefaultPebbleConfig(),
-		Encryption: db.EncryptionConfig{Key: raw, KeyID: "remote-unlock-key"},
+		Path:          node.PebbleDir,
+		NodeID:        node.NodeID,
+		DBID:          cluster.DBID,
+		OriginSigning: db.OriginSigningConfig{PrivateKey: node.OriginKey, TrustedKeys: registry},
+		Schema:        *schemaConfig(),
+		Pebble:        db.DefaultPebbleConfig(),
+		Encryption:    db.EncryptionConfig{Key: raw, KeyID: "remote-unlock-key"},
 	})
 	if err != nil {
 		t.Fatalf("open node dir: %v", err)

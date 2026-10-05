@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -19,7 +19,7 @@ func TestOpenBadPathFailsCleanly(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := testConfig(filepath.Join(blocker, "data"))
-	if _, err := Open(ctx, cfg); err == nil {
+	if _, err := openSignedFixture(ctx, cfg); err == nil {
 		t.Fatal("expected Open to fail on an impossible path")
 	}
 }
@@ -30,7 +30,7 @@ func TestOpenMissingKeyFailsCleanly(t *testing.T) {
 	ctx := context.Background()
 	cfg := testConfig(t.TempDir())
 	cfg.Encryption = EncryptionConfig{KeyID: "x", Provider: &failProvider{}}
-	if _, err := Open(ctx, cfg); err == nil {
+	if _, err := openSignedFixture(ctx, cfg); err == nil {
 		t.Fatal("expected Open to fail with a failing provider")
 	} else if !errors.Is(err, ErrEncryptionKey) {
 		t.Fatalf("expected ErrEncryptionKey, got %v", err)

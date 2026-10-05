@@ -22,8 +22,8 @@ full-mesh replication. The test gates on:
 ## Run
 
 ```sh
-SPEDSQL_LIVE_WRITE_PRIORITY_SECONDS=12 \
-SPEDSQL_LIVE_WRITE_PRIORITY_SYNC_TIMEOUT_SECONDS=120 \
+MURMUR_LIVE_WRITE_PRIORITY_SECONDS=12 \
+MURMUR_LIVE_WRITE_PRIORITY_SYNC_TIMEOUT_SECONDS=120 \
 go test ./tests-live/write-priority/ -run TestLocalWritePriority -v -count=1
 ```
 

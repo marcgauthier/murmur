@@ -2,9 +2,9 @@
 //
 // A node learns file metadata through normal replication, but object bytes
 // stay on the uploader until fetched. The fetch worker periodically scans
-// visible metadata for objects absent locally and pulls them from the
-// statically configured fetch peers, trying sources in turn until one serves
-// bytes that verify against the replicated digest and length.
+// visible metadata for objects absent locally and pulls them from static
+// fetch peers plus SWIM-discovered serving members, trying sources in turn
+// until one serves bytes that verify against the replicated digest and length.
 //
 // Transfers stage into per-source files under <Path>/files/staging and
 // publish atomically through objectstore InstallVerified: a crash or restart
@@ -12,15 +12,17 @@
 // is per-source because container bytes differ across uploads of identical
 // content (random container nonce); mixing sources would only fail install
 // and restart from zero.
-package replicateddb
+package murmur
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -66,7 +68,8 @@ type FileFetchStats struct {
 	BytesFetched uint64
 	// LastError is the most recent fetch failure, if any.
 	LastError string
-	// Sources is the configured static source count (excluding self).
+	// Sources is the current fetch source count, static plus
+	// SWIM-discovered (excluding self).
 	Sources int
 	// Serving reports whether this node serves fetches to peers.
 	Serving bool
@@ -92,13 +95,54 @@ func (db *DB) FileFetchStats() FileFetchStats {
 	return st
 }
 
-// sources lists fetch peers excluding the local node.
+// sources lists fetch sources excluding the local node: static FetchPeers
+// plus SWIM-discovered serving members, so SQL replication and object
+// replication share the same dynamic membership model.
 func (fs *fileStore) sources() []Peer {
+	return mergeFetchSources(fs.db.cfg.NodeID, fs.db.cfg.Files.FetchPeers, fs.discoveredSources())
+}
+
+// discoveredSources lists serving SWIM members as fetch sources, excluding
+// the local node and operator-excluded peers. It is empty without a
+// membership service.
+func (fs *fileStore) discoveredSources() []Peer {
+	repl := fs.db.replManager()
+	if repl == nil {
+		return nil
+	}
+	ms := repl.Membership()
+	if ms == nil {
+		return nil
+	}
 	var out []Peer
-	for _, p := range fs.db.cfg.Files.FetchPeers {
-		if p.NodeID == fs.db.cfg.NodeID {
+	for id, meta := range ms.AliveMembers() {
+		if id == fs.db.cfg.NodeID || meta.FetchEndpoint == "" || repl.IsPeerExcluded(id) {
 			continue
 		}
+		out = append(out, Peer{NodeID: id, Addrs: []string{meta.FetchEndpoint}})
+	}
+	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].NodeID[:], out[j].NodeID[:]) < 0 })
+	return out
+}
+
+// mergeFetchSources unions static and discovered sources while skipping the
+// local node. On a NodeID conflict the static entry wins: explicit operator
+// config beats discovery.
+func mergeFetchSources(self NodeID, static, discovered []Peer) []Peer {
+	var out []Peer
+	seen := map[NodeID]bool{self: true}
+	for _, p := range static {
+		if seen[p.NodeID] {
+			continue
+		}
+		seen[p.NodeID] = true
+		out = append(out, p)
+	}
+	for _, p := range discovered {
+		if seen[p.NodeID] {
+			continue
+		}
+		seen[p.NodeID] = true
 		out = append(out, p)
 	}
 	return out
@@ -124,7 +168,7 @@ func (db *DB) FetchFile(ctx context.Context, name string) error {
 		return err
 	}
 	if name == "" {
-		return fmt.Errorf("replicateddb: file name is required")
+		return fmt.Errorf("murmur: file name is required")
 	}
 	st, err := fs.status(fileRowID(name))
 	if err != nil {
@@ -138,7 +182,7 @@ func (db *DB) FetchFile(ctx context.Context, name string) error {
 	}
 	sources := fs.sources()
 	if len(sources) == 0 {
-		return fmt.Errorf("replicateddb: fetch %q: no fetch sources configured", name)
+		return fmt.Errorf("murmur: fetch %q: no fetch sources available", name)
 	}
 	timeout := db.cfg.Files.FetchTimeout
 	if timeout <= 0 {
@@ -176,7 +220,7 @@ func (db *DB) FetchFile(ctx context.Context, name string) error {
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no source served the object")
 	}
-	return fmt.Errorf("replicateddb: fetch %q: %w", name, lastErr)
+	return fmt.Errorf("murmur: fetch %q: %w", name, lastErr)
 }
 
 // maxContainerFor bounds the container length for a plaintext size: header,
@@ -325,6 +369,17 @@ func (fs *fileStore) noteFetchErr(msg string) {
 	fs.fetch.lastErr = msg
 }
 
+// fetchDiscoveryActive reports whether SWIM membership can yield fetch
+// sources later: files enabled plus a membership service. The background
+// worker starts on this promise even when no source is known yet at Open.
+func (db *DB) fetchDiscoveryActive() bool {
+	if db.files == nil || !db.cfg.Files.Enabled {
+		return false
+	}
+	repl := db.replManager()
+	return repl != nil && repl.Membership() != nil
+}
+
 // fetchLoop scans for missing objects on an interval (and when triggered)
 // and fetches each with bounded concurrency.
 func (db *DB) fetchLoop() {
@@ -375,7 +430,7 @@ func (db *DB) fetchScan() {
 		missing = append(missing, FileStatus{Name: name, Digest: digest, Size: size})
 		return nil
 	}); err != nil {
-		db.log.Warn("replicateddb: fetch scan failed", "err", err.Error())
+		db.log.Warn("murmur: fetch scan failed", "err", err.Error())
 		return
 	}
 	fs.fetch.pending.Store(int64(len(missing)))

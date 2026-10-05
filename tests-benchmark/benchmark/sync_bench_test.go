@@ -3,10 +3,11 @@ package benchmark
 import (
 	"bytes"
 	"context"
+	"github.com/marcgauthier/murmur/internal/testdb"
 	"testing"
 	"time"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/transport"
 )
 
@@ -16,21 +17,21 @@ func BenchmarkRebuild(b *testing.B) {
 	for _, n := range datasetSizes(b) {
 		b.Run(sizeName(n), func(b *testing.B) {
 			dir := b.TempDir()
-			node := replicateddb.NewNodeID()
-			mkcfg := func() replicateddb.Config {
-				return replicateddb.Config{
+			node := murmur.NewNodeID()
+			mkcfg := func() murmur.Config {
+				return testdb.Configure(murmur.Config{
 					Path:   dir,
 					NodeID: node,
-					Schema: replicateddb.SchemaConfig{
+					Schema: murmur.SchemaConfig{
 						Version: 1, Tables: benchSchema(), LocalDDL: benchLocalDDL(),
 					},
-					Pebble: replicateddb.DefaultPebbleConfig(),
-					Encryption: replicateddb.EncryptionConfig{
+					Pebble: murmur.DefaultPebbleConfig(),
+					Encryption: murmur.EncryptionConfig{
 						Key: bytes.Repeat([]byte{0x62}, 32), KeyID: "bench",
 					},
-				}
+				})
 			}
-			seed, err := replicateddb.Open(context.Background(), mkcfg())
+			seed, err := murmur.Open(context.Background(), mkcfg())
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -41,7 +42,7 @@ func BenchmarkRebuild(b *testing.B) {
 			}
 			b.ResetTimer()
 			start := time.Now()
-			db, err := replicateddb.Open(context.Background(), mkcfg())
+			db, err := murmur.Open(context.Background(), mkcfg())
 			elapsed := time.Since(start)
 			if err != nil {
 				b.Fatal(err)
@@ -79,44 +80,44 @@ func BenchmarkReplicationSync(b *testing.B) {
 		}
 		b.Run(sizeName(n), func(b *testing.B) {
 			ctx := context.Background()
-			nodeA, nodeB := replicateddb.NewNodeID(), replicateddb.NewNodeID()
-			dbid := replicateddb.NewDBID()
+			nodeA, nodeB := murmur.NewNodeID(), murmur.NewNodeID()
+			dbid := murmur.NewDBID()
 			ca, err := transport.GenerateCA(time.Hour)
 			if err != nil {
 				b.Fatal(err)
 			}
-			creds := func(n replicateddb.NodeID) *replicateddb.TLSCredential {
+			creds := func(n murmur.NodeID) *murmur.TLSCredential {
 				certPEM, keyPEM, err := ca.IssueNode(n, time.Hour)
 				if err != nil {
 					b.Fatal(err)
 				}
-				return &replicateddb.TLSCredential{CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: ca.CertPEM}
+				return &murmur.TLSCredential{CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: ca.CertPEM}
 			}
-			mkcfg := func(path string, node replicateddb.NodeID, tls *replicateddb.TLSCredential, listen string, peers []replicateddb.Peer) replicateddb.Config {
-				return replicateddb.Config{
+			mkcfg := func(path string, node murmur.NodeID, tls *murmur.TLSCredential, listen string, peers []murmur.Peer) murmur.Config {
+				return testdb.Configure(murmur.Config{
 					Path:   path,
 					NodeID: node,
 					DBID:   dbid,
-					Schema: replicateddb.SchemaConfig{
+					Schema: murmur.SchemaConfig{
 						Version: 1, Tables: benchSchema(), LocalDDL: benchLocalDDL(),
 					},
-					Pebble: replicateddb.DefaultPebbleConfig(),
-					Encryption: replicateddb.EncryptionConfig{
+					Pebble: murmur.DefaultPebbleConfig(),
+					Encryption: murmur.EncryptionConfig{
 						Key: bytes.Repeat([]byte{0x62}, 32), KeyID: "bench",
 					},
-					Replication: replicateddb.ReplicationConfig{
+					Replication: murmur.ReplicationConfig{
 						ListenAddr: listen, TLS: tls, Peers: peers,
 					},
-				}
+				})
 			}
 			const portA = "127.0.0.1:17443"
-			dbA, err := replicateddb.Open(ctx, mkcfg(b.TempDir(), nodeA, creds(nodeA), portA, nil))
+			dbA, err := murmur.Open(ctx, mkcfg(b.TempDir(), nodeA, creds(nodeA), portA, nil))
 			if err != nil {
 				b.Fatal(err)
 			}
 			defer dbA.Close()
-			dbB, err := replicateddb.Open(ctx, mkcfg(b.TempDir(), nodeB, creds(nodeB), "127.0.0.1:0",
-				[]replicateddb.Peer{{NodeID: nodeA, Addrs: []string{portA}}}))
+			dbB, err := murmur.Open(ctx, mkcfg(b.TempDir(), nodeB, creds(nodeB), "127.0.0.1:0",
+				[]murmur.Peer{{NodeID: nodeA, Addrs: []string{portA}}}))
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -154,7 +155,7 @@ func BenchmarkReplicationSync(b *testing.B) {
 	}
 }
 
-func countContacts(b *testing.B, db *replicateddb.DB) int {
+func countContacts(b *testing.B, db *murmur.DB) int {
 	b.Helper()
 	rows, err := db.QueryContext(context.Background(), `SELECT COUNT(*) FROM contacts`)
 	if err != nil {

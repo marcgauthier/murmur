@@ -20,7 +20,7 @@ Execution evidence for candidate `31bf1b5` is recorded in the 2026-09-29
 > tags. Every `go build` / `go vet` / `go test` command in this document
 > needs `-tags "sqlite_preupdate_hook sqlite_fts5"`, or `-tags modernc`
 > for the pure-Go backend. `tests-live/run.sh` defaults
-> `SPEDSQL_TAGS` to the CGO set. See [§2](#2-supported-platforms).
+> `MURMUR_TAGS` to the CGO set. See [§2](#2-supported-platforms).
 
 ## Contents
 
@@ -51,18 +51,19 @@ Release-specific execution evidence belongs in [§4](#4-verification-record).
 | 7 | Optional Plumtree dissemination with required-capability negotiation (mixed modes refuse) | Implemented | `replication/plumtree.go`, `plumtree/`; `go test -tags ... ./tests-live/plumtree-live` |
 | 8 | Transaction chunks (64 KiB, durable encrypted staging, restart resume, cross-peer repair) and paginated applied/observed progress | Implemented | `replication/transaction_chunks.go`, `replication/progress.go`, `replication/chunk_availability.go`, `state/transaction_stage.go`; `state/transaction_stage_test.go` covers restart/complete-batch staging; `replication/transaction_chunks_test.go` covers complete-only apply. `tests-live/large-payload` covers separate writes and large-value fidelity, not single bulk-transaction atomicity or interrupted cross-peer repair. |
 | 9 | Overload budgets: global/per-peer queue byte/entry caps, 256 MiB durable staging cap, token buckets, retryable overload responses | Implemented | `overload/`, replication queue accounting; `go test -tags ... ./tests-live/overload-budgets` |
-| 10 | Snapshot resync: consistent Pebble read cut, manifest v1, canonical digest, encrypted restart-safe staging, atomic (≤8 MiB) and chunked SSTable-ingest merge (≤512 MiB), atomic watermark publication, stall watchdog with bounded re-request, explicit busy deferral, per-peer transfer progress | Implemented | `state/snapshot*.go`, `replication/manager.go` (watchdog/deferral), `replication/snapshot_progress_test.go`; `go test -tags ... ./tests-live/snapshot-resync` (single + dual requester) |
+| 10 | Snapshot resync: consistent Pebble read cut, manifest v2, canonical digest, encrypted restart-safe staging, atomic (≤8 MiB) and chunked SSTable-ingest merge (≤512 MiB), atomic watermark publication, stall watchdog with bounded re-request, explicit busy deferral, per-peer transfer progress | Implemented | `state/snapshot*.go`, `replication/manager.go` (watchdog/deferral), `replication/snapshot_progress_test.go`; `go test -tags ... ./tests-live/snapshot-resync` (single + dual requester) |
 | 11 | Snapshot source tail-history retention lease | Implemented | `state/snapshot.go`, `state/store.go`, `state/scan.go`; `TestSnapshotTailRetentionLease*` covers concurrent writes/GC, cancellation/retry, and expiry. In-memory lease releases when export returns or expires; protection through receiver publication and tail catch-up still needs live acceptance. |
 | 12 | Log GC gated by persisted member admission/ack-progress retention deadlines; `RemovePeer` retirement persists across restart, `AddPeer` readmits | Implemented | `state/members.go`, `db.go`; `go test -tags ... ./tests-live/churn-retirement` |
 | 13 | Backup/restore with fresh-writer identity, durable restore marker (same-identity rollback rejected), new-DBID reseed | Implemented | `backup/`, `state/restore.go`; `go test -tags ... ./tests-live/backup-restore` |
 | 14 | SWIM/memberlist over QUIC | Implemented | `db.go` starts `replication.NewMembershipService` with configured bootstrap seeds; `replication/membership.go` calls `memberlist.Create`. Membership/transport tests exist. `TestDynamicBootstrapDiscovery` (partial-mesh) starts 3 nodes with no static peers and seed addresses only, requires SWIM membership of 3 on all nodes plus exact 20-row convergence with zero `AddPeer` calls (verified passing live; see §4 format for recording a candidate run). |
 | 15 | High/Low bridge: domain roles, recipient-sealed bundles, durable outbox (encrypted payloads) / inbox journals, aggregate capacity with backpressure, atomic imports with stable source receipts + contiguous stream progress, waiting-schema holds, status/replay diagnostics, ownership/provenance with reorder convergence, sealed file-object transfer | Implemented | `bridge/`; `go test ./bridge/`; `go test -tags ... ./tests-live/highlow ./tests-live/files-bridge ./tests-live/bridge-two-streams` |
-| 16 | Encrypted file objects: replicated metadata, streaming upload/read, search/list, delete tombstones, availability, grace collection, bounded mesh fetch from static peers, per-file key generations, object-inclusive vs metadata-only backup | Implemented | `objectstore/`, `files*.go`; `go test ./objectstore`; `go test -tags ... ./tests-live/files-soak`; File-fetch SWIM discovery remains pending independently of SQL membership (#14). |
+| 16 | Encrypted file objects: replicated metadata, streaming upload/read, search/list, delete tombstones, availability, grace collection, bounded mesh fetch from static peers plus SWIM-discovered serving members, per-file key generations, object-inclusive vs metadata-only backup | Implemented | `objectstore/`, `files*.go`; `go test ./objectstore`; `go test -tags ... ./tests-live/files-soak` |
 | 17 | Writer scheduling (90/10 shares, idle borrowing, bounded debt, cancellation-aware admission), reactive subscriptions, IP/CIDR admission, `database/sql` driver, internal test-node HTTPS API with client-certificate authorization, `DB.Status`/`DB.Metrics`/Prometheus collectors | Implemented | `scheduler.go`, `subscriptions.go`, `transport/addrs.go`, `driver.go`, `tests-live/harness/testnode/` TLS middleware (HTTPS health is exempt from client-certificate authorization); `go test -tags ... ./tests-live/api-mtls ./tests-live/loadshare ./tests-live/subscribe ./tests-live/addrpolicy`; `go test -tags ... ./metrics/` |
 | 18 | Hardening: decoder fuzz targets, crash-injection suite, adversarial-peer tests, cert-expiry rejection, disk-full fail-closed, short multi-process soaks | Implemented | `codec/`, `replication/fuzz_test.go`, `crash_test.go`, `diskfull_test.go`, `soak_test.go`; `go test -tags ... ./tests-live/soak-slo ./tests-live/long-running-five-node` (smoke durations; multi-hour/impaired-network acceptance remains pending) |
 | 19 | Benchmark matrix (§59–§61) with recorded 10K/100K results, cipher/compression matrix, local/live writer throughput, transaction-size matrix, concurrent-reader suite | Implemented | `benchmark/`; [Benchmarks](benchmarks.md#62-running-the-matrix) |
 | 20 | Automatic primary-key derivation (default `id` UUIDv4 / UUIDv5 from a flagged column) | Pending | Not implemented; v1 still requires the application to supply an explicit `BLOB(16)` PK. Not release-blocking. |
 | 21 | Embedded GORM dialect (SQLite-flavored DML, `Migrate`-based additive migrations, `murmur.Model`/`ID`/`Time`/`DeletedAt`, loud rejection of indexes/defaults/checks/constraints, real transactions) | Implemented | `gormmurmur/`; `go test -tags "sqlite_preupdate_hook sqlite_fts5" ./gormmurmur/` and `go test -tags modernc ./gormmurmur/`; `tests-live/gorm-sync`, `tests-live/gorm-migrate`, `tests-live/gorm-tx` (GORM-only access, real QUIC replication) |
+| 22 | Ed25519 transaction origin signatures, explicit origin-key registry, protocol/format 5 cutover, separately authorized snapshot sources | Implemented | [Origin signatures](origin-signatures.md); `codec/origin_test.go`, `state/origin_security_test.go`, `tests-live/origin-signatures/`; same-NodeID rotation/revocation remain deferred. |
 
 ## 2. Supported platforms
 
@@ -130,13 +131,13 @@ Persist `ca.CertPEM` once per cluster and one cert/key pair per node. Rotate bef
 - Rolling schema change: additive migrations only (`DB.Migrate`), one node at a time;
   mixed-version meshes keep replicating. Proven by
   `tests-live/schema-evolution`.
-- Upgrades: on-disk format is versioned (`format_version` = 2 with
+- Upgrades: on-disk format is versioned (`format_version` = 4 with
   minimum reader/writer enforcement); replication handshakes negotiate
   capabilities and refuse unknown required bits, so mixed-version
-  clusters fail closed instead of diverging. The compatible upgrade
-  paths (rolling previous-to-current binaries, current binary opening
-  a previous-release store, current restore of a previous-release
-  backup) are proven by `tests-live/release-upgrade`.
+  clusters fail closed instead of diverging. The signed-origin cutover
+  requires coordinated shutdown and explicit offline baseline migration.
+  `tests-live/release-upgrade` covers that cutover, migration of a previous
+  store, and migration after a previous-release backup restore.
 - Loss window: default durability syncs Pebble before every write
   acknowledgement. `DurabilityAsync` returns without a disk sync and
   syncs about once per second plus on graceful close; use it only when
@@ -151,10 +152,42 @@ bash tests-live/run.sh three-node-sync    # convergence smoke
 bash tests-live/run.sh snapshot-resync    # stale-node snapshot path
 bash tests-live/run.sh backup-restore     # restore identity rules
 bash tests-live/run.sh all                # full live matrix (long)
-SPEDSQL_TAGS=modernc bash tests-live/run.sh three-node-sync  # pure-Go backend
+MURMUR_TAGS=modernc bash tests-live/run.sh three-node-sync  # pure-Go backend
 ```
 
 ## 4. Verification record
+
+Origin-signature working-tree verification, 2026-10-04, Linux amd64 / Go 1.26.0
+(uncommitted changes; no release-candidate claim):
+
+- Modernc package suites passed for the root package, codec, origin, state,
+  replication, bridge, metrics, and GORM. Origin-security and concurrent-close
+  tests passed three repetitions under the race detector. The initial broader
+  race run exposed a cancellation/statement-start race; transaction operations
+  now retain the transaction mutex through statement startup.
+- The complete race rerun passed for the root package, codec, origin, state,
+  replication, bridge, metrics, and GORM (`go test -race -tags modernc -timeout
+  10m . ./codec ./origin ./state ./replication ./bridge ./metrics ./gormmurmur`);
+  the root package took 248 seconds. Artifact: `/tmp/murmur-origin-race-final.log`.
+- The real QUIC/mTLS `origin-signatures` scenario passed: A's proof reaches C
+  through B with A offline; forged, unsigned, cross-database and altered-chunk
+  identities are rejected without state/receipt/HLC advancement; restart keeps
+  the honest receipt; an unauthorized snapshot source is denied.
+- Live `partial-mesh`, `plumtree-live`, `txchunk-resume`, `snapshot-resync`,
+  `backup-restore`, `highlow`, `hostile-peer`, `version-skew`, and `release-upgrade`
+  passed. Upgrade evidence covers coordinated legacy shutdown/migration/restart,
+  direct old-store migration and old-backup restore, not mixed-protocol rolling
+  interoperability. The previous release was `4bdd2974766786865c6222bb4843cab79e41e5c5`.
+- Live `corrupt-snapshot`, `backup-under-fire`, and `tampered-backup` also passed.
+  Backup-under-fire completed 2,394 writes with zero failures, rejected the
+  interrupted artifact, and restored the final backup to the survivor digest.
+- Targeted origin-security checks passed with the CGO SQLite backend
+  (`sqlite_preupdate_hook sqlite_fts5`). Modernc `go vet ./...`, full-package
+  compilation, Markdown links/anchors/fences, and `git diff --check` passed.
+- Local artifacts: `/tmp/murmur-origin-suite.log`,
+  `/tmp/murmur-origin-race-close.log`, `/tmp/murmur-origin-live5.log`, and
+  `/tmp/murmur-origin-regression-live.log`. Signature microbenchmarks are recorded
+  in [§64](benchmarks.md#64-origin-signature-measurements).
 
 The entries below preserve previously recorded results. Their source snapshots
 were not fully identified by immutable commits, and their suite counts describe
@@ -188,7 +221,7 @@ SQLite backend refactor verification, 2026-09-28, linux/amd64:
 - New `replication/dialloop_stop_test.go` (detach-stops-dialer fix),
   including a `-race` run — pass; fails without the fix.
 - All 28 live suites via `tests-live/run.sh` (repaired to pass
-  `SPEDSQL_TAGS` to both the test-node harness build and `go test`, mirroring the
+  `MURMUR_TAGS` to both the test-node harness build and `go test`, mirroring the
   harness fix): `addrpolicy`, `allow-nodes` (20 s development window),
   `backup-restore`, `benchmark`, `bridge-two-streams`, `chaos-load`
   (3/3 after the dialLoop fix), `churn-retirement`, `crash-recovery`,
@@ -218,7 +251,7 @@ all gate suites pass locally (completion notes were in TASKS_COMPLETED.md
 under SNAPSHOT-PROGRESS-001, LIVE-GATE-001, LIVE-GROUP-A-001; the file was
 removed since, content survives in git history). Do not run two
 runner invocations against one checkout concurrently; isolate with
-`SPEDSQL_LIVE_RUNTIME`.
+`MURMUR_LIVE_RUNTIME`.
 
 2026-09-28 daemon API mTLS follow-up (historical — this feature was part of
 the now-removed `murmurd/` standalone daemon, which has been deferred for a
@@ -263,7 +296,7 @@ an isolated worktree checkout of that commit (clean tree, no patch):
   restore of a previous-release backup. Previous release for all three:
   `4bdd297` (old module path), so the suite also proves binary
   compatibility across the module rename. The suite additionally passes
-  with `SPEDSQL_TAGS=modernc`.
+  with `MURMUR_TAGS=modernc`.
 - Load-flake hardening in this candidate: admission/fetch-completed
   counters polled instead of asserted immediately (an event counter
   trails its durable record across goroutines), gc-balance adaptive
@@ -348,3 +381,5 @@ Before publishing:
 Record the resulting release tag and candidate hash in the release notes.
 Documentation-only updates may reference the tested candidate; any runtime
 change requires verification of the new candidate.
+
+Schema-level PN_COUNTER, typed OR_SET and numeric MAX/MIN are implemented alongside default LWW. See [merge policies](merge-policies.md) for the contract and regression/live coverage.

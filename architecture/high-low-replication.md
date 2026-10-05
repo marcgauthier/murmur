@@ -319,3 +319,5 @@ Acceptance requires:
 - High-owned fields surviving later Low updates, protected deletes requiring High
   resolution, and all High peers converging under reordered policy/value delivery.
 - Key rotation and prolonged destination outage staying within configured budgets.
+
+Current schema-level counter, set and extrema behavior, causal storage, signed wire formats, bridge ownership and upgrade requirements are specified in [merge policies](merge-policies.md). LWW remains the default.

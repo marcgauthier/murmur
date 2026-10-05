@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -23,7 +23,7 @@ func testSubscriptionDB(t *testing.T, modCfg func(*Config)) *DB {
 	if modCfg != nil {
 		modCfg(&cfg)
 	}
-	db, err := Open(context.Background(), cfg)
+	db, err := openSignedFixture(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestSubscriptionRemoteApplyAndSnapshot(t *testing.T) {
 		"name":  codec.Text("David"),
 		"score": codec.Int(99),
 	})
-	if err := db.ApplyRemote(ctx, batch); err != nil {
+	if err := applyRemoteFixture(db, ctx, batch); err != nil {
 		t.Fatalf("ApplyRemote: %v", err)
 	}
 

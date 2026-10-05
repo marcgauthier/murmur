@@ -16,7 +16,7 @@ import (
 // path for any non-trivial snapshot.
 func openChunkedStore(t *testing.T, node ids.NodeID, dbid ids.DBID) *Store {
 	t.Helper()
-	s, err := Open(t.TempDir(), node, dbid, Options{
+	s, err := openSignedFixture(t.TempDir(), node, dbid, Options{
 		Limits:                   codec.DefaultLimits(),
 		SnapshotAtomicMergeBytes: 1,
 	})
@@ -158,7 +158,7 @@ func TestSnapshotChunkedMergeResumesAfterRestart(t *testing.T) {
 	}
 	bPath := t.TempDir()
 	bNode := ids.NewNodeID()
-	b, err := Open(bPath, bNode, a.DBID(), Options{Limits: codec.DefaultLimits(), SnapshotAtomicMergeBytes: 1})
+	b, err := openSignedFixture(bPath, bNode, a.DBID(), Options{Limits: codec.DefaultLimits(), SnapshotAtomicMergeBytes: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestSnapshotChunkedMergeResumesAfterRestart(t *testing.T) {
 	if err := b.Close(); err != nil {
 		t.Fatal(err)
 	}
-	b, err = Open(bPath, bNode, a.DBID(), Options{Limits: codec.DefaultLimits(), SnapshotAtomicMergeBytes: 1})
+	b, err = openSignedFixture(bPath, bNode, a.DBID(), Options{Limits: codec.DefaultLimits(), SnapshotAtomicMergeBytes: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestSnapshotChunkedMergeCrashBeforePublish(t *testing.T) {
 	manifest, chunks := exportCollect(t, a)
 	bPath := t.TempDir()
 	bNode := ids.NewNodeID()
-	b, err := Open(bPath, bNode, a.DBID(), Options{Limits: codec.DefaultLimits(), SnapshotAtomicMergeBytes: 1})
+	b, err := openSignedFixture(bPath, bNode, a.DBID(), Options{Limits: codec.DefaultLimits(), SnapshotAtomicMergeBytes: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +258,7 @@ func TestSnapshotChunkedMergeCrashBeforePublish(t *testing.T) {
 	if err := b.Close(); err != nil {
 		t.Fatal(err)
 	}
-	b, err = Open(bPath, bNode, a.DBID(), Options{Limits: codec.DefaultLimits(), SnapshotAtomicMergeBytes: 1})
+	b, err = openSignedFixture(bPath, bNode, a.DBID(), Options{Limits: codec.DefaultLimits(), SnapshotAtomicMergeBytes: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +282,7 @@ func TestSnapshotSSTableIngestCrashBeforeProgressResumes(t *testing.T) {
 	manifest, chunks := exportCollect(t, a)
 	bPath, bNode := t.TempDir(), ids.NewNodeID()
 	open := func() *Store {
-		s, err := Open(bPath, bNode, a.DBID(), Options{Limits: codec.DefaultLimits(), SnapshotAtomicMergeBytes: 1})
+		s, err := openSignedFixture(bPath, bNode, a.DBID(), Options{Limits: codec.DefaultLimits(), SnapshotAtomicMergeBytes: 1})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -354,7 +354,7 @@ func TestSnapshotSSTableIngestUsesEncryptedVFS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	target, err := Open(dir+"/data", ids.NewNodeID(), a.DBID(), Options{FS: encFS, Limits: codec.DefaultLimits(), SnapshotAtomicMergeBytes: 1})
+	target, err := openSignedFixture(dir+"/data", ids.NewNodeID(), a.DBID(), Options{FS: encFS, Limits: codec.DefaultLimits(), SnapshotAtomicMergeBytes: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +374,7 @@ func TestSnapshotSSTableIngestUsesEncryptedVFS(t *testing.T) {
 
 func TestOpenRemovesInterruptedSnapshotIngestFile(t *testing.T) {
 	dir, node, dbID := t.TempDir(), ids.NewNodeID(), ids.NewDBID()
-	s, err := Open(dir, node, dbID, Options{Limits: codec.DefaultLimits()})
+	s, err := openSignedFixture(dir, node, dbID, Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +395,7 @@ func TestOpenRemovesInterruptedSnapshotIngestFile(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s, err = Open(dir, node, dbID, Options{Limits: codec.DefaultLimits()})
+	s, err = openSignedFixture(dir, node, dbID, Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}

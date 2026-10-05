@@ -1,4 +1,4 @@
-// Package replicateddb is an embedded, replicated, in-memory SQL engine.
+// Package murmur is an embedded, replicated, in-memory SQL engine.
 //
 // Applications link it directly; there is no standalone server. The query
 // database (SQLite-compatible, memory resident) is a rebuildable
@@ -9,11 +9,11 @@
 // Architecture:
 //
 //	Application SQL -> query engine -> TxDelta -> CRDT merge -> Pebble -> QUIC peers
-package replicateddb
+package murmur
 
 import "github.com/marcgauthier/murmur/ids"
 
-// Identity aliases so the public API reads naturally (replicateddb.NodeID)
+// Identity aliases so the public API reads naturally (murmur.NodeID)
 // while subpackages share one definition without import cycles.
 type (
 	// NodeID identifies a cluster node.

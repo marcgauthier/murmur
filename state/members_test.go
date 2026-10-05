@@ -175,7 +175,7 @@ func TestMemberListMergesExclusions(t *testing.T) {
 func TestMemberPersistenceAcrossReopen(t *testing.T) {
 	path := t.TempDir()
 	node := ids.NewNodeID()
-	s, err := Open(path, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
+	s, err := openSignedFixture(path, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func TestMemberPersistenceAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := Open(path, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
+	s2, err := openSignedFixture(path, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}

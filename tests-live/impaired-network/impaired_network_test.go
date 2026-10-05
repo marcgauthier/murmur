@@ -15,7 +15,7 @@
 // foreign root qdisc, and always removes qdisc 77: on cleanup.
 //
 // Needs CAP_NET_ADMIN (root or a network namespace): without it the
-// suite skips. SPEDSQL_IMPAIRED_NETWORK_FORCE=1 runs the same
+// suite skips. MURMUR_IMPAIRED_NETWORK_FORCE=1 runs the same
 // write/converge workload with no impairment (logic verification only).
 package impairednetwork_test
 
@@ -24,7 +24,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -40,15 +39,15 @@ import (
 const tableName = "imp_rows"
 
 func TestImpairedNetworkConverges(t *testing.T) {
-	force := os.Getenv("SPEDSQL_IMPAIRED_NETWORK_FORCE") == "1"
+	force := harness.GetEnv("MURMUR_IMPAIRED_NETWORK_FORCE") == "1"
 	tcOK, skipReason := tcCapable()
 	if !force && !tcOK {
-		t.Skipf("impaired-network needs tc/netem + CAP_NET_ADMIN on lo: %s (set SPEDSQL_IMPAIRED_NETWORK_FORCE=1 to run the workload unimpaired)", skipReason)
+		t.Skipf("impaired-network needs tc/netem + CAP_NET_ADMIN on lo: %s (set MURMUR_IMPAIRED_NETWORK_FORCE=1 to run the workload unimpaired)", skipReason)
 	}
 	if force && !tcOK {
 		t.Logf("FORCE mode: tc unusable (%s); running workload WITHOUT impairment", skipReason)
 	}
-	rows := envInt("SPEDSQL_IMPAIRED_NETWORK_ROWS", 8)
+	rows := envInt("MURMUR_IMPAIRED_NETWORK_ROWS", 8)
 
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:        "impaired-network",
@@ -430,7 +429,7 @@ func waitGCPass(t *testing.T, c *harness.Cluster, idx int, timeout time.Duration
 }
 
 func envInt(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {
 		return v
 	}
 	return fallback

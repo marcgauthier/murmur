@@ -10,27 +10,32 @@ import (
 )
 
 const (
-	TransactionChunkVersion    uint16 = 1
+	TransactionChunkVersion    uint16 = 2
 	TransactionChunkSize              = 64 << 10
 	transactionChunkMagic             = "TXCH"
-	transactionChunkHeaderSize        = 138
+	transactionChunkHeaderSize        = 138 + originEnvelopeSize + 8
 	maxTransactionChunkCount          = 65_536
 )
 
 // TransactionChunk is one canonical fragment of an encoded MutationBatch.
 // All chunks in a transaction repeat the same identity and whole-batch digest.
 type TransactionChunk struct {
-	Version     uint16
-	Origin      ids.NodeID
-	Sequence    uint64
-	TxID        ids.TxID
-	SchemaEpoch uint64
-	SchemaHash  [32]byte
-	TotalLength uint64
-	Digest      [sha256.Size]byte
-	Index       uint32
-	Count       uint32
-	Data        []byte
+	DBID             ids.DBID
+	HLC              uint64
+	SignatureVersion uint16
+	MutationDigest   [32]byte
+	OriginSignature  [64]byte
+	Version          uint16
+	Origin           ids.NodeID
+	Sequence         uint64
+	TxID             ids.TxID
+	SchemaEpoch      uint64
+	SchemaHash       [32]byte
+	TotalLength      uint64
+	Digest           [sha256.Size]byte
+	Index            uint32
+	Count            uint32
+	Data             []byte
 }
 
 // EncodeTransactionChunks serializes a batch once, then returns canonical
@@ -75,6 +80,7 @@ func VisitTransactionChunks(batch *MutationBatch, maxTransactionBytes int64, vis
 			end = len(raw)
 		}
 		chunk := &TransactionChunk{
+			DBID: batch.DBID, HLC: batch.HLC, SignatureVersion: batch.SignatureVersion, MutationDigest: batch.MutationDigest, OriginSignature: batch.OriginSignature,
 			Version: TransactionChunkVersion, Origin: batch.OriginNode,
 			Sequence: batch.Sequence, TxID: batch.TxID,
 			SchemaEpoch: batch.SchemaEpoch, SchemaHash: batch.SchemaHash,
@@ -111,6 +117,8 @@ func EncodeTransactionChunk(dst []byte, chunk *TransactionChunk, maxTransactionB
 	dst = binary.BigEndian.AppendUint32(dst, chunk.Index)
 	dst = binary.BigEndian.AppendUint32(dst, chunk.Count)
 	dst = binary.BigEndian.AppendUint32(dst, uint32(len(chunk.Data)))
+	dst = binary.BigEndian.AppendUint64(dst, chunk.HLC)
+	dst = appendOriginEnvelope(dst, chunk.OriginBatch())
 	dst = append(dst, chunk.Data...)
 	return dst, nil
 }
@@ -147,6 +155,15 @@ func DecodeTransactionChunk(src []byte, maxTransactionBytes int64) (*Transaction
 	off += 4
 	payloadLen := binary.BigEndian.Uint32(src[off : off+4])
 	off += 4
+	c.HLC = binary.BigEndian.Uint64(src[off : off+8])
+	off += 8
+	identity := &MutationBatch{}
+	consumeOriginEnvelope(src[off:off+originEnvelopeSize], identity)
+	off += originEnvelopeSize
+	c.DBID = identity.DBID
+	c.SignatureVersion = identity.SignatureVersion
+	c.MutationDigest = identity.MutationDigest
+	c.OriginSignature = identity.OriginSignature
 	if uint64(payloadLen) != uint64(len(src)-off) {
 		return nil, fmt.Errorf("codec: transaction chunk payload length mismatch")
 	}
@@ -203,7 +220,7 @@ func AssembleTransactionChunks(chunks []*TransactionChunk, limits Limits) (*Muta
 	if err != nil {
 		return nil, err
 	}
-	if len(rest) != 0 || batch.OriginNode != first.Origin || batch.Sequence != first.Sequence || batch.TxID != first.TxID || batch.SchemaEpoch != first.SchemaEpoch || batch.SchemaHash != first.SchemaHash {
+	if len(rest) != 0 || batch.OriginNode != first.Origin || batch.Sequence != first.Sequence || batch.TxID != first.TxID || batch.SchemaEpoch != first.SchemaEpoch || batch.SchemaHash != first.SchemaHash || batch.HLC != first.HLC || batch.DBID != first.DBID || batch.SignatureVersion != first.SignatureVersion || batch.MutationDigest != first.MutationDigest || batch.OriginSignature != first.OriginSignature {
 		return nil, fmt.Errorf("codec: assembled batch identity mismatch")
 	}
 	return batch, nil
@@ -234,7 +251,12 @@ func validateTransactionChunk(c *TransactionChunk, maxTransactionBytes int64) er
 }
 
 func sameTransactionChunk(a, b *TransactionChunk) bool {
-	return a.Version == b.Version && a.Origin == b.Origin && a.Sequence == b.Sequence && a.TxID == b.TxID &&
+	return a.DBID == b.DBID && a.HLC == b.HLC && a.SignatureVersion == b.SignatureVersion && a.MutationDigest == b.MutationDigest && a.OriginSignature == b.OriginSignature && a.Version == b.Version && a.Origin == b.Origin && a.Sequence == b.Sequence && a.TxID == b.TxID &&
 		a.SchemaEpoch == b.SchemaEpoch && a.SchemaHash == b.SchemaHash && a.TotalLength == b.TotalLength &&
 		a.Digest == b.Digest && a.Count == b.Count
+}
+
+// OriginBatch returns the immutable identity repeated by a chunk.
+func (c *TransactionChunk) OriginBatch() *MutationBatch {
+	return &MutationBatch{DBID: c.DBID, OriginNode: c.Origin, Sequence: c.Sequence, TxID: c.TxID, HLC: c.HLC, SchemaEpoch: c.SchemaEpoch, SchemaHash: c.SchemaHash, SignatureVersion: c.SignatureVersion, MutationDigest: c.MutationDigest, OriginSignature: c.OriginSignature}
 }

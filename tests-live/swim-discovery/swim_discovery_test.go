@@ -33,7 +33,7 @@ import (
 const tableName = "swim_rows"
 
 func TestSeedOnlyDiscoveryFormsFullMesh(t *testing.T) {
-	deadline := envSeconds("SPEDSQL_SWIM_DISCOVERY_SECONDS", 60)
+	deadline := envSeconds("MURMUR_SWIM_DISCOVERY_SECONDS", 60)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:           "swim-discovery",
 		NumNodes:       4,
@@ -73,7 +73,7 @@ func TestSeedOnlyDiscoveryFormsFullMesh(t *testing.T) {
 }
 
 func TestSeedKillAndRediscovery(t *testing.T) {
-	deadline := envSeconds("SPEDSQL_SWIM_DISCOVERY_SECONDS", 60)
+	deadline := envSeconds("MURMUR_SWIM_DISCOVERY_SECONDS", 60)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:           "swim-rediscovery",
 		NumNodes:       4,
@@ -607,7 +607,7 @@ func mustMetric(body, name string) float64 {
 }
 
 func envSeconds(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {
 		return v
 	}
 	return fallback

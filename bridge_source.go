@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -13,7 +13,7 @@ import (
 // ErrBridgeLogGone indicates a bridge exporter's source log was
 // garbage-collected past its resume point. Export stalls loudly: gaps must
 // never be silently skipped.
-var ErrBridgeLogGone = errors.New("replicateddb: source log garbage-collected past bridge resume")
+var ErrBridgeLogGone = errors.New("murmur: source log garbage-collected past bridge resume")
 
 // BridgeLogSource abstracts the origin logs a bridge exporter drains.
 // KnownOrigins lists candidate origins; ScanLog streams up to maxBatches
@@ -71,6 +71,13 @@ func (s bridgeLogSource) ScanLog(ctx context.Context, origin ids.NodeID, fromSeq
 		if len(filtered.Mutations) == 0 {
 			return nil // High policy metadata is not a Low export event.
 		}
+		if len(filtered.Mutations) != len(mb.Mutations) {
+			// A bridge projection is authorized by its separately signed artifact;
+			// it is not the original transaction's origin-authenticated payload.
+			filtered.SignatureVersion = 0
+			filtered.MutationDigest = [32]byte{}
+			filtered.OriginSignature = [64]byte{}
+		}
 		return fn(&filtered)
 	})
 	if errors.Is(err, state.ErrLogGone) {
@@ -94,7 +101,7 @@ func (s bridgeLogSource) ReleaseProtection(origin ids.NodeID) error {
 func (db *DB) BridgeSchema() (BridgeSchemaResolver, error) {
 	reg := db.schemaRegistry()
 	if reg == nil {
-		return nil, fmt.Errorf("replicateddb: schema is not ready")
+		return nil, fmt.Errorf("murmur: schema is not ready")
 	}
 	tables := make(map[uint32]string, len(reg.Tables))
 	cols := make(map[uint32]map[uint32]string, len(reg.Tables))
@@ -111,7 +118,7 @@ func (db *DB) BridgeSchema() (BridgeSchemaResolver, error) {
 	// here too (identically with or without local files enabled).
 	fids, err := resolveFileIDs()
 	if err != nil {
-		return nil, fmt.Errorf("replicateddb: file metadata schema: %w", err)
+		return nil, fmt.Errorf("murmur: file metadata schema: %w", err)
 	}
 	tables[fids.table] = fileTableName
 	cols[fids.table] = map[uint32]string{
@@ -131,7 +138,7 @@ type bridgeSchema struct {
 func (s bridgeSchema) TableName(tableID uint32) (string, error) {
 	name, ok := s.tables[tableID]
 	if !ok {
-		return "", fmt.Errorf("replicateddb: unknown table %d", tableID)
+		return "", fmt.Errorf("murmur: unknown table %d", tableID)
 	}
 	return name, nil
 }
@@ -139,11 +146,11 @@ func (s bridgeSchema) TableName(tableID uint32) (string, error) {
 func (s bridgeSchema) ColumnName(tableID, columnID uint32) (string, error) {
 	cols, ok := s.cols[tableID]
 	if !ok {
-		return "", fmt.Errorf("replicateddb: unknown table %d", tableID)
+		return "", fmt.Errorf("murmur: unknown table %d", tableID)
 	}
 	name, ok := cols[columnID]
 	if !ok {
-		return "", fmt.Errorf("replicateddb: unknown column %d of table %d", columnID, tableID)
+		return "", fmt.Errorf("murmur: unknown column %d of table %d", columnID, tableID)
 	}
 	return name, nil
 }

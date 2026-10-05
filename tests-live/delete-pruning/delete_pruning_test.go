@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,9 +27,9 @@ import (
 )
 
 func TestConcurrentDeletesResurrectionsAndUpdatesConverge(t *testing.T) {
-	keys := envInt("SPEDSQL_DELETE_PRUNING_KEYS", 300)
+	keys := envInt("MURMUR_DELETE_PRUNING_KEYS", 300)
 	if keys%3 != 0 {
-		t.Fatalf("SPEDSQL_DELETE_PRUNING_KEYS=%d must be a multiple of 3", keys)
+		t.Fatalf("MURMUR_DELETE_PRUNING_KEYS=%d must be a multiple of 3", keys)
 	}
 	third := keys / 3
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
@@ -277,7 +276,7 @@ func waitMetricAdvanced(t *testing.T, apiAddr, name string, before int64, timeou
 }
 
 func envInt(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {
 		return v
 	}
 	return fallback

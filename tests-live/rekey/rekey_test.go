@@ -90,6 +90,52 @@ func TestStorageKeyRekeySurvivesRestart(t *testing.T) {
 	assertNeverReady(t, cluster, 0, 8*time.Second)
 }
 
+// TestRekeyAwaitUnlockRestartsWithKeyID pins the rotate-then-restart
+// path for await-unlock nodes: after rotation the registry only honors
+// the new key ID, so the post-restart unlock must present (id, material)
+// together. Unlocking with the new material but no ID 401s.
+func TestRekeyAwaitUnlockRestartsWithKeyID(t *testing.T) {
+	cluster := harness.NewCluster(t, harness.ClusterOptions{
+		Name:        "rekey-unlock-id",
+		NumNodes:    1,
+		AwaitUnlock: true,
+		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{Name: "contacts", Columns: []schema.ColumnSchema{
+			{Name: "id", Type: schema.ColBlob},
+			{Name: "name", Type: schema.ColText, Nullable: true},
+		}}}},
+	})
+	cluster.UnlockNode(0, cluster.Nodes[0].KeyHex)
+	cluster.WaitNodeReady(0)
+	id := ids.NewRowID()
+	if err := cluster.ExecSQL(0, `INSERT INTO contacts (id, name) VALUES (?, ?)`,
+		hex.EncodeToString(id[:]), "pre-rotate"); err != nil {
+		t.Fatalf("pre-rotate write: %v", err)
+	}
+	newKey := make([]byte, 32)
+	if _, err := rand.Read(newKey); err != nil {
+		t.Fatal(err)
+	}
+	newKeyHex := hex.EncodeToString(newKey)
+	if err := cluster.RotateKey(0, "live-new-key", newKeyHex, string(db.AES256GCM)); err != nil {
+		t.Fatalf("rotate key: %v", err)
+	}
+	// SIGKILL (not graceful stop): persistence of the rotation must
+	// not depend on a clean shutdown.
+	cluster.KillNode(0)
+	rewriteKeyConfig(t, cluster, "live-new-key", newKeyHex)
+	cluster.StartNode(0)
+	cluster.UnlockNodeWithKeyID(0, "live-new-key", newKeyHex)
+	cluster.WaitNodeReady(0)
+	if n := rowCount(t, cluster); n != 1 {
+		t.Fatalf("reopened row count = %d, want 1", n)
+	}
+	postID := ids.NewRowID()
+	if err := cluster.ExecSQL(0, `INSERT INTO contacts (id, name) VALUES (?, ?)`,
+		hex.EncodeToString(postID[:]), "post-restart"); err != nil {
+		t.Fatalf("post-restart write: %v", err)
+	}
+}
+
 func rowCount(t *testing.T, cluster *harness.Cluster) int {
 	t.Helper()
 	res, err := cluster.QuerySQL(0, `SELECT count(*) FROM contacts`)

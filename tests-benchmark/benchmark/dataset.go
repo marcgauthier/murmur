@@ -1,7 +1,7 @@
 // Package benchmark holds the repeatable performance suite (PLAN section 59-61).
 //
 // Dataset sizes: 10K rows always; 100K rows unless -short; 1M rows when
-// REPLICATEDDB_BENCH_ROWS=1000000. Run with:
+// MURMUR_BENCH_ROWS=1000000. Run with:
 //
 //	go test ./tests-benchmark/benchmark/ -bench . -benchtime 2s
 //	go test ./tests-benchmark/benchmark/ -bench . -short          # 10K datasets only
@@ -11,12 +11,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/marcgauthier/murmur/internal/testdb"
 	"math/rand"
 	"os"
 	"strconv"
 	"testing"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/crypto"
 	"github.com/marcgauthier/murmur/schema"
 )
@@ -71,7 +72,7 @@ func benchLocalDDL() []string {
 
 // datasetSizes returns the row counts to benchmark.
 func datasetSizes(b *testing.B) []int {
-	if v := os.Getenv("REPLICATEDDB_BENCH_ROWS"); v != "" {
+	if v := os.Getenv("MURMUR_BENCH_ROWS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return []int{n}
 		}
@@ -108,25 +109,25 @@ func benchProvider() *crypto.MapProvider {
 // benchConfig returns the standard single-node benchmark configuration:
 // benchmark schema with local indexes/FTS plus explicit encryption and
 // database identity.
-func benchConfig(path string, node replicateddb.NodeID, dbid replicateddb.DBID) replicateddb.Config {
-	return replicateddb.Config{
+func benchConfig(path string, node murmur.NodeID, dbid murmur.DBID) murmur.Config {
+	return testdb.Configure(murmur.Config{
 		Path:   path,
 		NodeID: node,
 		DBID:   dbid,
-		Schema: replicateddb.SchemaConfig{
+		Schema: murmur.SchemaConfig{
 			Version: 1, Tables: benchSchema(), LocalDDL: benchLocalDDL(),
 		},
-		Pebble: replicateddb.DefaultPebbleConfig(),
-		Encryption: replicateddb.EncryptionConfig{
+		Pebble: murmur.DefaultPebbleConfig(),
+		Encryption: murmur.EncryptionConfig{
 			Key: bytes.Clone(benchKey), KeyID: "bench",
 		},
-	}
+	})
 }
 
 // openBenchDB opens a fresh single-node database.
-func openBenchDB(b *testing.B, path string) *replicateddb.DB {
+func openBenchDB(b *testing.B, path string) *murmur.DB {
 	b.Helper()
-	db, err := replicateddb.Open(context.Background(), benchConfig(path, replicateddb.NewNodeID(), replicateddb.NewDBID()))
+	db, err := murmur.Open(context.Background(), benchConfig(path, murmur.NewNodeID(), murmur.NewDBID()))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -137,11 +138,11 @@ func openBenchDB(b *testing.B, path string) *replicateddb.DB {
 // populate inserts n contacts (+2 orders each) in 5000-row transactions
 // (sized under MaxBatchMutations/MaxTransactionBytes for fast setup).
 // It returns the contact row IDs for point lookups.
-func populate(b testing.TB, db *replicateddb.DB, n int) []replicateddb.RowID {
+func populate(b testing.TB, db *murmur.DB, n int) []murmur.RowID {
 	b.Helper()
 	ctx := context.Background()
 	rng := rand.New(rand.NewSource(42))
-	ids := make([]replicateddb.RowID, 0, n)
+	ids := make([]murmur.RowID, 0, n)
 	const perTx = 5000
 	for base := 0; base < n; base += perTx {
 		tx, err := db.BeginTx(ctx, nil)
@@ -153,7 +154,7 @@ func populate(b testing.TB, db *replicateddb.DB, n int) []replicateddb.RowID {
 			end = n
 		}
 		for i := base; i < end; i++ {
-			id := replicateddb.NewRowID()
+			id := murmur.NewRowID()
 			ids = append(ids, id)
 			name := fmt.Sprintf("%s %s %d", firstNames[i%len(firstNames)], lastNames[(i/len(firstNames))%len(lastNames)], i)
 			phone := fmt.Sprintf("555-%04d", i%10000)
@@ -163,7 +164,7 @@ func populate(b testing.TB, db *replicateddb.DB, n int) []replicateddb.RowID {
 				b.Fatal(err)
 			}
 			for o := 0; o < 2; o++ {
-				oid := replicateddb.NewRowID()
+				oid := murmur.NewRowID()
 				if _, err := tx.ExecContext(ctx,
 					`INSERT INTO orders (id, contact_id, amount) VALUES (?, ?, ?)`,
 					oid[:], id[:], rng.Intn(500)); err != nil {
@@ -180,7 +181,7 @@ func populate(b testing.TB, db *replicateddb.DB, n int) []replicateddb.RowID {
 
 // drainRows fully consumes and closes rows (read benchmarks must do this;
 // an open Rows stalls writers).
-func drainRows(b *testing.B, rows *replicateddb.Rows) int {
+func drainRows(b *testing.B, rows *murmur.Rows) int {
 	b.Helper()
 	defer rows.Close()
 	n := 0

@@ -27,8 +27,8 @@ func TestProviderLookup(t *testing.T) {
 	if _, err := rand.Read(key); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("REPLICATEDDB_TEST_LOOKUP_KEY", hex.EncodeToString(key))
-	env := &EnvProvider{Var: "REPLICATEDDB_TEST_LOOKUP_KEY", ID: "k1"}
+	t.Setenv("MURMUR_TEST_LOOKUP_KEY", hex.EncodeToString(key))
+	env := &EnvProvider{Var: "MURMUR_TEST_LOOKUP_KEY", ID: "k1"}
 	for _, id := range []string{"", "k1"} {
 		if _, err := env.Lookup(ctx, id); err != nil {
 			t.Fatalf("env lookup %q: %v", id, err)

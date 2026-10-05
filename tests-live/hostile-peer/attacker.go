@@ -88,7 +88,7 @@ func (a *attacker) dial(t *testing.T, addr string, expect ids.NodeID, epoch uint
 		DBID:                a.dbid,
 		SchemaEpoch:         epoch,
 		SchemaHash:          hash,
-		Capabilities:        replication.CapZstd,
+		Capabilities:        replication.CapMergePolicies | replication.CapZstd | replication.CapOriginSignatures,
 		MaxTransactionBytes: 64 << 20,
 	}
 	if err := replication.WriteFrame(stream, replication.MsgHello, 0, replication.EncodeHello(nil, hello)); err != nil {

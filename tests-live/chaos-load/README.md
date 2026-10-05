@@ -8,6 +8,6 @@ re-admits peers while writes continue, waits for complete count/digest
 convergence, and commits a final write after healing.
 
 The partition and post-heal write windows each run 12 seconds by default. Set
-`SPEDSQL_CHAOS_PARTITION_SECONDS` and `SPEDSQL_CHAOS_HEAL_SECONDS` to tune them.
+`MURMUR_CHAOS_PARTITION_SECONDS` and `MURMUR_CHAOS_HEAL_SECONDS` to tune them.
 The harness preserves node configs and logs in `tests-live/failures/` when a
 run fails.

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"github.com/marcgauthier/murmur/internal/testdb"
 	"io"
 	"os"
 	"strings"
@@ -47,7 +48,7 @@ func openFileDB(t *testing.T, objectKey []byte) *db.DB {
 
 func openFileDBAt(t *testing.T, dir string, objectKey []byte) *db.DB {
 	t.Helper()
-	database, err := db.Open(context.Background(), db.Config{
+	database, err := db.Open(context.Background(), testdb.Configure(db.Config{
 		Path:   dir,
 		NodeID: db.NewNodeID(),
 		Schema: db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
@@ -60,7 +61,7 @@ func openFileDBAt(t *testing.T, dir string, objectKey []byte) *db.DB {
 			Enabled:   true,
 			ObjectKey: append([]byte(nil), objectKey...),
 		},
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -574,7 +575,7 @@ func TestFileBridgeDisabledFilesHold(t *testing.T) {
 	low := openFileDBAt(t, lowDir, bytes.Repeat([]byte{0x10}, 32))
 	// High starts without files: build the harness around it manually.
 	pebbleCfg := db.DefaultPebbleConfig()
-	high, err := db.Open(ctx, db.Config{
+	high, err := db.Open(ctx, testdb.Configure(db.Config{
 		Path:   highDir,
 		NodeID: highNode,
 		Schema: db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
@@ -583,7 +584,7 @@ func TestFileBridgeDisabledFilesHold(t *testing.T) {
 		}}},
 		Pebble:     pebbleCfg,
 		Encryption: db.EncryptionConfig{Key: bytes.Repeat([]byte{0x44}, 32), KeyID: "test-key"},
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -635,7 +636,7 @@ func TestFileBridgeDisabledFilesHold(t *testing.T) {
 	if err := high.Close(); err != nil {
 		t.Fatal(err)
 	}
-	high2, err := db.Open(ctx, db.Config{
+	high2, err := db.Open(ctx, testdb.Configure(db.Config{
 		Path:   highDir,
 		NodeID: highNode,
 		Schema: db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
@@ -645,7 +646,7 @@ func TestFileBridgeDisabledFilesHold(t *testing.T) {
 		Pebble:     pebbleCfg,
 		Encryption: db.EncryptionConfig{Key: bytes.Repeat([]byte{0x44}, 32), KeyID: "test-key"},
 		Files:      db.FilesConfig{Enabled: true, ObjectKey: bytes.Repeat([]byte{0x20}, 32)},
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}

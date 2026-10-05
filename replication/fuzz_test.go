@@ -58,7 +58,7 @@ func FuzzFrame(f *testing.F) {
 func FuzzHello(f *testing.F) {
 	h := &Hello{
 		ProtocolVersion: 1, MinProtocolVersion: 1,
-		NodeID: ids.NewNodeID(), DBID: ids.NewDBID(),
+		NodeID: ids.NewNodeID(), DBID: fixtureDBID,
 		Have: []codec.OriginWatermark{{Origin: ids.NewNodeID(), Sequence: 3}},
 	}
 	f.Add(EncodeHello(nil, h))
@@ -77,7 +77,7 @@ func FuzzBatchesMessage(f *testing.F) {
 		Sequence: 1, HLC: 1, SchemaEpoch: 1,
 		Mutations: []codec.Mutation{{Value: codec.Int(1)}},
 	}
-	f.Add(EncodeBatches(nil, []*codec.MutationBatch{b}))
+	f.Add(encodeBatchesFixture(nil, []*codec.MutationBatch{b}))
 	f.Add([]byte{})
 	f.Add([]byte{0, 0, 0, 1})
 	f.Fuzz(func(t *testing.T, data []byte) {

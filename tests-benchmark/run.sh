@@ -7,17 +7,17 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 scenario=${1:-all}
-binary=${SPEDSQL_BIN:-"$root/tests-benchmark/bin/testnode"}
-tags=${SPEDSQL_TAGS:-"sqlite_preupdate_hook sqlite_fts5"}
+binary=${MURMUR_BIN:-"$root/tests-benchmark/bin/testnode"}
+tags=${MURMUR_TAGS:-"sqlite_preupdate_hook sqlite_fts5"}
 race_args=()
-if [[ ${SPEDSQL_RACE:-0} == 1 ]]; then
+if [[ ${MURMUR_RACE:-0} == 1 ]]; then
   race_args=(-race)
 fi
-runtime_root=${SPEDSQL_LIVE_RUNTIME:-"$root/tests-benchmark/runtime"}
-failures_dir=${SPEDSQL_LIVE_FAILURES:-"$root/tests-benchmark/failures"}
-export SPEDSQL_BIN="$binary"
-export SPEDSQL_LIVE_RUNTIME="$runtime_root"
-export SPEDSQL_LIVE_FAILURES="$failures_dir"
+runtime_root=${MURMUR_LIVE_RUNTIME:-"$root/tests-benchmark/runtime"}
+failures_dir=${MURMUR_LIVE_FAILURES:-"$root/tests-benchmark/failures"}
+export MURMUR_BIN="$binary"
+export MURMUR_LIVE_RUNTIME="$runtime_root"
+export MURMUR_LIVE_FAILURES="$failures_dir"
 started_at=$SECONDS
 
 echo "======================================================================"
@@ -25,7 +25,7 @@ echo "  MURMUR-SQL BENCHMARK SUITE RUNNER"
 echo "======================================================================"
 
 # Reap leftover daemons rooted at OUR runtime dir on the way out, scoped by
-# --config path so parallel runs with their own SPEDSQL_LIVE_RUNTIME roots
+# --config path so parallel runs with their own MURMUR_LIVE_RUNTIME roots
 # (or tests-live runs) are never touched.
 sweep_runtime_daemons() {
   local pids
@@ -53,6 +53,7 @@ mkdir -p "$(dirname "$binary")"
 scenario_timeout() {
   case "$1" in
     benchmark) echo "20m" ;;
+    perf-matrix) echo "4h" ;;
     *) echo "10m" ;;
   esac
 }
@@ -68,7 +69,7 @@ run_go_suite() {
 run_benchmark_pkg() {
   # In-process Go suite: throughput Tests first, then the -short
   # micro-benchmark fast pass (10K datasets).
-  local benchtime=${SPEDSQL_BENCH_BENCHTIME:-1s}
+  local benchtime=${MURMUR_BENCH_BENCHTIME:-1s}
   echo ""
   echo ">>> RUNNING BENCHMARK SUITE: benchmark (throughput tests)"
   (cd "$root" && go test "${race_args[@]}" -tags "$tags" -v -count=1 -timeout="$(scenario_timeout benchmark)" "./tests-benchmark/benchmark")
@@ -76,6 +77,16 @@ run_benchmark_pkg() {
   echo ">>> RUNNING BENCHMARK SUITE: benchmark (micro-benchmarks, -short, benchtime=$benchtime)"
   (cd "$root" && go test "${race_args[@]}" -tags "$tags" -count=1 -timeout="$(scenario_timeout benchmark)" -run '^$' -bench . -short -benchtime "$benchtime" "./tests-benchmark/benchmark")
   echo ">>> SUITE COMPLETED: benchmark"
+}
+
+run_perf_matrix() {
+  # Characterization matrix only (tiers via MURMUR_PERF_TIER; the full
+  # tier builds a 1M-row template and runs 10-node live cells).
+  local tier=${MURMUR_PERF_TIER:-standard}
+  echo ""
+  echo ">>> RUNNING PERF MATRIX (tier=$tier)"
+  (cd "$root" && go test "${race_args[@]}" -tags "$tags" -v -count=1 -timeout="$(scenario_timeout perf-matrix)" -run '^TestPerfMatrix$' "./tests-benchmark/benchmark")
+  echo ">>> SUITE COMPLETED: perf-matrix"
 }
 
 ALL_SUITES="replication sqlite-bench benchmark"
@@ -93,12 +104,15 @@ case "$scenario" in
   benchmark)
     run_benchmark_pkg
     ;;
+  perf-matrix)
+    run_perf_matrix
+    ;;
   *)
     if [[ " $ALL_SUITES " == *" $scenario "* ]]; then
       run_go_suite "$scenario"
     else
       echo "Unknown suite: $scenario" >&2
-      echo "Available suites: $ALL_SUITES all" >&2
+      echo "Available suites: $ALL_SUITES all perf-matrix" >&2
       exit 1
     fi
     ;;

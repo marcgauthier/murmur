@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"bytes"
@@ -72,7 +72,7 @@ func openFetchPair(t *testing.T, ctx context.Context) (dbA, dbB *DB, nodeA, node
 	dbid = NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
-	dbA, err := Open(ctx, fetchReplConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, fetchReplConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func openFetchPair(t *testing.T, ctx context.Context) (dbA, dbB *DB, nodeA, node
 	cfgB := fetchReplConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
 		[]Peer{{NodeID: nodeA, Addrs: []string{replA}}})
 	cfgB.Files.FetchPeers = []Peer{{NodeID: nodeA, Addrs: []string{addrA}}}
-	dbB, err = Open(ctx, cfgB)
+	dbB, err = openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestFileFetchSourceFallback(t *testing.T) {
 	otherDB := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeB, nodeC, nodeD)
 
-	dbA, err := Open(ctx, fetchReplConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, fetchReplConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +157,7 @@ func TestFileFetchSourceFallback(t *testing.T) {
 	// C serves a different database: dials succeed, requests refuse.
 	cfgC := fetchReplConfig(t.TempDir(), nodeC, otherDB, creds[nodeC], nil)
 	cfgC.Replication.ListenAddr = ""
-	dbC, err := Open(ctx, cfgC)
+	dbC, err := openSignedFixture(ctx, cfgC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestFileFetchSourceFallback(t *testing.T) {
 	// D serves our database but holds no objects: requests miss.
 	cfgD := fetchReplConfig(t.TempDir(), nodeD, dbid, creds[nodeD], nil)
 	cfgD.Replication.ListenAddr = ""
-	dbD, err := Open(ctx, cfgD)
+	dbD, err := openSignedFixture(ctx, cfgD)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestFileFetchSourceFallback(t *testing.T) {
 		{NodeID: nodeD, Addrs: []string{fetchD}},
 		{NodeID: nodeA, Addrs: []string{fetchA}},
 	}
-	dbB, err := Open(ctx, cfgB)
+	dbB, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +260,7 @@ func TestFileFetchWorker(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
-	dbA, err := Open(ctx, fetchReplConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, fetchReplConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +272,7 @@ func TestFileFetchWorker(t *testing.T) {
 		[]Peer{{NodeID: nodeA, Addrs: []string{replA}}})
 	cfgB.Files.FetchPeers = []Peer{{NodeID: nodeA, Addrs: []string{fetchA}}}
 	cfgB.Files.FetchInterval = 200 * time.Millisecond
-	dbB, err := Open(ctx, cfgB)
+	dbB, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +309,7 @@ func TestFileFetchWorker(t *testing.T) {
 
 func TestFileFetchNoSources(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, fileTestConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, fileTestConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +328,7 @@ func TestFileFetchNoSources(t *testing.T) {
 
 func TestFetchStagingSweep(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, fileTestConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, fileTestConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}

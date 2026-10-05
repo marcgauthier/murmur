@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,18 +16,18 @@ import (
 // TestAllowedNodeIDsAcrossProcesses checks that certificate validity alone
 // does not authorize a process whose NodeID is absent from its peers' lists.
 func TestAllowedNodeIDsAcrossProcesses(t *testing.T) {
-	node1, node2, node3 := replicateddb.NewNodeID(), replicateddb.NewNodeID(), replicateddb.NewNodeID()
+	node1, node2, node3 := murmur.NewNodeID(), murmur.NewNodeID(), murmur.NewNodeID()
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:        "allow-nodes",
 		NumNodes:    3,
 		AwaitUnlock: true,
-		NodeIDs:     []replicateddb.NodeID{node1, node2, node3},
+		NodeIDs:     []murmur.NodeID{node1, node2, node3},
 		SchemaSQL: `CREATE TABLE IF NOT EXISTS items (
   id BLOB PRIMARY KEY NOT NULL,
   name TEXT NOT NULL DEFAULT ''
 );`,
 		// Node2 accepts only node1. Node1 and node3 have no identity filter.
-		AllowedPeersByNode: map[int][]replicateddb.NodeID{1: {node1}},
+		AllowedPeersByNode: map[int][]murmur.NodeID{1: {node1}},
 	})
 
 	for _, node := range cluster.Nodes {
@@ -38,7 +36,7 @@ func TestAllowedNodeIDsAcrossProcesses(t *testing.T) {
 	}
 	waitForPeers(t, cluster, []int{2, 1, 1}, 20*time.Second)
 
-	writeSeconds := envSeconds("SPEDSQL_ALLOW_NODES_WRITE_SECONDS", 180)
+	writeSeconds := envSeconds("MURMUR_ALLOW_NODES_WRITE_SECONDS", 180)
 	var written [3]atomic.Int64
 	stop := make(chan struct{})
 	var writers sync.WaitGroup
@@ -153,8 +151,5 @@ func connectedPeers(apiAddr string) int {
 }
 
 func envSeconds(name string, fallback int) int {
-	if value, err := strconv.Atoi(os.Getenv(name)); err == nil && value > 0 {
-		return value
-	}
-	return fallback
+	return harness.EnvInt(name, fallback)
 }

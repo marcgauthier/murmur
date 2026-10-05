@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -58,11 +58,11 @@ type bridgeImportInfo struct {
 func (db *DB) bridgeTable(tableName string) (*schema.TableSchema, error) {
 	reg := db.schemaRegistry()
 	if reg == nil {
-		return nil, fmt.Errorf("replicateddb: schema is not ready")
+		return nil, fmt.Errorf("murmur: schema is not ready")
 	}
 	t := reg.Table(tableName)
 	if t == nil {
-		return nil, fmt.Errorf("replicateddb: unknown table %q", tableName)
+		return nil, fmt.Errorf("murmur: unknown table %q", tableName)
 	}
 	return t, nil
 }
@@ -95,7 +95,7 @@ func (db *DB) BridgeFieldProvenance(tableName string, row ids.RowID, columnName 
 		}
 	}
 	if col == nil {
-		return BridgeProvenance{}, false, fmt.Errorf("replicateddb: unknown column %q of table %q", columnName, tableName)
+		return BridgeProvenance{}, false, fmt.Errorf("murmur: unknown column %q of table %q", columnName, tableName)
 	}
 	policy, ok, err := db.bridgePolicy(t.ID, row, col.ID)
 	if err != nil || !ok || policy.SourceDomain.IsZero() {
@@ -144,13 +144,13 @@ func (db *DB) bridgePolicy(table uint32, row ids.RowID, column uint32) (BridgePr
 		return BridgeProvenance{}, ok, err
 	}
 	if cell.Value.Type != codec.TypeBlob {
-		return BridgeProvenance{}, false, fmt.Errorf("replicateddb: corrupt bridge policy value")
+		return BridgeProvenance{}, false, fmt.Errorf("murmur: corrupt bridge policy value")
 	}
 	policy, err := decodeBridgeProvenance(cell.Value.B)
 	if err == nil {
 		policy.Version = cell.Version
 		if policy.TargetTable != table || policy.TargetRow != row || policy.TargetColumn != column {
-			return BridgeProvenance{}, false, fmt.Errorf("replicateddb: bridge policy target mismatch")
+			return BridgeProvenance{}, false, fmt.Errorf("murmur: bridge policy target mismatch")
 		}
 	}
 	return policy, err == nil, err
@@ -161,7 +161,7 @@ func (db *DB) bridgePolicy(table uint32, row ids.RowID, column uint32) (BridgePr
 // committed atomically with imported values.
 func (db *DB) BeginBridgeImportTx(ctx context.Context, txID ids.TxID, source ids.DBID, stream string, bundle ids.TxID, first, last uint64, allowHighDelete bool, opts *TxOptions) (*Tx, error) {
 	if source.IsZero() || stream == "" || len(stream) > 1024 || first == 0 || last < first {
-		return nil, fmt.Errorf("replicateddb: invalid bridge import provenance")
+		return nil, fmt.Errorf("murmur: invalid bridge import provenance")
 	}
 	tx, err := db.BeginTxWithID(ctx, txID, opts)
 	if err != nil {
@@ -179,7 +179,7 @@ func (db *DB) ReleaseBridgeOwnership(ctx context.Context, tableName string, row 
 		return err
 	}
 	if !ok || policy.Owner != BridgeOwnerHigh || policy.SourceDomain.IsZero() {
-		return fmt.Errorf("replicateddb: field has no releasable Low ownership")
+		return fmt.Errorf("murmur: field has no releasable Low ownership")
 	}
 	policy.Owner = BridgeOwnerLow
 	policy.OverrideTxID = ids.TxID{}
@@ -210,7 +210,7 @@ func (db *DB) ReleaseBridgeRowOwnership(ctx context.Context, tableName string, r
 		return err
 	}
 	if !ok || policy.Owner != BridgeOwnerHigh || policy.SourceDomain.IsZero() {
-		return fmt.Errorf("replicateddb: row has no releasable Low ownership")
+		return fmt.Errorf("murmur: row has no releasable Low ownership")
 	}
 	table, err := db.bridgeTable(tableName)
 	if err != nil {
@@ -328,13 +328,13 @@ func encodeBridgeProvenance(policy BridgeProvenance) []byte {
 func decodeBridgeProvenance(b []byte) (BridgeProvenance, error) {
 	var policy BridgeProvenance
 	if len(b) < 1+1+16+2+16+8+8+1+16+1+4+16+4 || b[0] != bridgePolicyVersion {
-		return policy, fmt.Errorf("replicateddb: malformed bridge policy value")
+		return policy, fmt.Errorf("murmur: malformed bridge policy value")
 	}
 	policy.Owner = BridgeFieldOwner(b[1])
 	copy(policy.SourceDomain[:], b[2:18])
 	streamLen := int(binary.BigEndian.Uint16(b[18:20]))
 	if streamLen > len(b)-20-74 || len(b) != 20+streamLen+74 {
-		return BridgeProvenance{}, fmt.Errorf("replicateddb: malformed bridge policy stream")
+		return BridgeProvenance{}, fmt.Errorf("murmur: malformed bridge policy stream")
 	}
 	off := 20
 	policy.Stream = string(b[off : off+streamLen])
@@ -364,6 +364,12 @@ func policyMutationsForTx(db *DB, tx *Tx, mutations []codec.Mutation) ([]codec.M
 	if tx.bridgeImport == nil {
 		seenRows := make(map[string]bool)
 		for _, mutation := range mutations {
+			if mutation.Flags == codec.FlagBridgeReceipt {
+				continue
+			}
+			if mutation.Policy != schema.LWW && db.schemaRegistry().TableByID(mutation.TableID) != nil && db.schemaRegistry().TableByID(mutation.TableID).ColumnByID(mutation.ColumnID) == nil {
+				continue
+			}
 			if mutation.TableID == BridgePolicyTableID {
 				continue
 			}
@@ -431,6 +437,9 @@ func policyMutationsForTx(db *DB, tx *Tx, mutations []codec.Mutation) ([]codec.M
 	info := tx.bridgeImport
 	seenRows := make(map[string]bool)
 	for _, mutation := range mutations {
+		if mutation.Flags == codec.FlagBridgeReceipt {
+			continue
+		}
 		if mutation.TableID == BridgePolicyTableID {
 			continue
 		}
@@ -504,10 +513,10 @@ func bridgeShadowClearFor(db *DB, table uint32, row ids.RowID, column uint32) (c
 func bridgeShadowMutationChecked(db *DB, table uint32, row ids.RowID, column uint32, set bool, v codec.Value) (codec.Mutation, error) {
 	s, ok := bridgeShadowColumn(column)
 	if !ok {
-		return codec.Mutation{}, fmt.Errorf("replicateddb: column %d of table %d cannot take a bridge shadow", column, table)
+		return codec.Mutation{}, fmt.Errorf("murmur: column %d of table %d cannot take a bridge shadow", column, table)
 	}
 	if cols := db.bridgeColumnsFor(table); cols != nil && cols[s] {
-		return codec.Mutation{}, fmt.Errorf("replicateddb: column %d of table %d collides with a bridge shadow", column, table)
+		return codec.Mutation{}, fmt.Errorf("murmur: column %d of table %d collides with a bridge shadow", column, table)
 	}
 	return bridgeShadowMutation(table, row, column, set, v)
 }
@@ -518,7 +527,7 @@ func bridgeShadowMutationChecked(db *DB, table uint32, row ids.RowID, column uin
 func bridgeShadowClearsForRow(db *DB, table uint32, row ids.RowID) ([]codec.Mutation, error) {
 	cols := db.bridgeColumnsFor(table)
 	if cols == nil {
-		return nil, fmt.Errorf("replicateddb: cannot enumerate columns of table %d for shadow clear", table)
+		return nil, fmt.Errorf("murmur: cannot enumerate columns of table %d for shadow clear", table)
 	}
 	out := make([]codec.Mutation, 0, len(cols))
 	for c := range cols {

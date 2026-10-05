@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 
 func TestBridgeLogSource(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestBridgeLogSource(t *testing.T) {
 
 func TestBridgeSchema(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestBridgeSchema(t *testing.T) {
 
 func TestBridgeLogSourceProtectResume(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -10,6 +10,6 @@ receiver's `spedsql_repl_snapshots_received_total` counter, and GC-phase
 forcing is proven by a polled `spedsql_gc_runs_total` pass plus
 `spedsql_gc_log_collected_total` advancement (a slipped tick fails loudly
 instead of silently taking the log path). Set
-`SPEDSQL_GRACEFUL_MEMBER_DEADLINE_SECONDS` (default 25) to tune the
+`MURMUR_GRACEFUL_MEMBER_DEADLINE_SECONDS` (default 25) to tune the
 member-deadline wait. Failure artifacts preserve configs and logs under
 `tests-live/failures/`.

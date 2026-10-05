@@ -9,26 +9,27 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 	"time"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
 )
 
 func main() {
 	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "spedsql-subscriptions-*")
+	dir, err := os.MkdirTemp("", "murmur-subscriptions-*")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
-	db, err := replicateddb.Open(ctx, replicateddb.Config{
+	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path:   dir,
-		NodeID: replicateddb.NewNodeID(),
-		Schema: replicateddb.SchemaConfig{
+		NodeID: murmur.NewNodeID(),
+		Schema: murmur.SchemaConfig{
 			Version: 1,
 			Tables: []schema.TableSchema{{
 				Name: "tasks",
@@ -38,12 +39,12 @@ func main() {
 				},
 			}},
 		},
-		Pebble: replicateddb.DefaultPebbleConfig(),
-		Encryption: replicateddb.EncryptionConfig{
+		Pebble: murmur.DefaultPebbleConfig(),
+		Encryption: murmur.EncryptionConfig{
 			Key:   []byte("0123456789abcdef0123456789abcdef"),
 			KeyID: "subscriptions-key",
 		},
-	})
+	}))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -56,7 +57,7 @@ func main() {
 	defer sub.Close()
 
 	for _, title := range []string{"first", "second"} {
-		id := replicateddb.NewRowID()
+		id := murmur.NewRowID()
 		if _, err := db.ExecContext(ctx,
 			`INSERT INTO tasks (id, title) VALUES (?, ?)`, id[:], title); err != nil {
 			log.Fatal(err)

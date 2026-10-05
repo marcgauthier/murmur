@@ -261,7 +261,7 @@ func TestServeChunkNeedValidation(t *testing.T) {
 // TestServeChunkNeedMissingData proves an unsatisfiable need against a live
 // store ends in an error (no network involved).
 func TestServeChunkNeedMissingData(t *testing.T) {
-	st, err := state.Open(t.TempDir(), ids.NewNodeID(), ids.NewDBID(), state.Options{Limits: codec.DefaultLimits()})
+	st, err := openSignedFixture(t.TempDir(), ids.NewNodeID(), fixtureDBID, state.Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,25 +391,41 @@ func TestOnSnapshotChunkPaths(t *testing.T) {
 		}}, newPeerState(ids.NewNodeID(), nil, false)
 	}
 	m, p := mk(&fakeApplier{})
-	if err := m.onSnapshotChunk(p, nil, &Frame{Payload: []byte("junk")}); err == nil {
+	m.claimSnapshotSource(p)
+	if err := onSnapshotChunkFixture(m, p, nil, &Frame{Payload: []byte("junk")}); err == nil {
 		t.Fatal("malformed chunk accepted")
 	}
 	m, p = mk(&fakeApplier{})
-	if err := m.onSnapshotChunk(p, nil, &Frame{Flags: FlagZstd, Payload: []byte("junk")}); err == nil {
+	m.claimSnapshotSource(p)
+	if err := onSnapshotChunkFixture(m, p, nil, &Frame{Flags: FlagZstd, Payload: []byte("junk")}); err == nil {
 		t.Fatal("malformed zstd chunk accepted")
 	}
 	m, p = mk(&fakeApplier{})
+	m.claimSnapshotSource(p)
 	raw := testChunkPayload(t)
-	if err := m.onSnapshotChunk(p, nil, &Frame{Payload: raw}); err == nil {
+	if err := onSnapshotChunkFixture(m, p, nil, &Frame{Payload: raw}); err == nil {
 		t.Fatal("chunk without manifest accepted")
 	}
 	m, p = mk(&fakeApplier{})
+	m.claimSnapshotSource(p)
 	m.snapRecvFor(p).manifest = &codec.SnapshotManifest{}
-	if err := m.onSnapshotChunk(p, nil, &Frame{Payload: raw}); err != nil {
+	if err := onSnapshotChunkFixture(m, p, nil, &Frame{Payload: raw}); err != nil {
 		t.Fatalf("valid chunk = %v", err)
 	}
 	if got := m.snapRecvFor(p).chunksReceived; got != 1 {
 		t.Fatalf("chunksReceived = %d", got)
+	}
+	// A second source's chunks are suppressed, not staged: concurrent
+	// transfers preempt each other and livelock.
+	q := newPeerState(ids.NewNodeID(), nil, false)
+	if err := onSnapshotChunkFixture(m, q, nil, &Frame{Payload: raw}); err != nil {
+		t.Fatalf("suppressed chunk errored: %v", err)
+	}
+	if got := m.st.snapshotFramesSuppressed.Load(); got != 1 {
+		t.Fatalf("snapshotFramesSuppressed = %d, want 1", got)
+	}
+	if got := m.snapRecvFor(q).chunksReceived; got != 0 {
+		t.Fatalf("suppressed chunksReceived = %d, want 0", got)
 	}
 }
 
@@ -420,16 +436,28 @@ func TestOnSnapshotDonePaths(t *testing.T) {
 		return &Manager{st: stats{}}, newPeerState(ids.NewNodeID(), nil, false)
 	}
 	m, p := mk()
-	if err := m.onSnapshotDone(p, nil); err != nil {
+	m.claimSnapshotSource(p)
+	if err := onSnapshotDoneFixture(m, p, nil); err != nil {
 		t.Fatal(err)
 	}
 	m, p = mk()
+	m.claimSnapshotSource(p)
 	m.snapRecvFor(p).manifest = &codec.SnapshotManifest{}
-	if err := m.onSnapshotDone(p, nil); err != nil {
+	if err := onSnapshotDoneFixture(m, p, nil); err != nil {
 		t.Fatal(err)
 	}
 	if m.st.snapshotReRequested.Load() != 1 || len(p.ctrlCh) != 1 {
 		t.Fatal("dangling manifest did not re-request")
+	}
+	// Done from a non-active source is ignored without re-requesting:
+	// resurrecting a suppressed transfer would loop serves forever.
+	q := newPeerState(ids.NewNodeID(), nil, false)
+	m.snapRecvFor(q).manifest = &codec.SnapshotManifest{}
+	if err := onSnapshotDoneFixture(m, q, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.st.snapshotReRequested.Load(); got != 1 {
+		t.Fatalf("snapshotReRequested = %d, want 1 (suppressed done re-requested)", got)
 	}
 }
 
@@ -445,7 +473,7 @@ func TestOnPlumtreePruneRefused(t *testing.T) {
 func testMembershipService() *MembershipService {
 	return &MembershipService{
 		localID:      ids.NewNodeID(),
-		dbid:         ids.NewDBID(),
+		dbid:         fixtureDBID,
 		aliveMembers: make(map[ids.NodeID]NodeMetadata),
 		eventCh:      make(chan MembershipEvent, 8),
 		log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -455,7 +483,7 @@ func testMembershipService() *MembershipService {
 func memberNode(id ids.NodeID, dbid ids.DBID, withMeta bool) *memberlist.Node {
 	n := &memberlist.Node{Name: id.String(), Addr: net.ParseIP("127.0.0.1"), Port: 9000}
 	if withMeta {
-		n.Meta = EncodeNodeMetadata(&NodeMetadata{DBID: dbid, Capabilities: 7, Endpoint: "127.0.0.1:9001"})
+		n.Meta = EncodeNodeMetadata(&NodeMetadata{DBID: dbid, Capabilities: CapMergePolicies | CapOriginSignatures | (7), Endpoint: "127.0.0.1:9001"})
 	}
 	return n
 }

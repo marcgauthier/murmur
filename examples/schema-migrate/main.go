@@ -10,10 +10,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
 )
 
@@ -40,28 +41,28 @@ func v2Tables() []schema.TableSchema {
 
 func main() {
 	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "spedsql-migrate-*")
+	dir, err := os.MkdirTemp("", "murmur-migrate-*")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
-	db, err := replicateddb.Open(ctx, replicateddb.Config{
+	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path:   dir,
-		NodeID: replicateddb.NewNodeID(),
-		Schema: replicateddb.SchemaConfig{Version: 1, Tables: v1Tables()},
-		Pebble: replicateddb.DefaultPebbleConfig(),
-		Encryption: replicateddb.EncryptionConfig{
+		NodeID: murmur.NewNodeID(),
+		Schema: murmur.SchemaConfig{Version: 1, Tables: v1Tables()},
+		Pebble: murmur.DefaultPebbleConfig(),
+		Encryption: murmur.EncryptionConfig{
 			Key:   []byte("0123456789abcdef0123456789abcdef"),
 			KeyID: "migrate-key",
 		},
-	})
+	}))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	id := replicateddb.NewRowID()
+	id := murmur.NewRowID()
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "ann"); err != nil {
 		log.Fatal(err)
@@ -83,7 +84,7 @@ func main() {
 	}
 	fmt.Printf("old row: name=%s phone=%v\n", name, phone)
 
-	id2 := replicateddb.NewRowID()
+	id2 := murmur.NewRowID()
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
 		id2[:], "bob", "613-555-0100"); err != nil {

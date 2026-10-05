@@ -2,6 +2,7 @@
 package openprogress_test
 
 import (
+ "github.com/marcgauthier/murmur/internal/testdb"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -35,9 +36,9 @@ func config(dir string, f fixture) db.Config {
 		}})
 		ddl = append(ddl, fmt.Sprintf("CREATE INDEX idx_%s_ordinal ON %s(ordinal)", name, name))
 	}
-	return db.Config{Path: filepath.Join(dir, "db"), NodeID: f.Node, DBID: f.DB,
+	return testdb.Configure(db.Config{Path: filepath.Join(dir, "db"), NodeID: f.Node, DBID: f.DB,
 		Schema: db.SchemaConfig{Version: 1, Tables: tables, LocalDDL: ddl}, Pebble: db.DefaultPebbleConfig(),
-		Encryption: db.EncryptionConfig{Key: bytes.Repeat([]byte{0x63}, 32), KeyID: "open-progress-live"}}
+		Encryption: db.EncryptionConfig{Key: bytes.Repeat([]byte{0x63}, 32), KeyID: "open-progress-live"}})
 }
 
 func TestEmbeddedOpenProgressLive(t *testing.T) {

@@ -10,7 +10,6 @@ package threewayheal_test
 
 import (
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -28,8 +27,8 @@ const tableName = "twh_rows"
 var crossLinks = [][2]int{{0, 2}, {0, 3}, {1, 2}, {1, 3}}
 
 func TestHealOrderDoesNotAffectFinalDigest(t *testing.T) {
-	orderA := parseOrder(t, "SPEDSQL_THREE_WAY_HEAL_ORDER", "0,1,2,3")
-	orderB := parseOrder(t, "SPEDSQL_THREE_WAY_HEAL_ORDER_B", "3,2,1,0")
+	orderA := parseOrder(t, "MURMUR_THREE_WAY_HEAL_ORDER", "0,1,2,3")
+	orderB := parseOrder(t, "MURMUR_THREE_WAY_HEAL_ORDER_B", "3,2,1,0")
 
 	digestA := runHealOrder(t, orderA, "a")
 	digestB := runHealOrder(t, orderB, "b")
@@ -183,7 +182,7 @@ func hasRow(t *testing.T, c *harness.Cluster, idx int, id string) bool {
 // invalid values fail fast rather than silently healing another order.
 func parseOrder(t *testing.T, env, fallback string) []int {
 	t.Helper()
-	raw := os.Getenv(env)
+	raw := harness.GetEnv(env)
 	if raw == "" {
 		raw = fallback
 	}

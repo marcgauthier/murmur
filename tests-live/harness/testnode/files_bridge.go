@@ -136,7 +136,7 @@ func (d *NodeDaemon) handleFilesDownload(w http.ResponseWriter, r *http.Request)
 	defer reader.Close()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	if _, err := io.Copy(w, reader); err != nil {
-		log.Printf("[SPEDSQL] file download %q interrupted: %v", name, err)
+		log.Printf("[MURMUR] file download %q interrupted: %v", name, err)
 	}
 }
 
@@ -397,7 +397,7 @@ func (d *NodeDaemon) initBridge(database *db.DB) error {
 		return fmt.Errorf("unknown bridge role %q", cfg.Role)
 	}
 	d.bridge = rt
-	log.Printf("[SPEDSQL] Bridge %s ready (stream %s)", cfg.Role, cfg.Stream)
+	log.Printf("[MURMUR] Bridge %s ready (stream %s)", cfg.Role, cfg.Stream)
 	return nil
 }
 

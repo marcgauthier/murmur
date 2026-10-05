@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 )
 
 // Concurrent-reader query benchmarks against the in-memory SQLite materialization.
@@ -22,18 +22,18 @@ import (
 // active queries to finish. Latency is per query and throughput uses wall time.
 //
 // Reader counts default to 1, 2, 4, 8, 16, 32 and can be overridden with a
-// comma-separated list, e.g. SPEDSQL_BENCH_READERS=1,4,16. Dataset sizes
-// follow the standard REPLICATEDDB_BENCH_ROWS / -short selection.
+// comma-separated list, e.g. MURMUR_BENCH_READERS=1,4,16. Dataset sizes
+// follow the standard MURMUR_BENCH_ROWS / -short selection.
 //
 // Run with either supported SQLite build:
 //
 //	go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./tests-benchmark/benchmark/ -bench 'BenchmarkConcurrent' -short -benchtime 2s
-//	SPEDSQL_BENCH_READERS=1,4,8 go test -tags modernc ./tests-benchmark/benchmark/ -bench 'BenchmarkConcurrentMixedSQLite' -short -benchtime 2s
-//	SPEDSQL_READ_BENCH_SECONDS=10 go test -tags modernc ./tests-benchmark/benchmark/ -run '^TestSQLiteConcurrentReaderThroughput$' -v -count=1 -timeout=300s
+//	MURMUR_BENCH_READERS=1,4,8 go test -tags modernc ./tests-benchmark/benchmark/ -bench 'BenchmarkConcurrentMixedSQLite' -short -benchtime 2s
+//	MURMUR_READ_BENCH_SECONDS=10 go test -tags modernc ./tests-benchmark/benchmark/ -run '^TestSQLiteConcurrentReaderThroughput$' -v -count=1 -timeout=300s
 
 // readerCounts returns the concurrent-reader levels to benchmark.
 func readerCounts() []int {
-	if raw := os.Getenv("SPEDSQL_BENCH_READERS"); raw != "" {
+	if raw := os.Getenv("MURMUR_BENCH_READERS"); raw != "" {
 		var out []int
 		for _, part := range strings.Split(raw, ",") {
 			n, err := strconv.Atoi(strings.TrimSpace(part))
@@ -51,7 +51,7 @@ func readerCounts() []int {
 
 // openSQLiteMemoryDB copies the n-row Pebble template to a fresh directory
 // and rebuilds its disposable in-memory SQL view.
-func openSQLiteMemoryDB(b testing.TB, n int) (*replicateddb.DB, []replicateddb.RowID) {
+func openSQLiteMemoryDB(b testing.TB, n int) (*murmur.DB, []murmur.RowID) {
 	b.Helper()
 	tmpl := templateFor(b, n)
 	dest := b.TempDir()
@@ -59,7 +59,7 @@ func openSQLiteMemoryDB(b testing.TB, n int) (*replicateddb.DB, []replicateddb.R
 		b.Fatal(err)
 	}
 	cfg := benchConfig(dest, tmpl.node, tmpl.dbid)
-	db, err := replicateddb.Open(context.Background(), cfg)
+	db, err := murmur.Open(context.Background(), cfg)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func openSQLiteMemoryDB(b testing.TB, n int) (*replicateddb.DB, []replicateddb.R
 // drainRowsCount fully consumes and closes rows, returning the row count.
 // Unlike drainRows it reports errors to the caller instead of failing the
 // benchmark, so worker goroutines can use it safely.
-func drainRowsCount(rows *replicateddb.Rows) (int, error) {
+func drainRowsCount(rows *murmur.Rows) (int, error) {
 	defer rows.Close()
 	cols := rows.Columns()
 	dest := make([]any, len(cols))
@@ -89,9 +89,9 @@ func drainRowsCount(rows *replicateddb.Rows) (int, error) {
 }
 
 // readerQuery runs one read and returns the number of rows scanned.
-type readerQuery func(ctx context.Context, db *replicateddb.DB, ids []replicateddb.RowID, rng *rand.Rand, i int) (int, error)
+type readerQuery func(ctx context.Context, db *murmur.DB, ids []murmur.RowID, rng *rand.Rand, i int) (int, error)
 
-func pkLookupQuery(ctx context.Context, db *replicateddb.DB, ids []replicateddb.RowID, rng *rand.Rand, _ int) (int, error) {
+func pkLookupQuery(ctx context.Context, db *murmur.DB, ids []murmur.RowID, rng *rand.Rand, _ int) (int, error) {
 	rows, err := db.QueryContext(ctx,
 		`SELECT name, phone, score FROM contacts WHERE id = ?`, ids[rng.Intn(len(ids))][:])
 	if err != nil {
@@ -100,7 +100,7 @@ func pkLookupQuery(ctx context.Context, db *replicateddb.DB, ids []replicateddb.
 	return drainRowsCount(rows)
 }
 
-func rangeLookupQuery(ctx context.Context, db *replicateddb.DB, _ []replicateddb.RowID, _ *rand.Rand, i int) (int, error) {
+func rangeLookupQuery(ctx context.Context, db *murmur.DB, _ []murmur.RowID, _ *rand.Rand, i int) (int, error) {
 	lo := (i * 131) % 900
 	rows, err := db.QueryContext(ctx,
 		`SELECT id FROM contacts WHERE score BETWEEN ? AND ? LIMIT 100`, lo, lo+100)
@@ -110,7 +110,7 @@ func rangeLookupQuery(ctx context.Context, db *replicateddb.DB, _ []replicateddb
 	return drainRowsCount(rows)
 }
 
-func mixedLookupQuery(ctx context.Context, db *replicateddb.DB, ids []replicateddb.RowID, rng *rand.Rand, i int) (int, error) {
+func mixedLookupQuery(ctx context.Context, db *murmur.DB, ids []murmur.RowID, rng *rand.Rand, i int) (int, error) {
 	if i%2 == 0 {
 		return pkLookupQuery(ctx, db, ids, rng, i)
 	}
@@ -120,7 +120,7 @@ func mixedLookupQuery(ctx context.Context, db *replicateddb.DB, ids []replicated
 // indexedEqualityQuery mirrors BenchmarkIndexedEquality: a single-column
 // indexed equality probe, the cheapest query shape in the suite.
 func indexedEqualityQuery(n int) readerQuery {
-	return func(ctx context.Context, db *replicateddb.DB, _ []replicateddb.RowID, _ *rand.Rand, i int) (int, error) {
+	return func(ctx context.Context, db *murmur.DB, _ []murmur.RowID, _ *rand.Rand, i int) (int, error) {
 		rows, err := db.QueryContext(ctx,
 			`SELECT id FROM contacts WHERE name = ?`, fmt.Sprintf("ann smith %d", (i*7919)%n))
 		if err != nil {
@@ -251,14 +251,14 @@ type readerResult struct {
 
 // TestSQLiteConcurrentReaderThroughput measures sustained multi-reader query
 // rate against the in-memory engine over a fixed wall-clock window
-// (SPEDSQL_READ_BENCH_SECONDS, default 10). Readers alternate point and range
+// (MURMUR_READ_BENCH_SECONDS, default 10). Readers alternate point and range
 // lookups on a 10K-row store; every point lookup must return exactly one row.
 func TestSQLiteConcurrentReaderThroughput(t *testing.T) {
 	readFor := 10 * time.Second
-	if raw := os.Getenv("SPEDSQL_READ_BENCH_SECONDS"); raw != "" {
+	if raw := os.Getenv("MURMUR_READ_BENCH_SECONDS"); raw != "" {
 		seconds, err := strconv.Atoi(raw)
 		if err != nil || seconds < 1 {
-			t.Fatal("SPEDSQL_READ_BENCH_SECONDS must be a positive integer")
+			t.Fatal("MURMUR_READ_BENCH_SECONDS must be a positive integer")
 		}
 		readFor = time.Duration(seconds) * time.Second
 	}

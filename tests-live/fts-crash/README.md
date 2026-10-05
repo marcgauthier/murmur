@@ -2,7 +2,7 @@
 
 Run with `go test -count=1 ./tests-live/fts-crash`. FTS5 indexes are
 local-only derived state, so this single-node suite seeds
-`SPEDSQL_FTS_CRASH_SEED` docs (default 200) with dual base+FTS
+`MURMUR_FTS_CRASH_SEED` docs (default 200) with dual base+FTS
 writes, proves MATCH equals the base table exactly pre-crash, then
 SIGKILLs mid-index-write (the kill only counts when a write was in
 flight). After restart it proves the in-memory index is gone,

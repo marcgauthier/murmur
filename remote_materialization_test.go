@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -12,7 +12,7 @@ func TestRemoteMaterializationFlushesAtTransactionCount(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.QueryStore.RemoteApplyInterval = time.Hour
 	cfg.QueryStore.RemoteApplyMaxTransactions = 3
-	db, err := Open(context.Background(), cfg)
+	db, err := openSignedFixture(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,7 +24,7 @@ func TestRemoteMaterializationFlushesAtTransactionCount(t *testing.T) {
 			values["id"] = codec.Blob(row[:])
 		}
 		batch := remoteBatchCells(db, peer, uint64(seq+1), uint64(100+seq), "contacts", row, values)
-		if err := db.ApplyRemote(context.Background(), batch); err != nil {
+		if err := applyRemoteFixture(db, context.Background(), batch); err != nil {
 			t.Fatal(err)
 		}
 		if seq < 2 {
@@ -48,7 +48,7 @@ func TestRemoteMaterializationGroupCountsTransactions(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.QueryStore.RemoteApplyInterval = time.Hour
 	cfg.QueryStore.RemoteApplyMaxTransactions = 3
-	db, err := Open(context.Background(), cfg)
+	db, err := openSignedFixture(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestRemoteMaterializationGroupCountsTransactions(t *testing.T) {
 		}
 		batches = append(batches, remoteBatchCells(db, peer, uint64(seq+1), uint64(100+seq), "contacts", row, values))
 	}
-	if err := db.ApplyRemoteGroup(context.Background(), batches); err != nil {
+	if err := applyRemoteGroupFixture(db, context.Background(), batches); err != nil {
 		t.Fatal(err)
 	}
 	waitForRemoteMaterialization(t, db)
@@ -76,7 +76,7 @@ func TestRemoteMaterializationCoalescesDeleteAndResurrection(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.QueryStore.RemoteApplyInterval = time.Hour
 	cfg.QueryStore.RemoteApplyMaxTransactions = 3
-	db, err := Open(context.Background(), cfg)
+	db, err := openSignedFixture(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestRemoteMaterializationCoalescesDeleteAndResurrection(t *testing.T) {
 		"id": codec.Blob(row[:]), "name": codec.Text("resurrected"),
 	})
 	for _, batch := range []*codec.MutationBatch{insert, deleted, resurrected} {
-		if err := db.ApplyRemote(context.Background(), batch); err != nil {
+		if err := applyRemoteFixture(db, context.Background(), batch); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -129,7 +129,7 @@ func TestRemoteRowCountAloneDoesNotWakeFlush(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.QueryStore.RemoteApplyInterval = time.Hour
 	cfg.QueryStore.RemoteApplyMaxTransactions = 1_000
-	db, err := Open(context.Background(), cfg)
+	db, err := openSignedFixture(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestRemoteRowCountAloneDoesNotWakeFlush(t *testing.T) {
 			codec.Mutation{TableID: table.ID, RowID: row, ColumnID: nameColumn, Value: codec.Text("row")},
 		)
 	}
-	if err := db.ApplyRemote(context.Background(), batch); err != nil {
+	if err := applyRemoteFixture(db, context.Background(), batch); err != nil {
 		t.Fatal(err)
 	}
 	var count int
@@ -174,7 +174,7 @@ func TestRemoteMaterializationFlushesAtInterval(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.QueryStore.RemoteApplyInterval = 20 * time.Millisecond
 	cfg.QueryStore.RemoteApplyMaxTransactions = 1_000
-	db, err := Open(context.Background(), cfg)
+	db, err := openSignedFixture(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestRemoteMaterializationFlushesAtInterval(t *testing.T) {
 	batch := remoteBatchCells(db, NewNodeID(), 1, 100, "contacts", row, map[string]codec.Value{
 		"id": codec.Blob(row[:]), "name": codec.Text("remote"),
 	})
-	if err := db.ApplyRemote(context.Background(), batch); err != nil {
+	if err := applyRemoteFixture(db, context.Background(), batch); err != nil {
 		t.Fatal(err)
 	}
 	waitForRemoteMaterialization(t, db)
@@ -206,7 +206,7 @@ func waitForRemoteMaterialization(t *testing.T, db *DB) {
 func TestRemotePebbleCommitContinuesDuringSQLiteRead(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.QueryStore.RemoteApplyInterval = time.Hour
-	db, err := Open(context.Background(), cfg)
+	db, err := openSignedFixture(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +228,7 @@ func TestRemotePebbleCommitContinuesDuringSQLiteRead(t *testing.T) {
 		"id": codec.Blob(remote[:]), "name": codec.Text("remote"),
 	})
 	result := make(chan error, 1)
-	go func() { result <- db.ApplyRemote(context.Background(), batch) }()
+	go func() { result <- applyRemoteFixture(db, context.Background(), batch) }()
 	select {
 	case err := <-result:
 		if err != nil {
@@ -253,7 +253,7 @@ func TestRemotePebbleCommitContinuesDuringSQLiteRead(t *testing.T) {
 func TestLocalWriteFlushesPendingRemoteRows(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.QueryStore.RemoteApplyInterval = time.Hour
-	db, err := Open(context.Background(), cfg)
+	db, err := openSignedFixture(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +262,7 @@ func TestLocalWriteFlushesPendingRemoteRows(t *testing.T) {
 	batch := remoteBatchCells(db, NewNodeID(), 1, 100, "contacts", row, map[string]codec.Value{
 		"id": codec.Blob(row[:]), "name": codec.Text("remote"),
 	})
-	if err := db.ApplyRemote(context.Background(), batch); err != nil {
+	if err := applyRemoteFixture(db, context.Background(), batch); err != nil {
 		t.Fatal(err)
 	}
 	if len(dumpSQL(t, db)) != 0 {

@@ -92,7 +92,14 @@ func (s *Store) StoreSchemaRevision(m *schema.Manifest) error {
 	if err := b.Set(SysKey(sysSchemaHash), m.Hash[:], nil); err != nil {
 		return err
 	}
-	return s.commitBatch(b, pebble.Sync)
+	if err := s.commitBatch(b, pebble.Sync); err != nil {
+		return err
+	}
+	registry, err := m.Registry()
+	if err == nil {
+		s.mergeRegistry.Store(registry)
+	}
+	return err
 }
 
 // StoreSchemaRevisions persists non-current ancestry (received from peers)

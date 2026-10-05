@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 // IsReadOnlyStatement reports whether q is a read-only statement. Unknown or
 // write-capable statements return false (safe default: write path).

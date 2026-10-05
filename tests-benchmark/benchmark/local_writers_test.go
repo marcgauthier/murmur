@@ -5,36 +5,37 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"github.com/marcgauthier/murmur/internal/testdb"
 	"os"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
 )
 
 // TestLocalWriterThroughput measures direct Go API writes to one encrypted
 // database. No daemon, HTTP service, peers, or QUIC connections are started.
 func TestLocalWriterThroughput(t *testing.T) {
-	runLocalWriterThroughput(t, replicateddb.DurabilityConfig{})
+	runLocalWriterThroughput(t, murmur.DurabilityConfig{})
 }
 
 // TestLocalPeriodicSyncThroughput measures the opt-in one-second sync mode
 // against the same single-row workload as TestLocalWriterThroughput.
 func TestLocalPeriodicSyncThroughput(t *testing.T) {
-	runLocalWriterThroughput(t, replicateddb.DurabilityConfig{
-		Mode: replicateddb.DurabilityAsync, SyncInterval: time.Second,
+	runLocalWriterThroughput(t, murmur.DurabilityConfig{
+		Mode: murmur.DurabilityAsync, SyncInterval: time.Second,
 	})
 }
 
-func runLocalWriterThroughput(t *testing.T, durability replicateddb.DurabilityConfig) {
+func runLocalWriterThroughput(t *testing.T, durability murmur.DurabilityConfig) {
 	writeFor := 10 * time.Second
-	if raw := os.Getenv("SPEDSQL_LOCAL_WRITE_BENCH_SECONDS"); raw != "" {
+	if raw := os.Getenv("MURMUR_LOCAL_WRITE_BENCH_SECONDS"); raw != "" {
 		seconds, err := strconv.Atoi(raw)
 		if err != nil || seconds < 1 {
-			t.Fatal("SPEDSQL_LOCAL_WRITE_BENCH_SECONDS must be a positive integer")
+			t.Fatal("MURMUR_LOCAL_WRITE_BENCH_SECONDS must be a positive integer")
 		}
 		writeFor = time.Duration(seconds) * time.Second
 	}
@@ -43,7 +44,7 @@ func runLocalWriterThroughput(t *testing.T, durability replicateddb.DurabilityCo
 		t.Run(fmt.Sprintf("%d_writers", writers), func(t *testing.T) {
 			ctx := context.Background()
 			cfg := localWriterConfig(t.TempDir(), durability)
-			db, err := replicateddb.Open(ctx, cfg)
+			db, err := murmur.Open(ctx, cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -111,7 +112,7 @@ func runLocalWriterThroughput(t *testing.T, durability replicateddb.DurabilityCo
 				t.Fatal(err)
 			}
 			db = nil
-			db, err = replicateddb.Open(ctx, cfg)
+			db, err = murmur.Open(ctx, cfg)
 			if err != nil {
 				t.Fatalf("reopen after writes: %v", err)
 			}
@@ -128,21 +129,21 @@ func runLocalWriterThroughput(t *testing.T, durability replicateddb.DurabilityCo
 	}
 }
 
-func localWriterConfig(path string, durability replicateddb.DurabilityConfig) replicateddb.Config {
-	return replicateddb.Config{
+func localWriterConfig(path string, durability murmur.DurabilityConfig) murmur.Config {
+	return testdb.Configure(murmur.Config{
 		Path:   path,
-		NodeID: replicateddb.NewNodeID(),
-		DBID:   replicateddb.NewDBID(),
-		Schema: replicateddb.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
+		NodeID: murmur.NewNodeID(),
+		DBID:   murmur.NewDBID(),
+		Schema: murmur.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
 			Name: "writer_bench", Columns: []schema.ColumnSchema{
 				{Name: "id", Type: schema.ColBlob},
 				{Name: "val", Type: schema.ColText},
 			},
 		}}},
-		Pebble:     replicateddb.DefaultPebbleConfig(),
+		Pebble:     murmur.DefaultPebbleConfig(),
 		Durability: durability,
-		Encryption: replicateddb.EncryptionConfig{
+		Encryption: murmur.EncryptionConfig{
 			Key: bytes.Clone(benchKey), KeyID: "bench",
 		},
-	}
+	})
 }

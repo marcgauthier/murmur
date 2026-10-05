@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -17,7 +17,7 @@ func TestSnapshotRestartServesPublishedRows(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeC)
 
-	dbA, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestSnapshotRestartServesPublishedRows(t *testing.T) {
 	pathC := t.TempDir()
 	cfgC := replConfig(pathC, nodeC, dbid, creds[nodeC],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
-	dbC, err := Open(ctx, cfgC)
+	dbC, err := openSignedFixture(ctx, cfgC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestSnapshotRestartServesPublishedRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Restart serves the published snapshot state unchanged.
-	dbC, err = Open(ctx, cfgC)
+	dbC, err = openSignedFixture(ctx, cfgC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestSnapshotSlowTransferSustainedWritesAndAggressiveGC(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeC)
 
-	dbA, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestSnapshotSlowTransferSustainedWritesAndAggressiveGC(t *testing.T) {
 	cfgC := replConfig(pathC, nodeC, dbid, creds[nodeC],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
 	cfgC.Replication.SnapshotChunkCells = 5 // smaller chunks to simulate multi-chunk transfer
-	dbC, err := Open(ctx, cfgC)
+	dbC, err := openSignedFixture(ctx, cfgC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestSnapshotTransferInterruptedBySourceAndReceiverRestarts(t *testing.T) {
 
 	pathA := t.TempDir()
 	cfgA := replConfig(pathA, nodeA, dbid, creds[nodeA], nil)
-	dbA, err := Open(ctx, cfgA)
+	dbA, err := openSignedFixture(ctx, cfgA)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +200,7 @@ func TestSnapshotTransferInterruptedBySourceAndReceiverRestarts(t *testing.T) {
 	cfgC := replConfig(pathC, nodeC, dbid, creds[nodeC],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
 	cfgC.Replication.SnapshotChunkCells = 2
-	dbC, err := Open(ctx, cfgC)
+	dbC, err := openSignedFixture(ctx, cfgC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestSnapshotTransferInterruptedBySourceAndReceiverRestarts(t *testing.T) {
 	_ = dbC.Close()
 
 	// Reopen C; it must re-request snapshot and catch up
-	dbC, err = Open(ctx, cfgC)
+	dbC, err = openSignedFixture(ctx, cfgC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestSnapshotTransferInterruptedBySourceAndReceiverRestarts(t *testing.T) {
 	_ = dbA.Close()
 
 	// Reopen A
-	dbA, err = Open(ctx, cfgA)
+	dbA, err = openSignedFixture(ctx, cfgA)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -43,8 +43,8 @@ func TestNegotiateCapabilities(t *testing.T) {
 func TestValidateIdentityHonorsVersionOverride(t *testing.T) {
 	peer := ids.NodeID{7}
 	dbid := ids.DBID{9}
-	stock := &Hello{ProtocolVersion: ProtocolVersion, MinProtocolVersion: MinProtocolVersion, NodeID: peer, DBID: dbid}
-	future := &Hello{ProtocolVersion: 99, MinProtocolVersion: 99, NodeID: peer, DBID: dbid}
+	stock := &Hello{ProtocolVersion: ProtocolVersion, MinProtocolVersion: MinProtocolVersion, NodeID: peer, DBID: dbid, Capabilities: CapMergePolicies | CapOriginSignatures}
+	future := &Hello{ProtocolVersion: 99, MinProtocolVersion: 99, NodeID: peer, DBID: dbid, Capabilities: CapMergePolicies | CapOriginSignatures}
 
 	overridden := &Manager{cfg: ManagerConfig{DBID: dbid, AdvertiseProtocolVersion: 99, AdvertiseMinProtocolVersion: 99}}
 	if err := overridden.validateIdentity(stock, peer); err == nil {
@@ -106,7 +106,7 @@ func TestHandshakeCapabilityNegotiation(t *testing.T) {
 		if err := WriteFrame(stream, MsgHello, 0, EncodeHello(nil, &Hello{
 			ProtocolVersion: ProtocolVersion, MinProtocolVersion: MinProtocolVersion,
 			NodeID: self, DBID: c.dbid, SchemaEpoch: 1, SchemaHash: hash,
-			Capabilities: caps,
+			Capabilities: CapMergePolicies | CapOriginSignatures | (caps),
 		})); err != nil {
 			t.Fatal(err)
 		}

@@ -19,6 +19,7 @@ import (
 
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 // Bundle suite and framing. The suite versions the whole construction
@@ -31,6 +32,7 @@ const (
 	// XChaCha20-Poly1305 content key, XChaCha20-Poly1305 payload, and zstd
 	// compression over the canonical encoding below.
 	SuiteV1 = 1
+	SuiteV2 = 2
 )
 
 // Wire sizes.
@@ -369,7 +371,7 @@ func openEnvelope(data []byte, trust *TrustStore, limits Limits) ([]byte, [keyID
 	if magic != BundleMagic {
 		return nil, signerID, fmt.Errorf("bridge: bad magic %q", magic)
 	}
-	if suite != SuiteV1 {
+	if suite != SuiteV2 {
 		return nil, signerID, fmt.Errorf("bridge: unsupported suite %d", suite)
 	}
 	var recipientID, ephPub [keyIDSize]byte
@@ -452,7 +454,7 @@ func sealEnvelope(signer *SignerKey, recipient [keyIDSize]byte, compressed []byt
 	header := make([]byte, 0, headerSize)
 	header = append(header, BundleMagic...)
 	var tmp [8]byte
-	binary.BigEndian.PutUint16(tmp[:2], SuiteV1)
+	binary.BigEndian.PutUint16(tmp[:2], SuiteV2)
 	header = append(header, tmp[:2]...)
 	header = append(header, signer.ID[:]...)
 	header = append(header, recipient[:]...)
@@ -493,7 +495,7 @@ func wrapContentKey(ephPriv, ephPub, recipient [keyIDSize]byte, wrapNonce [nonce
 	var aad bytes.Buffer
 	aad.WriteString(BundleMagic)
 	var tmp [2]byte
-	binary.BigEndian.PutUint16(tmp[:], SuiteV1)
+	binary.BigEndian.PutUint16(tmp[:], SuiteV2)
 	aad.Write(tmp[:])
 	aad.Write(ephPub[:])
 	aad.Write(recipient[:])
@@ -514,7 +516,7 @@ func unwrapContentKey(recipPriv, ephPub, recipient [keyIDSize]byte, wrapNonce, w
 	var aad bytes.Buffer
 	aad.WriteString(BundleMagic)
 	var tmp [2]byte
-	binary.BigEndian.PutUint16(tmp[:], SuiteV1)
+	binary.BigEndian.PutUint16(tmp[:], SuiteV2)
 	aad.Write(tmp[:])
 	aad.Write(ephPub[:])
 	aad.Write(recipient[:])
@@ -728,6 +730,8 @@ func encodeBatches(batches []Batch) ([]byte, error) {
 				buf.Write(tmp[:2])
 				buf.WriteString(c.Column)
 				buf.Write(codec.AppendValue(nil, c.Value))
+				buf.WriteByte(byte(c.Policy))
+				buf.Write(codec.EncodeCRDTRecords(nil, c.Records))
 			}
 		}
 	}
@@ -809,8 +813,16 @@ func decodeBatches(section []byte, limits Limits) ([]Batch, error) {
 				if err != nil {
 					return nil, fmt.Errorf("bridge: invalid value %d/%d/%d: %w", i, j, k, err)
 				}
-				r.Reset(remaining)
-				rec.Columns = append(rec.Columns, ColumnValue{Column: string(cname), Value: v})
+				if len(remaining) < 1 {
+					return nil, fmt.Errorf("bridge: missing merge policy")
+				}
+				policy := schema.MergePolicy(remaining[0])
+				records, next, err := codec.ConsumeCRDTRecords(remaining[1:], codec.Limits{MaxValueBytes: limits.MaxPayloadBytes, MaxMutations: 100000})
+				if err != nil {
+					return nil, err
+				}
+				r.Reset(next)
+				rec.Columns = append(rec.Columns, ColumnValue{Column: string(cname), Value: v, Policy: policy, Records: records})
 			}
 			b.Records = append(b.Records, rec)
 		}

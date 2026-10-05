@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -87,7 +87,7 @@ func assertConverged(t *testing.T, db *DB) {
 func crashDB(t *testing.T) (*DB, context.Context) {
 	t.Helper()
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,10 +139,12 @@ func TestCrashAfterSQLCommit(t *testing.T) {
 		t.Fatal("expected injected failure")
 	}
 	db.crash = nil
-	// SQL ran ahead and was rebuilt from Badger: the failed write is gone
-	// everywhere and generations agree.
-	if gen := db.Status().StateGeneration; gen != genBefore {
-		t.Fatalf("generation moved %d -> %d", genBefore, gen)
+	// SQL ran ahead and was rebuilt from Pebble: the failed write is
+	// gone everywhere. The recovery rebuild advances the generation by
+	// exactly one: every rebuild invalidates in-flight member probes so
+	// their phase-2 repair re-materializes rows the rebuild dropped.
+	if gen := db.Status().StateGeneration; gen != genBefore+1 {
+		t.Fatalf("generation moved %d -> %d, want exactly +1", genBefore, gen)
 	}
 	assertConverged(t, db)
 	if n := len(dumpSQL(t, db)); n != 1 {
@@ -205,7 +207,7 @@ func TestRemoteMaterializeFailureRebuilds(t *testing.T) {
 	})
 	db.crash = &crashHooks{remoteMaterialize: func() error { return errors.New("injected: apply failed") }}
 	// The batch is durable, so ApplyRemote still reports success (ack).
-	if err := db.ApplyRemote(ctx, batch); err != nil {
+	if err := applyRemoteFixture(db, ctx, batch); err != nil {
 		t.Fatal(err)
 	}
 	db.crash = nil
@@ -247,7 +249,7 @@ func TestPartialBatchSkippedNotWedged(t *testing.T) {
 	path := t.TempDir()
 	ctx := context.Background()
 	cfg := testConfig(path)
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +258,7 @@ func TestPartialBatchSkippedNotWedged(t *testing.T) {
 	batch := remoteBatchCells(db, peer, 1, 100, "contacts", row, map[string]codec.Value{
 		"name": codec.Text("nopk"),
 	})
-	if err := db.ApplyRemote(ctx, batch); err != nil {
+	if err := applyRemoteFixture(db, ctx, batch); err != nil {
 		t.Fatal(err)
 	}
 	if st := db.Status().State; st != StateReady {
@@ -267,7 +269,7 @@ func TestPartialBatchSkippedNotWedged(t *testing.T) {
 	}
 	_ = db.Close()
 	// Restart rebuild skips it too: the node still opens.
-	db2, err := Open(ctx, cfg)
+	db2, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

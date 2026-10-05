@@ -103,7 +103,7 @@ func (c *Capturer) convert(mb *codec.MutationBatch) ([]Batch, error) {
 		table uint32
 		row   ids.RowID
 	}
-	puts := make(map[rowKey]map[uint32]codec.Value)
+	puts := make(map[rowKey]map[uint32]codec.Mutation)
 	tombs := make(map[rowKey]bool)
 	var order []rowKey
 	seen := make(map[rowKey]bool)
@@ -126,10 +126,14 @@ func (c *Capturer) convert(mb *codec.MutationBatch) ([]Batch, error) {
 		}
 		cols := puts[k]
 		if cols == nil {
-			cols = make(map[uint32]codec.Value)
+			cols = make(map[uint32]codec.Mutation)
 			puts[k] = cols
 		}
-		cols[m.ColumnID] = m.Value
+		previous := cols[m.ColumnID]
+		if m.Policy != 0 {
+			m.Records = append(previous.Records, m.Records...)
+		}
+		cols[m.ColumnID] = m
 	}
 	emit := func(rec Record, file bool) {
 		if file {
@@ -154,7 +158,7 @@ func (c *Capturer) convert(mb *codec.MutationBatch) ([]Batch, error) {
 			if err != nil {
 				return nil, fmt.Errorf("bridge: capture: %w", err)
 			}
-			rec.Columns = append(rec.Columns, ColumnValue{Column: column, Value: v})
+			rec.Columns = append(rec.Columns, ColumnValue{Column: column, Value: v.Value, Policy: v.Policy, Records: v.Records})
 		}
 		// Deterministic column order for stable bundles.
 		for i := 1; i < len(rec.Columns); i++ {

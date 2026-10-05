@@ -1,6 +1,7 @@
 package reloadbenchmark_test
 
 import (
+ "github.com/marcgauthier/murmur/internal/testdb"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -66,12 +67,12 @@ func localDDL() []string {
 var fixtureKey = bytes.Repeat([]byte{0x72}, 32)
 
 func config(m manifest, dir string) db.Config {
-	return db.Config{
+	return testdb.Configure(db.Config{
 		Path: dir, NodeID: m.NodeID, DBID: m.DBID,
 		Schema:     db.SchemaConfig{Version: 1, Tables: tables(), LocalDDL: localDDL()},
 		Pebble:     db.DefaultPebbleConfig(),
 		Encryption: db.EncryptionConfig{Key: bytes.Clone(fixtureKey), KeyID: "reload-benchmark"},
-	}
+	})
 }
 
 func insertSQL(table schema.TableSchema) string {

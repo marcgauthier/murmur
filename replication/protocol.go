@@ -17,14 +17,16 @@ import (
 	"github.com/marcgauthier/murmur/schema"
 )
 
-// Protocol version 3 adds validated, indexed snapshot transfers.
+// Protocol version 4 requires immutable Ed25519 origin signatures.
 const (
-	ProtocolVersion    uint16 = 3
-	MinProtocolVersion uint16 = 3
+	ProtocolVersion    uint16 = 5
+	MinProtocolVersion uint16 = 5
 )
 
 // Capability bits.
 const (
+	CapOriginSignatures  uint64 = 1 << 4
+	CapMergePolicies     uint64 = 1 << 5
 	CapZstd              uint64 = 1 << 0
 	CapPlumtree          uint64 = 1 << 1
 	CapProgressPages     uint64 = 1 << 2
@@ -43,7 +45,7 @@ const (
 const CapRequiredMask uint64 = 1 << 63
 
 // KnownCaps is every capability bit this binary understands.
-const KnownCaps uint64 = CapZstd | CapPlumtree | CapProgressPages | CapTransactionChunks
+const KnownCaps uint64 = CapMergePolicies | CapOriginSignatures | CapZstd | CapPlumtree | CapProgressPages | CapTransactionChunks
 
 // NegotiateCapabilities intersects peer-advertised capabilities with local
 // support. Unknown bits are ignored unless the peer marks its set required

@@ -14,7 +14,7 @@ import (
 type committingChunkApplier struct{ store *state.Store }
 
 func (a committingChunkApplier) ApplyRemote(ctx context.Context, b *codec.MutationBatch) error {
-	_, err := a.store.CommitRemote(ctx, b)
+	_, err := commitRemoteFixture(a.store, ctx, b)
 	return err
 }
 func (committingChunkApplier) ApplySnapshotChunk(context.Context, *codec.SnapshotManifest, uint64, []codec.SnapshotCell, bool) (bool, error) {
@@ -22,14 +22,14 @@ func (committingChunkApplier) ApplySnapshotChunk(context.Context, *codec.Snapsho
 }
 
 func TestReceiveTransactionChunksAppliesOnlyAfterComplete(t *testing.T) {
-	store, err := state.Open(t.TempDir(), ids.NewNodeID(), ids.NewDBID(), state.Options{Limits: codec.DefaultLimits()})
+	store, err := openSignedFixture(t.TempDir(), ids.NewNodeID(), fixtureDBID, state.Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
 	origin := ids.NewNodeID()
 	batch := &codec.MutationBatch{ProtocolVersion: ProtocolVersion, TxID: ids.NewTxID(), OriginNode: origin, Sequence: 1, HLC: 100, Mutations: []codec.Mutation{{TableID: 1, RowID: ids.NewRowID(), ColumnID: 1, Value: codec.Text(strings.Repeat("z", 140<<10))}}}
-	chunks, err := codec.EncodeTransactionChunks(batch, 1<<20)
+	chunks, err := encodeChunksFixture(batch, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}

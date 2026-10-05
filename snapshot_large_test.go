@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 // committed state with watermarks and generation advanced together.
 func TestSnapshotLargeChunkedMergeEndToEnd(t *testing.T) {
 	ctx := context.Background()
-	dbA, err := Open(ctx, testConfig(t.TempDir()))
+	dbA, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestSnapshotLargeChunkedMergeEndToEnd(t *testing.T) {
 
 	cfgB := testConfig(t.TempDir())
 	cfgB.DBID = dbA.DBID()
-	dbB, err := Open(ctx, cfgB)
+	dbB, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}

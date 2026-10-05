@@ -76,7 +76,12 @@ func EncodeManifest(m *Manifest) []byte {
 		return bytes.Compare(parents[i][:], parents[j][:]) < 0
 	})
 	var dst []byte
-	dst = append(dst, manifestMagic...)
+	policyEncoding := hasMergePolicies(m.Tables)
+	if policyEncoding {
+		dst = append(dst, []byte("SMF2")...)
+	} else {
+		dst = append(dst, manifestMagic...)
+	}
 	dst = binary.BigEndian.AppendUint64(dst, m.Version)
 	dst = append(dst, m.CreatedOnNode[:]...)
 	dst = binary.BigEndian.AppendUint64(dst, m.TimeCreated)
@@ -102,6 +107,9 @@ func EncodeManifest(m *Manifest) []byte {
 				dst = append(dst, 1)
 			} else {
 				dst = append(dst, 0)
+			}
+			if policyEncoding {
+				dst = append(dst, byte(c.MergePolicy))
 			}
 			dst = binary.BigEndian.AppendUint32(dst, uint32(len(c.Name)))
 			dst = append(dst, c.Name...)
@@ -129,7 +137,8 @@ func DecodeManifest(src []byte) (*Manifest, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !bytes.Equal(magic, manifestMagic) {
+	policyEncoding := bytes.Equal(magic, []byte("SMF2"))
+	if !policyEncoding && !bytes.Equal(magic, manifestMagic) {
 		return nil, fmt.Errorf("schema: bad manifest magic")
 	}
 	m := &Manifest{}
@@ -205,7 +214,11 @@ func DecodeManifest(src []byte) (*Manifest, error) {
 		}
 		for j := uint32(0); j < ncols; j++ {
 			var c ColumnSchema
-			cfixed, err := need(10)
+			columnHeader := 10
+			if policyEncoding {
+				columnHeader++
+			}
+			cfixed, err := need(columnHeader)
 			if err != nil {
 				return nil, fmt.Errorf("schema: table %q column %d: %w", t.Name, j, err)
 			}
@@ -224,7 +237,12 @@ func DecodeManifest(src []byte) (*Manifest, error) {
 			default:
 				return nil, fmt.Errorf("schema: table %q column %d bad nullability", t.Name, j)
 			}
-			cnameLen := binary.BigEndian.Uint32(cfixed[6:10])
+			nameOffset := 6
+			if policyEncoding {
+				c.MergePolicy = MergePolicy(cfixed[6])
+				nameOffset++
+			}
+			cnameLen := binary.BigEndian.Uint32(cfixed[nameOffset : nameOffset+4])
 			if cnameLen == 0 || cnameLen > maxManifestName {
 				return nil, fmt.Errorf("schema: table %q column %d bad name length", t.Name, j)
 			}
@@ -434,7 +452,7 @@ func unionTable(at *TableSchema, bt *TableSchema) error {
 				return fmt.Errorf("schema: table %q column %q has conflicting ids %d and %d: %w",
 					at.Name, bc.Name, ac.ID, bc.ID, ErrUnsupportedSchema)
 			}
-			if ac.Type != bc.Type || ac.Nullable != bc.Nullable {
+			if ac.Type != bc.Type || ac.Nullable != bc.Nullable || ac.MergePolicy != bc.MergePolicy {
 				return fmt.Errorf("schema: table %q column %q has conflicting definitions: %w",
 					at.Name, bc.Name, ErrUnsupportedSchema)
 			}
@@ -489,7 +507,7 @@ func checkSuperset(base, next []TableSchema) error {
 				return fmt.Errorf("schema: migration drops table %q column %q (destructive changes need coordinated maintenance): %w",
 					bt.Name, bc.Name, ErrUnsupportedSchema)
 			}
-			if nc.ID != bc.ID || nc.Type != bc.Type || nc.Nullable != bc.Nullable {
+			if nc.ID != bc.ID || nc.Type != bc.Type || nc.Nullable != bc.Nullable || nc.MergePolicy != bc.MergePolicy {
 				return fmt.Errorf("schema: table %q column %q changes definition: %w",
 					bt.Name, bc.Name, ErrUnsupportedSchema)
 			}

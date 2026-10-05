@@ -272,10 +272,12 @@ func (e *Engine) upsertFullRow(ctx context.Context, table *schema.TableSchema, c
 }
 
 // RepairRows re-converges listed rows with durable state after a local
-// commit raced remote applies: a concurrent remote tombstone may have
-// deleted a just-written row from SQL (or hidden it while SQL still shows
-// it). For each row, SQL presence is reconciled with durable (Pebble) visibility.
-// Capture is suppressed: everything repaired is already durable.
+// commit raced remote applies or a rebuild: interleavings may have
+// deleted a just-written row from SQL, hidden it, or left a stale value
+// behind (a rebuild replays the pre-commit value, which is present but
+// outdated). Visible rows are upserted to current values, not merely
+// inserted when absent. Capture is suppressed: everything repaired is
+// already durable.
 func (e *Engine) RepairRows(src StateReader, rows []RowKey) error {
 	if len(rows) == 0 {
 		return nil
@@ -325,18 +327,22 @@ func (e *Engine) RepairRows(src StateReader, rows []RowKey) error {
 			}
 			visible := crdt.Visible(len(cells) > 0, newestOfCells(cells),
 				crdt.TombstoneState{Present: hasTomb, Version: tomb})
-			switch {
-			case visible && !present[k]:
-				if !rowMaterializable(table, cells) {
-					continue
+			if !visible {
+				if present[k] {
+					if err := e.deleteRow(ctx, table, k.RowID); err != nil {
+						return err
+					}
 				}
-				if err := e.insertFullRow(ctx, table, k.RowID, cells); err != nil {
-					return err
-				}
-			case !visible && present[k]:
-				if err := e.deleteRow(ctx, table, k.RowID); err != nil {
-					return err
-				}
+				continue
+			}
+			if !rowMaterializable(table, cells) {
+				continue
+			}
+			// Upsert, not insert-if-absent: a straddled update replays
+			// its pre-commit value (present but stale) and must be
+			// refreshed, not skipped.
+			if err := e.upsertFullRow(ctx, table, cells); err != nil {
+				return err
 			}
 		}
 		if _, err := e.write.ExecContext(ctx, "COMMIT"); err != nil {

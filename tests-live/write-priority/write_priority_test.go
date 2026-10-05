@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,7 +25,7 @@ import (
 
 func envSeconds(t *testing.T, key string, fallback int) time.Duration {
 	t.Helper()
-	value := os.Getenv(key)
+	value := harness.GetEnv(key)
 	if value == "" {
 		return time.Duration(fallback) * time.Second
 	}
@@ -38,8 +37,8 @@ func envSeconds(t *testing.T, key string, fallback int) time.Duration {
 }
 
 func TestLocalWritePriority(t *testing.T) {
-	writeFor := envSeconds(t, "SPEDSQL_LIVE_WRITE_PRIORITY_SECONDS", 12)
-	syncTimeout := envSeconds(t, "SPEDSQL_LIVE_WRITE_PRIORITY_SYNC_TIMEOUT_SECONDS", 120)
+	writeFor := envSeconds(t, "MURMUR_LIVE_WRITE_PRIORITY_SECONDS", 12)
+	syncTimeout := envSeconds(t, "MURMUR_LIVE_WRITE_PRIORITY_SYNC_TIMEOUT_SECONDS", 120)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:     "write-priority",
 		NumNodes: 2,

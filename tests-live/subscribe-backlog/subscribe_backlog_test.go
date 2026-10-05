@@ -14,7 +14,6 @@ package subscribebacklog_test
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"testing"
@@ -33,9 +32,9 @@ const (
 )
 
 func TestSubscriptionBacklogDeliversFullyAfterHeal(t *testing.T) {
-	backlogRows := envInt("SPEDSQL_SUBSCRIBE_BACKLOG_ROWS", 40)
+	backlogRows := envInt("MURMUR_SUBSCRIBE_BACKLOG_ROWS", 40)
 	if backlogRows >= eventBufferCap {
-		t.Fatalf("SPEDSQL_SUBSCRIBE_BACKLOG_ROWS=%d must stay below the %d-event subscriber buffer",
+		t.Fatalf("MURMUR_SUBSCRIBE_BACKLOG_ROWS=%d must stay below the %d-event subscriber buffer",
 			backlogRows, eventBufferCap)
 	}
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
@@ -256,7 +255,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 }
 
 func envInt(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {
 		return v
 	}
 	return fallback

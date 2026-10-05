@@ -42,7 +42,7 @@ var dosSchema = &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
 }}}
 
 func envSeconds(name string, def int) time.Duration {
-	if v := os.Getenv(name); v != "" {
+	if v := harness.GetEnv(name); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return time.Duration(n) * time.Second
 		}
@@ -51,7 +51,7 @@ func envSeconds(name string, def int) time.Duration {
 }
 
 func envInt(name string, def int) int {
-	if v := os.Getenv(name); v != "" {
+	if v := harness.GetEnv(name); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			return n
 		}
@@ -60,13 +60,13 @@ func envInt(name string, def int) int {
 }
 
 func TestDoSClientFlood(t *testing.T) {
-	attackFor := envSeconds("SPEDSQL_DOS_CLIENT_ATTACK_SECONDS", 60)
-	nTCPIdle := envInt("SPEDSQL_DOS_CLIENT_TCP_HALFOPEN", 48)
-	nTCPPartial := envInt("SPEDSQL_DOS_CLIENT_TCP_PARTIAL", 16)
-	nTLSIdle := envInt("SPEDSQL_DOS_CLIENT_TLS_IDLE", 16)
-	nLoris := envInt("SPEDSQL_DOS_CLIENT_SLOW_LORIS", 8)
-	nTrickle := envInt("SPEDSQL_DOS_CLIENT_TRICKLE", 4)
-	nQUICHalf := envInt("SPEDSQL_DOS_CLIENT_QUIC_HALFOPEN", 24)
+	attackFor := envSeconds("MURMUR_DOS_CLIENT_ATTACK_SECONDS", 60)
+	nTCPIdle := envInt("MURMUR_DOS_CLIENT_TCP_HALFOPEN", 48)
+	nTCPPartial := envInt("MURMUR_DOS_CLIENT_TCP_PARTIAL", 16)
+	nTLSIdle := envInt("MURMUR_DOS_CLIENT_TLS_IDLE", 16)
+	nLoris := envInt("MURMUR_DOS_CLIENT_SLOW_LORIS", 8)
+	nTrickle := envInt("MURMUR_DOS_CLIENT_TRICKLE", 4)
+	nQUICHalf := envInt("MURMUR_DOS_CLIENT_QUIC_HALFOPEN", 24)
 
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:        "dos-client",

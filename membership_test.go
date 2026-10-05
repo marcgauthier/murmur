@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -22,7 +22,7 @@ func openPairForMembership(t *testing.T, mutate func(*Config)) (nodeA, nodeB Nod
 		mutate(&cfgA)
 	}
 	var err error
-	dbA, err = Open(ctx, cfgA)
+	dbA, err = openSignedFixture(ctx, cfgA)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +30,7 @@ func openPairForMembership(t *testing.T, mutate func(*Config)) (nodeA, nodeB Nod
 
 	cfgB := replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
-	dbB, err = Open(ctx, cfgB)
+	dbB, err = openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,14 +244,14 @@ func TestRemovePeerRetiresAcrossRestart(t *testing.T) {
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
 	cfgA := replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil)
-	dbA, err := Open(ctx, cfgA)
+	dbA, err := openSignedFixture(ctx, cfgA)
 	if err != nil {
 		t.Fatal(err)
 	}
 	addrA := waitForAddr(t, dbA, 5*time.Second)
 	cfgB := replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
-	dbB, err := Open(ctx, cfgB)
+	dbB, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestRemovePeerRetiresAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbA2, err := Open(ctx, cfgA)
+	dbA2, err := openSignedFixture(ctx, cfgA)
 	if err != nil {
 		t.Fatal(err)
 	}

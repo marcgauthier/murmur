@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -201,26 +202,45 @@ func (s *Session) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 
 // Listener accepts mTLS QUIC connections.
 type Listener struct {
-	ln    *quic.Listener
+	ln   *quic.Listener
+	tr   *quic.Transport
+	conn net.PacketConn
+	// creds authenticates peers; local is our NodeID.
 	creds *Credentials
 	local ids.NodeID
 }
 
-// Listen starts the QUIC listener.
+// Listen starts the QUIC listener. The UDP socket and Transport are
+// owned explicitly (not via quic.ListenAddr): quic.Listener.Close
+// alone never releases the UDP bind — the Transport it creates
+// internally is unreachable, so the socket lingers until GC and a
+// same-port restart races EADDRINUSE. Explicit ownership makes Close
+// release the port synchronously.
 func Listen(addr string, creds *Credentials) (*Listener, error) {
 	local, err := creds.LocalNodeID()
 	if err != nil {
 		return nil, err
 	}
-	ln, err := quic.ListenAddr(addr, creds.ServerTLSConfig(), &quic.Config{
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("transport: listen %s: %w", addr, err)
+	}
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return nil, fmt.Errorf("transport: listen %s: %w", addr, err)
+	}
+	tr := &quic.Transport{Conn: conn}
+	ln, err := tr.Listen(creds.ServerTLSConfig(), &quic.Config{
 		MaxIdleTimeout:  30 * time.Second,
 		KeepAlivePeriod: 10 * time.Second,
 		EnableDatagrams: true,
 	})
 	if err != nil {
+		_ = tr.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("transport: listen %s: %w", addr, err)
 	}
-	return &Listener{ln: ln, creds: creds, local: local}, nil
+	return &Listener{ln: ln, tr: tr, conn: conn, creds: creds, local: local}, nil
 }
 
 // Addr returns the listener address.
@@ -259,7 +279,12 @@ func (l *Listener) Accept(ctx context.Context) (*Session, error) {
 }
 
 // Close stops the listener.
-func (l *Listener) Close() error { return l.ln.Close() }
+func (l *Listener) Close() error {
+	lnErr := l.ln.Close()
+	trErr := l.tr.Close()
+	connErr := l.conn.Close()
+	return errors.Join(lnErr, trErr, connErr)
+}
 
 // Dial connects to a peer and authenticates it as expect. With an address
 // policy configured, the destination is resolved and filtered first: literal

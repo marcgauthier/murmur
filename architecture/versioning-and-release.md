@@ -49,16 +49,17 @@ Require a new replication transport protocol version for shared membership/repli
 
 Version the new range/chunk and Plumtree message formats, schema ancestry, snapshot manifest/generation publication, and restore identity metadata. Negotiate required capabilities before starting transfers; an old peer must not interpret observed heads or staging receipts as applied watermarks. Preserve transaction identities across chunking and existing HLC/LWW semantics. Range/chunk transfer, Plumtree, snapshot publication, and restore metadata have implementations; their evidence and acceptance limits are recorded in [release status](release-status.md#1-verified-feature-matrix).
 
-Implementation status: fresh Pebble stores record `format_version`,
-`minimum_reader_version`, and `minimum_writer_version` (all 2); open fails
-closed when a store demands a newer reader or writer, while pre-marker v2
-stores default the minima to the format version. The QUIC handshake
+Implementation status: protocol/minimum version 5 require `CapOriginSignatures` and `CapMergePolicies`, mutation codec 3 and transaction chunks 2 carry origin proofs, and unsigned runtime fallback is disabled. Signed format-4 stores require explicit offline `MigrateMergePolicies`; unsigned legacy stores require baseline migration; see [origin signatures](origin-signatures.md).
+
+Fresh Pebble stores record `format_version`,
+`minimum_reader_version`, and `minimum_writer_version` (all 5); open fails
+closed when a store demands a newer reader or writer, and signed format 4 requires explicit merge-policy migration and legacy format 2/3 stores require explicit baseline migration. The QUIC handshake
 negotiates capabilities (`NegotiateCapabilities`): unknown optional bits are
 ignored, unknown required bits (marked with `CapRequiredMask`) refuse the
 session before any peer state exists, and sessions pin the negotiated usable
 set. Capability bits 1..31 are reserved for the target subsystems above and
 are defined alongside their features. Snapshot manifests already enforce
-`FormatVersion == 1` on both sides; range/chunk, Plumtree, generation
+`FormatVersion == 2` on both sides; range/chunk, Plumtree, generation
 publication, and restore-marker formats are implemented alongside their feature code.
 
 ---
@@ -107,7 +108,7 @@ When building with specialized tags or zero-CGO fallbacks:
 The default CGO configuration requires tags
 (`sqlengine/capture_mattn.go` needs the pre-update-hook API). Every build,
 vet, and test invocation must pass `-tags "sqlite_preupdate_hook sqlite_fts5"`
-or `-tags modernc`; `tests-live/run.sh` applies `SPEDSQL_TAGS` (defaulting to
+or `-tags modernc`; `tests-live/run.sh` applies `MURMUR_TAGS` (defaulting to
 the CGO set) to both the internal test-node build and the test run. The
 separately built test node is not race-instrumented by `go test -race` alone.
 

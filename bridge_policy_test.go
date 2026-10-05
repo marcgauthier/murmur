@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -14,12 +14,12 @@ func TestBridgeOwnershipPolicyReplicatesWithHighMutations(t *testing.T) {
 	cfgA, cfgB := testConfig(t.TempDir()), testConfig(t.TempDir())
 	cfgB.QueryStore.RemoteApplyMaxTransactions = 1
 	cfgA.DBID, cfgB.DBID = cluster, cluster
-	a, err := Open(ctx, cfgA)
+	a, err := openSignedFixture(ctx, cfgA)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer a.Close()
-	b, err := Open(ctx, cfgB)
+	b, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestBridgeOwnershipPolicyReplicatesWithHighMutations(t *testing.T) {
 		if err != nil || batch == nil {
 			t.Fatalf("read source sequence %d: batch=%v err=%v", seq, batch, err)
 		}
-		if err := b.ApplyRemote(ctx, batch); err != nil {
+		if err := applyRemoteFixture(b, ctx, batch); err != nil {
 			t.Fatalf("apply sequence %d: %v", seq, err)
 		}
 	}

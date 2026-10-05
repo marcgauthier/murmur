@@ -9,6 +9,8 @@ Search, write/replication, and startup performance scenarios.
 - [59. Search Benchmarks](#59-search-benchmarks)
 - [60. Write/Replication Benchmarks](#60-writereplication-benchmarks)
 - [61. Startup Benchmarks](#61-startup-benchmarks)
+- [64. Origin signature measurements](#64-origin-signature-measurements)
+- [65. Characterization matrix](#65-characterization-matrix)
 
 ---
 
@@ -104,7 +106,7 @@ populates ten realistic log tables using seeded gofakeit, targeting
 encrypted Pebble under `/media/marc/2TB/TEST` and separate processes for
 population, production `DB.Open`, and direct `Engine.Rebuild` measurement.
 Run `bash tests-live/run.sh reload-benchmark`; a 32 MiB development run uses
-`SPEDSQL_RELOAD_TARGET_BYTES=33554432`. It is excluded from routine live suites.
+`MURMUR_RELOAD_TARGET_BYTES=33554432`. It is excluded from routine live suites.
 
 Reports distinguish full open, registry/Pebble/engine open, direct rebuild,
 first query, and validation. They include logical payload and SQLite/disk
@@ -173,7 +175,7 @@ go test ./tests-benchmark/benchmark/ -bench . -short -benchtime 1s
 go test ./tests-benchmark/benchmark/ -bench . -benchtime 1s
 
 # Large datasets (slow one-time template build: minutes for 1M)
-REPLICATEDDB_BENCH_ROWS=1000000 go test ./tests-benchmark/benchmark/ -bench . -benchtime 1s
+MURMUR_BENCH_ROWS=1000000 go test ./tests-benchmark/benchmark/ -bench . -benchtime 1s
 
 # White-box snapshot-seed benchmark (root package)
 go test . -bench 'BenchmarkSnapshotSeed' -benchtime 1x
@@ -185,16 +187,19 @@ go test ./tests-benchmark/benchmark/ -bench 'BenchmarkCipherMatrix' -short
 go test ./tests-benchmark/benchmark/ -bench 'BenchmarkReplicationThroughput|BenchmarkFiveNodeSync|BenchmarkReconnectBacklog' -short
 
 # Direct Go API, one encrypted database, one and four concurrent writers
-SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./tests-benchmark/benchmark/ -run '^TestLocalWriterThroughput$' -v -count=1 -timeout=90s
+MURMUR_LOCAL_WRITE_BENCH_SECONDS=10 go test ./tests-benchmark/benchmark/ -run '^TestLocalWriterThroughput$' -v -count=1 -timeout=90s
 
 # Same local workload, async commits with a Pebble sync about once per second
-SPEDSQL_LOCAL_WRITE_BENCH_SECONDS=10 go test ./tests-benchmark/benchmark/ -run '^TestLocalPeriodicSyncThroughput$' -v -count=1 -timeout=90s
+MURMUR_LOCAL_WRITE_BENCH_SECONDS=10 go test ./tests-benchmark/benchmark/ -run '^TestLocalPeriodicSyncThroughput$' -v -count=1 -timeout=90s
 
 # Local transaction-size matrix: 1/10/100/1000 rows, 1/4 writers, both durability modes
-SPEDSQL_LOCAL_BATCH_BENCH_SECONDS=5 go test ./tests-benchmark/benchmark/ -run '^TestLocalTransactionBatchThroughput$' -v -count=1 -timeout=300s
+MURMUR_LOCAL_BATCH_BENCH_SECONDS=5 go test ./tests-benchmark/benchmark/ -run '^TestLocalTransactionBatchThroughput$' -v -count=1 -timeout=300s
+
+# Durability matrix: sync group commit vs async (10s + 10MB), 1/4/8 writers (10s each)
+MURMUR_GROUP_BENCH_SECONDS=10 go test -tags "sqlite_preupdate_hook sqlite_fts5" ./tests-benchmark/benchmark/ -run '^TestGroupCommitDurabilityMatrix$' -v -count=1 -timeout=600s
 
 # Live multi-process cluster, one and four concurrent SQL writers (10s each)
-SPEDSQL_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-benchmark/replication/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s
+MURMUR_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-benchmark/replication/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s
 
 # Pebble folder-size matrix across compression modes and traffic shapes
 go test ./tests-live/compression/ -run '^TestPebbleCompressionSizes$' -v -count=1 -timeout=15m
@@ -203,7 +208,7 @@ go test ./tests-live/compression/ -run '^TestPebbleCompressionSizes$' -v -count=
 go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./tests-benchmark/benchmark/ -bench 'BenchmarkConcurrent' -short -benchtime 1s
 
 # Same suite, restricted reader levels and 100K datasets
-SPEDSQL_BENCH_READERS=1,8 go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./tests-benchmark/benchmark/ -bench 'BenchmarkConcurrentMixedSQLite' -benchtime 1s
+MURMUR_BENCH_READERS=1,8 go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./tests-benchmark/benchmark/ -bench 'BenchmarkConcurrentMixedSQLite' -benchtime 1s
 
 # Fixed-window sustained multi-reader throughput (10s per reader level, 10K rows)
 go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./tests-benchmark/benchmark/ -run '^TestSQLiteConcurrentReaderThroughput$' -v -count=1 -timeout=300s
@@ -267,6 +272,18 @@ the cost of the transaction's Pebble sync. These are inserts into a growing
 table; the earlier `BenchmarkTxn1000Rows` updates existing rows in a template
 with a different schema and is a separate workload.
 
+The synchronous columns above predate synchronous group commit (2026-10-04),
+which lets concurrent writers share one fsync per group. The durability
+matrix (`TestGroupCommitDurabilityMatrix`, same Intel i5-6500 class,
+ten-second cases) measured, in acknowledged single-row sync inserts/sec:
+330 at 1 writer (mean group 1.0), 1,183 at 4 writers (mean group 3.8), and
+1,833 at 8 writers (mean group 5.4) — about 3.6x and 5.6x over the
+single-writer rate, which is unchanged (no batching partner). The same
+matrix measured async mode (ten-second interval plus ten-megabyte size
+trigger) at roughly 4,500–5,500 tx/s regardless of writer count, identical
+with group settings present or absent (group commit is inactive in async
+mode). Every case passed the reopen row-count check.
+
 The live writer benchmark starts a fresh encrypted single-node process per
 writer count and measures acknowledged single-row `INSERT` statements per
 wall-clock second. It checks the final SQL row count against the number of
@@ -286,11 +303,11 @@ behind a gate, and reports per-query p50/p95/p99 plus wall-clock throughput
 workloads are point lookups, single-column indexed equality probes,
 100-row-capped indexed ranges, and an alternating point/range mix. Reader
 levels default to 1, 2, 4, 8, 16, 32 and accept a comma-separated
-`SPEDSQL_BENCH_READERS` override; dataset sizes follow the standard
-`REPLICATEDDB_BENCH_ROWS` / `-short` selection. The benchmarks run under
+`MURMUR_BENCH_READERS` override; dataset sizes follow the standard
+`MURMUR_BENCH_ROWS` / `-short` selection. The benchmarks run under
 both the default mattn driver and the optional `modernc` driver. The
 fixed-window test runs the mixed workload for
-`SPEDSQL_READ_BENCH_SECONDS` (default 10) per reader level on a 10K-row
+`MURMUR_READ_BENCH_SECONDS` (default 10) per reader level on a 10K-row
 store and checks that every point lookup returns exactly one row.
 
 A 2026-09-28 short run on the four-core Intel i5-6500 (`-benchtime 1s`,
@@ -348,7 +365,7 @@ Coverage notes and manual procedures:
   rerun any replication benchmark under e.g.
   `tc qdisc add dev lo root netem delay 50ms loss 1%` (Linux, root) and
   remove it afterwards with `tc qdisc del dev lo root`.
-- 10M datasets are supported (`REPLICATEDDB_BENCH_ROWS=10000000`) but the
+- 10M datasets are supported (`MURMUR_BENCH_ROWS=10000000`) but the
   template build is populate-bound (SQL transactions); prefer a restored
   snapshot fixture when 10M runs become routine.
 - Engine-internal rebuild phases (row assembly vs inserts vs index/FTS
@@ -440,3 +457,221 @@ count. A paired 10 GB SSD observation took 67.542 seconds with reporting disable
 and 70.322 seconds with reporting enabled. OS cache was uncontrolled; see the
 [live benchmark results](../tests-live/reload-benchmark/README.md#startup-progress-without-a-counting-pass)
 for artifacts and validation details.
+
+## 64. Origin signature measurements
+
+The 2026-10-04 uncommitted origin-signature implementation was measured on
+Linux amd64, Intel i5-6500, Go 1.26.0 with:
+
+```bash
+go test -tags modernc -run '^$' -bench '^BenchmarkOrigin$' -benchmem -benchtime 300ms ./codec
+```
+
+| Mutation blob size | Sign (digest included) | Verify (digest included) | Forward serialization | Sign/verify allocation |
+|---|---:|---:|---:|---:|
+| 32 bytes | 36.0 µs | 77.1 µs | 1.03 µs | 480 B / 4 allocations |
+| 64 KiB | 227 µs | 322 µs | 89.6 µs | 480 B / 4 allocations |
+| 1 MiB | 3.32 ms | 3.78 ms | 866 µs | 480 B / 4 allocations |
+
+Digest computation streams blob bytes without allocating a payload-sized copy.
+Forwarding serializes the existing proof without re-signing; receive-side
+verification remains required. These are microbenchmarks with concurrent host
+activity, not end-to-end replication throughput guarantees. They do not include
+fsync, merge, compression, network transport, or text-value allocation behavior.
+The local artifact is `/tmp/murmur-origin-bench-final.log`; this is working-tree
+evidence, not verification of a release commit.
+
+### CRDT join cost
+
+Run `go test -tags modernc -run '^$' -bench '^BenchmarkMergePolicy$' -benchtime=1s ./state`.
+This kernel benchmark measures Pebble reads, causal join and projection at fixed
+cardinality; it excludes origin-signature verification, SQL capture and fsync.
+It compares LWW, PN_COUNTER, OR_SET and MAX/MIN at 1 record, and counter/set
+histories at 100 and 1,000 records. Cardinality includes retained removals;
+work scales with retained history, not only visible set membership.
+
+A 100 ms development run on an Intel i5-6500 (modernc, Linux/amd64) measured
+approximately 1.05 µs for LWW, 1.23–1.30 µs for extrema, 4.95 µs for one
+counter component and 755 µs for 1,000 components. OR_SET measured 11.9 µs
+at one addition and 2.95 ms at 1,000 additions. These are local kernel
+measurements under concurrent validation load, not throughput or latency SLOs.
+See [merge policies](merge-policies.md) for memory/storage growth and limits.
+
+---
+
+## 65. Characterization matrix
+
+The perf matrix (`TestPerfMatrix` in `tests-benchmark/benchmark/`,
+run with `bash tests-benchmark/run.sh perf-matrix`) is the repeatable
+characterization harness: one command produces machine-stamped numbers
+across dataset sizes, transaction batches, ciphers, mesh sizes,
+network shapes, and reconnect backlogs, plus a JSON report
+(`tests-benchmark/benchmark/perf-report-<ts>.json`, git-ignored) and a
+Markdown table in the test log ready for publication below. Tiers via
+`MURMUR_PERF_TIER`: `smoke` (10K rows, 2-node mesh; minutes),
+`standard` (10K+100K rows, 1/2/5-node meshes, 3 ciphers; tens of
+minutes), `full` (adds 1M rows, 10-node mesh, 50K backlog; ~1–2h).
+`MURMUR_PERF_MESH_ROWS` overrides the mesh blast size (default 2000).
+
+Method, shared by every cell:
+
+- Encryption is always on (AES-256-GCM unless the cell varies the
+  cipher); datasets are seeded (`populate` seed 42) and single-node
+  cells share one lazily built template store per size.
+- Every cell records wall time, throughput, p50/p95 where sampled,
+  on-disk bytes, and peak RSS (process `VmHWM` in-process, max daemon
+  `VmHWM` for live cells). Cells never constrain memory; RAM
+  characterization is a footprint curve (RSS vs rows/nodes), and the
+  runbook below covers enforced-limit runs.
+- Live cells use real multi-process daemons via the shared
+  `tests-live` harness with isolated dirs, certs, and ports; the
+  verdict inside a cell is exact convergence (counts plus digests),
+  so a published throughput number always implies a converged mesh.
+- Impairment shapes only replication ports (prio qdisc 77: with
+  netem on band 77:3, u32 filters on repl ports); API/metrics stay
+  clean so visibility latency measures replication, not API
+  slowness. Cells skip loudly without `CAP_NET_ADMIN`.
+- Numbers are single-run, loopback, and box-specific (stamped with
+  CPU/RAM/Go/tags); treat them as characterization, not SLOs.
+
+Cell definitions:
+
+| cell | dimensions | measures |
+|---|---|---|
+| `store_open` | rows 10K/100K/1M | template-copy + full production open wall, disk, RSS |
+| `pk_lookup` | rows | 10K point lookups: qps, p50/p95 |
+| `range_100` | rows | 1K capped indexed ranges: qps, p50/p95 |
+| `single_update` | rows | 300 sync single-cell txns: tx/s, p50/p95 |
+| `tx_batch` | rows × batch 1/10/100/1000 | tx/s and rows/s, sync durability |
+| `cipher_bulk` | cipher × rows | fresh-store populate rows/s + disk + full-reopen wall |
+| `mesh_blast` | nodes 1/2/5/10 | M-row parallel blast to convergence: rows/s; 100 visibility samples p50/p95 |
+| `mesh_impair` | delay50ms / loss1pct | 500-row blast rows/s + 20 visibility samples p50/p95 |
+| `reconnect` | backlog 1K/10K/50K | catch-up rows/s + whether the snapshot path fired |
+
+### Recorded results (perf matrix, 2026-10-04)
+
+Machine: linux/amd64, Intel i5-6500 @ 3.20GHz (4 cores), 31 GB RAM,
+Go 1.26.8, default CGO tags, loopback, quiet box (desktop SSD at 96%
+full — see the stall note). Encryption on throughout. `mesh_blast`
+uses 2000-row blasts; visibility is 100 sequential samples (20 under
+impairment). Tables show the full-tier run; the standard tier and
+focused reruns reproduced every read/cipher/mesh cell within ~30%
+unless noted. Open wall includes the template copy (per-file sync),
+which itself caught the loaded-filesystem stalls: the 100K copy
+measured 0.3s vs 4.9s across runs, so compare open walls accordingly.
+
+Single-node store by rows (template contacts/orders schema with
+name/score indexes plus FTS):
+
+| rows | open wall | disk | RSS | pk qps (p50/p95) | range qps (p50/p95) | 1-row update tx/s (p50/p95) |
+|---:|---|---|---|---|---|---|
+| 10K | 0.6s | 4.9 MB | 183 MB | 118,537 (0.01/0.02 ms) | 9,915 (0.09/0.16 ms) | 34* (3.3/149 ms) |
+| 100K | 9.1s | 52.7 MB | 471 MB | 121,807 (0.01/0.02 ms) | 7,645 (0.12/0.20 ms) | 281 (3.5/4.5 ms) |
+| 1M | 29.6s | 566 MB | 1,785 MB | 112,359 (0.01/0.02 ms) | 7,751 (0.12/0.20 ms) | 32* (3.9/78 ms) |
+
+Reads are flat from 10K to 1M (point ~115K qps, capped ranges ~8K
+qps). Open+rebuild runs ~11–34K rows/s with ~590 encrypted bytes per
+contact row (plus its orders/indexes/FTS) on disk; RSS grows
+183 → 471 → 1,785 MB. Starred (*) throughputs hit the sync-commit
+stalls below (p50 stays ~3–4 ms in every row).
+
+Sync-commit stall note (read before quoting a write throughput):
+every sync-write cell shows a stable p50 (~3–6 ms/commit) but
+throughput varies up to 15x run to run from episodic multi-second
+commit stalls — seen in all write cells across runs, including
+in-process phases with zero daemons up, on a 96%-full desktop SSD
+with concurrent desktop load. A spot fsync probe measured p50 2 ms /
+max 6 ms, so the stalls are episodic system I/O, not Murmur's steady
+state or a data-size cliff (the 100K store measured both 16/s and
+274/s for the same workload minutes apart). Quote p50 for sync
+commits; treat single-run sync throughput as a stall-affected sample.
+The §62 historical sync numbers (~340/s single-row) sit at the top of
+the observed range, i.e. stall-free runs.
+
+Transaction batches on the 100K store (sync durability; full-tier run):
+
+| batch | tx/s | rows/s | p50/txn |
+|---:|---:|---:|---:|
+| 1 | 274 | 274 | 3.5 ms |
+| 10 | 131 | 1,310 | 7.0 ms |
+| 100 | 28.8 | 2,884 | 31.6 ms |
+| 1,000 | 2.7 | 2,713 | 336 ms |
+
+Repeat runs measured b=1 at 16–18 tx/s under stalls (p50 6–60 ms);
+batching past 100 rows/txn stops gaining rows/s on this schema.
+
+Cipher bulk on the 100K store (fresh populate + full reopen):
+
+| cipher | populate rows/s | disk | reopen |
+|---|---|---|---|
+| aes256gcm | 2,056–2,441 | 59 MB | 3.3–3.7s |
+| chacha20 | 1,848–2,067 | 59 MB | 5.6–5.9s |
+| aegis256 | 1,740–1,909 | 59 MB | 4.7–5.8s |
+
+Ranges span the standard and full runs. Disk footprint is
+cipher-independent; AES (hardware) runs at or above the software
+ciphers within run variance. (At single-row granularity fsync hides
+all cipher cost; see `BenchmarkCipherMatrix`.)
+
+Live mesh blast (2000 rows, exact-convergence verdict):
+
+| nodes | rows/s | vis p50 | vis p95 | max daemon RSS |
+|---:|---:|---:|---:|---:|
+| 1 | 199 | 5 ms | 6 ms | 38 MB |
+| 2 | 199–223 | 704–905 ms | 933–1,074 ms | 40–41 MB |
+| 5 | 128–183 | 998 ms | 1,006–1,110 ms | 45–46 MB |
+| 10 | 90 | 1,046 ms | 2,116 ms | 52 MB |
+
+Ranges span up to three runs. Blast throughput falls with mesh size
+(fanout-limited gossip: 223 → 90 rows/s from 2 to 10 nodes) while
+daemon RSS stays ~40–52 MB. Visibility latency is dominated by the
+~1s remote-materialization timer (single-node local writes stay at
+5 ms); the 10-node tail (p95 2.1s) is last-follower convergence.
+
+Reconnect catch-up (2 nodes, log tail — no snapshot fired in any
+run; default retention covers these backlogs):
+
+| backlog | catch-up rows/s | max daemon RSS |
+|---:|---:|---:|
+| 1K | 536–901 | 38–39 MB |
+| 10K | 417–1,725 | 62 MB |
+| 50K | 262 | 109 MB |
+
+Ranges span two runs (50K single sample); catch-up writes hit the
+same sync-commit stalls. For snapshot-path catch-up numbers, force
+expiry with tight retention as in `tests-live/snapshot-resync/`.
+
+Impairment cells (`delay50ms`, `loss1pct`) skipped on this box: no
+`CAP_NET_ADMIN`. They run in privileged CI / big-box sessions.
+
+### Scaling runbook (10M/100M rows, 200 nodes, RAM limits, WAN)
+
+Cells above the `full` tier do not run on a 31 GB dev box; this
+runbook specifies how to produce them so numbers stay comparable when
+a bigger machine is available.
+
+- 10M/100M rows: do not extend `populate` (SQL-transaction-bound).
+  Restore a snapshot fixture into a template dir once, then point new
+  cells at it; keep the contacts/orders schema and seed. Budget
+  roughly 1 KB of encrypted Pebble per contact row plus indexes (read
+  the actual ratio off the `store_open` disk column first), and size
+  tmpfs/disk plus RSS headroom from the footprint curve before
+  launching. Publish the fixture's row count, content digest, and
+  build command alongside the numbers.
+- 200 nodes: the `abuse` live suite already proves 200-daemon
+  correctness; for perf, run `mesh_blast` with 200 nodes and
+  `MURMUR_PERF_MESH_ROWS` scaled down (blast time grows with
+  fanout-limited gossip, not just rows). Needs tens of GB of RAM;
+  record max daemon RSS and time-to-last-convergence, and expect the
+  visibility tail to dominate the blast rate.
+- RAM limits: wrap daemon invocations with
+  `systemd-run --user --scope -p MemoryMax=<N>G` (or a cgroupfs
+  equivalent) and rerun `store_open`/`mesh_blast`; report the
+  smallest limit that still converges plus the OOM-kill boundary.
+  In-process cells can use `RLIMIT_AS`, but it constrains the test
+  binary as a whole — prefer daemon-scoped limits.
+- WAN: the `mesh_impair` cells are the loopback proxy (50 ms / 1%).
+  For true multi-host runs, place daemons on separate hosts with the
+  harness port claims intact, shape the inter-host link with the same
+  netem specs, and publish RTT/loss traces next to the numbers; clock
+  sync (chrony/PTP) matters for visibility percentiles across hosts.

@@ -8,7 +8,6 @@ package flappartition_test
 
 import (
 	"fmt"
-	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -23,9 +22,9 @@ import (
 const tableName = "flap_rows"
 
 func TestFlappingPartitionLosesNoWrites(t *testing.T) {
-	cycles := envInt("SPEDSQL_FLAP_CYCLES", 5)
-	split := time.Duration(envInt("SPEDSQL_FLAP_SPLIT_SECONDS", 3)) * time.Second
-	healGap := time.Duration(envInt("SPEDSQL_FLAP_HEAL_SECONDS", 2)) * time.Second
+	cycles := envInt("MURMUR_FLAP_CYCLES", 5)
+	split := time.Duration(envInt("MURMUR_FLAP_SPLIT_SECONDS", 3)) * time.Second
+	healGap := time.Duration(envInt("MURMUR_FLAP_HEAL_SECONDS", 2)) * time.Second
 
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:        "flap-partition",
@@ -218,7 +217,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 }
 
 func envInt(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {
 		return v
 	}
 	return fallback

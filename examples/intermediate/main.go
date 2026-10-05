@@ -11,21 +11,22 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 	"time"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
 )
 
-func openNode(ctx context.Context, dir string, nodeID replicateddb.NodeID) *replicateddb.DB {
-	db, err := replicateddb.Open(ctx, replicateddb.Config{
+func openNode(ctx context.Context, dir string, nodeID murmur.NodeID) *murmur.DB {
+	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path: dir,
 		// The NodeID must be stable across restarts: the data
 		// directory is bound to the identity that created it.
 		NodeID: nodeID,
-		Schema: replicateddb.SchemaConfig{
+		Schema: murmur.SchemaConfig{
 			Version: 1,
 			Tables: []schema.TableSchema{{
 				Name: "orders",
@@ -41,14 +42,14 @@ func openNode(ctx context.Context, dir string, nodeID replicateddb.NodeID) *repl
 				`CREATE INDEX IF NOT EXISTS idx_orders_sku ON orders(sku)`,
 			},
 		},
-		Pebble: replicateddb.DefaultPebbleConfig(),
-		Encryption: replicateddb.EncryptionConfig{
-			Algorithm:       replicateddb.AES256GCM,
+		Pebble: murmur.DefaultPebbleConfig(),
+		Encryption: murmur.EncryptionConfig{
+			Algorithm:       murmur.AES256GCM,
 			Key:             []byte("0123456789abcdef0123456789abcdef"),
 			KeyID:           "intermediate-key",
 			DataKeyRotation: 24 * time.Hour,
 		},
-	})
+	}))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -57,13 +58,13 @@ func openNode(ctx context.Context, dir string, nodeID replicateddb.NodeID) *repl
 
 func main() {
 	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "spedsql-intermediate-*")
+	dir, err := os.MkdirTemp("", "murmur-intermediate-*")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
-	nodeID := replicateddb.NewNodeID()
+	nodeID := murmur.NewNodeID()
 	db := openNode(ctx, dir, nodeID)
 
 	// One explicit transaction with many statements commits atomically.
@@ -72,7 +73,7 @@ func main() {
 		log.Fatal(err)
 	}
 	for i := 0; i < 100; i++ {
-		id := replicateddb.NewRowID()
+		id := murmur.NewRowID()
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO orders (id, sku, qty) VALUES (?, ?, ?)`,
 			id[:], fmt.Sprintf("sku-%03d", i%10), i); err != nil {

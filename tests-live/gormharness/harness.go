@@ -1,6 +1,6 @@
 // Package gormharness spins in-process Murmur engines replicating over
 // real QUIC, each wrapped in the GORM dialect. GORM requires an
-// embedded *replicateddb.DB handle, so unlike the multi-process
+// embedded *murmur.DB handle, so unlike the multi-process
 // harness these nodes share the test process; replication,
 // encryption, and disk durability are fully real. Each app instance
 // embedding engine+GORM maps to one Node here.
@@ -12,14 +12,16 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/marcgauthier/murmur/internal/testdb"
 	"net"
 	"path/filepath"
 	"sort"
 	"testing"
 	"time"
 
-	replicateddb "github.com/marcgauthier/murmur"
-	murmur "github.com/marcgauthier/murmur/gormmurmur"
+	"github.com/marcgauthier/murmur"
+	gormmurmur "github.com/marcgauthier/murmur/gormmurmur"
+	"github.com/marcgauthier/murmur/internal/testidentity"
 	murmurSchema "github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/transport"
 	"gorm.io/gorm"
@@ -32,9 +34,9 @@ var TestKey = []byte("0123456789abcdef0123456789abcdef")
 type Node struct {
 	Label  string
 	Dir    string
-	NodeID replicateddb.NodeID
+	NodeID murmur.NodeID
 	Addr   string
-	DB     *replicateddb.DB
+	DB     *murmur.DB
 	GDB    *gorm.DB
 }
 
@@ -42,8 +44,8 @@ type Node struct {
 type Cluster struct {
 	t     *testing.T
 	Nodes []*Node
-	dbID  replicateddb.DBID
-	creds []*replicateddb.TLSCredential
+	dbID  murmur.DBID
+	creds []*murmur.TLSCredential
 }
 
 // NewCluster opens numNodes meshed engines with genesis derived from
@@ -51,7 +53,7 @@ type Cluster struct {
 // connections plus schema convergence.
 func NewCluster(t *testing.T, name string, numNodes int, models ...interface{}) *Cluster {
 	t.Helper()
-	genesis, err := murmur.GenesisTables(models...)
+	genesis, err := gormmurmur.GenesisTables(models...)
 	if err != nil {
 		t.Fatalf("genesis: %v", err)
 	}
@@ -59,7 +61,7 @@ func NewCluster(t *testing.T, name string, numNodes int, models ...interface{}) 
 	if err != nil {
 		t.Fatalf("ca: %v", err)
 	}
-	dbid := replicateddb.NewDBID()
+	dbid := murmur.NewDBID()
 	root := t.TempDir()
 
 	var c *Cluster
@@ -76,7 +78,7 @@ func NewCluster(t *testing.T, name string, numNodes int, models ...interface{}) 
 		t.Fatalf("cluster bring-up: %v", err)
 	}
 	for _, n := range c.Nodes {
-		gdb, err := gorm.Open(murmur.Open(n.DB), &gorm.Config{})
+		gdb, err := gorm.Open(gormmurmur.Open(n.DB), &gorm.Config{})
 		if err != nil {
 			t.Fatalf("gorm open %s: %v", n.Label, err)
 		}
@@ -92,22 +94,22 @@ func NewCluster(t *testing.T, name string, numNodes int, models ...interface{}) 
 	return c
 }
 
-func tryCluster(t *testing.T, name, root string, ca *transport.CA, dbid replicateddb.DBID, genesis []murmurSchema.TableSchema, numNodes int) (*Cluster, error) {
+func tryCluster(t *testing.T, name, root string, ca *transport.CA, dbid murmur.DBID, genesis []murmurSchema.TableSchema, numNodes int) (*Cluster, error) {
 	t.Helper()
 	c := &Cluster{t: t}
 	ports := make([]int, numNodes)
 	for i := range ports {
 		ports[i] = grabPort(t)
 	}
-	nodeIDs := make([]replicateddb.NodeID, numNodes)
-	creds := make([]*replicateddb.TLSCredential, numNodes)
+	nodeIDs := make([]murmur.NodeID, numNodes)
+	creds := make([]*murmur.TLSCredential, numNodes)
 	for i := range nodeIDs {
-		nodeIDs[i] = replicateddb.NewNodeID()
+		nodeIDs[i] = murmur.NewNodeID()
 		certPEM, keyPEM, err := ca.IssueNode(nodeIDs[i], 2*time.Hour)
 		if err != nil {
 			return nil, fmt.Errorf("issue node %d: %w", i, err)
 		}
-		creds[i] = &replicateddb.TLSCredential{CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: ca.CertPEM}
+		creds[i] = &murmur.TLSCredential{CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: ca.CertPEM}
 	}
 	cleanupOnErr := true
 	defer func() {
@@ -116,25 +118,26 @@ func tryCluster(t *testing.T, name, root string, ca *transport.CA, dbid replicat
 		}
 	}()
 	for i := 0; i < numNodes; i++ {
-		var peers []replicateddb.Peer
+		var peers []murmur.Peer
 		for j := 0; j < numNodes; j++ {
 			if j == i {
 				continue
 			}
-			peers = append(peers, replicateddb.Peer{
+			peers = append(peers, murmur.Peer{
 				NodeID: nodeIDs[j],
 				Addrs:  []string{fmt.Sprintf("127.0.0.1:%d", ports[j])},
 			})
 		}
 		label := fmt.Sprintf("%s-node%d", name, i)
 		dir := filepath.Join(root, label)
-		db, err := replicateddb.Open(context.Background(), replicateddb.Config{
-			Path:       filepath.Join(dir, "data"),
-			NodeID:     nodeIDs[i],
-			DBID:       dbid,
-			Encryption: replicateddb.EncryptionConfig{Key: append([]byte(nil), TestKey...), KeyID: "test"},
-			Schema:     replicateddb.SchemaConfig{Version: 1, Tables: genesis},
-			Replication: replicateddb.ReplicationConfig{
+		db, err := murmur.Open(context.Background(), testdb.Configure(murmur.Config{
+			Path:          filepath.Join(dir, "data"),
+			NodeID:        nodeIDs[i],
+			DBID:          dbid,
+			OriginSigning: testidentity.Config(nodeIDs[i]),
+			Encryption:    murmur.EncryptionConfig{Key: append([]byte(nil), TestKey...), KeyID: "test"},
+			Schema:        murmur.SchemaConfig{Version: 1, Tables: genesis},
+			Replication: murmur.ReplicationConfig{
 				ListenAddr:      fmt.Sprintf("127.0.0.1:%d", ports[i]),
 				TLS:             creds[i],
 				Peers:           peers,
@@ -143,7 +146,7 @@ func tryCluster(t *testing.T, name, root string, ca *transport.CA, dbid replicat
 				AckInterval:     100 * time.Millisecond,
 				MinLogRetention: time.Hour,
 			},
-		})
+		}))
 		if err != nil {
 			return nil, fmt.Errorf("open %s: %w", label, err)
 		}
@@ -241,7 +244,7 @@ func (c *Cluster) Count(idx int, model interface{}) int64 {
 		if err == nil {
 			return count
 		}
-		if !errors.Is(err, replicateddb.ErrMaterializerDirty) {
+		if !errors.Is(err, murmur.ErrMaterializerDirty) {
 			c.t.Fatalf("count %s: %v", n.Label, err)
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -351,9 +354,9 @@ func (c *Cluster) RestartNode(idx int) {
 	}
 	// Rebind the same address (peers dial it statically); retry
 	// briefly while the socket releases.
-	var db *replicateddb.DB
+	var db *murmur.DB
 	for attempt := 0; attempt < 25; attempt++ {
-		db, err = replicateddb.Open(context.Background(), c.reopenConfig(idx, epoch, live))
+		db, err = murmur.Open(context.Background(), c.reopenConfig(idx, epoch, live))
 		if err == nil {
 			break
 		}
@@ -363,29 +366,29 @@ func (c *Cluster) RestartNode(idx int) {
 		c.t.Fatalf("reopen %s: %v", n.Label, err)
 	}
 	n.DB = db
-	gdb, err := gorm.Open(murmur.Open(db), &gorm.Config{})
+	gdb, err := gorm.Open(gormmurmur.Open(db), &gorm.Config{})
 	if err != nil {
 		c.t.Fatalf("gorm reopen %s: %v", n.Label, err)
 	}
 	n.GDB = gdb
 }
 
-func (c *Cluster) reopenConfig(idx int, epoch uint64, live []murmurSchema.TableSchema) replicateddb.Config {
+func (c *Cluster) reopenConfig(idx int, epoch uint64, live []murmurSchema.TableSchema) murmur.Config {
 	n := c.Nodes[idx]
-	var peers []replicateddb.Peer
+	var peers []murmur.Peer
 	for j, other := range c.Nodes {
 		if j == idx {
 			continue
 		}
-		peers = append(peers, replicateddb.Peer{NodeID: other.NodeID, Addrs: []string{other.Addr}})
+		peers = append(peers, murmur.Peer{NodeID: other.NodeID, Addrs: []string{other.Addr}})
 	}
-	return replicateddb.Config{
+	return testdb.Configure(murmur.Config{
 		Path:       filepath.Join(n.Dir, "data"),
 		NodeID:     n.NodeID,
 		DBID:       c.dbID,
-		Encryption: replicateddb.EncryptionConfig{Key: append([]byte(nil), TestKey...), KeyID: "test"},
-		Schema:     replicateddb.SchemaConfig{Version: epoch, Tables: live},
-		Replication: replicateddb.ReplicationConfig{
+		Encryption: murmur.EncryptionConfig{Key: append([]byte(nil), TestKey...), KeyID: "test"},
+		Schema:     murmur.SchemaConfig{Version: epoch, Tables: live},
+		Replication: murmur.ReplicationConfig{
 			ListenAddr:      n.Addr,
 			TLS:             c.creds[idx],
 			Peers:           peers,
@@ -394,5 +397,5 @@ func (c *Cluster) reopenConfig(idx int, epoch uint64, live []murmurSchema.TableS
 			AckInterval:     100 * time.Millisecond,
 			MinLogRetention: time.Hour,
 		},
-	}
+	})
 }

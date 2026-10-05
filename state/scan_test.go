@@ -65,7 +65,7 @@ func TestReceiveProgressPagePaginatesWithRetainedBounds(t *testing.T) {
 			codec.Mutation{TableID: 1, RowID: ids.NewRowID(), ColumnID: 1, Value: codec.Int(int64(i))})
 		b.OriginNode = origin
 		b.Sequence = 1
-		if _, err := s.CommitRemote(context.Background(), b); err != nil {
+		if _, err := commitRemoteFixture(s, context.Background(), b); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import "sync/atomic"
 
@@ -19,10 +19,14 @@ type dbMetrics struct {
 	localCommits            atomic.Uint64
 	localCommitMutations    atomic.Uint64
 	localCommitLatencyNanos atomic.Uint64
-	periodicSyncs           atomic.Uint64
-	periodicSyncFailures    atomic.Uint64
-	writeAcquisitions       atomic.Uint64
-	writeQueueWaitNanos     atomic.Uint64
+	// Group commit (synchronous mode): durable group commits and the
+	// total member transactions they carried; divide for mean group size.
+	groupCommits         atomic.Uint64
+	groupCommitMembers   atomic.Uint64
+	periodicSyncs        atomic.Uint64
+	periodicSyncFailures atomic.Uint64
+	writeAcquisitions    atomic.Uint64
+	writeQueueWaitNanos  atomic.Uint64
 
 	// Remote apply and deferred SQLite materialization.
 	remoteApplies           atomic.Uint64
@@ -71,6 +75,8 @@ type MetricsSnapshot struct {
 	LocalCommits            uint64
 	LocalCommitMutations    uint64
 	LocalCommitLatencyNanos uint64
+	GroupCommits            uint64
+	GroupCommitMembers      uint64
 	PeriodicSyncs           uint64
 	PeriodicSyncFailures    uint64
 	WriteAcquisitions       uint64
@@ -124,6 +130,8 @@ func (m *dbMetrics) snapshot() MetricsSnapshot {
 		LocalCommits:            m.localCommits.Load(),
 		LocalCommitMutations:    m.localCommitMutations.Load(),
 		LocalCommitLatencyNanos: m.localCommitLatencyNanos.Load(),
+		GroupCommits:            m.groupCommits.Load(),
+		GroupCommitMembers:      m.groupCommitMembers.Load(),
 		PeriodicSyncs:           m.periodicSyncs.Load(),
 		PeriodicSyncFailures:    m.periodicSyncFailures.Load(),
 		WriteAcquisitions:       m.writeAcquisitions.Load(),

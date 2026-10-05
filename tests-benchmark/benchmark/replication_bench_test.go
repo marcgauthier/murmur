@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/marcgauthier/murmur/internal/testdb"
 	"testing"
 	"time"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/transport"
 )
 
@@ -16,9 +17,9 @@ const benchPortA = "127.0.0.1:17443"
 // benchMesh builds a CA plus a config factory for star-topology meshes:
 // node A listens on a fixed loopback port, others dial it.
 type benchMesh struct {
-	dbid  replicateddb.DBID
+	dbid  murmur.DBID
 	ca    *transport.CA
-	creds map[replicateddb.NodeID]*replicateddb.TLSCredential
+	creds map[murmur.NodeID]*murmur.TLSCredential
 }
 
 func newBenchMesh(b *testing.B) *benchMesh {
@@ -27,10 +28,10 @@ func newBenchMesh(b *testing.B) *benchMesh {
 	if err != nil {
 		b.Fatal(err)
 	}
-	return &benchMesh{dbid: replicateddb.NewDBID(), ca: ca, creds: map[replicateddb.NodeID]*replicateddb.TLSCredential{}}
+	return &benchMesh{dbid: murmur.NewDBID(), ca: ca, creds: map[murmur.NodeID]*murmur.TLSCredential{}}
 }
 
-func (m *benchMesh) tlsFor(b *testing.B, n replicateddb.NodeID) *replicateddb.TLSCredential {
+func (m *benchMesh) tlsFor(b *testing.B, n murmur.NodeID) *murmur.TLSCredential {
 	b.Helper()
 	if c, ok := m.creds[n]; ok {
 		return c
@@ -39,31 +40,31 @@ func (m *benchMesh) tlsFor(b *testing.B, n replicateddb.NodeID) *replicateddb.TL
 	if err != nil {
 		b.Fatal(err)
 	}
-	c := &replicateddb.TLSCredential{CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: m.ca.CertPEM}
+	c := &murmur.TLSCredential{CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: m.ca.CertPEM}
 	m.creds[n] = c
 	return c
 }
 
-func (m *benchMesh) config(b *testing.B, path string, node replicateddb.NodeID, listen string, peers []replicateddb.Peer) replicateddb.Config {
+func (m *benchMesh) config(b *testing.B, path string, node murmur.NodeID, listen string, peers []murmur.Peer) murmur.Config {
 	b.Helper()
-	return replicateddb.Config{
+	return testdb.Configure(murmur.Config{
 		Path:   path,
 		NodeID: node,
 		DBID:   m.dbid,
-		Schema: replicateddb.SchemaConfig{
+		Schema: murmur.SchemaConfig{
 			Version: 1, Tables: benchSchema(), LocalDDL: benchLocalDDL(),
 		},
-		Pebble: replicateddb.DefaultPebbleConfig(),
-		Encryption: replicateddb.EncryptionConfig{
+		Pebble: murmur.DefaultPebbleConfig(),
+		Encryption: murmur.EncryptionConfig{
 			Key: bytes.Clone(benchKey), KeyID: "bench",
 		},
-		Replication: replicateddb.ReplicationConfig{
+		Replication: murmur.ReplicationConfig{
 			ListenAddr: listen, TLS: m.tlsFor(b, node), Peers: peers,
 		},
-	}
+	})
 }
 
-func waitConnected(b *testing.B, db *replicateddb.DB, secs int) {
+func waitConnected(b *testing.B, db *murmur.DB, secs int) {
 	b.Helper()
 	deadline := time.Now().Add(time.Duration(secs) * time.Second)
 	for db.Status().ConnectedPeers == 0 {
@@ -74,7 +75,7 @@ func waitConnected(b *testing.B, db *replicateddb.DB, secs int) {
 	}
 }
 
-func waitContacts(b *testing.B, db *replicateddb.DB, n int, secs int) {
+func waitContacts(b *testing.B, db *murmur.DB, n int, secs int) {
 	b.Helper()
 	deadline := time.Now().Add(time.Duration(secs) * time.Second)
 	for {
@@ -94,14 +95,14 @@ func BenchmarkReplicationThroughput(b *testing.B) {
 	ctx := context.Background()
 	const n = 1000
 	mesh := newBenchMesh(b)
-	nodeA, nodeB := replicateddb.NewNodeID(), replicateddb.NewNodeID()
-	dbA, err := replicateddb.Open(ctx, mesh.config(b, b.TempDir(), nodeA, benchPortA, nil))
+	nodeA, nodeB := murmur.NewNodeID(), murmur.NewNodeID()
+	dbA, err := murmur.Open(ctx, mesh.config(b, b.TempDir(), nodeA, benchPortA, nil))
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer dbA.Close()
-	dbB, err := replicateddb.Open(ctx, mesh.config(b, b.TempDir(), nodeB, "127.0.0.1:0",
-		[]replicateddb.Peer{{NodeID: nodeA, Addrs: []string{benchPortA}}}))
+	dbB, err := murmur.Open(ctx, mesh.config(b, b.TempDir(), nodeB, "127.0.0.1:0",
+		[]murmur.Peer{{NodeID: nodeA, Addrs: []string{benchPortA}}}))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -111,7 +112,7 @@ func BenchmarkReplicationThroughput(b *testing.B) {
 	b.ResetTimer()
 	start := time.Now()
 	for i := 0; i < n; i++ {
-		id := replicateddb.NewRowID()
+		id := murmur.NewRowID()
 		if _, err := dbA.ExecContext(ctx,
 			`INSERT INTO contacts (id, name, phone, score) VALUES (?, ?, ?, ?)`,
 			id[:], fmt.Sprintf("t %d", i), fmt.Sprintf("555-%04d", i), i%1000); err != nil {
@@ -142,17 +143,17 @@ func BenchmarkFiveNodeSync(b *testing.B) {
 		b.Run(sizeName(n), func(b *testing.B) {
 			ctx := context.Background()
 			mesh := newBenchMesh(b)
-			nodeA := replicateddb.NewNodeID()
-			dbA, err := replicateddb.Open(ctx, mesh.config(b, b.TempDir(), nodeA, benchPortA, nil))
+			nodeA := murmur.NewNodeID()
+			dbA, err := murmur.Open(ctx, mesh.config(b, b.TempDir(), nodeA, benchPortA, nil))
 			if err != nil {
 				b.Fatal(err)
 			}
 			defer dbA.Close()
-			var followers []*replicateddb.DB
+			var followers []*murmur.DB
 			for i := 0; i < 4; i++ {
-				node := replicateddb.NewNodeID()
-				db, err := replicateddb.Open(ctx, mesh.config(b, b.TempDir(), node, "127.0.0.1:0",
-					[]replicateddb.Peer{{NodeID: nodeA, Addrs: []string{benchPortA}}}))
+				node := murmur.NewNodeID()
+				db, err := murmur.Open(ctx, mesh.config(b, b.TempDir(), node, "127.0.0.1:0",
+					[]murmur.Peer{{NodeID: nodeA, Addrs: []string{benchPortA}}}))
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -183,16 +184,16 @@ func BenchmarkReconnectBacklog(b *testing.B) {
 		b.Run(sizeName(n), func(b *testing.B) {
 			ctx := context.Background()
 			mesh := newBenchMesh(b)
-			nodeA, nodeB := replicateddb.NewNodeID(), replicateddb.NewNodeID()
-			dbA, err := replicateddb.Open(ctx, mesh.config(b, b.TempDir(), nodeA, benchPortA, nil))
+			nodeA, nodeB := murmur.NewNodeID(), murmur.NewNodeID()
+			dbA, err := murmur.Open(ctx, mesh.config(b, b.TempDir(), nodeA, benchPortA, nil))
 			if err != nil {
 				b.Fatal(err)
 			}
 			defer dbA.Close()
 			pathB := b.TempDir()
 			cfgB := mesh.config(b, pathB, nodeB, "127.0.0.1:0",
-				[]replicateddb.Peer{{NodeID: nodeA, Addrs: []string{benchPortA}}})
-			dbB, err := replicateddb.Open(ctx, cfgB)
+				[]murmur.Peer{{NodeID: nodeA, Addrs: []string{benchPortA}}})
+			dbB, err := murmur.Open(ctx, cfgB)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -203,7 +204,7 @@ func BenchmarkReconnectBacklog(b *testing.B) {
 			populate(b, dbA, n)
 			b.ResetTimer()
 			start := time.Now()
-			dbB, err = replicateddb.Open(ctx, cfgB)
+			dbB, err = murmur.Open(ctx, cfgB)
 			if err != nil {
 				b.Fatal(err)
 			}

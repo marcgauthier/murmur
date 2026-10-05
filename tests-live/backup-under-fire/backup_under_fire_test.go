@@ -26,7 +26,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,7 +49,7 @@ func schemaConfig() *db.SchemaConfig {
 }
 
 func agentTags() string {
-	if tags := os.Getenv("SPEDSQL_TAGS"); tags != "" {
+	if tags := harness.GetEnv("MURMUR_TAGS"); tags != "" {
 		return tags
 	}
 	if os.Getenv("CGO_ENABLED") == "0" {
@@ -78,7 +77,7 @@ func repoRoot(t *testing.T) string {
 }
 
 // buildAgent compiles the suite-local backup agent with the same tags as
-// the daemon under test (SPEDSQL_TAGS-aware, so the modernc config builds
+// the daemon under test (MURMUR_TAGS-aware, so the modernc config builds
 // a matching agent).
 func buildAgent(t *testing.T) string {
 	t.Helper()
@@ -93,14 +92,7 @@ func buildAgent(t *testing.T) string {
 
 func writeSeconds(t *testing.T) time.Duration {
 	t.Helper()
-	if v := os.Getenv("SPEDSQL_BACKUP_UNDER_FIRE_WRITE_SECONDS"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			t.Fatalf("bad SPEDSQL_BACKUP_UNDER_FIRE_WRITE_SECONDS=%q", v)
-		}
-		return time.Duration(n) * time.Second
-	}
-	return 30 * time.Second
+	return harness.EnvSeconds("MURMUR_BACKUP_UNDER_FIRE_WRITE_SECONDS", 30)
 }
 
 // agent wraps a running backupagent child process.
@@ -130,6 +122,28 @@ func startAgent(t *testing.T, bin string, cluster *harness.Cluster, replAddr str
 	caFile := filepath.Join(root, "ca.crt")
 	certFile := filepath.Join(root, "node.crt")
 	keyFile := filepath.Join(root, "node.key")
+	originKeyFile := filepath.Join(root, "origin.key")
+	originKeysFile := filepath.Join(root, "origin-public-keys.json")
+	signing := cluster.OriginSigning(id)
+	cluster.ProvisionOrigin(id, signing.PrivateKey)
+	if err := os.WriteFile(originKeyFile, signing.PrivateKey, 0600); err != nil {
+		t.Fatal(err)
+	}
+	publicKeys := make(map[string]string)
+	for _, originID := range append([]db.NodeID{id}, clusterNodeIDs(cluster)...) {
+		publicKey, ok := signing.TrustedKeys.Lookup(originID)
+		if !ok {
+			t.Fatal("missing origin public key")
+		}
+		publicKeys[originID.String()] = hex.EncodeToString(publicKey)
+	}
+	originKeysJSON, err := json.Marshal(publicKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(originKeysFile, originKeysJSON, 0644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(caFile, cluster.CA.CertPEM, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -169,6 +183,8 @@ func startAgent(t *testing.T, bin string, cluster *harness.Cluster, replAddr str
 		"--ca", caFile,
 		"--cert", certFile,
 		"--key", keyFile,
+		"--origin-key", originKeyFile,
+		"--origin-public-keys", originKeysFile,
 		"--table", "buf_rows",
 	)
 	stdin, err := cmd.StdinPipe()
@@ -204,6 +220,14 @@ func startAgent(t *testing.T, bin string, cluster *harness.Cluster, replAddr str
 	}
 	addAgentPeer(t, cluster, id.String(), replAddr)
 	return a
+}
+
+func clusterNodeIDs(cluster *harness.Cluster) []db.NodeID {
+	var out []db.NodeID
+	for _, node := range cluster.Nodes {
+		out = append(out, node.NodeID)
+	}
+	return out
 }
 
 func (a *agent) next(t *testing.T, timeout time.Duration) string {
@@ -578,11 +602,12 @@ func offlineOpen(t *testing.T, ctx context.Context, cluster *harness.Cluster, pe
 		t.Fatal(err)
 	}
 	handle, err := db.Open(ctx, db.Config{
-		Path:   pebbleDir,
-		NodeID: node,
-		DBID:   cluster.DBID,
-		Schema: *schemaConfig(),
-		Pebble: db.DefaultPebbleConfig(),
+		OriginSigning: cluster.OriginSigning(node),
+		Path:          pebbleDir,
+		NodeID:        node,
+		DBID:          cluster.DBID,
+		Schema:        *schemaConfig(),
+		Pebble:        db.DefaultPebbleConfig(),
 		// The agent stores use the same key ID the daemon unlock path
 		// uses, by suite construction.
 		Encryption: db.EncryptionConfig{Key: keyBytes(t, cluster.Nodes[0].KeyHex), KeyID: "remote-unlock-key"},

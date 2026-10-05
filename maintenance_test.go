@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 
 func TestRotateDataKey(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestSetEncryptionAlgorithm(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir()
 	cfg := testConfig(path)
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestSetEncryptionAlgorithm(t *testing.T) {
 
 	// Reopen with the same algorithm works and keeps data.
 	cfg.Encryption.Algorithm = ChaCha20Poly1305
-	db2, err := Open(ctx, cfg)
+	db2, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,12 +73,12 @@ func TestSetEncryptionAlgorithm(t *testing.T) {
 
 	// Reopen disagreeing with the persisted algorithm refuses.
 	cfg.Encryption.Algorithm = AES256GCM
-	if _, err := Open(ctx, cfg); err == nil || !strings.Contains(err.Error(), "disagrees") {
+	if _, err := openSignedFixture(ctx, cfg); err == nil || !strings.Contains(err.Error(), "disagrees") {
 		t.Fatalf("expected algorithm disagreement error, got %v", err)
 	}
 
 	// Unknown algorithms are rejected without state change.
-	db3, err := Open(ctx, testConfig(t.TempDir()))
+	db3, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestRewriteEncryptedFiles(t *testing.T) {
 	defer cancel()
 	path := t.TempDir()
 	cfg := testConfig(path)
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestRewriteEncryptedFiles(t *testing.T) {
 	_ = db.Close()
 
 	// Reopen: data intact, no journal left behind.
-	db2, err := Open(ctx, cfg)
+	db2, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestRewriteEncryptedFiles(t *testing.T) {
 }
 
 func TestMaintenanceRejectsWrites(t *testing.T) {
-	db, err := Open(context.Background(), testConfig(t.TempDir()))
+	db, err := openSignedFixture(context.Background(), testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestMaintenanceRejectsWrites(t *testing.T) {
 
 func TestEncryptionStatusShape(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -17,7 +17,7 @@ import (
 // releases the read lock, unblocking pending writers.
 func TestCanceledQueryUnblocksWriter(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(context.Background(), testConfig(dir))
+	db, err := openSignedFixture(context.Background(), testConfig(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestCanceledQueryUnblocksWriter(t *testing.T) {
 // does not wedge when blocked behind partially consumed rows.
 func TestPartiallyConsumedRowsTimeout(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(context.Background(), testConfig(dir))
+	db, err := openSignedFixture(context.Background(), testConfig(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestPartiallyConsumedRowsTimeout(t *testing.T) {
 // automatically rollback when their context is canceled.
 func TestAbandonedTransactionAutoRollback(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(context.Background(), testConfig(dir))
+	db, err := openSignedFixture(context.Background(), testConfig(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestAbandonedTransactionAutoRollback(t *testing.T) {
 // promptly and cleanly without hanging when readers, writers, and abandoned txs are active.
 func TestConcurrentCloseUnderActiveReadsAndWrites(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(context.Background(), testConfig(dir))
+	db, err := openSignedFixture(context.Background(), testConfig(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +262,7 @@ func TestConcurrentCloseUnderActiveReadsAndWrites(t *testing.T) {
 // without deadlocks during concurrent standalone reads.
 func TestReplicationUnderBlockedReads(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(context.Background(), testConfig(dir))
+	db, err := openSignedFixture(context.Background(), testConfig(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func TestReplicationUnderBlockedReads(t *testing.T) {
 
 	applyDone := make(chan error, 1)
 	go func() {
-		applyDone <- db.ApplyRemote(context.Background(), batch)
+		applyDone <- applyRemoteFixture(db, context.Background(), batch)
 	}()
 
 	// Closing read cursor allows remote materialization to complete
@@ -327,7 +327,7 @@ func TestReplicationUnderBlockedReads(t *testing.T) {
 // and canceled transactions are occurring.
 func TestKeyRotationUnderConcurrentQueries(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(context.Background(), testConfig(dir))
+	db, err := openSignedFixture(context.Background(), testConfig(dir))
 	if err != nil {
 		t.Fatal(err)
 	}

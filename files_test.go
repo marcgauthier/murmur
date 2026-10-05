@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"bytes"
@@ -35,7 +35,7 @@ func uploadBytes(t *testing.T, db *DB, name string, data []byte) FileInfo {
 
 func TestFilesDisabled(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,14 +60,14 @@ func TestFilesDisabled(t *testing.T) {
 func TestFilesEnabledRequiresKey(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.Files.Enabled = true
-	if _, err := Open(context.Background(), cfg); err == nil {
+	if _, err := openSignedFixture(context.Background(), cfg); err == nil {
 		t.Fatal("open with Files.Enabled and no key succeeded")
 	}
 }
 
 func TestFileUploadRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, fileTestConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, fileTestConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +120,7 @@ func TestFileUploadRoundTrip(t *testing.T) {
 
 func TestFileListSearch(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, fileTestConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, fileTestConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestFileListSearch(t *testing.T) {
 
 func TestFileDeleteTombstone(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, fileTestConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, fileTestConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestFileDeleteTombstone(t *testing.T) {
 func TestFileUnavailableStatus(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir()
-	db, err := Open(ctx, fileTestConfig(path))
+	db, err := openSignedFixture(ctx, fileTestConfig(path))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestFileRestartPersistence(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir()
 	cfg := fileTestConfig(path)
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +269,7 @@ func TestFileRestartPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(ctx, cfg)
+	db2, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func TestFileRestartPersistence(t *testing.T) {
 func TestFilePublishBeforeAck(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir()
-	db, err := Open(ctx, fileTestConfig(path))
+	db, err := openSignedFixture(ctx, fileTestConfig(path))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +319,7 @@ func TestFileTooLarge(t *testing.T) {
 	ctx := context.Background()
 	cfg := fileTestConfig(t.TempDir())
 	cfg.Files.MaxFileBytes = 16
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +354,7 @@ func TestFileTooLarge(t *testing.T) {
 
 func TestFilesGCReclaimsDeleted(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, fileTestConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, fileTestConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,7 +389,7 @@ func TestFileReservedTableCollision(t *testing.T) {
 	})
 	cfg.Files.Enabled = true
 	cfg.Files.ObjectKey = append([]byte(nil), testObjectKey...)
-	if _, err := Open(context.Background(), cfg); err == nil {
+	if _, err := openSignedFixture(context.Background(), cfg); err == nil {
 		t.Fatal("open with app table on the reserved file name succeeded")
 	}
 }
@@ -398,7 +398,7 @@ func TestFileObjectKeyRotation(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir()
 	cfg := fileTestConfig(path)
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +432,7 @@ func TestFileObjectKeyRotation(t *testing.T) {
 
 	// Reopen under the new key: everything readable.
 	cfg.Files.ObjectKey = append([]byte(nil), newKey...)
-	db2, err := Open(ctx, cfg)
+	db2, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +450,7 @@ func TestFileObjectKeyRotation(t *testing.T) {
 	}
 	// The retired key opens (single generation on disk) but cannot decrypt.
 	cfg.Files.ObjectKey = append([]byte(nil), testObjectKey...)
-	db3, err := Open(ctx, cfg)
+	db3, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -469,7 +469,7 @@ func TestFileObjectKeyRotation(t *testing.T) {
 func fileBackupSource(t *testing.T, ctx context.Context, dir string) (*DB, Config, map[string][]byte) {
 	t.Helper()
 	cfg := fileTestConfig(dir)
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +534,7 @@ func TestFileBackupRestoreInclusive(t *testing.T) {
 	}
 	cfg2 := fileTestConfig(restoredDir)
 	cfg2.NodeID = freshNode
-	db2, err := Open(ctx, cfg2)
+	db2, err := openSignedFixture(ctx, cfg2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -591,7 +591,7 @@ func TestFileBackupRestoreMetadataOnly(t *testing.T) {
 	}
 	cfg2 := fileTestConfig(restoredDir)
 	cfg2.NodeID = freshNode
-	db2, err := Open(ctx, cfg2)
+	db2, err := openSignedFixture(ctx, cfg2)
 	if err != nil {
 		t.Fatal(err)
 	}

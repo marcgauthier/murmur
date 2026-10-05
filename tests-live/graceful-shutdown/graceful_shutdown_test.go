@@ -173,7 +173,7 @@ func TestGracefulShutdownMidWriteAndMidSnapshot(t *testing.T) {
 	// counters until a pass runs after expiry and collects log batches.
 	gcRunsBefore := metricValue(t, cluster.Nodes[0].APIAddr, "spedsql_gc_runs_total")
 	collectedBefore := metricValue(t, cluster.Nodes[0].APIAddr, "spedsql_gc_log_collected_total")
-	deadlineWait := time.Duration(envSeconds("SPEDSQL_GRACEFUL_MEMBER_DEADLINE_SECONDS", 25)) * time.Second
+	deadlineWait := time.Duration(envSeconds("MURMUR_GRACEFUL_MEMBER_DEADLINE_SECONDS", 25)) * time.Second
 	t.Logf("waiting %v for member-deadline expiry", deadlineWait)
 	time.Sleep(deadlineWait)
 	waitGCPass(t, cluster.Nodes[0].APIAddr, gcRunsBefore, 120*time.Second)
@@ -398,7 +398,7 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 }
 
 func envSeconds(name string, fallback int) int {
-	if value, err := strconv.Atoi(os.Getenv(name)); err == nil && value > 0 {
+	if value, err := strconv.Atoi(harness.GetEnv(name)); err == nil && value > 0 {
 		return value
 	}
 	return fallback

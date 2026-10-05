@@ -1,7 +1,7 @@
 // Downgrade-guard acceptance: a previous-release binary must refuse a
 // store first written by the current binary.
 //
-// The current binary writes store format 3; the pinned previous release
+// The current binary writes store format 5; the pinned previous release
 // requires strict format equality with its own version (2) and fails
 // closed with a version error. The suite proves the refusal is clean
 // (version error, nonzero exit), the store is byte-untouched (the
@@ -13,6 +13,8 @@ package downgradeguard_test
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
@@ -29,24 +31,25 @@ import (
 	"time"
 
 	db "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/origin"
 	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 // defaultPrevRef pins the previous release the current build must refuse
-// to downgrade to. It tracks tests-live/release-upgrade; SPEDSQL_PREV_REF
+// to downgrade to. It tracks tests-live/release-upgrade; MURMUR_PREV_REF
 // overrides it per run.
 const defaultPrevRef = "4bdd2974766786865c6222bb4843cab79e41e5c5"
 
 func prevRef() string {
-	if ref := os.Getenv("SPEDSQL_PREV_REF"); ref != "" {
+	if ref := harness.GetEnv("MURMUR_PREV_REF"); ref != "" {
 		return ref
 	}
 	return defaultPrevRef
 }
 
 func prevTags() string {
-	if tags := os.Getenv("SPEDSQL_TAGS"); tags != "" {
+	if tags := harness.GetEnv("MURMUR_TAGS"); tags != "" {
 		return tags
 	}
 	if os.Getenv("CGO_ENABLED") == "0" {
@@ -197,9 +200,15 @@ func TestDowngradeGuardRefusesNewStore(t *testing.T) {
 
 	// Positive controls: the previous binary boots a fresh store (proving
 	// the old binary itself works), and the current binary opens that
-	// previous-release store (backward compatibility).
+	// previous-release store (backward compatibility). The legacy store
+	// is unsigned, so the current binary takes the explicit offline
+	// origin-baseline migration first (same flow release-upgrade proves).
 	freshCfg := writeFreshConfig(t, cluster)
 	probeBoot(t, "prev-on-fresh", oldBin, freshCfg)
+	// The migration CLI defaults --key-id to the unlock path's
+	// identity; this config-driven store was sealed under the config
+	// key ID, so pass it explicitly.
+	migrateBaseline(t, newBin, freshCfg, cluster.Nodes[0].KeyID)
 	probeBoot(t, "current-on-prev-store", newBin, freshCfg)
 
 	// The downgrade attempt: the previous binary must refuse the
@@ -220,7 +229,7 @@ func TestDowngradeGuardRefusesNewStore(t *testing.T) {
 	// markers still at the current version.
 	after := hashTree(t, node.PebbleDir)
 	assertStoreUntouched(t, before, after)
-	assertFormatMarkers(t, cluster, node.PebbleDir, node.NodeID.String(), 3)
+	assertFormatMarkers(t, cluster, node.PebbleDir, node.NodeID.String(), 5)
 
 	// The current binary reopens the store with identical data and identity.
 	cluster.StartNode(0)
@@ -270,21 +279,34 @@ func writeFreshConfig(t *testing.T, cluster *harness.Cluster) string {
 	if err := os.WriteFile(filepath.Join(tlsDir, "node.key"), keyPEM, 0600); err != nil {
 		t.Fatal(err)
 	}
+	// The current binary requires an origin signing key file bound to
+	// the local NodeID; the previous release predates origin keys and
+	// ignores the fields.
+	pub, originKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originKeyFile := filepath.Join(tlsDir, "origin.key")
+	if err := os.WriteFile(originKeyFile, originKey, 0600); err != nil {
+		t.Fatal(err)
+	}
 	cfg := map[string]any{
-		"node_id":            fresh.String(),
-		"db_id":              db.NewDBID().String(),
-		"data_dir":           root,
-		"listen_addr":        fmt.Sprintf("127.0.0.1:%d", freePort(t)),
-		"api_addr":           fmt.Sprintf("127.0.0.1:%d", freePort(t)),
-		"await_unlock":       false,
-		"key_hex":            base.KeyHex,
-		"key_id":             base.KeyID,
-		"schema_path":        schemaDir,
-		"tls_ca_cert_file":   filepath.Join(tlsDir, "ca.crt"),
-		"tls_node_cert_file": filepath.Join(tlsDir, "node.crt"),
-		"tls_node_key_file":  filepath.Join(tlsDir, "node.key"),
-		"peers":              []map[string]any{},
-		"schema":             schemaConfig(),
+		"node_id":                 fresh.String(),
+		"db_id":                   db.NewDBID().String(),
+		"data_dir":                root,
+		"listen_addr":             fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+		"api_addr":                fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+		"await_unlock":            false,
+		"key_hex":                 base.KeyHex,
+		"key_id":                  base.KeyID,
+		"origin_signing_key_file": originKeyFile,
+		"origin_public_keys":      map[string]string{fresh.String(): hex.EncodeToString(pub)},
+		"schema_path":             schemaDir,
+		"tls_ca_cert_file":        filepath.Join(tlsDir, "ca.crt"),
+		"tls_node_cert_file":      filepath.Join(tlsDir, "node.crt"),
+		"tls_node_key_file":       filepath.Join(tlsDir, "node.key"),
+		"peers":                   []map[string]any{},
+		"schema":                  schemaConfig(),
 	}
 	raw, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -297,6 +319,16 @@ func writeFreshConfig(t *testing.T, cluster *harness.Cluster) string {
 	return cfgFile
 }
 
+// migrateBaseline runs the offline origin-baseline migration that adopts
+// an unsigned legacy store.
+func migrateBaseline(t *testing.T, bin, cfgFile, keyID string) {
+	t.Helper()
+	cmd := exec.Command(bin, "migrate-origin-baseline", "--config", cfgFile, "--key-id", keyID)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("offline origin baseline migration: %v: %s", err, out)
+	}
+}
+
 // probeBoot runs a daemon on a config until /healthz reports ready, then
 // stops it cleanly. It proves the binary can open the store.
 func probeBoot(t *testing.T, name, bin, cfgFile string) {
@@ -304,7 +336,11 @@ func probeBoot(t *testing.T, name, bin, cfgFile string) {
 	logFile := filepath.Join(t.TempDir(), name+".log")
 	cmd := startDaemon(t, bin, cfgFile, logFile)
 	apiAddr := configAddr(t, cfgFile, "api_addr")
-	waitHealthz(t, apiAddr, 30*time.Second)
+	if err := waitHealthz(apiAddr, 30*time.Second); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("%s: %v\n%s", name, err, readLogTail(t, logFile))
+	}
 	t.Logf("%s: booted and healthy", name)
 	if err := cmd.Process.Signal(os.Interrupt); err != nil {
 		t.Fatalf("%s: interrupt: %v", name, err)
@@ -386,8 +422,7 @@ func configAddr(t *testing.T, cfgFile, key string) string {
 	return addr
 }
 
-func waitHealthz(t *testing.T, apiAddr string, timeout time.Duration) {
-	t.Helper()
+func waitHealthz(apiAddr string, timeout time.Duration) error {
 	client := &http.Client{
 		Timeout:   5 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec // healthz probe in a test
@@ -398,12 +433,12 @@ func waitHealthz(t *testing.T, apiAddr string, timeout time.Duration) {
 		if err == nil {
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				return
+				return nil
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("daemon at %s never became healthy within %v", apiAddr, timeout)
+	return fmt.Errorf("daemon at %s never became healthy within %v", apiAddr, timeout)
 }
 
 func freePort(t *testing.T) int {
@@ -520,12 +555,20 @@ func assertFormatMarkers(t *testing.T, cluster *harness.Cluster, pebbleDir, node
 	if err != nil {
 		t.Fatal(err)
 	}
+	// NOTE: no testdb.Configure here — it overwrites OriginSigning with
+	// deterministic fixture keys, but this store pinned the daemon's
+	// real key. The offline open must present the same identity.
+	registry, _ := origin.NewKeyRegistry(nil)
+	for _, n := range cluster.Nodes {
+		_ = registry.Add(n.NodeID, n.OriginKey.Public().(ed25519.PublicKey))
+	}
 	handle, err := db.Open(context.Background(), db.Config{
-		Path:   pebbleDir,
-		NodeID: node,
-		DBID:   cluster.DBID,
-		Schema: *schemaConfig(),
-		Pebble: db.DefaultPebbleConfig(),
+		Path:          pebbleDir,
+		NodeID:        node,
+		DBID:          cluster.DBID,
+		OriginSigning: db.OriginSigningConfig{PrivateKey: cluster.Nodes[0].OriginKey, TrustedKeys: registry},
+		Schema:        *schemaConfig(),
+		Pebble:        db.DefaultPebbleConfig(),
 		// No unlock API is involved (await_unlock=false); the daemon
 		// opens with the config key_id directly.
 		Encryption: db.EncryptionConfig{Key: key, KeyID: cluster.Nodes[0].KeyID},

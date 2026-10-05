@@ -95,7 +95,7 @@ jobs:
       - name: Run pure-Go live matrix
         env:
           CGO_ENABLED: 0
-          SPEDSQL_TAGS: modernc
+          MURMUR_TAGS: modernc
         run: |
           bash tests-live/run.sh three-node-sync
           bash tests-live/run.sh rolling-restart
@@ -104,7 +104,7 @@ jobs:
       - name: Run race-instrumented live matrix
         env:
           CGO_ENABLED: 1
-          SPEDSQL_RACE: '1'
+          MURMUR_RACE: '1'
         run: |
           bash tests-live/run.sh three-node-sync
           bash tests-live/run.sh rolling-restart

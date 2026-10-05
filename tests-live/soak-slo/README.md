@@ -10,12 +10,12 @@ generation, replication queue depth, and Pebble disk usage from Prometheus.
 Configure a longer acceptance run with:
 
 ```sh
-SPEDSQL_SLO_DURATION_SECONDS=7200 \
-SPEDSQL_SLO_SETTLE_SECONDS=300 \
+MURMUR_SLO_DURATION_SECONDS=7200 \
+MURMUR_SLO_SETTLE_SECONDS=300 \
 go test -count=1 -timeout=3h ./tests-live/soak-slo
 ```
 
-`SPEDSQL_SLO_DURATION_SECONDS` and `SPEDSQL_SLO_SETTLE_SECONDS` are independently
+`MURMUR_SLO_DURATION_SECONDS` and `MURMUR_SLO_SETTLE_SECONDS` are independently
 configurable. The two-hour command is the long-running acceptance profile; the
 short smoke run is not evidence that it has completed. These are broad
 stability gates for the current test environment, not a cross-hardware

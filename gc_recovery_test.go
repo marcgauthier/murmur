@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -45,7 +45,7 @@ func gcTestConfig(path string) Config {
 // and the retained log grows without bound under any sustained workload.
 func TestGCDrainsPastUnitCap(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, gcTestConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, gcTestConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestGCExpiredObligationReleasesHistory(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("expired", func(t *testing.T) {
-		db, err := Open(ctx, gcTestConfig(t.TempDir()))
+		db, err := openSignedFixture(ctx, gcTestConfig(t.TempDir()))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -127,7 +127,7 @@ func TestGCExpiredObligationReleasesHistory(t *testing.T) {
 	})
 
 	t.Run("live-pins", func(t *testing.T) {
-		db, err := Open(ctx, gcTestConfig(t.TempDir()))
+		db, err := openSignedFixture(ctx, gcTestConfig(t.TempDir()))
 		if err != nil {
 			t.Fatal(err)
 		}

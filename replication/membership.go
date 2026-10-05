@@ -51,18 +51,33 @@ type NodeMetadata struct {
 	DBID         ids.DBID
 	Capabilities uint64
 	Endpoint     string // Advertised reachable host:port
+	// FetchEndpoint is the reachable file-fetch host:port, empty when the
+	// node does not serve object fetches. It travels as an optional
+	// suffix so version-1 decoders (which ignore trailing bytes) keep
+	// working: no version bump, no rolling-upgrade break.
+	FetchEndpoint string
 }
 
 // EncodeNodeMetadata encodes metadata into binary format.
 func EncodeNodeMetadata(m *NodeMetadata) []byte {
 	endpointBytes := []byte(m.Endpoint)
-	buf := make([]byte, MetadataMinLen+len(endpointBytes))
+	fetchBytes := []byte(m.FetchEndpoint)
+	n := MetadataMinLen + len(endpointBytes)
+	if len(fetchBytes) > 0 {
+		n += 2 + len(fetchBytes)
+	}
+	buf := make([]byte, n)
 	binary.BigEndian.PutUint32(buf[0:4], MetadataMagic)
 	buf[4] = MetadataVersion
 	copy(buf[5:21], m.DBID[:])
 	binary.BigEndian.PutUint64(buf[21:29], m.Capabilities)
 	binary.BigEndian.PutUint16(buf[29:31], uint16(len(endpointBytes)))
 	copy(buf[31:], endpointBytes)
+	if len(fetchBytes) > 0 {
+		off := MetadataMinLen + len(endpointBytes)
+		binary.BigEndian.PutUint16(buf[off:off+2], uint16(len(fetchBytes)))
+		copy(buf[off+2:], fetchBytes)
+	}
 	return buf
 }
 
@@ -87,10 +102,22 @@ func DecodeNodeMetadata(b []byte, expectedDBID ids.DBID) (*NodeMetadata, error) 
 		return nil, ErrInvalidNodeMetadata
 	}
 	endpoint := string(b[31 : 31+epLen])
+	// Optional fetch-endpoint suffix: fetchLen(2) + bytes. Parsed only
+	// when it fits; anything beyond is ignored for forward compatibility,
+	// and a truncated suffix degrades to "not serving" rather than failing
+	// the whole (prefix-valid) record.
+	var fetchEndpoint string
+	if rest := b[MetadataMinLen+int(epLen):]; len(rest) >= 2 {
+		fetchLen := int(binary.BigEndian.Uint16(rest[:2]))
+		if fetchLen <= len(rest)-2 {
+			fetchEndpoint = string(rest[2 : 2+fetchLen])
+		}
+	}
 	return &NodeMetadata{
-		DBID:         dbid,
-		Capabilities: caps,
-		Endpoint:     endpoint,
+		DBID:          dbid,
+		Capabilities:  caps,
+		Endpoint:      endpoint,
+		FetchEndpoint: fetchEndpoint,
 	}, nil
 }
 
@@ -200,6 +227,12 @@ type MembershipService struct {
 	aliveMembers map[ids.NodeID]NodeMetadata
 	eventCh      chan MembershipEvent
 
+	// fetchEndpoint is the locally served file-fetch host:port advertised
+	// in SWIM metadata (empty when not serving). It is set after the
+	// fetch server binds, so it cannot come from static config: fetch
+	// endpoints commonly listen on ephemeral ports.
+	fetchEndpoint atomic.Value // string
+
 	probesCompleted    atomic.Uint64
 	probeFailures      atomic.Uint64
 	refutations        atomic.Uint64
@@ -289,9 +322,10 @@ func (s *MembershipService) NodeMeta(limit int) []byte {
 		}
 	}
 	meta := &NodeMetadata{
-		DBID:         s.dbid,
-		Capabilities: KnownCaps,
-		Endpoint:     advertise,
+		DBID:          s.dbid,
+		Capabilities:  KnownCaps,
+		Endpoint:      advertise,
+		FetchEndpoint: s.advertisedFetchEndpoint(),
 	}
 	enc := EncodeNodeMetadata(meta)
 	if len(enc) > limit {
@@ -299,6 +333,49 @@ func (s *MembershipService) NodeMeta(limit int) []byte {
 		return enc[:limit]
 	}
 	return enc
+}
+
+// advertisedFetchEndpoint returns the locally served file-fetch endpoint,
+// or "" when this node does not serve fetches.
+func (s *MembershipService) advertisedFetchEndpoint() string {
+	if v := s.fetchEndpoint.Load(); v != nil {
+		if addr, ok := v.(string); ok {
+			return addr
+		}
+	}
+	return ""
+}
+
+// SetFetchEndpoint advertises (or clears, when empty) the locally served
+// file-fetch endpoint and re-broadcasts local node state so the new
+// metadata gossips to the cluster. It is called once the fetch server has
+// bound its (possibly ephemeral) port. With no other members the update
+// is a no-op and the next join carries the endpoint; failures only delay
+// propagation and are logged.
+func (s *MembershipService) SetFetchEndpoint(addr string) {
+	s.fetchEndpoint.Store(addr)
+	s.mu.RLock()
+	closed := s.closed
+	ml := s.ml
+	s.mu.RUnlock()
+	if closed || ml == nil {
+		return
+	}
+	if err := ml.UpdateNode(2 * time.Second); err != nil {
+		s.log.Debug("fetch endpoint re-advertisement pending", slog.Any("err", err))
+	}
+}
+
+// AliveMembers returns the current alive-member view (excluding self),
+// including each member's advertised fetch endpoint ("" when not serving).
+func (s *MembershipService) AliveMembers() map[ids.NodeID]NodeMetadata {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[ids.NodeID]NodeMetadata, len(s.aliveMembers))
+	for id, meta := range s.aliveMembers {
+		out[id] = meta
+	}
+	return out
 }
 
 // NotifyMsg implements memberlist.Delegate.
@@ -473,7 +550,7 @@ func (s *MembershipService) reconcile() {
 				}
 				s.handler.OnPeerDiscovered(id, endpoint, *meta)
 			}
-		} else if existing.Endpoint != meta.Endpoint || existing.Capabilities != meta.Capabilities {
+		} else if existing.Endpoint != meta.Endpoint || existing.Capabilities != meta.Capabilities || existing.FetchEndpoint != meta.FetchEndpoint {
 			s.aliveMembers[id] = *meta
 			s.reconciledUpdates.Add(1)
 			if s.handler != nil {

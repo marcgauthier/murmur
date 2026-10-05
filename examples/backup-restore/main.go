@@ -10,11 +10,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 	"path/filepath"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/backup"
 	"github.com/marcgauthier/murmur/schema"
 )
@@ -31,27 +32,27 @@ func schemaTables() []schema.TableSchema {
 
 func main() {
 	ctx := context.Background()
-	base, err := os.MkdirTemp("", "spedsql-backup-*")
+	base, err := os.MkdirTemp("", "murmur-backup-*")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(base)
 
-	db, err := replicateddb.Open(ctx, replicateddb.Config{
+	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path:   filepath.Join(base, "node"),
-		NodeID: replicateddb.NewNodeID(),
-		Schema: replicateddb.SchemaConfig{Version: 1, Tables: schemaTables()},
-		Pebble: replicateddb.DefaultPebbleConfig(),
-		Encryption: replicateddb.EncryptionConfig{
+		NodeID: murmur.NewNodeID(),
+		Schema: murmur.SchemaConfig{Version: 1, Tables: schemaTables()},
+		Pebble: murmur.DefaultPebbleConfig(),
+		Encryption: murmur.EncryptionConfig{
 			Key:   []byte("0123456789abcdef0123456789abcdef"),
 			KeyID: "backup-key",
 		},
-	})
+	}))
 	if err != nil {
 		log.Fatal(err)
 	}
 	for i := 0; i < 5; i++ {
-		id := replicateddb.NewRowID()
+		id := murmur.NewRowID()
 		if _, err := db.ExecContext(ctx,
 			`INSERT INTO records (id, body) VALUES (?, ?)`,
 			id[:], fmt.Sprintf("record-%d", i)); err != nil {
@@ -75,7 +76,7 @@ func main() {
 
 	// Clone restore under a fresh writer identity: reusing the source
 	// NodeID is rejected so origin sequences can never repeat.
-	fresh := replicateddb.NewNodeID()
+	fresh := murmur.NewNodeID()
 	restored := filepath.Join(base, "restored")
 	if _, err := backup.Restore(ctx, backup.RestoreConfig{
 		Source:      dest,
@@ -85,16 +86,16 @@ func main() {
 	}); err != nil {
 		log.Fatal(err)
 	}
-	clone, err := replicateddb.Open(ctx, replicateddb.Config{
+	clone, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path:   restored,
 		NodeID: fresh,
-		Schema: replicateddb.SchemaConfig{Version: 1, Tables: schemaTables()},
-		Pebble: replicateddb.DefaultPebbleConfig(),
-		Encryption: replicateddb.EncryptionConfig{
+		Schema: murmur.SchemaConfig{Version: 1, Tables: schemaTables()},
+		Pebble: murmur.DefaultPebbleConfig(),
+		Encryption: murmur.EncryptionConfig{
 			Key:   []byte("0123456789abcdef0123456789abcdef"),
 			KeyID: "backup-key",
 		},
-	})
+	}))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -108,7 +109,7 @@ func main() {
 	if n != 5 {
 		log.Fatalf("want 5 restored rows, got %d", n)
 	}
-	id := replicateddb.NewRowID()
+	id := murmur.NewRowID()
 	if _, err := clone.ExecContext(ctx,
 		`INSERT INTO records (id, body) VALUES (?, ?)`, id[:], "post-restore"); err != nil {
 		log.Fatal(err)

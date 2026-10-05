@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -22,7 +22,7 @@ func openWithDDL(t *testing.T, ddl, localDDL []string) (*DB, error) {
 	cfg := testConfig(t.TempDir())
 	cfg.Schema.DDL = ddl
 	cfg.Schema.LocalDDL = localDDL
-	db, err := Open(context.Background(), cfg)
+	db, err := openSignedFixture(context.Background(), cfg)
 	if err == nil {
 		t.Cleanup(func() { db.Close() })
 	}
@@ -111,7 +111,7 @@ func TestOpenAcceptsToleratedDDL(t *testing.T) {
 }
 
 func TestExecStatementGate(t *testing.T) {
-	db, err := Open(context.Background(), testConfig(t.TempDir()))
+	db, err := openSignedFixture(context.Background(), testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ DROP TABLE contacts`, `/* x */ attach 'f' as g`,
 }
 
 func TestPoolQueryGate(t *testing.T) {
-	db, err := Open(context.Background(), testConfig(t.TempDir()))
+	db, err := openSignedFixture(context.Background(), testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestPoolQueryGate(t *testing.T) {
 }
 
 func TestTxQueryGate(t *testing.T) {
-	db, err := Open(context.Background(), testConfig(t.TempDir()))
+	db, err := openSignedFixture(context.Background(), testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func TestForeignKeysStayUnenforced(t *testing.T) {
 }
 
 func TestPrimaryKeyMustBe16Bytes(t *testing.T) {
-	db, err := Open(context.Background(), testConfig(t.TempDir()))
+	db, err := openSignedFixture(context.Background(), testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}

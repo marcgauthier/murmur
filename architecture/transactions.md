@@ -148,6 +148,12 @@ This reduces replication volume substantially.
 
 ## 15. Pebble Atomic Batch for a Local Mutation
 
+Local transactions are signed after assigning their origin sequence, before the atomic Pebble commit; remote transactions verify before any durable prepare, merge, receipt or HLC observation. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
+
+Transaction methods hold the transaction mutex through statement startup so
+context cancellation cannot roll back concurrently with an executing statement.
+Callers must still close transaction query rows before committing or rolling back.
+
 Once a transaction has been accepted for durable replication, a single Pebble batch must atomically:
 
 - Merge/update all winning cell states.
@@ -164,7 +170,7 @@ Ordinary remote apply writes the complete encoded transaction to a synced prepar
 
 This prepare record is the recovery boundary needed before any ordinary remote winner state is staged with `DB.Ingest`. The current ordinary apply implementation still uses the atomic batch to install winners; it does not yet use external SSTable ingestion. Any future ingestion optimization must keep the prepare record until the final metadata batch commits, and recovery must tolerate replay after ingestion by applying the same CRDT versions idempotently. Large snapshot imports already use SSTable ingestion because their candidate is staged separately, progress is replayable, SQL remains gated, and snapshot watermarks/generation publish only in the final batch. Local commits continue to use one synced batch.
 
-Pebble batches do not provide Badger-style optimistic transaction conflict detection. Serialize the entire read/merge/write operation for all local, remote, metadata, acknowledgement, and GC mutations through one state-store writer coordinator. Use an indexed batch where a merge needs to read its own pending writes. Independent readers use Pebble snapshots and bounded iterators; close snapshots, iterators, and value closers on every path, and copy borrowed bytes before retaining them.
+Pebble batches do not provide Badger-style optimistic transaction conflict detection. Serialize the entire read/merge/write operation for all local, remote, metadata, acknowledgement, and GC mutations through one state-store writer coordinator. Use an indexed batch where a merge needs to read its own pending writes. Independent readers use Pebble snapshots and bounded iterators; close snapshots, iterators, and value closers on every path, and copy borrowed bytes before retaining them. With synchronous group commit ([Section 16](#16-local-sql-commit-ordering)), one synced batch carries a whole group of local transactions instead of one; the serialization requirement is unchanged.
 
 This is one of the most important correctness requirements.
 
@@ -220,6 +226,38 @@ The client may retry.
 Therefore every mutation batch must have a TxID and duplicate TxIDs must be idempotent.
 
 This is a normal ambiguous-commit scenario and must have explicit tests.
+
+### Synchronous group commit
+
+Single-row synchronous writes are fsync-bound (one `pebble.Sync` per transaction, a few hundred tx/s), while the same workload without per-transaction sync runs an order of magnitude faster. Synchronous group commit closes most of that gap without weakening durability: concurrent transactions briefly queue after their SQL commit and share one Pebble batch with one fsync, and each transaction is still acknowledged only after that shared fsync.
+
+Path (enabled by default in synchronous mode; see `GroupCommitConfig`):
+
+```text
+1. Steps 1-7 above run serialized under writeMu, as before.
+2. The transaction enqueues its MutationBatch (still under writeMu, so
+   group order matches SQL-commit order), then releases its admission
+   ticket and writeMu so the next transaction's SQL overlaps this fsync.
+3. The first arrival (leader) waits up to MaxDelay for followers, or
+   until MaxTransactions/MaxBytes is reached, then commits the whole
+   group with one Store.CommitLocalGroup call: per-member log rows,
+   receipts, contiguous local sequences, origin signatures, and one
+   generation bump per applied member, in a single synced Pebble batch.
+4. The leader runs one remote flush, probes each member for interleaved
+   non-local commits (generation delta versus local-sequence delta;
+   equal deltas mean only lower-HLC local commits landed, which can
+   never overturn the member's materialized rows), repairs touched rows
+   when the probe trips, advances the materialized generation, and
+   notifies subscribers/replication once.
+5. Every member is ACKed (or failed) individually.
+```
+
+Consequences:
+
+- A group commit is atomic across members: if the shared Pebble commit fails, every member gets an error and the materializer rebuilds from durable state (the same "SQL ahead of durable" recovery as the single path). A failed group never partially acknowledges.
+- The ambiguous-commit rule is unchanged: crash after the shared fsync leaves every member durable, so duplicates must stay idempotent (duplicate TxIDs are acknowledged without reapplying).
+- Isolated writes pay up to `MaxDelay` (default one millisecond) with no batching benefit; throughput scales with concurrency (about one fsync per group). A negative `MaxDelay` disables grouping and restores the one-batch-per-transaction path.
+- `Metrics().GroupCommits` and `GroupCommitMembers` report group count and total carried transactions; divide for mean group size.
 
 ---
 

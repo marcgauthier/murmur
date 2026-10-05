@@ -45,9 +45,9 @@ func TestFrameRejects(t *testing.T) {
 func TestHelloRoundTrip(t *testing.T) {
 	h := &Hello{
 		ProtocolVersion: ProtocolVersion, MinProtocolVersion: MinProtocolVersion,
-		NodeID: ids.NewNodeID(), DBID: ids.NewDBID(),
+		NodeID: ids.NewNodeID(), DBID: fixtureDBID,
 		SchemaEpoch: 9, SchemaAuthorNode: ids.NewNodeID(), SchemaTimeCreated: 77,
-		Capabilities: CapZstd,
+		Capabilities: CapMergePolicies | CapOriginSignatures | (CapZstd),
 		Have:         []codec.OriginWatermark{{Origin: ids.NewNodeID(), Sequence: 12}},
 	}
 	h.SchemaHash[31] = 7
@@ -102,7 +102,7 @@ func TestBatchesRoundTrip(t *testing.T) {
 			Mutations: []codec.Mutation{{TableID: 1, RowID: ids.NewRowID(), ColumnID: 2, Value: codec.Text("v")}},
 		},
 	}
-	got, err := DecodeBatches(EncodeBatches(nil, batches), codec.DefaultLimits())
+	got, err := DecodeBatches(encodeBatchesFixture(nil, batches), codec.DefaultLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestSnapshotChunkRoundTrip(t *testing.T) {
 	if !got.Last || got.Index != 7 || len(got.Cells) != 1 {
 		t.Fatalf("mismatch: %+v", got)
 	}
-	if ProtocolVersion != 3 || MinProtocolVersion != 3 {
-		t.Fatal("snapshot format requires replication protocol v3")
+	if ProtocolVersion != 5 || MinProtocolVersion != 5 {
+		t.Fatal("snapshot format requires replication protocol v5")
 	}
 }

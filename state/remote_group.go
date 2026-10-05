@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crdt"
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 type remoteGroupCell struct {
@@ -41,6 +43,12 @@ func (s *Store) CommitRemoteGroup(ctx context.Context, batches []*codec.Mutation
 	defer s.gate.RUnlock()
 	var groupBytes int64
 	for _, batch := range batches {
+		if err := s.VerifyOrigin(batch); err != nil {
+			return MergeResult{}, err
+		}
+		if err := s.validatePolicyBatch(batch); err != nil {
+			return MergeResult{}, err
+		}
 		if len(batch.Mutations) == 0 {
 			return MergeResult{}, fmt.Errorf("state: empty batch in remote group")
 		}
@@ -63,6 +71,12 @@ func (s *Store) CommitRemoteGroup(ctx context.Context, batches []*codec.Mutation
 	staged := make(map[string]*remoteGroupCell)
 	order := make([]string, 0)
 	receipts := make(map[ids.TxID]struct{}, len(batches))
+	groupIdentities := make(map[ids.TxID][]byte, len(batches))
+	type originPosition struct {
+		Origin   ids.NodeID
+		Sequence uint64
+	}
+	groupSequences := make(map[originPosition][]byte, len(batches))
 	gen, err := s.readU64Direct(sysGeneration)
 	if err != nil {
 		return MergeResult{}, err
@@ -72,6 +86,18 @@ func (s *Store) CommitRemoteGroup(ctx context.Context, batches []*codec.Mutation
 		return MergeResult{}, err
 	}
 	for _, batch := range batches {
+		if err := s.checkRemoteIdentity(batch); err != nil {
+			return MergeResult{}, err
+		}
+		if previous, ok := groupIdentities[batch.TxID]; ok && !bytes.Equal(previous, codec.EncodeBatch(nil, batch)) {
+			return MergeResult{}, codec.ErrOriginConflict
+		}
+		groupIdentities[batch.TxID] = codec.EncodeBatch(nil, batch)
+		position := originPosition{batch.OriginNode, batch.Sequence}
+		if previous, ok := groupSequences[position]; ok && !bytes.Equal(previous, groupIdentities[batch.TxID]) {
+			return MergeResult{}, codec.ErrOriginConflict
+		}
+		groupSequences[position] = groupIdentities[batch.TxID]
 		if _, seen := receipts[batch.TxID]; seen {
 			continue
 		}
@@ -117,30 +143,17 @@ func (s *Store) CommitRemoteGroup(ctx context.Context, batches []*codec.Mutation
 		gen++
 		result.Applied = true
 		dirty = true
-		s.clock.Observe(batch.HLC)
 	}
 	if !dirty {
 		result.Generation = gen
 		return result, nil
 	}
-	for _, key := range order {
-		cell := staged[key]
-		if !cell.changed {
-			continue
-		}
-		if cell.tomb {
-			if err := b.Set(cell.key, codec.EncodeTombstone(nil, cell.version), nil); err != nil {
-				return MergeResult{}, err
-			}
-			result.Winners = append(result.Winners, WinningChange{TableID: cell.table, RowID: cell.row, Tombstone: true, Version: cell.version})
-		} else {
-			value := codec.CellState{Version: cell.version, Value: cell.value}
-			if err := b.Set(cell.key, codec.EncodeCellState(nil, value), nil); err != nil {
-				return MergeResult{}, err
-			}
-			result.Winners = append(result.Winners, WinningChange{TableID: cell.table, RowID: cell.row, ColumnID: cell.column, Value: cell.value, Version: cell.version})
-		}
+	var writeErr error
+	result.Winners, writeErr = writeStagedCells(b, staged, order)
+	if writeErr != nil {
+		return MergeResult{}, writeErr
 	}
+
 	if err := b.Set(SysKey(sysHLC), encodeU64(maxHLC), nil); err != nil {
 		return MergeResult{}, err
 	}
@@ -153,6 +166,7 @@ func (s *Store) CommitRemoteGroup(ctx context.Context, batches []*codec.Mutation
 		return MergeResult{}, err
 	}
 	result.Generation = gen
+	s.clock.Observe(maxHLC)
 	return result, nil
 }
 
@@ -168,6 +182,48 @@ func (s *Store) mergeRemoteGroupBatch(b *pebble.Batch, batch *codec.MutationBatc
 	seen := make(map[string]struct{}, len(batch.Mutations))
 	for i := range batch.Mutations {
 		mutation := &batch.Mutations[i]
+		if mutation.Flags == codec.FlagBridgeReceipt {
+			key := ReceiptKey(ids.TxID(mutation.RowID))
+			if old, err := s.getDirect(key); err == nil && !bytes.Equal(old, mutation.Value.B) {
+				return codec.ErrOriginConflict
+			} else if err != nil && !isNotFound(err) {
+				return err
+			}
+			if old := staged[string(key)]; old != nil && !bytes.Equal(old.value.B, mutation.Value.B) {
+				return codec.ErrOriginConflict
+			}
+			if staged[string(key)] == nil {
+				*order = append(*order, string(key))
+			}
+			staged[string(key)] = &remoteGroupCell{key: key, value: mutation.Value, changed: true, present: true}
+			continue
+		}
+		if mutation.Policy != 0 {
+			if err := s.mergePolicyMutation(mutation, ver, staged, order); err != nil {
+				return err
+			}
+			continue
+		}
+		if !mutation.IsTombstone() && s.isMergeShadow(mutation.TableID, mutation.ColumnID) && s.columnPolicy(mutation.TableID, mutation.ColumnID) != schema.LWW {
+			cell, err := stageCell(s, staged, order, CellKey(mutation.TableID, mutation.RowID, mutation.ColumnID), mutation.TableID, mutation.RowID, mutation.ColumnID)
+			if err != nil {
+				return err
+			}
+			if cell.present {
+				epoch, _, active, err := codec.ShadowValue(cell.value, s.limits)
+				if err != nil {
+					return err
+				}
+				if !active {
+					epoch = cell.version
+				}
+				if crdt.CompareVersion(ver, epoch) <= 0 {
+					continue
+				}
+			}
+			cell.value, cell.version, cell.present, cell.changed = mutation.Value, ver, true, true
+			continue
+		}
 		var key []byte
 		var mapKey string
 		var storedVersion crdt.Version

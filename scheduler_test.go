@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -457,7 +457,7 @@ func TestSchedulerExclusion(t *testing.T) {
 // admits through the coordinator under its class.
 func TestCoordinatorCoversMutationPaths(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,7 +474,7 @@ func TestCoordinatorCoversMutationPaths(t *testing.T) {
 
 	// Remote apply and schema sync share the remote class (errors ignored:
 	// admission precedes the work).
-	_ = db.ApplyRemote(ctx, &codec.MutationBatch{OriginNode: NewNodeID(), Sequence: 1})
+	_ = applyRemoteFixture(db, ctx, &codec.MutationBatch{OriginNode: NewNodeID(), Sequence: 1})
 	_ = db.SyncSchemas(ctx, nil)
 	if got := acq().Remote.Acquisitions; got != 2 {
 		t.Fatalf("remote acquisitions = %d, want 2", got)

@@ -17,7 +17,7 @@ func TestSeparateStreamsDataAndControl(t *testing.T) {
 
 	mgrA, _, addrA := cl.testManager(t, nodeA, 1)
 
-	stB, err := state.Open(t.TempDir(), nodeB, cl.dbid, state.Options{})
+	stB, err := openSignedFixture(t.TempDir(), nodeB, cl.dbid, state.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestSeparateSnapshotStream(t *testing.T) {
 
 	mgrA, _, addrA := cl.testManager(t, nodeA, 1)
 
-	stB, err := state.Open(t.TempDir(), nodeB, cl.dbid, state.Options{})
+	stB, err := openSignedFixture(t.TempDir(), nodeB, cl.dbid, state.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}

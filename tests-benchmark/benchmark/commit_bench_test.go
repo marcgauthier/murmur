@@ -7,10 +7,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crypto"
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/internal/testidentity"
 	"github.com/marcgauthier/murmur/state"
 )
 
@@ -37,7 +38,7 @@ func openTemplateStore(b *testing.B, n int) (*state.Store, func()) {
 		b.Fatal(err)
 	}
 	st, err := state.Open(filepath.Join(dest, "data"), tmpl.node, tmpl.dbid,
-		state.Options{FS: efs, Limits: codec.DefaultLimits()})
+		state.Options{FS: efs, Limits: codec.DefaultLimits(), OriginSigning: testidentity.Config(tmpl.node)})
 	if err != nil {
 		reg.Close()
 		b.Fatal(err)
@@ -120,4 +121,4 @@ func BenchmarkRemoteApplyRate(b *testing.B) {
 	}
 }
 
-var _ = replicateddb.NewNodeID
+var _ = murmur.NewNodeID

@@ -10,12 +10,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"net"
 	"os"
 	"time"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/transport"
 )
@@ -29,7 +30,7 @@ func freePort() int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-func waitCounts(ctx context.Context, dbs []*replicateddb.DB, want int, timeout time.Duration, what string) {
+func waitCounts(ctx context.Context, dbs []*murmur.DB, want int, timeout time.Duration, what string) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
@@ -50,7 +51,7 @@ func waitCounts(ctx context.Context, dbs []*replicateddb.DB, want int, timeout t
 
 func main() {
 	ctx := context.Background()
-	base, err := os.MkdirTemp("", "spedsql-partition-*")
+	base, err := os.MkdirTemp("", "murmur-partition-*")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -60,21 +61,21 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	dbid := replicateddb.NewDBID()
+	dbid := murmur.NewDBID()
 
 	const nodes = 3
-	ids := make([]replicateddb.NodeID, nodes)
+	ids := make([]murmur.NodeID, nodes)
 	addrs := make([]string, nodes)
-	dbs := make([]*replicateddb.DB, nodes)
+	dbs := make([]*murmur.DB, nodes)
 	for i := range ids {
-		ids[i] = replicateddb.NewNodeID()
+		ids[i] = murmur.NewNodeID()
 		addrs[i] = fmt.Sprintf("127.0.0.1:%d", freePort())
 	}
 	for i := range dbs {
-		var peers []replicateddb.Peer
+		var peers []murmur.Peer
 		for j := range ids {
 			if i != j {
-				peers = append(peers, replicateddb.Peer{NodeID: ids[j], Addrs: []string{addrs[j]}})
+				peers = append(peers, murmur.Peer{NodeID: ids[j], Addrs: []string{addrs[j]}})
 			}
 		}
 		certPEM, keyPEM, err := ca.IssueNode(ids[i], 24*time.Hour)
@@ -85,11 +86,11 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		dbs[i], err = replicateddb.Open(ctx, replicateddb.Config{
+		dbs[i], err = murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 			Path:   dir,
 			NodeID: ids[i],
 			DBID:   dbid,
-			Schema: replicateddb.SchemaConfig{
+			Schema: murmur.SchemaConfig{
 				Version: 1,
 				Tables: []schema.TableSchema{{
 					Name: "notes",
@@ -99,19 +100,19 @@ func main() {
 					},
 				}},
 			},
-			Pebble: replicateddb.DefaultPebbleConfig(),
-			Encryption: replicateddb.EncryptionConfig{
+			Pebble: murmur.DefaultPebbleConfig(),
+			Encryption: murmur.EncryptionConfig{
 				Key:   []byte("0123456789abcdef0123456789abcdef"),
 				KeyID: "partition-key",
 			},
-			Replication: replicateddb.ReplicationConfig{
+			Replication: murmur.ReplicationConfig{
 				ListenAddr: addrs[i],
-				TLS: &replicateddb.TLSCredential{
+				TLS: &murmur.TLSCredential{
 					CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: ca.CertPEM,
 				},
 				Peers: peers,
 			},
-		})
+		}))
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -120,19 +121,19 @@ func main() {
 
 	// Baseline converges, then node 3 is cut off in both directions.
 	for r := 0; r < 6; r++ {
-		id := replicateddb.NewRowID()
+		id := murmur.NewRowID()
 		if _, err := dbs[0].ExecContext(ctx,
 			`INSERT INTO notes (id, body) VALUES (?, ?)`, id[:], fmt.Sprintf("base-%d", r)); err != nil {
 			log.Fatal(err)
 		}
 	}
 	waitCounts(ctx, dbs, 6, 60*time.Second, "baseline")
-	for _, db := range []*replicateddb.DB{dbs[0], dbs[1]} {
+	for _, db := range []*murmur.DB{dbs[0], dbs[1]} {
 		if err := db.RemovePeer(ctx, ids[2]); err != nil {
 			log.Fatal(err)
 		}
 	}
-	for _, id := range []replicateddb.NodeID{ids[0], ids[1]} {
+	for _, id := range []murmur.NodeID{ids[0], ids[1]} {
 		if err := dbs[2].RemovePeer(ctx, id); err != nil {
 			log.Fatal(err)
 		}
@@ -141,12 +142,12 @@ func main() {
 
 	// Offline writes on both sides: neither fails, neither crosses yet.
 	for r := 0; r < 4; r++ {
-		id := replicateddb.NewRowID()
+		id := murmur.NewRowID()
 		if _, err := dbs[0].ExecContext(ctx,
 			`INSERT INTO notes (id, body) VALUES (?, ?)`, id[:], fmt.Sprintf("online-%d", r)); err != nil {
 			log.Fatal(err)
 		}
-		id = replicateddb.NewRowID()
+		id = murmur.NewRowID()
 		if _, err := dbs[2].ExecContext(ctx,
 			`INSERT INTO notes (id, body) VALUES (?, ?)`, id[:], fmt.Sprintf("offline-%d", r)); err != nil {
 			log.Fatal(err)
@@ -159,7 +160,7 @@ func main() {
 	for i, db := range dbs {
 		for j, id := range ids {
 			if i != j {
-				if err := db.AddPeer(ctx, replicateddb.Peer{NodeID: id, Addrs: []string{addrs[j]}}); err != nil {
+				if err := db.AddPeer(ctx, murmur.Peer{NodeID: id, Addrs: []string{addrs[j]}}); err != nil {
 					log.Fatal(err)
 				}
 			}

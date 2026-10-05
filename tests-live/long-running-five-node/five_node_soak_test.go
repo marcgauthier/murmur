@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,7 +24,7 @@ var statusClient = &http.Client{Timeout: 3 * time.Second}
 
 func envSeconds(t *testing.T, key string, fallback int) time.Duration {
 	t.Helper()
-	if raw := os.Getenv(key); raw != "" {
+	if raw := harness.GetEnv(key); raw != "" {
 		value, err := strconv.Atoi(raw)
 		if err != nil || value < 1 {
 			t.Fatalf("%s must be a positive number of seconds", key)
@@ -36,9 +35,9 @@ func envSeconds(t *testing.T, key string, fallback int) time.Duration {
 }
 
 func TestFiveNodePersistentCapacityAndMeshSoak(t *testing.T) {
-	duration := envSeconds(t, "SPEDSQL_FIVE_NODE_DURATION_SECONDS", 30)
-	interval := envMillis(t, "SPEDSQL_FIVE_NODE_INTERVAL_MS", 50)
-	settle := envSeconds(t, "SPEDSQL_FIVE_NODE_SETTLE_SECONDS", 120)
+	duration := envSeconds(t, "MURMUR_FIVE_NODE_DURATION_SECONDS", 30)
+	interval := envMillis(t, "MURMUR_FIVE_NODE_INTERVAL_MS", 50)
+	settle := envSeconds(t, "MURMUR_FIVE_NODE_SETTLE_SECONDS", 120)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:        "long-running-five-node",
 		NumNodes:    5,
@@ -172,7 +171,7 @@ func TestFiveNodePersistentCapacityAndMeshSoak(t *testing.T) {
 
 func envMillis(t *testing.T, key string, fallback int) time.Duration {
 	t.Helper()
-	if raw := os.Getenv(key); raw != "" {
+	if raw := harness.GetEnv(key); raw != "" {
 		value, err := strconv.Atoi(raw)
 		if err != nil || value < 1 {
 			t.Fatalf("%s must be a positive number of milliseconds", key)

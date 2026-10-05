@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 )
 
 // TestLocalTransactionBatchThroughput compares rows per SQL transaction on
@@ -20,21 +20,21 @@ func TestLocalTransactionBatchThroughput(t *testing.T) {
 		t.Skip("local transaction-size benchmark runs outside -short")
 	}
 	writeFor := 2 * time.Second
-	if raw := os.Getenv("SPEDSQL_LOCAL_BATCH_BENCH_SECONDS"); raw != "" {
+	if raw := os.Getenv("MURMUR_LOCAL_BATCH_BENCH_SECONDS"); raw != "" {
 		seconds, err := strconv.Atoi(raw)
 		if err != nil || seconds < 1 {
-			t.Fatal("SPEDSQL_LOCAL_BATCH_BENCH_SECONDS must be a positive integer")
+			t.Fatal("MURMUR_LOCAL_BATCH_BENCH_SECONDS must be a positive integer")
 		}
 		writeFor = time.Duration(seconds) * time.Second
 	}
 
 	modes := []struct {
 		name       string
-		durability replicateddb.DurabilityConfig
+		durability murmur.DurabilityConfig
 	}{
 		{name: "sync_each"},
-		{name: "sync_1s", durability: replicateddb.DurabilityConfig{
-			Mode: replicateddb.DurabilityAsync, SyncInterval: time.Second,
+		{name: "sync_1s", durability: murmur.DurabilityConfig{
+			Mode: murmur.DurabilityAsync, SyncInterval: time.Second,
 		}},
 	}
 	for _, mode := range modes {
@@ -44,7 +44,7 @@ func TestLocalTransactionBatchThroughput(t *testing.T) {
 				t.Run(name, func(t *testing.T) {
 					ctx := context.Background()
 					cfg := localWriterConfig(t.TempDir(), mode.durability)
-					db, err := replicateddb.Open(ctx, cfg)
+					db, err := murmur.Open(ctx, cfg)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -131,7 +131,7 @@ func TestLocalTransactionBatchThroughput(t *testing.T) {
 						t.Fatal(err)
 					}
 					db = nil
-					db, err = replicateddb.Open(ctx, cfg)
+					db, err = murmur.Open(ctx, cfg)
 					if err != nil {
 						t.Fatalf("reopen after writes: %v", err)
 					}

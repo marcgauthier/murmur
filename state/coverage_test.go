@@ -65,7 +65,7 @@ func TestReceiveWatermarksListsOrigins(t *testing.T) {
 	}
 	// Ship a's log to b so b tracks two origins.
 	_, err := a.LogScan(a.NodeID(), 1, 100, 1<<20, func(batch *codec.MutationBatch) error {
-		_, err := b.CommitRemote(ctx, batch)
+		_, err := commitRemoteFixture(b, ctx, batch)
 		return err
 	})
 	if err != nil {

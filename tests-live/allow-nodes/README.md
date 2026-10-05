@@ -12,5 +12,5 @@ all identities; node2 allows only node1. All nodes produce application writes
 concurrently for three minutes by default. The test requires the unauthorized
 node3-to-node2 session to remain absent while traffic is active, then checks
 all rows and ordered state digests converge through node1. Set
-`SPEDSQL_ALLOW_NODES_WRITE_SECONDS` to shorten or extend the workload. Failure
+`MURMUR_ALLOW_NODES_WRITE_SECONDS` to shorten or extend the workload. Failure
 artifacts preserve all node configurations and logs under `tests-live/failures/`.

@@ -135,6 +135,9 @@ func (s *Store) StageTransactionChunk(_ context.Context, raw []byte, maxBytes in
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := s.VerifyOriginChunk(c); err != nil {
+		return nil, nil, err
+	}
 	s.gate.RLock()
 	defer s.gate.RUnlock()
 	s.writeMu.Lock()
@@ -233,6 +236,9 @@ func (s *Store) StageTransactionChunk(_ context.Context, raw []byte, maxBytes in
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := s.VerifyOrigin(batch); err != nil {
+		return nil, nil, err
+	}
 	return batch, nil, nil
 }
 
@@ -315,7 +321,7 @@ func (s *Store) ClearStagedTransaction(tx ids.TxID) error {
 }
 
 func sameStagedTransaction(a, b *codec.TransactionChunk) bool {
-	return a.Version == b.Version && a.Origin == b.Origin && a.Sequence == b.Sequence && a.TxID == b.TxID && a.SchemaEpoch == b.SchemaEpoch && a.SchemaHash == b.SchemaHash && a.TotalLength == b.TotalLength && a.Digest == b.Digest && a.Count == b.Count
+	return a.DBID == b.DBID && a.HLC == b.HLC && a.SignatureVersion == b.SignatureVersion && a.MutationDigest == b.MutationDigest && a.OriginSignature == b.OriginSignature && a.Version == b.Version && a.Origin == b.Origin && a.Sequence == b.Sequence && a.TxID == b.TxID && a.SchemaEpoch == b.SchemaEpoch && a.SchemaHash == b.SchemaHash && a.TotalLength == b.TotalLength && a.Digest == b.Digest && a.Count == b.Count
 }
 
 func encodeStagedMeta(c *codec.TransactionChunk, received uint32) []byte {
@@ -329,11 +335,16 @@ func encodeStagedMeta(c *codec.TransactionChunk, received uint32) []byte {
 	out = binary.BigEndian.AppendUint64(out, c.TotalLength)
 	out = append(out, c.Digest[:]...)
 	out = binary.BigEndian.AppendUint32(out, c.Count)
-	return binary.BigEndian.AppendUint32(out, received)
+	out = binary.BigEndian.AppendUint32(out, received)
+	out = binary.BigEndian.AppendUint64(out, c.HLC)
+	out = append(out, c.DBID[:]...)
+	out = binary.BigEndian.AppendUint16(out, c.SignatureVersion)
+	out = append(out, c.MutationDigest[:]...)
+	return append(out, c.OriginSignature[:]...)
 }
 
 func decodeStagedMeta(raw []byte) (*codec.TransactionChunk, uint32, error) {
-	if len(raw) != 130 {
+	if len(raw) != 252 {
 		return nil, 0, fmt.Errorf("state: corrupt staged transaction metadata")
 	}
 	c := &codec.TransactionChunk{}
@@ -357,6 +368,11 @@ func decodeStagedMeta(raw []byte) (*codec.TransactionChunk, uint32, error) {
 	c.Count = binary.BigEndian.Uint32(raw[o : o+4])
 	o += 4
 	received := binary.BigEndian.Uint32(raw[o : o+4])
+	c.HLC = binary.BigEndian.Uint64(raw[130:138])
+	copy(c.DBID[:], raw[138:154])
+	c.SignatureVersion = binary.BigEndian.Uint16(raw[154:156])
+	copy(c.MutationDigest[:], raw[156:188])
+	copy(c.OriginSignature[:], raw[188:252])
 	if c.Count == 0 || received > c.Count {
 		return nil, 0, fmt.Errorf("state: invalid staged transaction metadata")
 	}

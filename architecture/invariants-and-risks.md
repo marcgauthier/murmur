@@ -203,6 +203,6 @@ Before stable release:
 - verify High ownership protection and file-object integrity across imports, snapshots, and restore.
 - keep optional service administration/unlock authorization separate from mesh permissions.
 
-If forwarded origin records are accepted, the batch must be cryptographically attributable or trusted according to the cluster trust model. In an all-trusted-node cluster, mTLS plus protocol validation may be sufficient. If nodes are not mutually trusted, add origin signatures in a future security phase.
+Forwarded transactions must authenticate their immutable identity and mutation digest with the origin's Ed25519 key. mTLS authenticates the forwarding peer independently. Unsigned input is rejected before applied progress. Merged-state snapshots require separately configured trusted sources; signatures do not provide Byzantine consensus or schema authorization. See [origin signatures](origin-signatures.md).
 
 ---

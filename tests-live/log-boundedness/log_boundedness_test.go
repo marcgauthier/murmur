@@ -37,7 +37,7 @@ func schemaConfig() *db.SchemaConfig {
 }
 
 func loadSeconds() int {
-	if v := os.Getenv("SPEDSQL_LOG_BOUNDEDNESS_SECONDS"); v != "" {
+	if v := harness.GetEnv("MURMUR_LOG_BOUNDEDNESS_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}

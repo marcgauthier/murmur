@@ -232,3 +232,5 @@ Arrival order does not matter.
 
 ---
 
+
+Current schema-level counter, set and extrema behavior, causal storage, signed wire formats, bridge ownership and upgrade requirements are specified in [merge policies](merge-policies.md). LWW remains the default.

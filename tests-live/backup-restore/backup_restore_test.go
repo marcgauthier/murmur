@@ -12,6 +12,8 @@ package backuprestore_test
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -25,6 +27,7 @@ import (
 
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/origin"
 	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
@@ -172,12 +175,25 @@ func offlineConfig(t *testing.T, pebbleDir string, cluster *harness.Cluster, nod
 	if err != nil {
 		t.Fatal(err)
 	}
+	var signingKey ed25519.PrivateKey
+	registry, _ := origin.NewKeyRegistry(nil)
+	for _, n := range cluster.Nodes {
+		_ = registry.Add(n.NodeID, n.OriginKey.Public().(ed25519.PublicKey))
+		if n.NodeID == node {
+			signingKey = n.OriginKey
+		}
+	}
+	if len(signingKey) == 0 {
+		_, signingKey, _ = ed25519.GenerateKey(rand.Reader)
+		_ = registry.Add(node, signingKey.Public().(ed25519.PublicKey))
+	}
 	return db.Config{
-		Path:   pebbleDir,
-		NodeID: node,
-		DBID:   cluster.DBID,
-		Schema: *schemaConfig(),
-		Pebble: db.DefaultPebbleConfig(),
+		Path:          pebbleDir,
+		NodeID:        node,
+		DBID:          cluster.DBID,
+		OriginSigning: db.OriginSigningConfig{PrivateKey: signingKey, TrustedKeys: registry},
+		Schema:        *schemaConfig(),
+		Pebble:        db.DefaultPebbleConfig(),
 		// The daemon unlocks with key_id "remote-unlock-key" (see
 		// handleAdminUnlock); the offline open must use the same ID.
 		Encryption: db.EncryptionConfig{Key: keyBytes(t, cluster.Nodes[0].KeyHex), KeyID: "remote-unlock-key"},
@@ -203,7 +219,22 @@ func rewriteNodeConfig(t *testing.T, node *harness.Node, freshNodeID string) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		t.Fatal(err)
 	}
+	_, freshKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.OriginKey = freshKey
+	if err := os.WriteFile(filepath.Join(node.TLSDir, "origin.key"), freshKey, 0600); err != nil {
+		t.Fatal(err)
+	}
 	cfg["node_id"] = freshNodeID
+	if originKeys, ok := cfg["origin_public_keys"].(map[string]any); ok {
+		originKeys[freshNodeID] = hex.EncodeToString(node.OriginKey.Public().(ed25519.PublicKey))
+		cfg["origin_public_keys"] = originKeys
+	}
+	if sources, ok := cfg["trusted_snapshot_sources"].([]any); ok {
+		cfg["trusted_snapshot_sources"] = append(sources, freshNodeID)
+	}
 	out, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		t.Fatal(err)
@@ -224,6 +255,7 @@ func mustParseNodeID(t *testing.T, s string) db.NodeID {
 }
 
 func reissueNodeCert(t *testing.T, cluster *harness.Cluster, node *harness.Node, freshNodeID string) {
+	cluster.ProvisionOrigin(node.NodeID, node.OriginKey)
 	t.Helper()
 	id := mustParseNodeID(t, freshNodeID)
 	certPEM, keyPEM, err := cluster.CA.IssueNode(id, 24*time.Hour)

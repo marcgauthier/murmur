@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 
 func TestStateStorePeerExclusion(t *testing.T) {
 	dir := t.TempDir()
-	store, err := state.Open(dir, ids.NewNodeID(), ids.NewDBID(), state.Options{})
+	store, err := openStateSignedFixture(dir, ids.NewNodeID(), ids.NewDBID(), state.Options{})
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestPeerExclusionAndRetirement(t *testing.T) {
 	dirA := t.TempDir()
 	dirB := t.TempDir()
 
-	dbA, err := Open(ctx, replConfig(dirA, nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replConfig(dirA, nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestPeerExclusionAndRetirement(t *testing.T) {
 	addrA := waitForAddr(t, dbA, 5*time.Second)
 
 	cfgB := replConfig(dirB, nodeB, dbid, creds[nodeB], []Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
-	dbB, err := Open(ctx, cfgB)
+	dbB, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestPeerExclusionAndRetirement(t *testing.T) {
 	}
 
 	// Reopen dbB with nodeA in initial Peers config
-	dbB2, err := Open(ctx, cfgB)
+	dbB2, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestPeerManagementValidation(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA)
 
-	db, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	db, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func TestPeerManagementValidation(t *testing.T) {
 	}
 
 	// Closed DB validation
-	db2, err := Open(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	db2, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	if err != nil {
 		t.Fatal(err)
 	}

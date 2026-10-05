@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,9 +29,9 @@ const (
 )
 
 func TestChunkedTransactionResumesAfterReceiverSIGKILL(t *testing.T) {
-	rows := envInt("SPEDSQL_TXCHUNK_ROWS", 1200)
-	valueBytes := envInt("SPEDSQL_TXCHUNK_VALUE_BYTES", 9000)
-	maxAttempts := envInt("SPEDSQL_TXCHUNK_ATTEMPTS", 3)
+	rows := envInt("MURMUR_TXCHUNK_ROWS", 1200)
+	valueBytes := envInt("MURMUR_TXCHUNK_VALUE_BYTES", 9000)
+	maxAttempts := envInt("MURMUR_TXCHUNK_ATTEMPTS", 3)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:        "txchunk-resume",
 		NumNodes:    3,
@@ -448,7 +447,7 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 }
 
 func envInt(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {
 		return v
 	}
 	return fallback

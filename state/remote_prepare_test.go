@@ -14,7 +14,7 @@ func TestCommitRemotePreparedRecoveryIsAtomic(t *testing.T) {
 	node := ids.NewNodeID()
 	origin := ids.NewNodeID()
 	opt := Options{Limits: codec.DefaultLimits()}
-	s, err := Open(path, node, ids.DBID{}, opt)
+	s, err := openSignedFixture(path, node, ids.DBID{}, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +29,7 @@ func TestCommitRemotePreparedRecoveryIsAtomic(t *testing.T) {
 	}
 	batch.Mutations[0].RowID[0] = 9
 	s.remotePrepareFault = func() error { return errors.New("injected interruption after prepare") }
-	if _, err := s.CommitRemote(context.Background(), batch); err == nil {
+	if _, err := commitRemoteFixture(s, context.Background(), batch); err == nil {
 		t.Fatal("expected interruption after durable prepare")
 	}
 	if wm, _ := s.ReceiveWatermark(origin); wm != 0 {
@@ -45,7 +45,7 @@ func TestCommitRemotePreparedRecoveryIsAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s, err = Open(path, node, ids.DBID{}, opt)
+	s, err = openSignedFixture(path, node, ids.DBID{}, opt)
 	if err != nil {
 		t.Fatalf("open and recover: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestCommitRemotePreparedRecoveryIsAtomic(t *testing.T) {
 	if hlc := s.ClockMax(); hlc < batch.HLC {
 		t.Fatalf("recovered HLC = %d", hlc)
 	}
-	if _, err := s.CommitRemote(context.Background(), batch); err != nil {
+	if _, err := commitRemoteFixture(s, context.Background(), batch); err != nil {
 		t.Fatalf("idempotent retry: %v", err)
 	}
 	if gen, _ := s.StateGeneration(); gen != 1 {

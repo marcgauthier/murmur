@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,7 +29,7 @@ import (
 )
 
 func TestPauseResumeLosesNoWrites(t *testing.T) {
-	stopSeconds := envSeconds("SPEDSQL_PAUSE_RESUME_STOP_SECONDS", 20)
+	stopSeconds := envSeconds("MURMUR_PAUSE_RESUME_STOP_SECONDS", 20)
 	if stopSeconds < 15 {
 		t.Logf("stop window %ds below the 15s floor; using 15s", stopSeconds)
 		stopSeconds = 15
@@ -437,7 +436,7 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 }
 
 func envSeconds(name string, fallback int) int {
-	if value, err := strconv.Atoi(os.Getenv(name)); err == nil && value > 0 {
+	if value, err := strconv.Atoi(harness.GetEnv(name)); err == nil && value > 0 {
 		return value
 	}
 	return fallback

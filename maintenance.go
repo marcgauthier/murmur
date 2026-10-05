@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"bytes"
@@ -24,7 +24,7 @@ func (db *DB) RotateStorageKey(ctx context.Context, material KeyMaterial) error 
 	if db.dbState != StateReady {
 		st := db.dbState
 		db.mu.Unlock()
-		return fmt.Errorf("replicateddb: rotate in state %s", st)
+		return fmt.Errorf("murmur: rotate in state %s", st)
 	}
 	reg := db.keyReg
 	if reg == nil {
@@ -47,7 +47,7 @@ func (db *DB) RotateStorageKey(ctx context.Context, material KeyMaterial) error 
 	}
 	algID, _ := crypto.ParseAlgorithm(material.Algorithm) // validated above
 	if _, err := reg.RewrapWith(ctx, material); err != nil {
-		return fmt.Errorf("replicateddb: rewrap key registry: %w", err)
+		return fmt.Errorf("murmur: rewrap key registry: %w", err)
 	}
 	// Later persists must re-wrap under the new key, not the provider that
 	// served the old one. The next Open uses the application's own
@@ -69,7 +69,7 @@ func (db *DB) RotateDataKey(ctx context.Context) error {
 	if db.dbState != StateReady {
 		st := db.dbState
 		db.mu.Unlock()
-		return fmt.Errorf("replicateddb: rotate data key in state %s", st)
+		return fmt.Errorf("murmur: rotate data key in state %s", st)
 	}
 	mgr := db.encMgr
 	if mgr == nil {
@@ -85,7 +85,7 @@ func (db *DB) RotateDataKey(ctx context.Context) error {
 	}()
 
 	if _, err := mgr.RotateDataKey(ctx); err != nil {
-		return fmt.Errorf("replicateddb: rotate data key: %w", err)
+		return fmt.Errorf("murmur: rotate data key: %w", err)
 	}
 	return nil
 }
@@ -97,13 +97,13 @@ func (db *DB) RotateDataKey(ctx context.Context) error {
 func (db *DB) SetEncryptionAlgorithm(ctx context.Context, algorithm EncryptionAlgorithm) error {
 	algID, err := parseAlgorithm(algorithm)
 	if err != nil {
-		return fmt.Errorf("replicateddb: SetEncryptionAlgorithm: %w", err)
+		return fmt.Errorf("murmur: SetEncryptionAlgorithm: %w", err)
 	}
 	db.mu.Lock()
 	if db.dbState != StateReady {
 		st := db.dbState
 		db.mu.Unlock()
-		return fmt.Errorf("replicateddb: set algorithm in state %s", st)
+		return fmt.Errorf("murmur: set algorithm in state %s", st)
 	}
 	reg, mgr := db.keyReg, db.encMgr
 	if reg == nil || mgr == nil {
@@ -121,13 +121,13 @@ func (db *DB) SetEncryptionAlgorithm(ctx context.Context, algorithm EncryptionAl
 	}()
 
 	if err := reg.SetDefaultAlgorithm(ctx, algID); err != nil {
-		return fmt.Errorf("replicateddb: set write algorithm: %w", err)
+		return fmt.Errorf("murmur: set write algorithm: %w", err)
 	}
 	// The algorithm is persisted; mint its first data key now. If this
 	// fails the caller retries RotateDataKey: until then new files keep
 	// using the previous generation (retained, never orphaned).
 	if _, err := mgr.RotateDataKey(ctx); err != nil {
-		return fmt.Errorf("replicateddb: mint data key for %s: %w", algorithm, err)
+		return fmt.Errorf("murmur: mint data key for %s: %w", algorithm, err)
 	}
 	db.mu.Lock()
 	db.cfg.Encryption.Algorithm = algorithm
@@ -191,7 +191,7 @@ func (db *DB) RewriteEncryptedFiles(ctx context.Context) error {
 	if db.dbState != StateReady {
 		st := db.dbState
 		db.mu.Unlock()
-		return fmt.Errorf("replicateddb: rewrite in state %s", st)
+		return fmt.Errorf("murmur: rewrite in state %s", st)
 	}
 	mgr := db.encMgr
 	if mgr == nil || db.keyReg == nil {
@@ -207,7 +207,7 @@ func (db *DB) RewriteEncryptedFiles(ctx context.Context) error {
 	// the state flips, so a refused admission leaves no residue.
 	ticket, err := db.sched.Admit(ctx, WriterMaintenance)
 	if err != nil {
-		return fmt.Errorf("replicateddb: writer admission: %w", err)
+		return fmt.Errorf("murmur: writer admission: %w", err)
 	}
 	defer ticket.Release()
 
@@ -245,14 +245,14 @@ func (db *DB) RewriteEncryptedFiles(ctx context.Context) error {
 			// Past flush: the handle is dead; reopen before resuming.
 			if rerr := db.store.ReopenAfterMaintenance(); rerr != nil {
 				db.setState(StateFailed)
-				return fmt.Errorf("replicateddb: reopen after failed maintenance close: %w (close: %v)",
+				return fmt.Errorf("murmur: reopen after failed maintenance close: %w (close: %v)",
 					rerr, err)
 			}
 		}
 		// Flush failed: the store never closed and stays usable.
 		db.startReplicationAfterMaintenance(peers, hadManager)
 		markUsable()
-		return fmt.Errorf("replicateddb: close for maintenance: %w", err)
+		return fmt.Errorf("murmur: close for maintenance: %w", err)
 	}
 	// The store is closed; rewrite (journaled, resumable). A rewrite error
 	// or cancel still reopens and resumes below.
@@ -262,7 +262,7 @@ func (db *DB) RewriteEncryptedFiles(ctx context.Context) error {
 	}()
 	if err := db.store.ReopenAfterMaintenance(); err != nil {
 		db.setState(StateFailed)
-		return fmt.Errorf("replicateddb: reopen after maintenance: %w", err)
+		return fmt.Errorf("murmur: reopen after maintenance: %w", err)
 	}
 	// Nobody could write across the window; a generation change means the
 	// rewrite did not preserve logical state. Fail closed (restart
@@ -270,9 +270,9 @@ func (db *DB) RewriteEncryptedFiles(ctx context.Context) error {
 	if gen, err := db.store.StateGeneration(); err != nil || gen != preGen {
 		db.setState(StateFailed)
 		if err != nil {
-			return fmt.Errorf("replicateddb: verify after maintenance: %w", err)
+			return fmt.Errorf("murmur: verify after maintenance: %w", err)
 		}
-		return fmt.Errorf("replicateddb: generation changed across maintenance (%d != %d)", gen, preGen)
+		return fmt.Errorf("murmur: generation changed across maintenance (%d != %d)", gen, preGen)
 	}
 	db.startReplicationAfterMaintenance(peers, hadManager)
 	markUsable()

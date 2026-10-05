@@ -7,7 +7,7 @@
 // fail closed on anything else. Data replication stays gated until both
 // sides verify identical schemas; retained batches from validated
 // compatible ancestors remain applicable after additive upgrades.
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -123,14 +123,14 @@ func (db *DB) migrate(ctx context.Context, newTables []schema.TableSchema, local
 	st := db.dbState
 	db.mu.Unlock()
 	if st != StateReady {
-		return fmt.Errorf("replicateddb: migrate in state %s", st)
+		return fmt.Errorf("murmur: migrate in state %s", st)
 	}
 	// Serialize with writes, applies, rotation, and adoption. Lock order
 	// (outer to inner): scheduler ticket, writeMu, applyMu, db.mu, store
 	// gate. Migrations are maintenance-class writers.
 	ticket, err := db.sched.Admit(ctx, WriterMaintenance)
 	if err != nil {
-		return fmt.Errorf("replicateddb: writer admission: %w", err)
+		return fmt.Errorf("murmur: writer admission: %w", err)
 	}
 	defer ticket.Release()
 	db.writeMu.Lock()
@@ -138,14 +138,14 @@ func (db *DB) migrate(ctx context.Context, newTables []schema.TableSchema, local
 	db.applyMu.Lock()
 	defer db.applyMu.Unlock()
 	if st := db.getState(); st != StateReady {
-		return fmt.Errorf("replicateddb: migrate in state %s", st)
+		return fmt.Errorf("murmur: migrate in state %s", st)
 	}
 	cur, err := db.store.LoadSchemaManifest()
 	if err != nil {
 		return err
 	}
 	if cur == nil {
-		return fmt.Errorf("replicateddb: no published schema")
+		return fmt.Errorf("murmur: no published schema")
 	}
 	assigned, err := schema.AssignIDs(cur.Tables, newTables)
 	if err != nil {
@@ -258,7 +258,7 @@ func (db *DB) publishSchemaRevisionWithLocalDDL(cur, next *schema.Manifest, loca
 	// partially applied DDL from generated definitions. Callers hold
 	// applyMu, which rebuildLocked requires.
 	if err := db.rebuildLocked(); err != nil {
-		return fmt.Errorf("replicateddb: rebuild after schema publish: %w", err)
+		return fmt.Errorf("murmur: rebuild after schema publish: %w", err)
 	}
 	db.setSchemaRegistry(newReg)
 	db.setSchemaIdentity(replication.SchemaIdentity{
@@ -332,7 +332,7 @@ func (db *DB) LiveSchema() (uint64, []schema.TableSchema, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.reg == nil {
-		return 0, nil, fmt.Errorf("replicateddb: schema not initialized")
+		return 0, nil, fmt.Errorf("murmur: schema not initialized")
 	}
 	return db.reg.Epoch, registryTables(db.reg), nil
 }
@@ -360,7 +360,7 @@ func (db *DB) RevisionsForPeer(wantCurrent bool, wantIDs [][32]byte, maxBytes in
 	}
 	if wantCurrent {
 		if !take(cur) {
-			return nil, fmt.Errorf("replicateddb: current schema exceeds %d bytes", maxBytes)
+			return nil, fmt.Errorf("murmur: current schema exceeds %d bytes", maxBytes)
 		}
 	}
 	seen := map[[32]byte]bool{schema.RevisionID(cur): true}

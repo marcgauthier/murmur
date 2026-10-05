@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -10,35 +10,38 @@ import (
 	"time"
 )
 
-// DriverName is the database/sql driver name for replicateddb.
+// DriverName is the database/sql driver name for murmur.
 //
 // Register a *DB under a handle, then open it through database/sql:
 //
-//	replicateddb.RegisterDriverDB("primary", db)
-//	sqldb, err := sql.Open(replicateddb.DriverName, "primary")
+//	murmur.RegisterDriverDB("primary", db)
+//	sqldb, err := sql.Open(murmur.DriverName, "primary")
 //
 // Alternatively, bypass the registry with sql.OpenDB:
 //
-//	sqldb := sql.OpenDB(replicateddb.NewConnector(db))
+//	sqldb := sql.OpenDB(murmur.NewConnector(db))
 //
 // All statements execute through the controlled transaction and capture
 // APIs: Exec runs writes as implicit transactions, Query runs reads on the
 // shared materialization, and Begin maps to DB.BeginTx. Closing the sql.DB
 // (or its connections) never closes the underlying *DB.
-const DriverName = "replicateddb"
+const DriverName = "murmur"
+
+// LegacyDriverName is the retained legacy driver name ("replicateddb") for backwards compatibility.
+const LegacyDriverName = "replicateddb"
 
 // ErrDriverNotRegistered is returned when opening an unregistered handle.
-var ErrDriverNotRegistered = fmt.Errorf("replicateddb: driver database not registered")
+var ErrDriverNotRegistered = fmt.Errorf("murmur: driver database not registered")
 
 // ErrDriverTxActive is returned when beginning a transaction on a connection
 // that already holds one.
-var ErrDriverTxActive = fmt.Errorf("replicateddb: transaction already in progress")
+var ErrDriverTxActive = fmt.Errorf("murmur: transaction already in progress")
 
 // ErrDriverWriteQuery is returned when a write-capable statement is issued
 // as a Query outside an explicit transaction. Writes issued through the
 // read path would bypass change capture, so use Exec (implicit transaction)
 // or Begin + Query + Commit instead.
-var ErrDriverWriteQuery = fmt.Errorf("replicateddb: write statement requires Exec or an explicit transaction")
+var ErrDriverWriteQuery = fmt.Errorf("murmur: write statement requires Exec or an explicit transaction")
 
 var (
 	defaultSQLDriver = &sqlDriver{}
@@ -51,6 +54,7 @@ var (
 
 func init() {
 	sql.Register(DriverName, defaultSQLDriver)
+	sql.Register(LegacyDriverName, defaultSQLDriver)
 }
 
 // RegisterDriverDB exposes db to sql.Open(DriverName, name). It overwrites
@@ -90,7 +94,7 @@ func NewConnector(db *DB) driver.Connector {
 // connection shares the same *DB.
 func (c *Connector) Connect(_ context.Context) (driver.Conn, error) {
 	if c == nil || c.db == nil {
-		return nil, fmt.Errorf("replicateddb: nil connector database")
+		return nil, fmt.Errorf("murmur: nil connector database")
 	}
 	switch c.db.getState() {
 	case StateClosed, StateClosing:
@@ -432,7 +436,7 @@ func (r *txDriverRows) Next(dest []driver.Value) error {
 
 func scanToDriverValues(ncols int, scan func(dest ...any) error, dest []driver.Value) error {
 	if len(dest) != ncols {
-		return fmt.Errorf("replicateddb: column count %d != dest %d", ncols, len(dest))
+		return fmt.Errorf("murmur: column count %d != dest %d", ncols, len(dest))
 	}
 	vals := make([]any, ncols)
 	ptrs := make([]any, ncols)
@@ -496,14 +500,14 @@ func toDriverValue(v any) (driver.Value, error) {
 		if driver.IsValue(v) {
 			return v, nil
 		}
-		return nil, fmt.Errorf("replicateddb: unsupported column type %T", v)
+		return nil, fmt.Errorf("murmur: unsupported column type %T", v)
 	}
 }
 
 func uintToDriverValue(v uint64) (driver.Value, error) {
 	const maxInt64 = uint64(1<<63 - 1)
 	if v > maxInt64 {
-		return nil, fmt.Errorf("replicateddb: unsigned value %d overflows int64", v)
+		return nil, fmt.Errorf("murmur: unsigned value %d overflows int64", v)
 	}
 	return int64(v), nil
 }

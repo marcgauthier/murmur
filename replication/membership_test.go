@@ -62,7 +62,7 @@ func (h *mockMembershipHandler) hasLeft(nodeID ids.NodeID) bool {
 }
 
 func TestNodeMetadataEncoding(t *testing.T) {
-	dbid := ids.NewDBID()
+	dbid := fixtureDBID
 	meta := &NodeMetadata{
 		DBID:         dbid,
 		Capabilities: CapZstd,
@@ -110,7 +110,7 @@ func TestMembershipServiceDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dbid := ids.NewDBID()
+	dbid := fixtureDBID
 
 	nodeA := ids.NewNodeID()
 	certA, keyA, err := ca.IssueNode(nodeA, 24*time.Hour)
@@ -241,7 +241,7 @@ func TestMembershipReconciliationAndBootstrapRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dbid := ids.NewDBID()
+	dbid := fixtureDBID
 
 	nodeA := ids.NewNodeID()
 	certA, keyA, err := ca.IssueNode(nodeA, 24*time.Hour)

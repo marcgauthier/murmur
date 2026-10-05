@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 // admission always precedes the conflicting SQL/state locks:
 //
 //	Class            Sections
-//	WriterLocal      BeginTx (whole transaction, SQL plus durable commit)
+//	WriterLocal      BeginTx (SQL phase; the grouped shared fsync runs ticketless)
 //	WriterRemote     ApplyRemote, ApplySnapshotChunk, SyncSchemas
 //	WriterMaintenance Migrate, RewriteEncryptedFiles, log/receipt GC units
 //
@@ -95,13 +95,13 @@ func (c *WriterSchedulingConfig) withDefaults() {
 
 func (c WriterSchedulingConfig) validate() error {
 	if c.LocalShare <= 0 || c.RemoteShare <= 0 {
-		return fmt.Errorf("replicateddb: writer shares must be positive (got %d/%d)", c.LocalShare, c.RemoteShare)
+		return fmt.Errorf("murmur: writer shares must be positive (got %d/%d)", c.LocalShare, c.RemoteShare)
 	}
 	if c.LocalShare+c.RemoteShare != 100 {
-		return fmt.Errorf("replicateddb: writer shares must total 100 (got %d/%d)", c.LocalShare, c.RemoteShare)
+		return fmt.Errorf("murmur: writer shares must total 100 (got %d/%d)", c.LocalShare, c.RemoteShare)
 	}
 	if c.MaxDebt <= 0 {
-		return fmt.Errorf("replicateddb: writer max debt must be positive")
+		return fmt.Errorf("murmur: writer max debt must be positive")
 	}
 	return nil
 }

@@ -26,7 +26,7 @@
 //  5. Cleanup with RemovePeer for every cross edge, then re-verify each
 //     cluster still converges internally.
 //
-// Knob: SPEDSQL_DBID_ISO_WINDOW_S (default 10, minimum 10) sets the
+// Knob: MURMUR_DBID_ISO_WINDOW_S (default 10, minimum 10) sets the
 // isolation observation window. Default runtime is well under 3 minutes.
 package dbidisolation_test
 
@@ -49,7 +49,7 @@ import (
 )
 
 func TestCrossDatabasePeersNeverConnect(t *testing.T) {
-	window := time.Duration(envInt("SPEDSQL_DBID_ISO_WINDOW_S", 10)) * time.Second
+	window := time.Duration(envInt("MURMUR_DBID_ISO_WINDOW_S", 10)) * time.Second
 	if window < 10*time.Second {
 		t.Fatalf("isolation window %v below the 10s minimum", window)
 	}
@@ -420,7 +420,7 @@ func waitMetricAdvanced(t *testing.T, name string, timeout time.Duration, nodes 
 }
 
 func envInt(name string, fallback int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {
 		return v
 	}
 	return fallback

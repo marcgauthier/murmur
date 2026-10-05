@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -78,8 +77,8 @@ func TestContinuousWritesAcrossPartitionAndHealing(t *testing.T) {
 		}(node)
 	}
 
-	partitionSeconds := envSeconds("SPEDSQL_CHAOS_PARTITION_SECONDS", 12)
-	healSeconds := envSeconds("SPEDSQL_CHAOS_HEAL_SECONDS", 12)
+	partitionSeconds := envSeconds("MURMUR_CHAOS_PARTITION_SECONDS", 12)
+	healSeconds := envSeconds("MURMUR_CHAOS_HEAL_SECONDS", 12)
 	time.Sleep(time.Duration(partitionSeconds) * time.Second)
 	pauseAndDrain(t, &paused, &active)
 	leftRows := 1 + int(writes[0].Load()+writes[1].Load())
@@ -240,7 +239,7 @@ func assertConverged(t *testing.T, cluster *harness.Cluster, wantRows int) {
 }
 
 func envSeconds(name string, fallback int) int {
-	if value, err := strconv.Atoi(os.Getenv(name)); err == nil && value > 0 {
+	if value, err := strconv.Atoi(harness.GetEnv(name)); err == nil && value > 0 {
 		return value
 	}
 	return fallback

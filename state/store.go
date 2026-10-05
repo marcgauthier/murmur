@@ -17,10 +17,17 @@ import (
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crdt"
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/origin"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 // Options configures the durable store.
 type Options struct {
+	OriginSigning origin.Config
+	// MigrateUnsignedBaseline authorizes offline conversion of trusted legacy state.
+	// Conversion finishes before Open returns; no unsigned runtime mode is exposed.
+	MigrateUnsignedBaseline bool
+	MigrateMergePolicies    bool
 	// FS is the filesystem Pebble uses (the encrypted VFS in production).
 	// Nil means vfs.Default.
 	FS vfs.FS
@@ -38,6 +45,11 @@ type Options struct {
 	// CompactionConcurrency caps background compactions as (1, n).
 	// Zero keeps Pebble's default (1, 1).
 	CompactionConcurrency int
+	// DisableAutomaticCompactions stops Pebble from scheduling automatic
+	// compactions (flushes still run). Production leaves it false; tests
+	// use it to simulate stalled compaction and prove the node stays
+	// correct while L0 debt piles up.
+	DisableAutomaticCompactions bool
 	// Compression overrides every level's block profile. Nil keeps default.
 	Compression *sstable.CompressionProfile
 	// WALBytesPerSync smooths WAL writes. Zero keeps Pebble's default.
@@ -148,9 +160,14 @@ type retentionLease struct {
 // commits serialize on one writer mutex and apply atomically through a
 // Pebble batch; multi-key reads use point-in-time snapshots.
 type Store struct {
-	db     *pebble.DB
-	clock  crdt.Clock
-	limits codec.Limits
+	policyMergeAttempts atomic.Uint64
+	policyMergeNanos    atomic.Uint64
+	policyRejected      atomic.Uint64
+	mergeRegistry       atomic.Pointer[schema.Registry]
+	migratingOrigin     bool
+	db                  *pebble.DB
+	clock               crdt.Clock
+	limits              codec.Limits
 
 	nodeID ids.NodeID
 	dbID   ids.DBID
@@ -174,6 +191,12 @@ type Store struct {
 	openOpt  Options
 
 	writeOpts *pebble.WriteOptions
+	// unsyncedBytes estimates WAL bytes written without a sync. Every
+	// NoSync commit through commitBatch/dbSet adds its size; Sync
+	// subtracts the pre-sync total. Reads are approximate (batch bytes,
+	// not exact WAL framing) and exist only to drive the asynchronous
+	// size-triggered durability sync.
+	unsyncedBytes atomic.Uint64
 	// fatal is the sticky fail-closed capture: once Pebble reports a
 	// terminal storage error, every operation returns ErrStorageFailed
 	// until the process restarts.
@@ -198,6 +221,10 @@ type Store struct {
 // Open opens (or creates) the store. nodeID must match any stored identity;
 // dbID zero loads the stored id, nonzero must match or initialize.
 func Open(path string, nodeID ids.NodeID, dbID ids.DBID, opt Options) (*Store, error) {
+	if err := opt.OriginSigning.Validate(nodeID); err != nil {
+		return nil, err
+	}
+	opt.OriginSigning.PrivateKey = append([]byte(nil), opt.OriginSigning.PrivateKey...)
 	fs := opt.FS
 	if fs == nil {
 		fs = vfs.Default
@@ -234,6 +261,7 @@ func Open(path string, nodeID ids.NodeID, dbID ids.DBID, opt Options) (*Store, e
 		n := opt.CompactionConcurrency
 		popt.CompactionConcurrencyRange = func() (int, int) { return 1, n }
 	}
+	popt.DisableAutomaticCompactions = opt.DisableAutomaticCompactions
 	popt.EnsureDefaults()
 	if opt.Compression != nil {
 		for i := range popt.Levels {
@@ -272,9 +300,19 @@ func Open(path string, nodeID ids.NodeID, dbID ids.DBID, opt Options) (*Store, e
 		db.Close()
 		return nil, fmt.Errorf("state: clean interrupted snapshot ingest: %w", err)
 	}
+	if err := s.loadMergeRegistry(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := s.recoverPreparedRemote(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("state: recover prepared remote transaction: %w", err)
+	}
+	if s.migratingOrigin {
+		if err := s.finishOriginBaseline(); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 	return s, nil
 }
@@ -286,15 +324,31 @@ func (s *Store) initMeta(nodeID ids.NodeID, dbID ids.DBID) error {
 	defer b.Close()
 	set := func(k, v []byte) error { return b.Set(k, v, nil) }
 	// Format version: this binary opens [MinFormatVersion, FormatVersion].
-	// Older binaries required strict equality with their own version, so
-	// they refuse stores first written here (downgrade guard), while this
-	// binary keeps opening previous-release stores read-write.
+	// Ordinary open requires signed format 5. Format 4 requires explicit
+	// offline merge-policy migration. Legacy formats 2/3 are
+	// recognized only during explicit offline trusted-baseline migration.
 	raw, err := s.getDirect(SysKey(sysFormat))
 	var storedFormat uint64
 	if err == nil {
 		v, ok := decodeU64(raw)
 		if !ok || v < MinFormatVersion || v > FormatVersion {
 			return fmt.Errorf("state: unsupported format version %d (want %d..%d)", v, MinFormatVersion, FormatVersion)
+		}
+		if v == 4 {
+			if !s.openOpt.MigrateMergePolicies {
+				return fmt.Errorf("state: signed format 4 requires explicit MigrateMergePolicies")
+			}
+			for _, name := range []string{sysFormat, sysMinReader, sysMinWriter} {
+				if err := set(SysKey(name), encodeU64(FormatVersion)); err != nil {
+					return err
+				}
+			}
+		}
+		if v < 4 {
+			if !s.openOpt.MigrateUnsignedBaseline {
+				return fmt.Errorf("state: unsigned legacy store requires explicit MigrateOriginBaseline")
+			}
+			s.migratingOrigin = true
 		}
 		storedFormat = v
 	} else if isNotFound(err) {
@@ -378,6 +432,15 @@ func (s *Store) initMeta(nodeID ids.NodeID, dbID ids.DBID) error {
 		}
 	} else {
 		return err
+	}
+	if !s.migratingOrigin {
+		adopting := false
+		if old, e := s.getDirect(SysKey(sysLocalNode)); e == nil {
+			adopting = !bytes.Equal(old, nodeID[:])
+		}
+		if err := s.pinOriginKey(b, adopting); err != nil {
+			return err
+		}
 	}
 	// Restore HLC floor so the clock cannot move backwards.
 	if raw, err := s.getDirect(SysKey(sysHLC)); err == nil {
@@ -556,8 +619,12 @@ func (s *Store) failedErr() error { return s.fatal.err() }
 // Logger.Fatalf and still returns nil from Commit; the post-commit capture
 // check turns that silent data loss into an explicit failure.
 func (s *Store) commitBatch(b *pebble.Batch, o *pebble.WriteOptions) error {
+	n := int64(b.Len())
 	if err := b.Commit(o); err != nil {
 		return err
+	}
+	if o == pebble.NoSync {
+		s.unsyncedBytes.Add(uint64(n))
 	}
 	return s.failedErr()
 }
@@ -566,6 +633,9 @@ func (s *Store) commitBatch(b *pebble.Batch, o *pebble.WriteOptions) error {
 func (s *Store) dbSet(key, value []byte, o *pebble.WriteOptions) error {
 	if err := s.db.Set(key, value, o); err != nil {
 		return err
+	}
+	if o == pebble.NoSync {
+		s.unsyncedBytes.Add(uint64(int64(len(key)) + int64(len(value))))
 	}
 	return s.failedErr()
 }
@@ -682,6 +752,16 @@ func (s *Store) CommitLocal(_ context.Context, batch *codec.MutationBatch) (Merg
 	}
 	seq++
 	batch.Sequence = seq
+	batch.ProtocolVersion = 5
+	if err := s.finalizeLocalPolicies(batch, make(map[string]*remoteGroupCell), new([]string)); err != nil {
+		return MergeResult{}, err
+	}
+	if err := checkBatchLimits(batch, s.limits); err != nil {
+		return MergeResult{}, err
+	}
+	if err := codec.SignOrigin(batch, s.dbID, s.openOpt.OriginSigning.PrivateKey); err != nil {
+		return MergeResult{}, err
+	}
 	ver := batch.Version()
 	b := s.db.NewBatch()
 	defer b.Close()
@@ -729,8 +809,18 @@ func (s *Store) CommitLocal(_ context.Context, batch *codec.MutationBatch) (Merg
 // CommitRemote durably merges a batch received from a peer. The batch keeps
 // its original origin/sequence identity for multi-origin forwarding.
 func (s *Store) CommitRemote(_ context.Context, batch *codec.MutationBatch) (MergeResult, error) {
+	if !s.migratingOrigin {
+		if err := s.VerifyOrigin(batch); err != nil {
+			return MergeResult{}, err
+		}
+	}
 	s.gate.RLock()
 	defer s.gate.RUnlock()
+	if !s.migratingOrigin {
+		if err := s.validatePolicyBatch(batch); err != nil {
+			return MergeResult{}, err
+		}
+	}
 	if len(batch.Mutations) == 0 {
 		return MergeResult{}, fmt.Errorf("state: empty batch")
 	}
@@ -740,6 +830,11 @@ func (s *Store) CommitRemote(_ context.Context, batch *codec.MutationBatch) (Mer
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	var res MergeResult
+	if !s.migratingOrigin {
+		if err := s.checkRemoteIdentity(batch); err != nil {
+			return MergeResult{}, err
+		}
+	}
 	// Duplicate TxID: acknowledge without reapplying.
 	if _, err := s.getDirect(ReceiptKey(batch.TxID)); err == nil {
 		gen, err := s.readU64Direct(sysGeneration)
@@ -780,6 +875,9 @@ func (s *Store) CommitRemote(_ context.Context, batch *codec.MutationBatch) (Mer
 		return MergeResult{}, fmt.Errorf("%w: origin %s want %d got %d", ErrGap, batch.OriginNode, wm+1, batch.Sequence)
 	}
 	encoded := codec.EncodeBatch(nil, batch)
+	if s.migratingOrigin {
+		encoded = append(append([]byte(nil), encoded[:94]...), encoded[codec.BatchHeaderSize:]...)
+	}
 	prepared, err := s.getDirect(SysKey(sysRemotePrepare))
 	if err == nil {
 		if !bytes.Equal(prepared, encoded) {
@@ -850,59 +948,12 @@ func (s *Store) CommitRemote(_ context.Context, batch *codec.MutationBatch) (Mer
 // mergeIntoBatch LWW-merges every mutation against stored state, staging
 // winner writes into b. Callers hold writeMu.
 func (s *Store) mergeIntoBatch(b *pebble.Batch, batch *codec.MutationBatch, ver crdt.Version) ([]WinningChange, error) {
-	winners := make([]WinningChange, 0, len(batch.Mutations))
-	// Pebble batches are write-only until commit; staged tracks cells
-	// already decided in this batch so intra-batch duplicates keep the
-	// first write (the old read-your-writes semantics).
-	staged := make(map[string]struct{}, len(batch.Mutations))
-	for i := range batch.Mutations {
-		m := &batch.Mutations[i]
-		if m.IsTombstone() {
-			key := string(TombKey(m.TableID, m.RowID))
-			if _, ok := staged[key]; ok {
-				continue
-			}
-			staged[key] = struct{}{}
-			stored, present, err := s.getTombDirect(m.TableID, m.RowID)
-			if err != nil {
-				return nil, err
-			}
-			switch crdt.MergeCell(ver, stored, present) {
-			case crdt.MergeTake:
-				if err := b.Set(TombKey(m.TableID, m.RowID), codec.EncodeTombstone(nil, ver), nil); err != nil {
-					return nil, err
-				}
-				winners = append(winners, WinningChange{
-					TableID: m.TableID, RowID: m.RowID,
-					Tombstone: true, Version: ver,
-				})
-			case crdt.MergeKeep, crdt.MergeEqual:
-			}
-			continue
-		}
-		key := string(CellKey(m.TableID, m.RowID, m.ColumnID))
-		if _, ok := staged[key]; ok {
-			continue
-		}
-		staged[key] = struct{}{}
-		stored, present, err := s.getCellDirect(m.TableID, m.RowID, m.ColumnID)
-		if err != nil {
-			return nil, err
-		}
-		switch crdt.MergeCell(ver, stored.Version, present) {
-		case crdt.MergeTake:
-			st := codec.CellState{Version: ver, Value: m.Value}
-			if err := b.Set(CellKey(m.TableID, m.RowID, m.ColumnID), codec.EncodeCellState(nil, st), nil); err != nil {
-				return nil, err
-			}
-			winners = append(winners, WinningChange{
-				TableID: m.TableID, RowID: m.RowID, ColumnID: m.ColumnID,
-				Value: m.Value, Version: ver,
-			})
-		case crdt.MergeKeep, crdt.MergeEqual:
-		}
+	staged := make(map[string]*remoteGroupCell)
+	var order []string
+	if err := s.mergeRemoteGroupBatch(b, batch, staged, &order); err != nil {
+		return nil, err
 	}
-	return winners, nil
+	return writeStagedCells(b, staged, order)
 }
 
 func (s *Store) getCellDirect(table uint32, row ids.RowID, col uint32) (codec.CellState, bool, error) {
@@ -1064,6 +1115,26 @@ func (s *Store) StateGeneration() (uint64, error) {
 	return s.readU64Direct(sysGeneration)
 }
 
+// BumpGeneration advances the monotonic mutation generation without
+// mutating data. Materializer rebuilds call it before discarding
+// SQLite: group members whose inline applies the rebuild drops must
+// observe a generation change at their durable commit so the repair
+// probe re-materializes them.
+func (s *Store) BumpGeneration() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	gen, err := s.readU64Direct(sysGeneration)
+	if err != nil {
+		return err
+	}
+	b := s.db.NewBatch()
+	defer b.Close()
+	if err := b.Set(SysKey(sysGeneration), encodeU64(gen+1), nil); err != nil {
+		return err
+	}
+	return s.commitBatch(b, s.writeOpts)
+}
+
 // SchemaEpoch returns the stored schema epoch and hash.
 func (s *Store) SchemaEpoch() (uint64, [32]byte, error) {
 	s.gate.RLock()
@@ -1169,6 +1240,13 @@ func (s *Store) AsyncDurability() bool {
 	return s.writeOpts == pebble.NoSync
 }
 
+// UnsyncedBytes estimates WAL bytes written without a sync (see
+// unsyncedBytes). It drives the asynchronous size-triggered durability
+// sync and is always zero in synchronous mode.
+func (s *Store) UnsyncedBytes() uint64 {
+	return s.unsyncedBytes.Load()
+}
+
 // Sync appends a WAL-only record and syncs it, ensuring durability of all
 // previously committed transactions. Pebble skips an empty batch entirely.
 func (s *Store) Sync() error {
@@ -1176,10 +1254,18 @@ func (s *Store) Sync() error {
 	defer s.gate.RUnlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	before := s.unsyncedBytes.Load()
 	if err := s.db.LogData(nil, pebble.Sync); err != nil {
 		return err
 	}
-	return s.failedErr()
+	if err := s.failedErr(); err != nil {
+		return err
+	}
+	// Subtract only the pre-sync total so bytes appended concurrently
+	// with the sync stay counted toward the next window. The counter only
+	// grows between the load above and here, so this never underflows.
+	s.unsyncedBytes.Add(-before)
+	return nil
 }
 
 // Size returns the database's total disk usage in bytes.
@@ -1340,6 +1426,14 @@ func checkBatchLimits(batch *codec.MutationBatch, lim codec.Limits) error {
 				n = len(m.Value.S)
 			case codec.TypeBlob:
 				n = len(m.Value.B)
+			}
+			for _, r := range m.Records {
+				if len(r.Key) > lim.MaxValueBytes || len(r.Data) > lim.MaxValueBytes {
+					return fmt.Errorf("state: CRDT record exceeds value limit: %w", ErrTooBig)
+				}
+			}
+			if lim.MaxMutations > 0 && len(m.Records) > lim.MaxMutations {
+				return fmt.Errorf("state: CRDT record count exceeds limit: %w", ErrTooBig)
 			}
 			if n > lim.MaxValueBytes {
 				return fmt.Errorf("state: mutation %d value of %d bytes exceeds %d: %w",
@@ -1510,6 +1604,13 @@ func (s *Store) RecordReceipt(txID ids.TxID) error {
 	defer s.gate.RUnlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	// Administrative receipt recording must not overwrite an authenticated
+	// mesh or atomic bridge receipt with a local placeholder.
+	if _, err := s.getDirect(ReceiptKey(txID)); err == nil {
+		return nil
+	} else if !isNotFound(err) {
+		return err
+	}
 	var receipt [24]byte
 	copy(receipt[:16], s.nodeID[:])
 	return s.dbSet(ReceiptKey(txID), receipt[:], s.writeOpts)

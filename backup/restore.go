@@ -17,7 +17,7 @@ import (
 
 // Restore unpacks a backup bundle from cfg.Source into cfg.TargetPath and cfg.KeysPath,
 // then records a restore intent requiring a fresh writer identity.
-// After Restore completes, the database is opened via replicateddb.Open using the
+// After Restore completes, the database is opened via murmur.Open using the
 // master key and cfg.FreshNodeID; opening under any other NodeID is rejected.
 func Restore(ctx context.Context, cfg RestoreConfig) (*Metadata, error) {
 	cfg.withDefaults()

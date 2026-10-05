@@ -64,7 +64,7 @@ Limit one active retrieval for a transaction identity locally while accepting id
 
 Transactions fitting a frame may use the existing complete-batch encoding. Larger transactions use versioned chunks carrying origin/sequence, TxID, schema version/hash, total encoded length, canonical transaction digest, and chunk index/count. Use protocol-wide 64 KiB payload chunks, with an exact shorter final chunk, independent of the supplying peer; the negotiated frame limit must accommodate one chunk plus headers. This makes partial chunk indexes stable across source changes. Validate all lengths, indexes, counts, total-byte limits, and schema/identity compatibility before allocation or staging.
 
-The `codec` package implements the version-1 `TXCH` frame and canonical transaction encoding/assembly in `EncodeTransactionChunks`, `EncodeTransactionChunk`, `DecodeTransactionChunk`, and `AssembleTransactionChunks`. It fixes payload chunks at 64 KiB, bounds the transaction at the configured codec limit (64 MiB by default), rejects inconsistent metadata and duplicate/missing chunks, and verifies the canonical digest and mutation identity before returning an assembled batch. `state.Store.StageTransactionChunk` persists fragments and the received count atomically; `replication.Manager` resumes incomplete transfers from the source or up to two alternate peers and applies only the fully assembled batch. Progress pages advertise the observed head, and separate cursor pages advertise the durable chunk bitmap.
+The `codec` package implements the version-2 `TXCH` frame and canonical transaction encoding/assembly in `EncodeTransactionChunks`, `EncodeTransactionChunk`, `DecodeTransactionChunk`, and `AssembleTransactionChunks`. It fixes payload chunks at 64 KiB, bounds the transaction at the configured codec limit (64 MiB by default), rejects inconsistent metadata and duplicate/missing chunks, and verifies the canonical digest and mutation identity before returning an assembled batch. `state.Store.StageTransactionChunk` persists fragments and the received count atomically; `replication.Manager` resumes incomplete transfers from the source or up to two alternate peers and applies only the fully assembled batch. Progress pages advertise the observed head, and separate cursor pages advertise the durable chunk bitmap.
 
 Stage chunks in package-owned encrypted Pebble storage outside authoritative current state, atomically persisting chunk receipt and transfer metadata. Byte-identical duplicates are harmless; conflicting digest/length/chunk definitions fail closed. Advertise only durably staged chunks for resumable transfer. When all chunks validate against the transaction digest, reconstruct the bounded transaction and atomically commit its complete mutations, log, receipt, and contiguous watermark through the normal apply coordinator. Staged data never appears in SQL queries. A crash before the apply commit resumes/retries staging; a crash after it deduplicates by the committed identity.
 
@@ -136,6 +136,8 @@ Implemented remote apply groups start at one transaction, double after successfu
 ---
 
 ## 33. Wire Encoding
+
+Transaction chunk v2 repeats the signed immutable identity and verifies it before staging. Complete assembly validates both the encoded-batch digest and signed mutation digest. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
 
 Use a compact versioned binary encoding.
 

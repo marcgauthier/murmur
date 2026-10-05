@@ -16,7 +16,7 @@ func TestPeerSelectionBoundedByFanout(t *testing.T) {
 	localID := ids.NewNodeID()
 	dbid := cluster.dbid
 
-	st, err := state.Open(t.TempDir(), localID, dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
+	st, err := openSignedFixture(t.TempDir(), localID, dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestPeerRotation(t *testing.T) {
 	localID := ids.NewNodeID()
 	dbid := cluster.dbid
 
-	st, err := state.Open(t.TempDir(), localID, dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
+	st, err := openSignedFixture(t.TempDir(), localID, dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestMembershipHandlerUpdates(t *testing.T) {
 	localID := ids.NewNodeID()
 	dbid := cluster.dbid
 
-	st, err := state.Open(t.TempDir(), localID, dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
+	st, err := openSignedFixture(t.TempDir(), localID, dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestAntiEntropyJitterAndExecution(t *testing.T) {
 	nodeB := ids.NewNodeID()
 	credsB := cluster.creds(t, nodeB)
 
-	stB, err := state.Open(t.TempDir(), nodeB, dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
+	stB, err := openSignedFixture(t.TempDir(), nodeB, dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +233,7 @@ func TestAntiEntropyJitterAndExecution(t *testing.T) {
 		t.Fatal("Node B failed to bind listener")
 	}
 
-	stA, err := state.Open(t.TempDir(), nodeA, dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
+	stA, err := openSignedFixture(t.TempDir(), nodeA, dbid, state.Options{Limits: codec.Limits{MaxValueBytes: 64, MaxMutations: 100}})
 	if err != nil {
 		t.Fatal(err)
 	}

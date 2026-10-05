@@ -106,7 +106,7 @@ func startChurnNode(t *testing.T, cluster *testCluster, idx int) *churnNode {
 
 func (n *churnNode) start(t *testing.T, cluster *testCluster) {
 	t.Helper()
-	st, err := state.Open(n.dir, n.id, cluster.dbid, state.Options{Limits: codec.DefaultLimits()})
+	st, err := openSignedFixture(n.dir, n.id, cluster.dbid, state.Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}

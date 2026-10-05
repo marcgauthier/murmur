@@ -13,8 +13,8 @@ The default run lasts five seconds with one second between uploads. To run the
 longer file soak, set the duration and interval explicitly:
 
 ```sh
-SPEDSQL_FILES_SOAK_DURATION_SECONDS=600 \
-SPEDSQL_FILES_SOAK_INTERVAL_SECONDS=60 \
+MURMUR_FILES_SOAK_DURATION_SECONDS=600 \
+MURMUR_FILES_SOAK_INTERVAL_SECONDS=60 \
 go test -timeout=12m -count=1 ./tests-live/files-soak
 ```
 

@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 
 func openCoverageDB(t *testing.T) *DB {
 	t.Helper()
-	db, err := Open(context.Background(), testConfig(t.TempDir()))
+	db, err := openSignedFixture(context.Background(), testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +380,7 @@ func TestBridgeThinWrappers(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.Files.Enabled = true
 	cfg.Files.ObjectKey = append([]byte(nil), testObjectKey...)
-	fdb, err := Open(ctx, cfg)
+	fdb, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -491,7 +491,7 @@ func TestOpenWithZstdLevels(t *testing.T) {
 		t.Run(fmt.Sprintf("%s-%d", mode.Algorithm, mode.ZstdLevel), func(t *testing.T) {
 			cfg := testConfig(t.TempDir())
 			cfg.Pebble.Compression = mode
-			db, err := Open(ctx, cfg)
+			db, err := openSignedFixture(ctx, cfg)
 			if err != nil {
 				t.Fatal(err)
 			}

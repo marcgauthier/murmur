@@ -11,25 +11,26 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 
-	replicateddb "github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/schema"
 )
 
 func main() {
 	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "spedsql-prepared-*")
+	dir, err := os.MkdirTemp("", "murmur-prepared-*")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
-	db, err := replicateddb.Open(ctx, replicateddb.Config{
+	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path:   dir,
-		NodeID: replicateddb.NewNodeID(),
-		Schema: replicateddb.SchemaConfig{
+		NodeID: murmur.NewNodeID(),
+		Schema: murmur.SchemaConfig{
 			Version: 1,
 			Tables: []schema.TableSchema{{
 				Name: "sensors",
@@ -40,13 +41,13 @@ func main() {
 				},
 			}},
 		},
-		Pebble: replicateddb.DefaultPebbleConfig(),
-		Encryption: replicateddb.EncryptionConfig{
+		Pebble: murmur.DefaultPebbleConfig(),
+		Encryption: murmur.EncryptionConfig{
 			Key:   []byte("0123456789abcdef0123456789abcdef"),
 			KeyID: "prepared-key",
 		},
-		Cache: replicateddb.CacheConfig{StatementCacheEntries: 64},
-	})
+		Cache: murmur.CacheConfig{StatementCacheEntries: 64},
+	}))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -58,7 +59,7 @@ func main() {
 	}
 	defer stmt.Close()
 	for i := 0; i < 50; i++ {
-		id := replicateddb.NewRowID()
+		id := murmur.NewRowID()
 		if _, err := stmt.ExecContext(ctx, id[:], fmt.Sprintf("sensor-%d", i%5), i); err != nil {
 			log.Fatal(err)
 		}

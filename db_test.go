@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"bytes"
@@ -12,6 +12,7 @@ import (
 
 	"github.com/marcgauthier/murmur/crypto"
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/internal/testidentity"
 	"github.com/marcgauthier/murmur/schema"
 )
 
@@ -36,11 +37,13 @@ var testKey = bytes.Repeat([]byte{0x3a}, 32)
 const testKeyID = "test-key"
 
 func testConfig(path string) Config {
+	node := NewNodeID()
 	return Config{
-		Path:   path,
-		NodeID: NewNodeID(),
-		Schema: SchemaConfig{Version: 1, Tables: testSchema()},
-		Pebble: DefaultPebbleConfig(),
+		OriginSigning: testidentity.Config(node),
+		Path:          path,
+		NodeID:        node,
+		Schema:        SchemaConfig{Version: 1, Tables: testSchema()},
+		Pebble:        DefaultPebbleConfig(),
 		Encryption: EncryptionConfig{
 			Key:   append([]byte(nil), testKey...),
 			KeyID: testKeyID,
@@ -109,7 +112,7 @@ func TestLocalWriteReopenRebuild(t *testing.T) {
 	path := t.TempDir()
 	cfg := testConfig(path)
 
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +141,7 @@ func TestLocalWriteReopenRebuild(t *testing.T) {
 
 	// Reopen with the same NodeID: the in-memory database is rebuilt purely
 	// from Badger and must be identical.
-	db2, err := Open(ctx, cfg)
+	db2, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +158,7 @@ func TestLocalWriteReopenRebuild(t *testing.T) {
 
 func TestExplicitTxCoalescing(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +205,7 @@ func TestExplicitTxCoalescing(t *testing.T) {
 
 func TestTxRollback(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +234,7 @@ func TestTxRollback(t *testing.T) {
 
 func TestDeleteAndResurrectSQL(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +261,7 @@ func TestDeleteAndResurrectSQL(t *testing.T) {
 
 func TestQueryRowAndPrepare(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +295,7 @@ func TestOversizeValueRejected(t *testing.T) {
 	ctx := context.Background()
 	cfg := testConfig(t.TempDir())
 	cfg.MaxReplicatedValueBytes = 16
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,14 +318,14 @@ func TestSchemaMismatchFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir()
 	cfg := testConfig(path)
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = db.Close()
 	// Reopen with a different schema epoch: must refuse.
 	cfg.Schema.Version = 2
-	if _, err := Open(ctx, cfg); !errors.Is(err, ErrSchemaMismatch) {
+	if _, err := openSignedFixture(ctx, cfg); !errors.Is(err, ErrSchemaMismatch) {
 		t.Fatalf("expected ErrSchemaMismatch, got %v", err)
 	}
 }
@@ -341,7 +344,7 @@ func TestEncryptedOpenWrongKeyFails(t *testing.T) {
 	path := t.TempDir()
 	key := randomKey(t)
 	cfg := providerConfig(testConfig(path), "k1", key)
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +355,7 @@ func TestEncryptedOpenWrongKeyFails(t *testing.T) {
 	_ = db.Close()
 
 	// Correct key reopens.
-	db2, err := Open(ctx, cfg)
+	db2, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +366,7 @@ func TestEncryptedOpenWrongKeyFails(t *testing.T) {
 
 	// Wrong key fails to open.
 	cfg = providerConfig(cfg, "k1", randomKey(t))
-	if _, err := Open(ctx, cfg); err == nil {
+	if _, err := openSignedFixture(ctx, cfg); err == nil {
 		t.Fatal("expected open with wrong key to fail")
 	}
 }
@@ -375,7 +378,7 @@ func TestRotateStorageKey(t *testing.T) {
 	key1 := randomKey(t)
 	key2 := randomKey(t)
 	cfg := providerConfig(testConfig(path), "k1", key1)
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,7 +422,7 @@ func TestRotateStorageKey(t *testing.T) {
 
 	// New key opens with all data.
 	cfg = providerConfig(cfg, "k2", key2)
-	db2, err := Open(ctx, cfg)
+	db2, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,14 +434,14 @@ func TestRotateStorageKey(t *testing.T) {
 
 	// Old key is rejected.
 	cfg = providerConfig(cfg, "k1", key1)
-	if _, err := Open(ctx, cfg); err == nil {
+	if _, err := openSignedFixture(ctx, cfg); err == nil {
 		t.Fatal("expected old key to be rejected after rotation")
 	}
 }
 
 func TestStatusBasics(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,7 +498,7 @@ func TestRestartPreservesDeclarationColumnOrder(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	cfg := testConfig(dir)
-	db, err := Open(ctx, cfg)
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,7 +511,7 @@ func TestRestartPreservesDeclarationColumnOrder(t *testing.T) {
 		t.Fatalf("fresh open columns=%v, want %v", cols, want)
 	}
 
-	db2, err := Open(ctx, cfg)
+	db2, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -531,7 +534,7 @@ func queryColumns(t *testing.T, db *DB, q string) []string {
 
 func TestMetricsStmtCacheCounters(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -576,7 +579,7 @@ func TestPebbleCacheSettings(t *testing.T) {
 	}
 
 	// 4. Open real DB with custom cache size
-	db, err := Open(ctx, cfgDirect)
+	db, err := openSignedFixture(ctx, cfgDirect)
 	if err != nil {
 		t.Fatalf("Open with custom cache failed: %v", err)
 	}
@@ -584,4 +587,3 @@ func TestPebbleCacheSettings(t *testing.T) {
 	t.Logf("Pebble metrics with 128MiB cache setting: %+v", metrics)
 	_ = db.Close()
 }
-

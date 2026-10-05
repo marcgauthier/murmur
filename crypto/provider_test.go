@@ -69,15 +69,15 @@ func TestEnvProvider(t *testing.T) {
 	if _, err := rand.Read(key); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("REPLICATEDDB_TEST_KEY", hex.EncodeToString(key))
-	mat, err := (&EnvProvider{Var: "REPLICATEDDB_TEST_KEY"}).Current(context.Background())
+	t.Setenv("MURMUR_TEST_KEY", hex.EncodeToString(key))
+	mat, err := (&EnvProvider{Var: "MURMUR_TEST_KEY"}).Current(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hex.EncodeToString(mat.Key) != hex.EncodeToString(key) {
 		t.Fatal("key mismatch")
 	}
-	if _, err := (&EnvProvider{Var: "REPLICATEDDB_TEST_KEY_MISSING"}).Current(context.Background()); err == nil {
+	if _, err := (&EnvProvider{Var: "MURMUR_TEST_KEY_MISSING"}).Current(context.Background()); err == nil {
 		t.Fatal("expected missing-var error")
 	}
 }
@@ -134,8 +134,8 @@ func TestProviderAlgorithmLengths(t *testing.T) {
 	if _, err := p.Current(context.Background()); err == nil {
 		t.Fatal("expected length mismatch for AES-128-GCM")
 	}
-	t.Setenv("REPLICATEDDB_TEST_KEY16", "00112233445566778899aabbccddeeff")
-	m16, err := (&EnvProvider{Var: "REPLICATEDDB_TEST_KEY16", Algorithm: AlgorithmAEGIS128L}).Current(context.Background())
+	t.Setenv("MURMUR_TEST_KEY16", "00112233445566778899aabbccddeeff")
+	m16, err := (&EnvProvider{Var: "MURMUR_TEST_KEY16", Algorithm: AlgorithmAEGIS128L}).Current(context.Background())
 	if err != nil || len(m16.Key) != 16 || m16.Algorithm != AlgorithmAEGIS128L.String() {
 		t.Fatalf("env16: %v", err)
 	}

@@ -17,6 +17,11 @@ import (
 // subsystems are not implemented; their Status fields stay zero and must not
 // be mistaken for measured zeros.
 type stats struct {
+	originUnsigned         atomic.Uint64
+	originUnknown          atomic.Uint64
+	originSignatureInvalid atomic.Uint64
+	originDigestMismatch   atomic.Uint64
+	snapshotSourcesDenied  atomic.Uint64
 	// Connection and handshake.
 	dials                    atomic.Uint64
 	dialFailures             atomic.Uint64
@@ -82,6 +87,7 @@ type stats struct {
 	snapshotReRequested       atomic.Uint64
 	snapshotBusyReceived      atomic.Uint64
 	snapshotsBusyDeferred     atomic.Uint64
+	snapshotFramesSuppressed  atomic.Uint64
 
 	// Schema synchronization.
 	schemaRequestsSent      atomic.Uint64
@@ -110,8 +116,13 @@ type stats struct {
 // StatsSnapshot is a point-in-time copy of Manager counters plus queue-depth
 // gauges. It never contains secrets: only counts, depths, and sizes.
 type StatsSnapshot struct {
-	PeerCount      int
-	ConnectedPeers int
+	OriginUnsigned         uint64
+	OriginUnknown          uint64
+	OriginSignatureInvalid uint64
+	OriginDigestMismatch   uint64
+	SnapshotSourcesDenied  uint64
+	PeerCount              int
+	ConnectedPeers         int
 	// GatingMembers counts persisted members whose retention obligation
 	// is live (active, non-excluded, deadline unexpired). It is the GC
 	// gating set, independent of sessions and selection.
@@ -184,6 +195,7 @@ type StatsSnapshot struct {
 	SnapshotReRequested       uint64
 	SnapshotBusyReceived      uint64
 	SnapshotsBusyDeferred     uint64
+	SnapshotFramesSuppressed  uint64
 
 	SchemaRequestsSent      uint64
 	SchemaRequestsReceived  uint64
@@ -212,6 +224,11 @@ type StatsSnapshot struct {
 func (m *Manager) Stats() StatsSnapshot {
 	s := &m.st
 	out := StatsSnapshot{
+		OriginUnsigned:            s.originUnsigned.Load(),
+		OriginUnknown:             s.originUnknown.Load(),
+		OriginSignatureInvalid:    s.originSignatureInvalid.Load(),
+		OriginDigestMismatch:      s.originDigestMismatch.Load(),
+		SnapshotSourcesDenied:     s.snapshotSourcesDenied.Load(),
 		Dials:                     s.dials.Load(),
 		DialFailures:              s.dialFailures.Load(),
 		DialPolicyDenials:         s.dialPolicyDenials.Load(),
@@ -272,6 +289,7 @@ func (m *Manager) Stats() StatsSnapshot {
 		SnapshotReRequested:       s.snapshotReRequested.Load(),
 		SnapshotsBusyDeferred:     s.snapshotsBusyDeferred.Load(),
 		SnapshotBusyReceived:      s.snapshotBusyReceived.Load(),
+		SnapshotFramesSuppressed:  s.snapshotFramesSuppressed.Load(),
 
 		SchemaRequestsSent:      s.schemaRequestsSent.Load(),
 		SchemaRequestsReceived:  s.schemaRequestsReceived.Load(),

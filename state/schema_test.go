@@ -194,7 +194,7 @@ func TestStoreSchemaRevisionsKeepsCurrent(t *testing.T) {
 func TestSchemaRevisionSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	node := ids.NewNodeID()
-	s, err := Open(dir, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
+	s, err := openSignedFixture(dir, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func TestSchemaRevisionSurvivesRestart(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s, err = Open(dir, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
+	s, err = openSignedFixture(dir, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}

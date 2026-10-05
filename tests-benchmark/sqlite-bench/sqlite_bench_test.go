@@ -145,11 +145,11 @@ func countRows(t *testing.T, db *sql.DB, label, table string) int {
 }
 
 func TestSQLiteDriverComparison(t *testing.T) {
-	rows := envInt(t, "SPEDSQL_SQLITE_BENCH_ROWS", 100000)
-	pointIters := envInt(t, "SPEDSQL_SQLITE_BENCH_POINT_ITERS", 20000)
-	joinIters := envInt(t, "SPEDSQL_SQLITE_BENCH_JOIN_ITERS", 10000)
-	scanIters := envInt(t, "SPEDSQL_SQLITE_BENCH_SCAN_ITERS", 10)
-	joinScanIters := envInt(t, "SPEDSQL_SQLITE_BENCH_JOIN_SCAN_ITERS", 5)
+	rows := envInt(t, "MURMUR_SQLITE_BENCH_ROWS", 100000)
+	pointIters := envInt(t, "MURMUR_SQLITE_BENCH_POINT_ITERS", 20000)
+	joinIters := envInt(t, "MURMUR_SQLITE_BENCH_JOIN_ITERS", 10000)
+	scanIters := envInt(t, "MURMUR_SQLITE_BENCH_SCAN_ITERS", 10)
+	joinScanIters := envInt(t, "MURMUR_SQLITE_BENCH_JOIN_SCAN_ITERS", 5)
 
 	var active []driverDef
 	for _, d := range drivers {
@@ -422,7 +422,7 @@ func benchSeed(b *testing.B, d driverDef, rows int) *sql.DB {
 }
 
 func benchRows() int {
-	if v := os.Getenv("SPEDSQL_SQLITE_BENCH_ROWS"); v != "" {
+	if v := os.Getenv("MURMUR_SQLITE_BENCH_ROWS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}

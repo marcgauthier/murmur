@@ -1,4 +1,4 @@
-package replicateddb
+package murmur
 
 import (
 	"context"
@@ -94,7 +94,7 @@ func TestBridgeShadowReorderConvergence(t *testing.T) {
 	newDB := func() *DB {
 		cfg := testConfig(t.TempDir())
 		cfg.QueryStore.RemoteApplyMaxTransactions = 1
-		db, err := Open(ctx, cfg)
+		db, err := openSignedFixture(ctx, cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -111,10 +111,10 @@ func TestBridgeShadowReorderConvergence(t *testing.T) {
 	// Identical seed on both peers.
 	seedA := shadowImportBatch(dbA, row, 100, 1, lowNode, source, table, idCol, nameCol, scoreCol, "low-1", 1, 1)
 	seedB := shadowImportBatch(dbB, row, 100, 1, lowNode, source, table, idCol, nameCol, scoreCol, "low-1", 1, 1)
-	if err := dbA.ApplyRemote(ctx, seedA); err != nil {
+	if err := applyRemoteFixture(dbA, ctx, seedA); err != nil {
 		t.Fatal(err)
 	}
-	if err := dbB.ApplyRemote(ctx, seedB); err != nil {
+	if err := applyRemoteFixture(dbB, ctx, seedB); err != nil {
 		t.Fatal(err)
 	}
 
@@ -132,14 +132,14 @@ func TestBridgeShadowReorderConvergence(t *testing.T) {
 	lowHLC := overCell.Version.HLC + 1000
 	upA := shadowImportBatch(dbA, row, lowHLC, 2, lowNode, source, table, idCol, nameCol, scoreCol, "low-2", 2, 2)
 	upB := shadowImportBatch(dbB, row, lowHLC, 2, lowNode, source, table, idCol, nameCol, scoreCol, "low-2", 2, 2)
-	if err := dbA.ApplyRemote(ctx, upA); err != nil {
+	if err := applyRemoteFixture(dbA, ctx, upA); err != nil {
 		t.Fatal(err)
 	}
-	if err := dbB.ApplyRemote(ctx, upB); err != nil {
+	if err := applyRemoteFixture(dbB, ctx, upB); err != nil {
 		t.Fatal(err)
 	}
 	// The override batch replicates to B after its import.
-	if err := dbB.ApplyRemote(ctx, shadowLocalBatch(t, dbA, 1)); err != nil {
+	if err := applyRemoteFixture(dbB, ctx, shadowLocalBatch(t, dbA, 1)); err != nil {
 		t.Fatal(err)
 	}
 	waitForRemoteMaterialization(t, dbA)
@@ -174,7 +174,7 @@ func TestBridgeShadowReorderConvergence(t *testing.T) {
 	if err := dbA.ReleaseBridgeOwnership(ctx, "contacts", row, "name"); err != nil {
 		t.Fatal(err)
 	}
-	if err := dbB.ApplyRemote(ctx, shadowLocalBatch(t, dbA, 2)); err != nil {
+	if err := applyRemoteFixture(dbB, ctx, shadowLocalBatch(t, dbA, 2)); err != nil {
 		t.Fatal(err)
 	}
 	waitForRemoteMaterialization(t, dbB)
@@ -215,7 +215,7 @@ func TestBridgeShadowDeleteReorderConvergence(t *testing.T) {
 	newDB := func() *DB {
 		cfg := testConfig(t.TempDir())
 		cfg.QueryStore.RemoteApplyMaxTransactions = 1
-		db, err := Open(ctx, cfg)
+		db, err := openSignedFixture(ctx, cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -228,10 +228,10 @@ func TestBridgeShadowDeleteReorderConvergence(t *testing.T) {
 	source := ids.NewDBID()
 	lowNode := ids.NewNodeID()
 
-	if err := dbA.ApplyRemote(ctx, shadowImportBatch(dbA, row, 100, 1, lowNode, source, table, idCol, nameCol, scoreCol, "low-1", 1, 1)); err != nil {
+	if err := applyRemoteFixture(dbA, ctx, shadowImportBatch(dbA, row, 100, 1, lowNode, source, table, idCol, nameCol, scoreCol, "low-1", 1, 1)); err != nil {
 		t.Fatal(err)
 	}
-	if err := dbB.ApplyRemote(ctx, shadowImportBatch(dbB, row, 100, 1, lowNode, source, table, idCol, nameCol, scoreCol, "low-1", 1, 1)); err != nil {
+	if err := applyRemoteFixture(dbB, ctx, shadowImportBatch(dbB, row, 100, 1, lowNode, source, table, idCol, nameCol, scoreCol, "low-1", 1, 1)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := dbA.ExecContext(ctx, `UPDATE contacts SET name=? WHERE id=?`, "high", row[:]); err != nil {
@@ -242,13 +242,13 @@ func TestBridgeShadowDeleteReorderConvergence(t *testing.T) {
 		t.Fatal("override cell missing")
 	}
 	delHLC := overCell.Version.HLC + 1000
-	if err := dbA.ApplyRemote(ctx, shadowDeleteBatch(dbA, row, delHLC, 2, lowNode, source, table, 2)); err != nil {
+	if err := applyRemoteFixture(dbA, ctx, shadowDeleteBatch(dbA, row, delHLC, 2, lowNode, source, table, 2)); err != nil {
 		t.Fatal(err)
 	}
-	if err := dbB.ApplyRemote(ctx, shadowDeleteBatch(dbB, row, delHLC, 2, lowNode, source, table, 2)); err != nil {
+	if err := applyRemoteFixture(dbB, ctx, shadowDeleteBatch(dbB, row, delHLC, 2, lowNode, source, table, 2)); err != nil {
 		t.Fatal(err)
 	}
-	if err := dbB.ApplyRemote(ctx, shadowLocalBatch(t, dbA, 1)); err != nil {
+	if err := applyRemoteFixture(dbB, ctx, shadowLocalBatch(t, dbA, 1)); err != nil {
 		t.Fatal(err)
 	}
 	waitForRemoteMaterialization(t, dbA)
@@ -262,7 +262,7 @@ func TestBridgeShadowDeleteReorderConvergence(t *testing.T) {
 	if err := dbA.ReleaseBridgeOwnership(ctx, "contacts", row, "name"); err != nil {
 		t.Fatal(err)
 	}
-	if err := dbB.ApplyRemote(ctx, shadowLocalBatch(t, dbA, 2)); err != nil {
+	if err := applyRemoteFixture(dbB, ctx, shadowLocalBatch(t, dbA, 2)); err != nil {
 		t.Fatal(err)
 	}
 	waitForRemoteMaterialization(t, dbB)
@@ -278,7 +278,7 @@ func TestBridgeShadowDeleteReorderConvergence(t *testing.T) {
 func TestBridgeShadowFileReorderConvergence(t *testing.T) {
 	ctx := context.Background()
 	newDB := func() *DB {
-		db, err := Open(ctx, fileTestConfig(t.TempDir()))
+		db, err := openSignedFixture(ctx, fileTestConfig(t.TempDir()))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -302,7 +302,7 @@ func TestBridgeShadowFileReorderConvergence(t *testing.T) {
 		[]BridgeFilePut{{Row: row, Name: "doc", Digest: lowD1, Size: 10}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := dbB.ApplyRemote(ctx, shadowLocalBatch(t, dbA, 1)); err != nil {
+	if err := applyRemoteFixture(dbB, ctx, shadowLocalBatch(t, dbA, 1)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -337,14 +337,14 @@ func TestBridgeShadowFileReorderConvergence(t *testing.T) {
 			},
 		}
 	}
-	if err := dbA.ApplyRemote(ctx, mkUpdate(dbA)); err != nil {
+	if err := applyRemoteFixture(dbA, ctx, mkUpdate(dbA)); err != nil {
 		t.Fatal(err)
 	}
-	if err := dbB.ApplyRemote(ctx, mkUpdate(dbB)); err != nil {
+	if err := applyRemoteFixture(dbB, ctx, mkUpdate(dbB)); err != nil {
 		t.Fatal(err)
 	}
 	// dbA local seq 1 is the file seed import; seq 2 is the upload.
-	if err := dbB.ApplyRemote(ctx, shadowLocalBatch(t, dbA, 2)); err != nil {
+	if err := applyRemoteFixture(dbB, ctx, shadowLocalBatch(t, dbA, 2)); err != nil {
 		t.Fatal(err)
 	}
 	for name, db := range map[string]*DB{"A": dbA, "B": dbB} {
@@ -368,7 +368,7 @@ func TestBridgeShadowFileReorderConvergence(t *testing.T) {
 		if err := dbA.ReleaseBridgeFileOwnership(ctx, row, f); err != nil {
 			t.Fatal(err)
 		}
-		if err := dbB.ApplyRemote(ctx, shadowLocalBatch(t, dbA, uint64(3+i))); err != nil {
+		if err := applyRemoteFixture(dbB, ctx, shadowLocalBatch(t, dbA, uint64(3+i))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -514,7 +514,7 @@ func TestBridgeShadowSchemaGuards(t *testing.T) {
 
 func TestBatchTouchesBridgePolicy(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
