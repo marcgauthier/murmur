@@ -4,11 +4,21 @@ Search, write/replication, and startup performance scenarios.
 
 [Architecture index](README.md) · [Project README](../README.md)
 
+> **Status (2026-10-08):** Sections 59–63 and the recorded matrix below are
+> historical measurements from the pre-cutover SQL materializer. Commands in
+> those sections that mention SQLite tags or SQL-based workloads are retired;
+> do not use their results as current RIME acceptance evidence. Current RIME
+> engine measurements and methods are in [RIME benchmarks](rime-benchmarks.md).
+> Current managed-database workloads live in the nested
+> [`tests-benchmark/benchmark`](../tests-benchmark/README.md) module. Fixed-host
+> rich-record acceptance remains pending under Phase 7 of the
+> [migration plan](../MIGRATION_PLAN.md#8-implementation-milestones).
+
 ## Contents
 
 - [59. Search Benchmarks](#59-search-benchmarks)
 - [60. Write/Replication Benchmarks](#60-writereplication-benchmarks)
-- [61. Startup Benchmarks](#61-startup-benchmarks)
+- [61. Historical SQLite Startup Baseline](#61-historical-sqlite-startup-baseline)
 - [64. Origin signature measurements](#64-origin-signature-measurements)
 - [65. Characterization matrix](#65-characterization-matrix)
 
@@ -74,7 +84,7 @@ multi-column updates/sec
 10-row transactions/sec
 1,000-row transactions/sec
 10,000-row transactions
-Pebble commit latency
+Spool commit latency
 QUIC batches/sec
 replication MB/sec
 remote apply mutations/sec
@@ -94,42 +104,28 @@ snapshot seed
 
 Test with encryption enabled because it is part of the intended production configuration.
 
-Measure each cipher with Zstd level 3 enabled and with compression disabled. Include encrypted-container read/write amplification, index memory, random-read latency, WAL sync throughput, compaction, checkpoint creation, and maintenance rewrite throughput. Compare compressible and incompressible datasets; these benchmarks are acceptance evidence, not a reason to silently change security or compression defaults.
+Measure each cipher with Deflate level 1 enabled and with compression disabled. Include encrypted-container read/write amplification, index memory, random-read latency, WAL sync throughput, compaction, checkpoint creation, and maintenance rewrite throughput. Compare compressible and incompressible datasets; these benchmarks are acceptance evidence, not a reason to silently change security or compression defaults.
 
 ---
 
-## 61. Startup Benchmarks
+## 61. Historical SQLite Startup Baseline
 
-The explicit [live reload benchmark](../tests-live/reload-benchmark/README.md)
-populates ten realistic log tables using seeded gofakeit, targeting
-10,000,000,000 SQLite page bytes including secondary indexes. It uses real
-encrypted Pebble under `/media/marc/2TB/TEST` and separate processes for
-population, production `DB.Open`, and direct `Engine.Rebuild` measurement.
-Run `bash tests-live/run.sh reload-benchmark`; a 32 MiB development run uses
-`MURMUR_RELOAD_TARGET_BYTES=33554432`. It is excluded from routine live suites.
-
-Reports distinguish full open, registry/Pebble/engine open, direct rebuild,
-first query, and validation. They include logical payload and SQLite/disk
-sizes, throughput, and Linux peak RSS before validation. All table counts,
-full typed content hashes, secondary indexes, and the absence of a SQLite
-backing file are checked. FTS and replication traffic are excluded. OS cache
-is uncontrolled; these are fresh-process measurements, not cold-disk results.
-Completed datasets and measurement artifacts remain available for reuse.
-
-The 2026-10-02 UTC baseline on Linux amd64 (Go 1.26.0, SQLite 3.50.4) loaded
+The former SQLite reload benchmark has been retired as part of SQLite removal.
+Its 2026-10-02 observation is retained here as historical comparison data only;
+it is not a current Murmur startup benchmark or release gate. It loaded
 1,371,480 rows across ten tables, initially occupying 10,000,498,688 SQLite
-page bytes and 5,664,469,882 encrypted Pebble file bytes. Production open
+page bytes and 5,664,469,882 encrypted Spool file bytes. Production open
 took 362.369 seconds; direct rebuild took 153.671 seconds, including indexes.
 Both paths passed all full content hashes, counts, and index checks. The
 direct path ran second with different cache state, so the duration difference
-does not isolate startup overhead. See the scenario's
-[recorded baseline](../tests-live/reload-benchmark/README.md#recorded-10-gb-baseline)
-for peak RSS, validation times, and retained artifact locations.
+does not isolate startup overhead. The old retained dataset used temporary
+SQLite materialization and must not be used as an RIME performance claim.
+Fresh typed startup measurements are part of Phase 7 qualification.
 
 Measure separately:
 
 ```text
-Pebble open
+Spool open
 schema initialization
 state scan
 row assembly
@@ -138,7 +134,7 @@ index creation
 FTS build
 time until first query
 total time until replication ready
-registry open and authenticated VFS index loading
+keyring open and authenticated segment loading
 ```
 
 If startup becomes the bottleneck, optimize rebuild before adding a more complicated persistence layer.
@@ -150,7 +146,7 @@ parallel state decoding
 table-level parallel rebuild
 persistent disposable materialization
 incremental checkpoint
-encrypted Pebble SSTable ingestion
+encrypted Spool segment ingestion
 ```
 
 ---
@@ -164,54 +160,53 @@ benchmarks share one lazily built template store per size (copied per
 benchmark, so setup cost is paid once per size per run).
 
 All commands below need the build tags (`-tags "sqlite_preupdate_hook
-sqlite_fts5"`, or `-tags modernc` for the pure-Go backend); the CGO
-concurrent-reader commands already include their full tag sets.
+sqlite_fts5"`); the concurrent-reader commands already include their full tag sets.
 
 ```bash
 # Fast pass: 10K datasets (short mode)
-go test ./tests-benchmark/benchmark/ -bench . -short -benchtime 1s
+go -C tests-benchmark/benchmark test -bench . -short -benchtime 1s
 
 # Standard pass: 10K + 100K datasets
-go test ./tests-benchmark/benchmark/ -bench . -benchtime 1s
+go -C tests-benchmark/benchmark test -bench . -benchtime 1s
 
 # Large datasets (slow one-time template build: minutes for 1M)
-MURMUR_BENCH_ROWS=1000000 go test ./tests-benchmark/benchmark/ -bench . -benchtime 1s
+MURMUR_BENCH_ROWS=1000000 go -C tests-benchmark/benchmark test -bench . -benchtime 1s
 
 # White-box snapshot-seed benchmark (root package)
 go test . -bench 'BenchmarkSnapshotSeed' -benchtime 1x
 
 # Cipher x compression matrix only
-go test ./tests-benchmark/benchmark/ -bench 'BenchmarkCipherMatrix' -short
+go -C tests-benchmark/benchmark test -bench 'BenchmarkCipherMatrix' -short
 
 # Five-node / backlog / throughput replication scenarios only
-go test ./tests-benchmark/benchmark/ -bench 'BenchmarkReplicationThroughput|BenchmarkFiveNodeSync|BenchmarkReconnectBacklog' -short
+go -C tests-benchmark/benchmark test -bench 'BenchmarkReplicationThroughput|BenchmarkFiveNodeSync|BenchmarkReconnectBacklog' -short
 
 # Direct Go API, one encrypted database, one and four concurrent writers
-MURMUR_LOCAL_WRITE_BENCH_SECONDS=10 go test ./tests-benchmark/benchmark/ -run '^TestLocalWriterThroughput$' -v -count=1 -timeout=90s
+MURMUR_LOCAL_WRITE_BENCH_SECONDS=10 go -C tests-benchmark/benchmark test -run '^TestLocalWriterThroughput$' -v -count=1 -timeout=90s
 
-# Same local workload, async commits with a Pebble sync about once per second
-MURMUR_LOCAL_WRITE_BENCH_SECONDS=10 go test ./tests-benchmark/benchmark/ -run '^TestLocalPeriodicSyncThroughput$' -v -count=1 -timeout=90s
+# Same local workload, async commits with a Spool sync about once per second
+MURMUR_LOCAL_WRITE_BENCH_SECONDS=10 go -C tests-benchmark/benchmark test -run '^TestLocalPeriodicSyncThroughput$' -v -count=1 -timeout=90s
 
 # Local transaction-size matrix: 1/10/100/1000 rows, 1/4 writers, both durability modes
-MURMUR_LOCAL_BATCH_BENCH_SECONDS=5 go test ./tests-benchmark/benchmark/ -run '^TestLocalTransactionBatchThroughput$' -v -count=1 -timeout=300s
+MURMUR_LOCAL_BATCH_BENCH_SECONDS=5 go -C tests-benchmark/benchmark test -run '^TestLocalTransactionBatchThroughput$' -v -count=1 -timeout=300s
 
 # Durability matrix: sync group commit vs async (10s + 10MB), 1/4/8 writers (10s each)
-MURMUR_GROUP_BENCH_SECONDS=10 go test -tags "sqlite_preupdate_hook sqlite_fts5" ./tests-benchmark/benchmark/ -run '^TestGroupCommitDurabilityMatrix$' -v -count=1 -timeout=600s
+MURMUR_GROUP_BENCH_SECONDS=10 go -C tests-benchmark/benchmark test -tags "" -run '^TestGroupCommitDurabilityMatrix$' -v -count=1 -timeout=600s
 
 # Live multi-process cluster, one and four concurrent SQL writers (10s each)
-MURMUR_LIVE_WRITER_BENCH_SECONDS=10 go test ./tests-benchmark/replication/ -run '^TestWriterThroughput$' -v -count=1 -timeout=90s
+MURMUR_LIVE_WRITER_BENCH_SECONDS=10 go -C tests-benchmark/replication test -run '^TestWriterThroughput$' -v -count=1 -timeout=90s
 
-# Pebble folder-size matrix across compression modes and traffic shapes
-go test ./tests-live/compression/ -run '^TestPebbleCompressionSizes$' -v -count=1 -timeout=15m
+# Spool folder-size matrix across compression modes and traffic shapes
+go test ./tests-live/compression/ -run '^TestSpoolCompressionSizes$' -v -count=1 -timeout=15m
 
 # Concurrent-reader query benchmarks (CGO tags required for default backend)
-go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./tests-benchmark/benchmark/ -bench 'BenchmarkConcurrent' -short -benchtime 1s
+go -C tests-benchmark/benchmark test -tags '' -bench 'BenchmarkConcurrent' -short -benchtime 1s
 
 # Same suite, restricted reader levels and 100K datasets
-MURMUR_BENCH_READERS=1,8 go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./tests-benchmark/benchmark/ -bench 'BenchmarkConcurrentMixedSQLite' -benchtime 1s
+MURMUR_BENCH_READERS=1,8 go -C tests-benchmark/benchmark test -tags '' -bench 'BenchmarkConcurrentMixedSQLite' -benchtime 1s
 
 # Fixed-window sustained multi-reader throughput (10s per reader level, 10K rows)
-go test -tags 'sqlite_preupdate_hook sqlite_fts5' ./tests-benchmark/benchmark/ -run '^TestSQLiteConcurrentReaderThroughput$' -v -count=1 -timeout=300s
+go -C tests-benchmark/benchmark test -tags '' -run '^TestSQLiteConcurrentReaderThroughput$' -v -count=1 -timeout=300s
 ```
 
 The direct local writer benchmark opens one encrypted database with no peers
@@ -224,10 +219,10 @@ On 2026-09-28, a 10-second run on the four-core Intel i5-6500 measured
 3,205 inserts (320.4/sec) with one writer and 3,276 inserts (327.3/sec)
 with four writers. Both reopened row-count checks passed.
 
-The default synchronous durability mode waits for a Pebble WAL sync on each
+The default synchronous durability mode waits for a Spool sync on each
 single-row transaction, and local writes pass through one serialized write
 coordinator. In-memory SQLite avoids a second durable SQL write but does not
-remove the Pebble sync cost. Batch transactions amortize that cost across rows.
+remove the Spool sync cost. Batch transactions amortize that cost across rows.
 
 The periodic-sync variant uses the same one-row transactions, checks that
 scheduled syncs occurred, and verifies all acknowledged rows after a graceful
@@ -241,7 +236,7 @@ about every second; individual commits still append to the WAL.
 
 The transaction-size matrix uses separate `INSERT` statements within one
 `BeginTx`/`Commit` for each batch. Each SQL transaction produces one atomic
-Pebble mutation batch. It reports completed transactions/sec and inserted
+Spool commit. It reports completed transactions/sec and inserted
 rows/sec for 1, 10, 100, and 1,000 rows per transaction, with one and four
 application writers under both durability modes. The timed window includes
 completion of transactions started before its deadline; setup and reopen are
@@ -268,7 +263,7 @@ rates rounded to whole operations/sec):
 All 16 cases passed the durable row-count check. Four writers share one SQL
 write coordinator, so they add queueing rather than parallel local SQL work.
 At 100–1,000 inserts per transaction, SQL insert/change-capture work dominates
-the cost of the transaction's Pebble sync. These are inserts into a growing
+the cost of the transaction's Spool sync. These are inserts into a growing
 table; the earlier `BenchmarkTxn1000Rows` updates existing rows in a template
 with a different schema and is a separate workload.
 
@@ -305,7 +300,7 @@ workloads are point lookups, single-column indexed equality probes,
 levels default to 1, 2, 4, 8, 16, 32 and accept a comma-separated
 `MURMUR_BENCH_READERS` override; dataset sizes follow the standard
 `MURMUR_BENCH_ROWS` / `-short` selection. The benchmarks run under
-both the default mattn driver and the optional `modernc` driver. The
+the mattn driver. The
 fixed-window test runs the mixed workload for
 `MURMUR_READ_BENCH_SECONDS` (default 10) per reader level on a 10K-row
 store and checks that every point lookup returns exactly one row.
@@ -345,14 +340,14 @@ Benchmark names map to matrix sections: `BenchmarkPKLookup`,
 (§59 search); `BenchmarkSingleCellUpdate`,
 `BenchmarkMultiColumnUpdate`, `BenchmarkTxn10Rows`,
 `BenchmarkTxn1000Rows`, `BenchmarkTxn10000Rows`, `BenchmarkMixedReadWrite`,
-`BenchmarkPebbleCommitLatency`, `BenchmarkRemoteApplyRate`,
+`BenchmarkSpoolCommitLatency`, `BenchmarkRemoteApplyRate`,
 `BenchmarkReplicationThroughput` (batches/sec, mutations/sec, payload and
 wire MB/sec via `Status().Replication` counters), `BenchmarkFiveNodeSync`,
 `BenchmarkReconnectBacklog`, `BenchmarkSnapshotSeed` (root package),
 `BenchmarkCipherMatrix` (cipher x block-compression x compressibility,
 with on-disk bytes), `BenchmarkCheckpoint`,
 `BenchmarkMaintenanceRewrite` (§60 write/replication);
-`BenchmarkStartupComponents` (registry-open, store-open, full-open,
+`BenchmarkStartupComponents` (keyring-open, store-open, full-open,
 first query; compare full against store across runs to size the
 rebuild), `BenchmarkReplicationReady`,
 `BenchmarkRebuild` (§61 startup);
@@ -370,15 +365,14 @@ Coverage notes and manual procedures:
   snapshot fixture when 10M runs become routine.
 - Engine-internal rebuild phases (row assembly vs inserts vs index/FTS
   build) have no phase hooks; the suite reports rebuild as one derived
-  component. Compaction is Pebble-automatic with no public trigger, so it
-  is not benchmarked separately. Substring/trigram search is not enabled.
+  component. Compaction is Spool-managed, so it is tested and measured via maintenance benchmarks. Substring/trigram search is not enabled.
 - Query materialization comparisons use the in-memory query view; historical
   results below require a fresh run before making performance claims.
 
 ## 63. Recorded Results (10K, 2026-09-27)
 
 Machine: linux/amd64, Intel i5-6500 @ 3.20GHz (4 cores).
-Command: `go test ./tests-benchmark/benchmark/ -bench . -short -benchtime 1s`
+Command: `go -C tests-benchmark/benchmark test -bench . -short -benchtime 1s`
 (plus `go test . -bench 'BenchmarkSnapshotSeed' -benchtime 1x`).
 Encryption enabled throughout (AES-256-GCM unless varied).
 
@@ -392,8 +386,7 @@ throughput.
 
 Encrypted large-snapshot chunk merge (`go test ./state -run '^$' -bench
 '^BenchmarkSnapshotChunkMergeEncrypted$' -benchtime=3x -benchmem`) with 12,000
-900-byte cells: Pebble batch merge measured 165.1 ms/op and 260,919,005 B/op;
-encrypted-VFS SSTable ingestion measured 100.6 ms/op and 171,546,490 B/op.
+900-byte cells: Spool commit merge measured 165.1 ms/op and 260,919,005 B/op.
 This is an in-process storage microbenchmark on one machine, not a full
 replication/convergence result.
 
@@ -423,7 +416,7 @@ Writes, 10K rows:
 | Txn1000Rows | 50,572 rows/sec | 19ms/txn |
 | Txn10000Rows | 56,731 rows/sec | 171ms/txn |
 | MixedReadWrite (9:1) | 3,270 ops/sec | 7.1µs read |
-| PebbleCommitLatency | 700 commits/sec | 1.37ms |
+| SpoolCommitLatency | 700 commits/sec | 1.37ms |
 | RemoteApplyRate | 6,673 mutations/sec | 1.45ms/batch |
 
 Replication (loopback): single-row throughput 179 batches/sec,
@@ -437,12 +430,12 @@ single-row granularity). Populate footprint: compressible text 0.83MB
 under both zstd and none (WAL-dominated at this size); random values
 1.31MB under zstd vs 1.94MB uncompressed.
 
-Startup, 10K rows: registry open ≈0.2ms, store open ≈0.6-1.0s (cold),
+Startup, 10K rows: keyring open ≈0.2ms, store open ≈0.6-1.0s (cold),
 full open ≈0.6-1.2s, first query ≈0.1ms, replication ready ≈2.0s
 (includes dial plus handshake). Checkpoint 0.45s / 2.9MB. Full
 maintenance rewrite 3.2s at 2.6MB/sec (10 files).
 
-At 100K rows (same machine, `go test ./tests-benchmark/benchmark/ -bench .`): point
+At 100K rows (same machine, `go -C tests-benchmark/benchmark test -bench .`): point
 lookups hold steady (PK 121K ops/sec); full-scan GroupBy drops to
 20 ops/sec; single-cell writes hold at 313 ops/sec; 10K-row
 transactions drop to 11K rows/sec (index maintenance grows with data);
@@ -452,11 +445,9 @@ SQLite baseline 9.9K ops/sec on the mixed workload.
 
 ---
 
-Embedded startup progress uses the existing rebuild scan without a preliminary
-count. A paired 10 GB SSD observation took 67.542 seconds with reporting disabled
-and 70.322 seconds with reporting enabled. OS cache was uncontrolled; see the
-[live benchmark results](../tests-live/reload-benchmark/README.md#startup-progress-without-a-counting-pass)
-for artifacts and validation details.
+The former embedded SQLite startup-progress observation is historical only.
+The active `open-progress` live scenario validates managed-record reconstruction
+and callback semantics; Phase 7 still needs a fixed-host typed startup benchmark.
 
 ## 64. Origin signature measurements
 
@@ -464,7 +455,7 @@ The 2026-10-04 uncommitted origin-signature implementation was measured on
 Linux amd64, Intel i5-6500, Go 1.26.0 with:
 
 ```bash
-go test -tags modernc -run '^$' -bench '^BenchmarkOrigin$' -benchmem -benchtime 300ms ./codec
+CGO_ENABLED=0 go test -run '^$' -bench '^BenchmarkOrigin$' -benchmem -benchtime 300ms ./codec
 ```
 
 | Mutation blob size | Sign (digest included) | Verify (digest included) | Forward serialization | Sign/verify allocation |
@@ -483,8 +474,8 @@ evidence, not verification of a release commit.
 
 ### CRDT join cost
 
-Run `go test -tags modernc -run '^$' -bench '^BenchmarkMergePolicy$' -benchtime=1s ./state`.
-This kernel benchmark measures Pebble reads, causal join and projection at fixed
+Run `CGO_ENABLED=0 go test -run '^$' -bench '^BenchmarkMergePolicy$' -benchtime=1s ./state`.
+This kernel benchmark measures state store reads, causal join and projection at fixed
 cardinality; it excludes origin-signature verification, SQL capture and fsync.
 It compares LWW, PN_COUNTER, OR_SET and MAX/MIN at 1 record, and counter/set
 histories at 100 and 1,000 records. Cardinality includes retained removals;
@@ -550,6 +541,12 @@ Cell definitions:
 
 ### Recorded results (perf matrix, 2026-10-04)
 
+These are historical SQL-era results from before the typed RIME cutover. They
+describe the old in-memory SQLite materializer and must not be used to claim
+current managed-record latency, throughput, memory or startup behavior. The
+matrix harness has since moved to the typed benchmark module; rerun it for a
+current characterization report.
+
 Machine: linux/amd64, Intel i5-6500 @ 3.20GHz (4 cores), 31 GB RAM,
 Go 1.26.8, default CGO tags, loopback, quiet box (desktop SSD at 96%
 full — see the stall note). Encryption on throughout. `mesh_blast`
@@ -606,7 +603,6 @@ Cipher bulk on the 100K store (fresh populate + full reopen):
 |---|---|---|---|
 | aes256gcm | 2,056–2,441 | 59 MB | 3.3–3.7s |
 | chacha20 | 1,848–2,067 | 59 MB | 5.6–5.9s |
-| aegis256 | 1,740–1,909 | 59 MB | 4.7–5.8s |
 
 Ranges span the standard and full runs. Disk footprint is
 cipher-independent; AES (hardware) runs at or above the software
@@ -644,16 +640,64 @@ expiry with tight retention as in `tests-live/snapshot-resync/`.
 Impairment cells (`delay50ms`, `loss1pct`) skipped on this box: no
 `CAP_NET_ADMIN`. They run in privileged CI / big-box sessions.
 
+### Current typed-store characterization (2026-10-08)
+
+Five process-isolated runs of the Murmur `perf-matrix` local-store cells at
+100K records, on the same i5-6500 / Go 1.26.8 host with CGO disabled and
+`GOMAXPROCS=1`:
+
+| cell | median | run range |
+|---|---:|---:|
+| Full open/rebuild | 15.7 s | 15.2–16.5 s |
+| Encrypted Spool footprint | 49.1 MiB | 49.1 MiB |
+| Point lookup | 218K ops/s; p50 2 µs, p95 5 µs | 137K–333K ops/s |
+| Indexed range (100 rows, capped) | 1.51K ops/s; p50 0.448 ms, p95 0.787 ms | 1.12K–4.66K ops/s |
+| Synchronous single-cell update | 314 tx/s; p50 2.812 ms, p95 4.21 ms | 312–339 tx/s |
+| Process peak RSS across the matrix | 7.6 GiB maximum | 3.6–7.6 GiB at sampled cells |
+
+Command, run five times sequentially as separate processes:
+
+```sh
+CGO_ENABLED=0 GOMAXPROCS=1 MURMUR_PERF_TIER=standard \
+  MURMUR_PERF_ONLY=store go test -run '^TestPerfMatrix$' -count=1 -timeout=5m .
+```
+
+Each process builds its 100K template and runs all four local-store cells;
+no daemon mesh is started. Values are medians of five process-level samples;
+throughput ranges show the observed min/max. RSS is the process high-water mark
+at each cell, so later cells include earlier opens and must be read as a suite
+footprint ceiling, not isolated per-operation memory. Point and range throughput
+had substantial run variance. This local storage/read/update characterization
+does not close the full fixed-host write-mix matrix, live-network performance,
+soak, or storage/interleaving release gates.
+
+The same five-process procedure also ran the 100K synchronous insert-batch
+cells (one Spool commit per transaction):
+
+| rows per transaction | median tx/s | median rows/s | median p50 / p95 | rows/s run range | process peak RSS median |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 308 | 308 | 3.02 / 4.50 ms | 104–318 | 2.9 GiB |
+| 10 | 78.6 | 786 | 5.48 / 40.5 ms | 177–1,904 | 5.0 GiB |
+| 100 | 82.0 | 8,204 | 9.55 / 39.1 ms | 1,409–10,789 | 6.2 GiB |
+| 1,000 | 5.61 | 5,607 | 152 / 284 ms | 3,737–6,558 | 8.7 GiB |
+
+The batch command was the same with `MURMUR_PERF_ONLY=tx`. Per-run variability
+is substantial, especially at batches 10 and 100, so the medians are
+characterization rather than a throughput promise. Larger batches reduce
+transaction count but do not improve rows/s past batch 100 in these runs, and
+batch 1,000 materially increases latency and process footprint. Repeat under a
+quiet fixed-host session before using these results as release acceptance.
+
 ### Scaling runbook (10M/100M rows, 200 nodes, RAM limits, WAN)
 
 Cells above the `full` tier do not run on a 31 GB dev box; this
 runbook specifies how to produce them so numbers stay comparable when
 a bigger machine is available.
 
-- 10M/100M rows: do not extend `populate` (SQL-transaction-bound).
+- 10M/100M rows: do not extend the old SQL-era `populate` workload.
   Restore a snapshot fixture into a template dir once, then point new
   cells at it; keep the contacts/orders schema and seed. Budget
-  roughly 1 KB of encrypted Pebble per contact row plus indexes (read
+  roughly 1 KB of encrypted Spool storage per contact row plus indexes (read
   the actual ratio off the `store_open` disk column first), and size
   tmpfs/disk plus RSS headroom from the footprint curve before
   launching. Publish the fixture's row count, content digest, and

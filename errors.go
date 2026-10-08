@@ -1,6 +1,11 @@
 package murmur
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+
+	"github.com/marcgauthier/murmur/ids"
+)
 
 // Typed errors. Wrap underlying errors with context while preserving
 // errors.Is / errors.As.
@@ -35,6 +40,10 @@ var (
 	// ErrAmbiguousCommit indicates durability succeeded but acknowledgement
 	// was lost; retry with the same TxID is safe (idempotent).
 	ErrAmbiguousCommit = errors.New("murmur: ambiguous commit")
+	// ErrCommitOutcomeUncertain indicates a durable write may or may not have
+	// reached storage. Inspect CommitOutcomeUncertainError.TxID and resolve it
+	// with HasTransactionReceipt after reopening the database.
+	ErrCommitOutcomeUncertain = errors.New("murmur: commit outcome uncertain")
 	// ErrBatchTooLarge indicates a transaction that does not fit in one
 	// durable commit; split it into smaller transactions.
 	ErrBatchTooLarge = errors.New("murmur: batch too large")
@@ -50,8 +59,6 @@ var (
 	// incompatible store (e.g. the legacy Badger layout). It is reported
 	// before any file is created or modified; migrate explicitly.
 	ErrUnsupportedStorageFormat = errors.New("murmur: unsupported storage format")
-	// ErrSubscriptionClosed is returned when operating on a closed subscription.
-	ErrSubscriptionClosed = errors.New("murmur: subscription closed")
 	// ErrSubscriptionReset indicates the subscription was reset due to slow consumer or rebuilt materializer.
 	ErrSubscriptionReset = errors.New("murmur: subscription reset, resnapshot required")
 	// ErrSubscriptionExpired indicates the requested resume cursor is no longer available in retained history.
@@ -79,3 +86,25 @@ var (
 	// ErrFileTooLarge indicates an upload exceeding Files.MaxFileBytes.
 	ErrFileTooLarge = errors.New("murmur: file too large")
 )
+
+// CommitOutcomeUncertainError preserves the transaction identity when a
+// storage failure makes a commit's outcome ambiguous. After reopening, use
+// DB.HasTransactionReceipt(TxID) to determine whether the transaction landed.
+type CommitOutcomeUncertainError struct {
+	TxID  ids.TxID
+	Cause error
+}
+
+func (e *CommitOutcomeUncertainError) Error() string {
+	if e == nil {
+		return ErrCommitOutcomeUncertain.Error()
+	}
+	return fmt.Sprintf("%v (transaction %x): %v", ErrCommitOutcomeUncertain, e.TxID, e.Cause)
+}
+
+func (e *CommitOutcomeUncertainError) Unwrap() []error {
+	if e == nil {
+		return []error{ErrCommitOutcomeUncertain}
+	}
+	return []error{ErrCommitOutcomeUncertain, e.Cause}
+}

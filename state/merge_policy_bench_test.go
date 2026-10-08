@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crdt"
 	"github.com/marcgauthier/murmur/ids"
@@ -40,7 +39,7 @@ func BenchmarkMergePolicy(b *testing.B) {
 				}
 				row := ids.NewRowID()
 				m := codec.Mutation{TableID: 1, RowID: row, ColumnID: 2, Policy: p, Value: codec.Real(1)}
-				seed := s.db.NewBatch()
+				seed := s.mem.newBatch()
 				for i := 0; i < size; i++ {
 					var key, data []byte
 					if p == schema.PN_COUNTER {
@@ -52,13 +51,13 @@ func BenchmarkMergePolicy(b *testing.B) {
 					} else {
 						continue
 					}
-					if err = seed.Set(crdtKey(1, row, 2, key), codec.EncodeCellState(nil, codec.CellState{Version: crdt.Version{HLC: 1, NodeID: s.NodeID()}, Value: codec.Blob(data)}), nil); err != nil {
+					if err = seed.Set(crdtKey(1, row, 2, key), codec.EncodeCellState(nil, codec.CellState{Version: crdt.Version{HLC: 1, NodeID: s.NodeID()}, Value: codec.Blob(data)})); err != nil {
 						b.Fatal(err)
 					}
 					m.Records = []codec.CRDTRecord{{Key: key, Data: data}}
 					m.Value = codec.Null()
 				}
-				if err = seed.Commit(pebble.NoSync); err != nil {
+				if err = s.commitBatch(seed, false); err != nil {
 					b.Fatal(err)
 				}
 				seed.Close()
@@ -70,7 +69,7 @@ func BenchmarkMergePolicy(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					stage := make(map[string]*remoteGroupCell)
 					var order []string
-					batch := s.db.NewBatch()
+					batch := s.mem.newBatch()
 					if err = s.mergeRemoteGroupBatch(batch, &codec.MutationBatch{HLC: uint64(i + 2), OriginNode: s.NodeID(), Mutations: []codec.Mutation{m}}, stage, &order); err != nil {
 						b.Fatal(err)
 					}

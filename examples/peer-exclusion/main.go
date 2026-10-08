@@ -4,7 +4,7 @@
 //
 // Run it:
 //
-//	go run -tags "sqlite_preupdate_hook sqlite_fts5" ./examples/peer-exclusion
+//	go run ./examples/peer-exclusion
 package main
 
 import (
@@ -17,9 +17,14 @@ import (
 	"time"
 
 	"github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
+	rowids "github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/transport"
 )
+
+type note struct {
+	ID   rowids.RowID `rime:"primary"`
+	Body string
+}
 
 func freePort() int {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -30,18 +35,18 @@ func freePort() int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-func count(ctx context.Context, db *murmur.DB) int {
-	var n int
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM notes`).Scan(&n); err != nil {
+func count(table *murmur.RecordTable[note]) int {
+	n, err := table.Where().Count()
+	if err != nil {
 		log.Fatal(err)
 	}
 	return n
 }
 
-func waitCount(ctx context.Context, db *murmur.DB, want int, timeout time.Duration) {
+func waitCount(table *murmur.RecordTable[note], want int, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if count(ctx, db) == want {
+		if count(table) == want {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -56,6 +61,12 @@ func main() {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(base)
+	definition, err := murmur.Define[note]("notes", 10, murmur.RecordOptions{
+		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	ca, err := transport.GenerateCA(24 * time.Hour)
 	if err != nil {
@@ -85,17 +96,9 @@ func main() {
 			Path:   dirs[i],
 			NodeID: ids[i],
 			DBID:   dbid,
-			Schema: murmur.SchemaConfig{
-				Version: 1,
-				Tables: []schema.TableSchema{{
-					Name: "notes",
-					Columns: []schema.ColumnSchema{
-						{Name: "id", Type: schema.ColBlob},
-						{Name: "body", Type: schema.ColText, Nullable: true},
-					},
-				}},
-			},
-			Pebble: murmur.DefaultPebbleConfig(),
+			Schema: murmur.SchemaConfig{Version: 1},
+			Tables: []murmur.TableDefinition{definition},
+			Spool:  murmur.DefaultSpoolConfig(),
 			Encryption: murmur.EncryptionConfig{
 				Key:   []byte("0123456789abcdef0123456789abcdef"),
 				KeyID: "exclusion-key",
@@ -116,14 +119,22 @@ func main() {
 
 	nodeA, nodeB := open(0), open(1)
 	defer nodeB.Close()
+	tableA, err := murmur.TableOf[note](nodeA, "notes")
+	if err != nil {
+		log.Fatal(err)
+	}
+	tableB, err := murmur.TableOf[note](nodeB, "notes")
+	if err != nil {
+		log.Fatal(err)
+	}
 	for r := 0; r < 2; r++ {
-		id := murmur.NewRowID()
-		if _, err := nodeA.ExecContext(ctx,
-			`INSERT INTO notes (id, body) VALUES (?, ?)`, id[:], fmt.Sprintf("base-%d", r)); err != nil {
+		if err := nodeA.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+			return tableA.Insert(tx, &note{ID: murmur.NewRowID(), Body: fmt.Sprintf("base-%d", r)})
+		}); err != nil {
 			log.Fatal(err)
 		}
 	}
-	waitCount(ctx, nodeB, 2, 30*time.Second)
+	waitCount(tableB, 2, 30*time.Second)
 	fmt.Println("baseline converged; node A retires node B")
 
 	if err := nodeA.RemovePeer(ctx, ids[1]); err != nil {
@@ -136,6 +147,10 @@ func main() {
 	// Reopen: the exclusion is durable, so no session reforms.
 	nodeA = open(0)
 	defer nodeA.Close()
+	tableA, err = murmur.TableOf[note](nodeA, "notes")
+	if err != nil {
+		log.Fatal(err)
+	}
 	time.Sleep(5 * time.Second)
 	if got := nodeA.Status().ConnectedPeers; got != 0 {
 		log.Fatalf("node A reconnected to retired peer (%d sessions)", got)
@@ -147,10 +162,11 @@ func main() {
 		log.Fatal(err)
 	}
 	id := murmur.NewRowID()
-	if _, err := nodeB.ExecContext(ctx,
-		`INSERT INTO notes (id, body) VALUES (?, ?)`, id[:], "reunion"); err != nil {
+	if err := nodeB.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+		return tableB.Insert(tx, &note{ID: id, Body: "reunion"})
+	}); err != nil {
 		log.Fatal(err)
 	}
-	waitCount(ctx, nodeA, 3, 30*time.Second)
+	waitCount(tableA, 3, 30*time.Second)
 	fmt.Println("readmitted: reunion row replicated to node A")
 }

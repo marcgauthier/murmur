@@ -118,6 +118,59 @@ func TestFileUploadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestTypedFileMetadataPersistsWithoutSQLMaterializer(t *testing.T) {
+	ctx := context.Background()
+	cfg := testConfig(t.TempDir())
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	cfg.Files.Enabled = true
+	cfg.Files.ObjectKey = append([]byte(nil), testObjectKey...)
+	db, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("typed file payload")
+	info, err := db.UploadFile(ctx, "typed/report.txt", bytes.NewReader(want))
+	if err != nil {
+		t.Fatalf("upload through typed database: %v", err)
+	}
+	status, err := db.FileStatus(ctx, "typed/report.txt")
+	if err != nil || !status.Exists || !status.Available || status.Digest != info.Digest || status.Size != int64(len(want)) {
+		t.Fatalf("typed file status = %+v, %v", status, err)
+	}
+	reader, err := db.OpenFile(ctx, "typed/report.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	if closeErr := reader.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("typed file contents = %q, %v", got, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(ctx, cfg)
+	if err != nil {
+		t.Fatalf("reopen typed file database: %v", err)
+	}
+	defer db.Close()
+	status, err = db.FileStatus(ctx, "typed/report.txt")
+	if err != nil || !status.Exists || !status.Available || status.Digest != info.Digest {
+		t.Fatalf("typed file status after reopen = %+v, %v", status, err)
+	}
+	if err := db.DeleteFile(ctx, "typed/report.txt"); err != nil {
+		t.Fatalf("delete typed file: %v", err)
+	}
+	status, err = db.FileStatus(ctx, "typed/report.txt")
+	if err != nil || !status.Deleted {
+		t.Fatalf("typed deleted file status = %+v, %v", status, err)
+	}
+}
+
 func TestFileListSearch(t *testing.T) {
 	ctx := context.Background()
 	db, err := openSignedFixture(ctx, fileTestConfig(t.TempDir()))

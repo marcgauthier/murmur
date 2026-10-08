@@ -1,22 +1,27 @@
-// Command limits shows fail-closed write limits: tiny value and batch
-// caps reject oversized work with an error while normal writes pass.
+// Command limits shows fail-closed value and batch limits with managed typed
+// writes: oversized work is rejected and normal writes still pass.
 //
-// Run it:
+// Run it with:
 //
-//	go run -tags "sqlite_preupdate_hook sqlite_fts5" ./examples/limits
+//	go run ./examples/limits
 package main
 
 import (
 	"context"
 	"fmt"
-	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 	"strings"
 
 	"github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
+	"github.com/marcgauthier/murmur/ids"
 )
+
+type blob struct {
+	ID      ids.RowID `rime:"primary"`
+	Payload string
+}
 
 func main() {
 	ctx := context.Background()
@@ -26,28 +31,21 @@ func main() {
 	}
 	defer os.RemoveAll(dir)
 
+	definition, err := murmur.Define[blob]("blobs", 22, murmur.RecordOptions{
+		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Payload": 2},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
-		Path:   dir,
-		NodeID: murmur.NewNodeID(),
-		Schema: murmur.SchemaConfig{
-			Version: 1,
-			Tables: []schema.TableSchema{{
-				Name: "blobs",
-				Columns: []schema.ColumnSchema{
-					{Name: "id", Type: schema.ColBlob},
-					{Name: "payload", Type: schema.ColText, Nullable: true},
-				},
-			}},
-		},
-		Pebble: murmur.DefaultPebbleConfig(),
+		Path: dir, NodeID: murmur.NewNodeID(),
+		Schema: murmur.SchemaConfig{Version: 1}, Tables: []murmur.TableDefinition{definition},
+		Spool: murmur.DefaultSpoolConfig(),
 		Encryption: murmur.EncryptionConfig{
-			Key:   []byte("0123456789abcdef0123456789abcdef"),
-			KeyID: "limits-key",
+			Key: []byte("0123456789abcdef0123456789abcdef"), KeyID: "limits-key",
 		},
-		// Deliberately tiny caps for the demo (defaults are
-		// 16 MiB per value and 100,000 mutations per batch).
-		// The value cap must clear per-mutation encoding overhead,
-		// so 128 still rejects the 1 KiB probe below.
+		// The value cap clears per-mutation encoding overhead while still
+		// rejecting the one-kilobyte payload below.
 		MaxReplicatedValueBytes: 128,
 		MaxBatchMutations:       10,
 	}))
@@ -55,51 +53,40 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
+	blobs, err := murmur.TableOf[blob](db, "blobs")
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	// A 1 KiB value exceeds the 64-byte cap: rejected, nothing stored.
-	id := murmur.NewRowID()
-	_, err = db.ExecContext(ctx,
-		`INSERT INTO blobs (id, payload) VALUES (?, ?)`, id[:], strings.Repeat("x", 1024))
+	// A one-kilobyte field exceeds the cap and leaves no row behind.
+	err = db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+		return blobs.Insert(tx, &blob{ID: murmur.NewRowID(), Payload: strings.Repeat("x", 1024)})
+	})
 	fmt.Printf("oversized value -> err=%v\n", err != nil)
 	if err == nil {
 		log.Fatal("oversized value was accepted, want rejection")
 	}
 
-	// A 20-statement transaction exceeds the 10-mutation batch cap.
-	// The rejection may land on a statement or at commit; either way
-	// nothing from the batch may survive.
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	rejected := false
-	for i := 0; i < 20 && !rejected; i++ {
-		mid := murmur.NewRowID()
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO blobs (id, payload) VALUES (?, ?)`, mid[:], "ok"); err != nil {
-			rejected = true
+	// Six two-field rows exceed the ten-mutation atomic batch cap.
+	err = db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+		rows := make([]*blob, 6)
+		for i := range rows {
+			rows[i] = &blob{ID: murmur.NewRowID(), Payload: "ok"}
 		}
-	}
-	if !rejected {
-		if err := tx.Commit(); err != nil {
-			rejected = true
-		}
-	} else {
-		_ = tx.Rollback()
-	}
-	fmt.Printf("oversized batch -> err=%v\n", rejected)
-	if !rejected {
+		return blobs.InsertMany(tx, rows)
+	})
+	fmt.Printf("oversized batch -> err=%v\n", err != nil)
+	if err == nil {
 		log.Fatal("oversized batch committed, want rejection")
 	}
 
-	// Normal writes still pass and the rejects left no trace.
-	id = murmur.NewRowID()
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO blobs (id, payload) VALUES (?, ?)`, id[:], "small"); err != nil {
+	if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+		return blobs.Insert(tx, &blob{ID: murmur.NewRowID(), Payload: "small"})
+	}); err != nil {
 		log.Fatal(err)
 	}
-	var n int
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM blobs`).Scan(&n); err != nil {
+	n, err := blobs.Where().Count()
+	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("rows after limits demo: %d\n", n)

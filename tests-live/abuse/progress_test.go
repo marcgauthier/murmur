@@ -101,7 +101,7 @@ func (r *reporter) statusLoop(stop <-chan struct{}, cluster *harness.Cluster, n 
 		case <-ticker.C:
 			min, max, down := -1, -1, 0
 			for i := 0; i < n; i++ {
-				c, err := cluster.QueryRowCount(i, tableName)
+				c, _, err := abuseNodeState(cluster, i)
 				if err != nil {
 					down++
 					continue

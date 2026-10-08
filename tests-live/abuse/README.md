@@ -12,7 +12,7 @@ plus PK-ordered digests), never a sample.
 ```sh
 # Quick smoke: 3 nodes, ~60 s of abuse
 MURMUR_ABUSE_NODES=3 MURMUR_ABUSE_DURATION_SECONDS=60 \
-  go test -tags "sqlite_preupdate_hook sqlite_fts5" ./tests-live/abuse/ -v -count=1 -timeout=10m
+  go test ./tests-live/abuse/ -v -count=1 -timeout=10m
 
 # Default: 10 nodes, 10 minutes of abuse
 bash tests-live/run.sh abuse
@@ -20,7 +20,7 @@ bash tests-live/run.sh abuse
 # Large-scale: 100 nodes, 2 hours of abuse
 MURMUR_ABUSE_NODES=100 MURMUR_ABUSE_DURATION_SECONDS=7200 \
   MURMUR_ABUSE_SETTLE_SECONDS=600 \
-  go test -tags "sqlite_preupdate_hook sqlite_fts5" ./tests-live/abuse/ -v -count=1 -timeout=3h
+  go test ./tests-live/abuse/ -v -count=1 -timeout=3h
 ```
 
 ## Knobs

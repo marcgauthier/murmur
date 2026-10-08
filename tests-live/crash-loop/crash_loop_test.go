@@ -5,8 +5,8 @@
 // digests; it must reach ready within a bound after the final restart
 // (no wedge); and a post-loop write on it must replicate everywhere.
 //
-// Kill placement is proven, not assumed: every round requires a SQL
-// request in flight on the victim (mid-write), and the final round
+// Kill placement is proven, not assumed: every round requires a managed
+// typed write request in flight on the victim (mid-write), and the final round
 // kills immediately after a 30-row burst on a survivor, which the
 // 1s remote-apply tick cannot have flushed yet (mid-replication).
 package crashloop_test
@@ -15,14 +15,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -31,22 +31,16 @@ func TestCrashLoopNodeConvergesWithoutLoss(t *testing.T) {
 	uptime := time.Duration(envInt("MURMUR_CRASH_LOOP_UPTIME_MS", 1000)) * time.Millisecond
 	const victim = 2
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "crash-loop",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "cl_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:         "crash-loop",
+		NumNodes:     3,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 
 	// Positive control: honest 3-node convergence before any crash.
 	for node := 0; node < 3; node++ {
 		name := fmt.Sprintf("base-node%d", node+1)
-		if err := cluster.ExecSQL(node, "INSERT INTO cl_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", node+1), name); err != nil {
+		if err := cluster.TypedInsert(node, name); err != nil {
 			t.Fatalf("baseline write node%d: %v", node+1, err)
 		}
 	}
@@ -79,9 +73,8 @@ func TestCrashLoopNodeConvergesWithoutLoss(t *testing.T) {
 				}
 				seq := seqs[node].Add(1)
 				name := fmt.Sprintf("n%d-%08d", node+1, seq)
-				id := fmt.Sprintf("%02x%030x", node+1, seq)
 				inFlight[node].Add(1)
-				err := cluster.ExecSQL(node, "INSERT INTO cl_rows (id, name) VALUES (?, ?)", id, name)
+				err := cluster.TypedInsert(node, name)
 				inFlight[node].Add(-1)
 				if err == nil {
 					ackMu.Lock()
@@ -103,8 +96,7 @@ func TestCrashLoopNodeConvergesWithoutLoss(t *testing.T) {
 			// remote-apply tick is 1s).
 			for i := 0; i < 30; i++ {
 				name := fmt.Sprintf("burst-%d", i)
-				id := fmt.Sprintf("b0%030x", i)
-				if err := cluster.ExecSQL(0, "INSERT INTO cl_rows (id, name) VALUES (?, ?)", id, name); err != nil {
+				if err := cluster.TypedInsert(0, name); err != nil {
 					t.Fatalf("round %d burst: %v", round, err)
 				}
 				ackMu.Lock()
@@ -145,7 +137,7 @@ func TestCrashLoopNodeConvergesWithoutLoss(t *testing.T) {
 	t.Logf("all %d acknowledged writes survived %d SIGKILLs", total, rounds)
 
 	postLoop := "post-loop-from-victim"
-	if err := cluster.ExecSQL(victim, "INSERT INTO cl_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 777001), postLoop); err != nil {
+	if err := cluster.TypedInsert(victim, postLoop); err != nil {
 		t.Fatalf("post-loop write: %v", err)
 	}
 	waitForConvergence(t, cluster, 60*time.Second)
@@ -162,7 +154,7 @@ func waitInflight(t *testing.T, c *harness.Cluster, node int, inFlight *[3]atomi
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("node%d had no SQL request in flight before SIGKILL", node+1)
+	t.Fatalf("node%d had no typed write request in flight before SIGKILL", node+1)
 }
 
 func waitForPeers(t *testing.T, c *harness.Cluster, want []int, timeout time.Duration) {
@@ -200,32 +192,24 @@ func connectedPeers(apiAddr string) int {
 	return st.ConnectedPeers
 }
 
-// waitForConvergence polls exact counts plus two digests: name-ordered
-// and PK-ordered. Names are unique, so both orders are deterministic.
+// waitForConvergence polls exact counts and a sorted typed-name digest.
 func waitForConvergence(t *testing.T, c *harness.Cluster, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
 		var wantCount int
-		var wantID string
+		var wantDigest string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "cl_rows")
+			names, err := c.TypedNames(i)
 			if err != nil {
 				ok = false
 				break
 			}
-			// Ordered by PK id only: names are unique today but a
-			// future duplicate would make a name-ordered digest
-			// nondeterministic, so the name digest is dropped.
-			dID, err := c.ComputeTableDigest(i, "cl_rows", "id")
-			if err != nil {
-				ok = false
-				break
-			}
+			digest := digestNames(names)
 			if i == 0 {
-				wantCount, wantID = n, dID
-			} else if n != wantCount || dID != wantID {
+				wantCount, wantDigest = len(names), digest
+			} else if len(names) != wantCount || digest != wantDigest {
 				ok = false
 				break
 			}
@@ -236,25 +220,22 @@ func waitForConvergence(t *testing.T, c *harness.Cluster, timeout time.Duration)
 		time.Sleep(100 * time.Millisecond)
 	}
 	for i := range c.Nodes {
-		n, _ := c.QueryRowCount(i, "cl_rows")
-		d, _ := c.ComputeTableDigest(i, "cl_rows", "id")
-		t.Logf("node %d at timeout: count=%d digest=%s", i+1, n, d)
+		names, _ := c.TypedNames(i)
+		t.Logf("node %d at timeout: count=%d digest=%s", i+1, len(names), digestNames(names))
 	}
-	t.Fatalf("nodes did not converge (counts + name/PK digests) within %v", timeout)
+	t.Fatalf("nodes did not converge (counts + typed-name digests) within %v", timeout)
 }
 
 func assertAcknowledgedPresent(t *testing.T, c *harness.Cluster, acknowledged map[string]struct{}) {
 	t.Helper()
 	for i := range c.Nodes {
-		res, err := c.QuerySQL(i, "SELECT name FROM cl_rows")
+		names, err := c.TypedNames(i)
 		if err != nil {
 			t.Fatalf("node%d recovery query: %v", i+1, err)
 		}
-		present := make(map[string]struct{}, len(res.Rows))
-		for _, row := range res.Rows {
-			if len(row) > 0 {
-				present[fmt.Sprint(row[0])] = struct{}{}
-			}
+		present := make(map[string]struct{}, len(names))
+		for _, name := range names {
+			present[name] = struct{}{}
 		}
 		for name := range acknowledged {
 			if _, ok := present[name]; !ok {
@@ -262,6 +243,11 @@ func assertAcknowledgedPresent(t *testing.T, c *harness.Cluster, acknowledged ma
 			}
 		}
 	}
+}
+
+func digestNames(names []string) string {
+	sort.Strings(names)
+	return strings.Join(names, "\n")
 }
 
 func envInt(name string, fallback int) int {

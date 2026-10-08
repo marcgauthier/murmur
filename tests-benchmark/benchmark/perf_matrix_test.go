@@ -62,18 +62,12 @@ func perfCiphers(tier string) []struct {
 	name string
 	alg  murmur.EncryptionAlgorithm
 } {
-	all := []struct {
+	return []struct {
 		name string
 		alg  murmur.EncryptionAlgorithm
 	}{
 		{"aes256gcm", murmur.AES256GCM},
-		{"chacha20", murmur.ChaCha20Poly1305},
-		{"aegis256", murmur.AEGIS256},
 	}
-	if tier == "smoke" {
-		return all[:1]
-	}
-	return all
 }
 
 // perfCell is one published measurement. Unused dimensions stay at their
@@ -174,7 +168,7 @@ func perfMachineStamp() perfMachine {
 		Cores:   runtime.NumCPU(),
 		Go:      runtime.Version(),
 		Tags:    buildTags(),
-		Storage: "pebble+encrypted-vfs",
+		Storage: "spool+aes-256-gcm",
 	}
 }
 
@@ -267,13 +261,14 @@ func dirSizeBytes(root string) int64 {
 	return total
 }
 
-// buildTags reports the SQLite backend tags: the runner's MURMUR_TAGS
-// override when set, else the default CGO tag set.
+// buildTags reports the backend tags the suite ran with: the runner's
+// MURMUR_TAGS override when set, else "none" (the typed backend needs no
+// build tags).
 func buildTags() string {
 	if v := os.Getenv("MURMUR_TAGS"); v != "" {
 		return v
 	}
-	return "sqlite_preupdate_hook sqlite_fts5"
+	return "none"
 }
 
 // perfLat collects samples and reports percentiles in milliseconds.
@@ -357,11 +352,13 @@ func perfStoreCells(t *testing.T, rep *perfReport, n int) {
 		}
 		openWall := time.Since(start)
 		// First query proves the materialization is usable.
-		rows, err := db.QueryContext(ctx, `SELECT count(*) FROM contacts`)
+		contacts, err := murmur.TableOf[benchContact](db, "contacts")
 		if err != nil {
 			t.Fatal(err)
 		}
-		_ = drainTestRows(t, rows)
+		if _, err := contacts.Where().Count(); err != nil {
+			t.Fatal(err)
+		}
 		disk := dirSizeBytes(dest)
 		rss := procPeakRSSMB()
 		_ = db.Close()
@@ -376,19 +373,18 @@ func perfStoreCells(t *testing.T, rep *perfReport, n int) {
 	// Point lookups.
 	func() {
 		db, ids := openTemplateDB(t, n)
+		contacts, err := murmur.TableOf[benchContact](db, "contacts")
+		if err != nil {
+			t.Fatal(err)
+		}
 		rng := rand.New(rand.NewSource(7))
 		const ops = 10000
 		var lat perfLat
 		start := time.Now()
 		for i := 0; i < ops; i++ {
 			op := time.Now()
-			rows, err := db.QueryContext(ctx,
-				`SELECT name, phone, score FROM contacts WHERE id = ?`, ids[rng.Intn(len(ids))][:])
-			if err != nil {
+			if _, err := contacts.Get(ids[rng.Intn(len(ids))]); err != nil {
 				t.Fatal(err)
-			}
-			if got := drainTestRows(t, rows); got != 1 {
-				t.Fatalf("lookup returned %d rows", got)
 			}
 			lat.record(time.Since(op))
 		}
@@ -405,18 +401,23 @@ func perfStoreCells(t *testing.T, rep *perfReport, n int) {
 	// Capped indexed ranges.
 	func() {
 		db, _ := openTemplateDB(t, n)
+		contacts, err := murmur.TableOf[benchContact](db, "contacts")
+		if err != nil {
+			t.Fatal(err)
+		}
+		scoreField := murmur.NumericFieldOf[benchContact, int64](contacts, "Score")
 		const ops = 1000
 		var lat perfLat
 		start := time.Now()
 		for i := 0; i < ops; i++ {
-			lo := (i * 131) % 900
+			lo := int64((i * 131) % 900)
 			op := time.Now()
-			rows, err := db.QueryContext(ctx,
-				`SELECT id FROM contacts WHERE score BETWEEN ? AND ? LIMIT 100`, lo, lo+100)
+			rows, err := contacts.Where(scoreField.Between(lo, lo+100)).Limit(100).Find()
 			if err != nil {
 				t.Fatal(err)
 			}
-			drainTestRows(t, rows)
+			for range rows {
+			}
 			lat.record(time.Since(op))
 		}
 		wall := time.Since(start)
@@ -432,19 +433,25 @@ func perfStoreCells(t *testing.T, rep *perfReport, n int) {
 	// Single-cell synchronous updates.
 	func() {
 		db, ids := openTemplateDB(t, n)
+		contacts, err := murmur.TableOf[benchContact](db, "contacts")
+		if err != nil {
+			t.Fatal(err)
+		}
 		rng := rand.New(rand.NewSource(11))
 		const ops = 300
 		var lat perfLat
 		start := time.Now()
 		for i := 0; i < ops; i++ {
 			op := time.Now()
-			tx, err := db.BeginTx(ctx, nil)
+			score := int64(rng.Intn(1000))
+			tx, err := db.BeginTx(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE contacts SET score = ? WHERE id = ?`,
-				rng.Intn(1000), ids[rng.Intn(len(ids))][:]); err != nil {
+			if err := contacts.Update(tx, ids[rng.Intn(len(ids))], func(c *benchContact) error {
+				c.Score = score
+				return nil
+			}); err != nil {
 				t.Fatal(err)
 			}
 			if err := tx.Commit(); err != nil {
@@ -464,7 +471,7 @@ func perfStoreCells(t *testing.T, rep *perfReport, n int) {
 }
 
 // perfTxCells measures transaction-size throughput (1/10/100/1000 rows)
-// on a 100K store (10K in smoke): one atomic Pebble batch per SQL
+// on a 100K store (10K in smoke): one atomic Spool commit per typed
 // transaction, synchronous durability.
 func perfTxCells(t *testing.T, rep *perfReport, tier string) {
 	t.Helper()
@@ -479,6 +486,10 @@ func perfTxCells(t *testing.T, rep *perfReport, tier string) {
 	}
 	for _, bsize := range batches {
 		db, _ := openTemplateDB(t, n)
+		contacts, err := murmur.TableOf[benchContact](db, "contacts")
+		if err != nil {
+			t.Fatal(err)
+		}
 		ops := 200
 		switch {
 		case bsize >= 1000:
@@ -490,15 +501,15 @@ func perfTxCells(t *testing.T, rep *perfReport, tier string) {
 		start := time.Now()
 		for i := 0; i < ops; i++ {
 			op := time.Now()
-			tx, err := db.BeginTx(ctx, nil)
+			tx, err := db.BeginTx(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
 			for r := 0; r < bsize; r++ {
-				id := murmur.NewRowID()
-				if _, err := tx.ExecContext(ctx,
-					`INSERT INTO contacts (id, name, phone, score) VALUES (?, ?, ?, ?)`,
-					id[:], fmt.Sprintf("tx-%d-%d", i, r), "555-0000", r); err != nil {
+				if err := contacts.Insert(tx, &benchContact{
+					ID: murmur.NewRowID(), Name: fmt.Sprintf("tx-%d-%d", i, r),
+					Phone: "555-0000", Score: int64(r),
+				}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -553,11 +564,13 @@ func perfCipherCells(t *testing.T, rep *perfReport, tier string) {
 			t.Fatal(err)
 		}
 		openWall := time.Since(start)
-		rows, err := db2.QueryContext(ctx, `SELECT count(*) FROM contacts`)
+		contacts, err := murmur.TableOf[benchContact](db2, "contacts")
 		if err != nil {
 			t.Fatal(err)
 		}
-		_ = drainTestRows(t, rows)
+		if _, err := contacts.Where().Count(); err != nil {
+			t.Fatal(err)
+		}
 		_ = db2.Close()
 		rep.add(perfCell{
 			Name: "cipher_bulk", Rows: n, Cipher: c.name, Ops: int64(n), WallMs: popWall.Milliseconds(),
@@ -568,24 +581,4 @@ func perfCipherCells(t *testing.T, rep *perfReport, tier string) {
 		t.Logf("cipher_bulk rows=%d cipher=%s populate=%.0frows/s disk=%dMB reopen=%s",
 			n, c.name, float64(n)/popWall.Seconds(), diskPop/(1<<20), openWall.Round(time.Millisecond))
 	}
-}
-
-// drainTestRows consumes rows in Test (non-Benchmark) context.
-func drainTestRows(t *testing.T, rows *murmur.Rows) int {
-	t.Helper()
-	defer rows.Close()
-	n := 0
-	cols := rows.Columns()
-	dest := make([]any, len(cols))
-	ptrs := make([]any, len(cols))
-	for i := range dest {
-		ptrs[i] = &dest[i]
-	}
-	for rows.Next() {
-		if err := rows.Scan(ptrs...); err != nil {
-			t.Fatal(err)
-		}
-		n++
-	}
-	return n
 }

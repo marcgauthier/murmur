@@ -1,8 +1,17 @@
-# Crash mid-migration lands in a defined state
+# Multi-peer schema migration crash recovery
 
-Run with `go test -count=1 ./tests-live/migration-crash`. A node is
-SIGKILLed mid-migration (`MURMUR_MIGRATION_CRASH_KILL_DELAY_MS`);
-on restart it must land cleanly in exactly one defined state (old
-schema at epoch 1 with pre-crash rows intact, or new schema at epoch
-2), never a mix. Post-migration writes replicate and all nodes finish
-with equal digests.
+Run with `CGO_ENABLED=0 GOMAXPROCS=1 bash tests-live/run.sh migration-crash`.
+
+The scenario starts three typed Murmur nodes and seeds converged records. It
+isolates one node from the other two, then injects process exit immediately
+before and immediately after the durable schema-manifest store. The peers stay
+on epoch 1 during each crash. Before-store recovery reopens at epoch 1 and
+retries the migration; after-store recovery reopens at epoch 2 with the v2
+application descriptor. In both cases, peers adopt epoch 2, rebind their typed
+handles, and converge with the recovered node, including a write to the new
+field.
+
+The testnode's crash hook is available only under the `murmur_testhooks` build
+tag, which the scenario runner adds for this scenario. The root Murmur test
+`TestTypedSchemaMigrationProcessCrashBoundary` separately covers these local
+durability boundaries.

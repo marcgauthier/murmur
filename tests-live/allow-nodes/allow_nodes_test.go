@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,14 +19,11 @@ import (
 func TestAllowedNodeIDsAcrossProcesses(t *testing.T) {
 	node1, node2, node3 := murmur.NewNodeID(), murmur.NewNodeID(), murmur.NewNodeID()
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "allow-nodes",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		NodeIDs:     []murmur.NodeID{node1, node2, node3},
-		SchemaSQL: `CREATE TABLE IF NOT EXISTS items (
-  id BLOB PRIMARY KEY NOT NULL,
-  name TEXT NOT NULL DEFAULT ''
-);`,
+		Name:         "allow-nodes",
+		NumNodes:     3,
+		AwaitUnlock:  true,
+		NodeIDs:      []murmur.NodeID{node1, node2, node3},
+		TypedRecords: true,
 		// Node2 accepts only node1. Node1 and node3 have no identity filter.
 		AllowedPeersByNode: map[int][]murmur.NodeID{1: {node1}},
 	})
@@ -52,9 +50,7 @@ func TestAllowedNodeIDsAcrossProcesses(t *testing.T) {
 					return
 				case <-ticker.C:
 				}
-				id := fmt.Sprintf("%032x", int64(node+1)*1_000_000+seq)
-				if err := cluster.ExecSQL(node, "INSERT INTO items (id, name) VALUES (?, ?)", id,
-					fmt.Sprintf("node%d-write-%d", node+1, seq)); err != nil {
+				if err := cluster.TypedInsert(node, fmt.Sprintf("node%d-write-%d", node+1, seq)); err != nil {
 					cluster.MarkFailed(fmt.Sprintf("node%d write %d: %v", node+1, seq, err))
 					return
 				}
@@ -76,16 +72,12 @@ func TestAllowedNodeIDsAcrossProcesses(t *testing.T) {
 	for time.Now().Before(deadline) {
 		converged := true
 		for i := range cluster.Nodes {
-			count, err := cluster.QueryRowCount(i, "items")
-			if err != nil || count != want {
+			names, err := cluster.TypedNames(i)
+			if err != nil || len(names) != want {
 				converged = false
 				break
 			}
-			got, err := cluster.ComputeTableDigest(i, "items", "name")
-			if err != nil {
-				converged = false
-				break
-			}
+			got := strings.Join(names, "\x00")
 			if digest == "" {
 				digest = got
 			} else if got != digest {
@@ -100,13 +92,13 @@ func TestAllowedNodeIDsAcrossProcesses(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	for i, node := range cluster.Nodes {
-		count, err := cluster.QueryRowCount(i, "items")
-		if err != nil || count != want {
-			t.Fatalf("%s rows=%d err=%v, want all %d application writes", node.Label, count, err, want)
+		names, err := cluster.TypedNames(i)
+		if err != nil || len(names) != want {
+			t.Fatalf("%s records=%d err=%v, want all %d application writes", node.Label, len(names), err, want)
 		}
-		got, err := cluster.ComputeTableDigest(i, "items", "name")
-		if err != nil || got != digest {
-			t.Fatalf("%s digest=%s err=%v, want %s", node.Label, got, err, digest)
+		got := strings.Join(names, "\x00")
+		if got != digest {
+			t.Fatalf("%s names=%v, want %s", node.Label, names, digest)
 		}
 	}
 	// B must keep just A as a direct peer throughout the workload. C reaches B's

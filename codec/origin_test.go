@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/schema"
 )
 
 func originVector() (*MutationBatch, ed25519.PrivateKey) {
@@ -114,6 +115,133 @@ func TestOriginMutationOrderAndChunkIdentity(t *testing.T) {
 	c.HLC++
 	if err := VerifyOriginIdentity(c.OriginBatch(), b.DBID, key.Public().(ed25519.PublicKey)); err == nil {
 		t.Fatal("chunk identity tampering accepted")
+	}
+}
+
+func originV5Vector() (*MutationBatch, ed25519.PrivateKey) {
+	key := ed25519.NewKeyFromSeed(make([]byte, 32))
+	b := &MutationBatch{ProtocolVersion: 5, DBID: ids.DBID{1}, OriginNode: ids.NodeID{2}, Sequence: 3, TxID: ids.TxID{4}, HLC: 5, SchemaEpoch: 6, SchemaHash: [32]byte{7}, Mutations: []Mutation{
+		{TableID: 8, RowID: ids.RowID{9}, ColumnID: 10, Value: Text("hello"), Policy: schema.LWW},
+		{TableID: 8, RowID: ids.RowID{10}, ColumnID: 11, Value: Blob([]byte{1, 2, 3}), Policy: schema.OR_SET, Records: []CRDTRecord{{Key: []byte("k1"), Data: []byte("d1")}, {Key: []byte("k2"), Data: []byte("d2")}}},
+		{TableID: 8, RowID: ids.RowID{11}, ColumnID: ColumnTombstone, Value: Null(), Flags: FlagTombstone, Policy: schema.LWW},
+	}}
+	if err := SignOrigin(b, b.DBID, key); err != nil {
+		panic(err)
+	}
+	return b, key
+}
+
+func cloneBatch(b *MutationBatch) *MutationBatch {
+	out := *b
+	out.Mutations = make([]Mutation, len(b.Mutations))
+	for i := range b.Mutations {
+		out.Mutations[i] = b.Mutations[i]
+		// Deep-copy record bytes: tamper cases mutate them in place and
+		// must never pollute the shared original.
+		records := make([]CRDTRecord, len(b.Mutations[i].Records))
+		for j := range b.Mutations[i].Records {
+			records[j].Key = append([]byte(nil), b.Mutations[i].Records[j].Key...)
+			records[j].Data = append([]byte(nil), b.Mutations[i].Records[j].Data...)
+		}
+		out.Mutations[i].Records = records
+	}
+	return &out
+}
+
+// Inserting a duplicate mutation must invalidate the signature: the digest
+// covers the count and every mutation in order.
+func TestOriginDuplicateMutationRejected(t *testing.T) {
+	original, key := originV5Vector()
+	pub := key.Public().(ed25519.PublicKey)
+	b := cloneBatch(original)
+	b.Mutations = append(b.Mutations, original.Mutations[0])
+	if err := VerifyOrigin(b, original.DBID, pub); !errors.Is(err, ErrOriginDigest) {
+		t.Fatalf("duplicate mutation: %v", err)
+	}
+}
+
+// Policy and CRDT records are covered by the digest at protocol v5 (the
+// production floor): flipping, reordering, dropping, or adding any of them
+// must invalidate the signature.
+func TestOriginV5PolicyAndRecordsTamperingRejected(t *testing.T) {
+	original, key := originV5Vector()
+	pub := key.Public().(ed25519.PublicKey)
+	cases := map[string]func(*MutationBatch){
+		"policy flip":      func(b *MutationBatch) { b.Mutations[1].Policy = schema.PN_COUNTER },
+		"policy on LWW":    func(b *MutationBatch) { b.Mutations[0].Policy = schema.MAX },
+		"records reorder":  func(b *MutationBatch) { r := b.Mutations[1].Records; r[0], r[1] = r[1], r[0] },
+		"record key flip":  func(b *MutationBatch) { b.Mutations[1].Records[0].Key[0]++ },
+		"record data flip": func(b *MutationBatch) { b.Mutations[1].Records[1].Data[0]++ },
+		"record drop":      func(b *MutationBatch) { b.Mutations[1].Records = b.Mutations[1].Records[:1] },
+		"record append":    func(b *MutationBatch) { b.Mutations[1].Records = append(b.Mutations[1].Records, CRDTRecord{Key: []byte("k3")}) },
+		"records on LWW":   func(b *MutationBatch) { b.Mutations[0].Records = []CRDTRecord{{Key: []byte("x")}} },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			b := cloneBatch(original)
+			mutate(b)
+			if err := VerifyOrigin(b, original.DBID, pub); !errors.Is(err, ErrOriginDigest) {
+				t.Fatalf("%s: %v", name, err)
+			}
+		})
+	}
+	if err := VerifyOrigin(original, original.DBID, pub); err != nil {
+		t.Fatalf("valid v5 batch: %v", err)
+	}
+}
+
+// nil and empty values canonicalize identically: same digest bytes, same
+// decoded form, interchangeable under one signature.
+func TestOriginNilEmptyValueCanonicalization(t *testing.T) {
+	key := ed25519.NewKeyFromSeed(make([]byte, 32))
+	pub := key.Public().(ed25519.PublicKey)
+	mkbatch := func(v Value) *MutationBatch {
+		return &MutationBatch{ProtocolVersion: 5, DBID: ids.DBID{1}, OriginNode: ids.NodeID{2}, Sequence: 3, TxID: ids.TxID{4}, HLC: 5, SchemaEpoch: 1, Mutations: []Mutation{{TableID: 8, RowID: ids.RowID{9}, ColumnID: 10, Value: v}}}
+	}
+	nilBatch, emptyBatch := mkbatch(Blob(nil)), mkbatch(Blob([]byte{}))
+	if MutationDigest(nilBatch) != MutationDigest(emptyBatch) {
+		t.Fatal("nil and empty blob digests differ")
+	}
+	if err := SignOrigin(nilBatch, nilBatch.DBID, key); err != nil {
+		t.Fatal(err)
+	}
+	// Same envelope verifies on the empty-valued twin.
+	emptyBatch.MutationDigest, emptyBatch.SignatureVersion, emptyBatch.OriginSignature =
+		nilBatch.MutationDigest, nilBatch.SignatureVersion, nilBatch.OriginSignature
+	if err := VerifyOrigin(emptyBatch, nilBatch.DBID, pub); err != nil {
+		t.Fatalf("canonical twin rejected: %v", err)
+	}
+	for name, b := range map[string]*MutationBatch{"nil": nilBatch, "empty": emptyBatch} {
+		decoded, rest, err := DecodeBatch(EncodeBatch(nil, b), DefaultLimits())
+		if err != nil || len(rest) != 0 {
+			t.Fatalf("%s round-trip: %v", name, err)
+		}
+		if MutationDigest(decoded) != MutationDigest(b) {
+			t.Fatalf("%s digest changed across round-trip", name)
+		}
+		if err := VerifyOrigin(decoded, nilBatch.DBID, pub); err != nil {
+			t.Fatalf("%s decoded rejected: %v", name, err)
+		}
+	}
+}
+
+// A v5 batch exercising every signed dimension must survive
+// encode/decode with identical digest and signature input.
+func TestOriginV5RoundTripVector(t *testing.T) {
+	original, key := originV5Vector()
+	pub := key.Public().(ed25519.PublicKey)
+	decoded, rest, err := DecodeBatch(EncodeBatch(nil, original), DefaultLimits())
+	if err != nil || len(rest) != 0 {
+		t.Fatalf("decode: %v", err)
+	}
+	if MutationDigest(decoded) != original.MutationDigest {
+		t.Fatal("digest changed across round-trip")
+	}
+	if hex.EncodeToString(OriginSigningBytes(decoded)) != hex.EncodeToString(OriginSigningBytes(original)) {
+		t.Fatal("signature input changed across round-trip")
+	}
+	if err := VerifyOrigin(decoded, original.DBID, pub); err != nil {
+		t.Fatalf("decoded batch rejected: %v", err)
 	}
 }
 

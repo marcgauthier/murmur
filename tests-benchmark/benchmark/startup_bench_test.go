@@ -6,55 +6,47 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/codec"
-	"github.com/marcgauthier/murmur/crypto"
 	"github.com/marcgauthier/murmur/internal/testidentity"
+	"github.com/marcgauthier/murmur/spool"
 	"github.com/marcgauthier/murmur/state"
 )
 
 // BenchmarkStartupComponents breaks Open into externally measurable
-// phases on template copies: registry open, store (Pebble) open, full
-// open (store plus engine rebuild), and time to first query. Compare
-// full-open against store-open across runs to size the rebuild; same-run
-// subtraction is polluted by page-cache warmth. Single-shot per size
+// phases on template copies: store (Spool) open, full open (store plus
+// engine rebuild), and time to first query. Compare full-open against
+// store-open across runs to size the rebuild. Single-shot per size
 // with explicit metrics.
 func BenchmarkStartupComponents(b *testing.B) {
 	for _, n := range datasetSizes(b) {
 		b.Run(sizeName(n), func(b *testing.B) {
 			ctx := context.Background()
 			tmpl := templateFor(b, n)
-			var dbid [16]byte
-			copy(dbid[:], tmpl.dbid[:])
-			prov := benchProvider()
 
-			// Registry + store opens on one copy.
+			// Store open on one copy.
 			dir1 := b.TempDir()
 			if err := copyDir(tmpl.dir, dir1); err != nil {
 				b.Fatal(err)
 			}
+			dataPath := filepath.Join(dir1, "data")
 			start := time.Now()
-			reg, err := crypto.OpenRegistry(filepath.Join(dir1, "keys"), prov, dbid)
-			regOpen := time.Since(start)
-			if err != nil {
-				b.Fatal(err)
-			}
-			efs, err := crypto.NewEncryptedFS(crypto.FSOptions{Base: vfs.Default, Registry: reg, DBID: dbid})
-			if err != nil {
-				reg.Close()
-				b.Fatal(err)
-			}
-			start = time.Now()
-			st, err := state.Open(filepath.Join(dir1, "data"), tmpl.node, tmpl.dbid,
-				state.Options{FS: efs, Limits: codec.DefaultLimits(), OriginSigning: testidentity.Config(tmpl.node)})
+			st, err := state.Open(dataPath, tmpl.node, tmpl.dbid,
+				state.Options{
+					Spool: spool.Options{
+						Path:          dataPath,
+						MasterKey:     append([]byte(nil), benchKey...),
+						WrappingKeyID: "bench",
+						Encryption:    spool.EncryptionAES256GCM,
+					},
+					Limits:        codec.DefaultLimits(),
+					OriginSigning: testidentity.Config(tmpl.node),
+				})
 			storeOpen := time.Since(start)
 			if err != nil {
-				reg.Close()
 				b.Fatal(err)
 			}
 			_ = st.Close()
-			reg.Close()
 
 			// Full open on another copy.
 			dir2 := b.TempDir()
@@ -68,21 +60,19 @@ func BenchmarkStartupComponents(b *testing.B) {
 				b.Fatal(err)
 			}
 			defer db.Close()
-			qstart := time.Now()
-			rows, err := db.QueryContext(ctx, `SELECT COUNT(*) FROM contacts`)
+			contacts, err := murmur.TableOf[benchContact](db, "contacts")
 			if err != nil {
 				b.Fatal(err)
 			}
-			var count int
-			for rows.Next() {
-				_ = rows.Scan(&count)
+			qstart := time.Now()
+			count, err := contacts.Where().Count()
+			if err != nil {
+				b.Fatal(err)
 			}
-			rows.Close()
 			if count != n {
 				b.Fatalf("rebuilt %d rows, want %d", count, n)
 			}
 			firstQuery := time.Since(qstart)
-			b.ReportMetric(float64(regOpen.Nanoseconds()), "registry-open-ns")
 			b.ReportMetric(float64(storeOpen.Nanoseconds()), "store-open-ns")
 			b.ReportMetric(float64(fullOpen.Nanoseconds()), "full-open-ns")
 			b.ReportMetric(float64(firstQuery.Nanoseconds()), "first-query-ns")

@@ -6,11 +6,11 @@ Change capture, transaction coalescing, commit/apply ordering, and idempotency.
 
 ## Contents
 
-- [8. Change Capture: Use SQLite Pre-Update Hook First](#8-change-capture-use-sqlite-pre-update-hook-first)
+- [8. RIME Prepared-Change Capture](#8-rime-prepared-change-capture)
 - [9. Transaction Delta Coalescing](#9-transaction-delta-coalescing)
-- [15. Pebble Atomic Batch for a Local Mutation](#15-pebble-atomic-batch-for-a-local-mutation)
-- [16. Local SQL Commit Ordering](#16-local-sql-commit-ordering)
-- [17. Alternative Write Optimization](#17-alternative-write-optimization)
+- [15. Spool Atomic Commit for a Local Mutation](#15-spool-atomic-commit-for-a-local-mutation)
+- [16. Durable-First Typed Commit Ordering](#16-durable-first-typed-commit-ordering)
+- [17. Durability Modes](#17-durability-modes)
 - [18. Remote Mutation Apply Path](#18-remote-mutation-apply-path)
 - [19. Prevent Replication Echo](#19-prevent-replication-echo)
 - [49. Idempotency](#49-idempotency)
@@ -18,143 +18,36 @@ Change capture, transaction coalescing, commit/apply ordering, and idempotency.
 
 ---
 
-## 8. Change Capture: Use SQLite Pre-Update Hook First
+## 8. RIME Prepared-Change Capture
 
-Preferred mechanism:
+Managed RIME transactions expose an immutable prepared-change set before
+publication. Each change carries stable table and row identity, operation,
+old/new values, base versions and final per-field state. Preparation validates
+schema, codecs, ownership, limits and merge policy before Spool durability.
+Application writes never rely on SQL hooks or asynchronous change queues.
 
-```text
-sqlite3_preupdate_hook()
-```
-
-SQLite exposes a pre-update hook when compiled with:
-
-```text
-SQLITE_ENABLE_PREUPDATE_HOOK
-```
-
-The callback receives INSERT, UPDATE, and DELETE operations and can retrieve old/new column values.
-
-This is a better primary design than generating a trigger for every replicated column.
-
-### Advantages
-
-- No persistent trigger objects required.
-- No per-table replication log table in SQLite.
-- Captures writes regardless of SQL statement shape.
-- Multi-row updates naturally produce per-row events.
-- Old and new values are available.
-- Nested changes caused by triggers can be observed.
-- Less schema-generation logic.
-- Easier to disable capture while applying remote mutations.
-
-### Required build check
-
-The bundled mattn SQLite build enables:
-
-```text
-SQLITE_ENABLE_PREUPDATE_HOOK
-```
-
-Create an integration test that fails the build/test suite if the hook is unavailable.
-
-### Important limitation
-
-The pre-update hook does not fire for virtual tables.
-
-That is acceptable for this architecture because FTS/search virtual tables are local derived structures and should not replicate directly.
-
-### Trigger fallback
-
-Implement a generated-trigger capture backend only if the pre-update hook cannot be used reliably with the supported SQLite drivers.
-
-Define:
-
-```go
-type ChangeCapture interface {
-    Begin(txID TxID)
-    Events() []RawChange
-    Reset()
-}
-```
-
-Implementations:
-
-```text
-PreUpdateCapture
-TriggerCapture
-```
-
-Do not implement CR-SQLite as the fallback.
-
----
+Preparation owns all data needed by durable encoding and later publication.
+Mutable inputs are cloned before staging, and values in the prepared set are
+not exposed for mutation. A failed preparation aborts the RIME transaction and
+leaves durable state unchanged.
 
 ## 9. Transaction Delta Coalescing
 
-A SQL transaction can modify the same cell multiple times.
+Repeated changes to one record are coalesced to the final durable delta while
+operation hooks retain their documented execution count. The adapter converts
+prepared RIME changes into canonical Spool mutations, assigns transaction and
+origin metadata, and enforces per-value, mutation-count and encoded-byte caps
+before submitting durable work.
 
-Example:
+## 15. Spool Atomic Commit for a Local Mutation
 
-```sql
-BEGIN;
-UPDATE contacts SET phone='111' WHERE id=?;
-UPDATE contacts SET phone='222' WHERE id=?;
-COMMIT;
-```
+Local transactions are signed after assigning their origin sequence, before the atomic Spool commit; remote transactions verify before any durable prepare, merge, receipt or HLC observation. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
 
-Replication should normally emit only:
+Transaction methods serialize staging against cancellation, so cancellation
+cannot roll back concurrently with an executing mutation. Read results are
+detached from the transaction and do not require SQL row-handle closure.
 
-```text
-phone = "222"
-```
-
-not both intermediate values.
-
-Maintain a transaction-local delta:
-
-```go
-type CellKey struct {
-    TableID  uint32
-    RowID    UUID
-    ColumnID uint32
-}
-
-type TxCellDelta struct {
-    OriginalPresent bool
-    OriginalValue   Value
-
-    FinalPresent    bool
-    FinalValue      Value
-}
-```
-
-Coalesce events by:
-
-```text
-(table ID, row UUID, column ID)
-```
-
-At commit:
-
-- INSERT then UPDATE -> one final INSERT state.
-- UPDATE then UPDATE -> one final value.
-- INSERT then DELETE within the same transaction -> no externally visible row mutation.
-- UPDATE then DELETE -> row tombstone.
-- DELETE then INSERT with same UUID -> define as row resurrection and emit final row state.
-- Setting a value to its existing value -> omit mutation.
-
-This reduces replication volume substantially.
-
----
-
-## 15. Pebble Atomic Batch for a Local Mutation
-
-Local transactions are signed after assigning their origin sequence, before the atomic Pebble commit; remote transactions verify before any durable prepare, merge, receipt or HLC observation. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
-
-Transaction methods hold the transaction mutex through statement startup so
-context cancellation cannot roll back concurrently with an executing statement.
-Callers must still close transaction query rows before committing or rolling back.
-
-Once a transaction has been accepted for durable replication, a single Pebble batch must atomically:
+Once a transaction has been accepted for durable replication, a single Spool commit must atomically:
 
 - Merge/update all winning cell states.
 - Update tombstone states.
@@ -164,134 +57,93 @@ Once a transaction has been accepted for durable replication, a single Pebble ba
 - Write transaction receipt.
 - Update a materialization generation counter.
 
-Commit the batch with `pebble.Sync` and keep WAL enabled. Do not write these as independent batches.
+Commit the mutations to Spool at the configured durability level. Do not write these as independent commits.
 
-Ordinary remote apply writes the complete encoded transaction to a synced prepare record first. It then atomically commits winning cells, log, receipt, receive watermark, HLC, state generation, and removal of that record in one Pebble batch. Store open replays any surviving prepare record through the same idempotent apply path before exposing state. Thus a crash before the final batch leaves the transaction unapplied and recoverable; a crash after it leaves the complete transaction committed and no prepare record. Materialization generation is updated after applying winners to SQL; on restart, SQL is rebuilt from committed state before its generation is advanced.
+Ordinary remote apply writes the complete encoded transaction to a synced
+prepare record first. It then atomically commits winning cells, log, receipt,
+receive watermark, HLC, state generation, and removal of that record in one
+Spool commit. Store open replays any surviving prepare record through the same
+idempotent apply path before exposing state. Thus a crash before the final
+commit leaves the transaction unapplied and recoverable; a crash after it leaves
+the complete transaction committed and no prepare record. RIME is rebuilt from
+committed state before its materialized generation is advanced. Before final
+snapshot publication, typed callback writes drain and new callbacks wait until
+the rebuilt RIME generation is installed, so a snapshot cannot invalidate a
+staged callback's generation.
 
-This prepare record is the recovery boundary needed before any ordinary remote winner state is staged with `DB.Ingest`. The current ordinary apply implementation still uses the atomic batch to install winners; it does not yet use external SSTable ingestion. Any future ingestion optimization must keep the prepare record until the final metadata batch commits, and recovery must tolerate replay after ingestion by applying the same CRDT versions idempotently. Large snapshot imports already use SSTable ingestion because their candidate is staged separately, progress is replayable, SQL remains gated, and snapshot watermarks/generation publish only in the final batch. Local commits continue to use one synced batch.
-
-Pebble batches do not provide Badger-style optimistic transaction conflict detection. Serialize the entire read/merge/write operation for all local, remote, metadata, acknowledgement, and GC mutations through one state-store writer coordinator. Use an indexed batch where a merge needs to read its own pending writes. Independent readers use Pebble snapshots and bounded iterators; close snapshots, iterators, and value closers on every path, and copy borrowed bytes before retaining them. With synchronous group commit ([Section 16](#16-local-sql-commit-ordering)), one synced batch carries a whole group of local transactions instead of one; the serialization requirement is unchanged.
+The state store maintains an in-memory Radix tree representing current authoritative state. Serialize the entire read/merge/write operation for all local, remote, metadata, acknowledgement, and GC mutations through one state-store writer coordinator. Transactions can read their own pending writes before persistence. Independent readers use pinned Radix tree snapshots; with synchronous group commit ([Section 16](#16-durable-first-typed-commit-ordering)), one synced Spool commit carries a whole group of local transactions instead of one; the serialization requirement is unchanged.
 
 This is one of the most important correctness requirements.
 
 ---
 
-## 16. Local SQL Commit Ordering
+## 16. Durable-First Typed Commit Ordering
 
-There is no distributed ACID transaction shared by SQLite and Pebble.
-
-Because the SQLite materialization is disposable, exploit that fact instead of attempting a complex two-phase commit between two embedded engines.
-
-Recommended local write path:
+RIME is a rebuildable materializer and Spool is authoritative. Every accepted
+local transaction follows this order:
 
 ```text
-1. Acquire local write transaction context.
-2. Begin SQLite transaction.
-3. Execute SQL.
-4. Pre-update hook records all row/cell changes.
-5. Coalesce transaction delta.
-6. Validate the coalesced transaction's encoded size against MaxTransactionBytes; roll back SQL on overflow. Otherwise COMMIT SQLite (in-memory commit; `PRAGMA synchronous = OFF`).
-7. Build final MutationBatch.
-8. Commit MutationBatch + current state atomically to Pebble (batch.Commit(pebble.Sync) performs the single authoritative fsync).
-9. Record SQL materialization generation = Pebble generation.
-10. ACK success to application.
+1. Stage and validate typed changes in a managed RIME transaction.
+2. Acquire writer admission and the ordered local commit position.
+3. Encode the final mutation batch, origin signature, HLC and transaction ID.
+4. Commit the batch, receipt, local sequence and state generation to Spool.
+5. Publish the prepared managed RIME transaction in the same commit order.
+6. Notify subscriptions and replication, then acknowledge the caller.
 ```
 
-Why commit SQL first?
-
-Because COMMIT can still fail due to SQL constraints or deferred checks. The package should not durably replicate a transaction that SQLite rejected. The in-memory SQLite commit does not establish durability; physical disk synchronization happens once per transaction in Step 8 on Pebble.
-
-### Failure after SQLite commit but before Pebble commit
-
-The application must not receive success.
-
-The in-memory query database is now ahead of durable state.
-
-Immediately:
-
-```text
-mark materializer DIRTY
-block subsequent writes
-rebuild affected rows or rebuild complete SQLite state from Pebble
-resume
-return error to caller
-```
-
-Because SQLite is non-authoritative, this failure is recoverable.
-
-### Failure after Pebble commit but before client receives success
-
-The client may retry.
-
-Therefore every mutation batch must have a TxID and duplicate TxIDs must be idempotent.
-
-This is a normal ambiguous-commit scenario and must have explicit tests.
+A rejection before Spool durability aborts RIME publication and returns a
+definite error. A failure after Spool durability freezes the adapter and reports
+an uncertain outcome with the transaction ID; restart reconstructs RIME from
+Spool, and `HasTransactionReceipt` resolves whether the commit landed. Remote
+transactions use the same durable-before-publication boundary after signature,
+schema and merge validation.
 
 ### Synchronous group commit
 
-Single-row synchronous writes are fsync-bound (one `pebble.Sync` per transaction, a few hundred tx/s), while the same workload without per-transaction sync runs an order of magnitude faster. Synchronous group commit closes most of that gap without weakening durability: concurrent transactions briefly queue after their SQL commit and share one Pebble batch with one fsync, and each transaction is still acknowledged only after that shared fsync.
+Synchronous typed writes are grouped by default when the configured delay is
+positive. A group batches ordered mutation batches in one `Store.CommitLocalGroup`
+call and one Spool sync. Each prepared RIME transaction is then published in
+the original group order. Callers receive success only after both durability
+and publication complete. Node-local writes and ephemeral writes use the direct
+path when their payload is ineligible for replicated group commit.
 
-Path (enabled by default in synchronous mode; see `GroupCommitConfig`):
+Close stops admission, lets active staging finish, flushes the pending group,
+and waits for all admitted members. A shared Spool failure fails every member;
+no member is acknowledged. A process exit before the durable group leaves no
+member visible after reopen. A failure after durability is treated as an
+uncertain outcome and the materializer is rebuilt or the node fails closed.
 
-```text
-1. Steps 1-7 above run serialized under writeMu, as before.
-2. The transaction enqueues its MutationBatch (still under writeMu, so
-   group order matches SQL-commit order), then releases its admission
-   ticket and writeMu so the next transaction's SQL overlaps this fsync.
-3. The first arrival (leader) waits up to MaxDelay for followers, or
-   until MaxTransactions/MaxBytes is reached, then commits the whole
-   group with one Store.CommitLocalGroup call: per-member log rows,
-   receipts, contiguous local sequences, origin signatures, and one
-   generation bump per applied member, in a single synced Pebble batch.
-4. The leader runs one remote flush, probes each member for interleaved
-   non-local commits (generation delta versus local-sequence delta;
-   equal deltas mean only lower-HLC local commits landed, which can
-   never overturn the member's materialized rows), repairs touched rows
-   when the probe trips, advances the materialized generation, and
-   notifies subscribers/replication once.
-5. Every member is ACKed (or failed) individually.
-```
+Focused `TestGroupCommit*` coverage exercises concurrent writers, conflicting
+updates to one row, one shared ENOSPC failure, process exit before Spool commit,
+and Close with queued members. Broader storage-fault and multi-peer process
+qualification remains part of the migration release gates.
 
-Consequences:
-
-- A group commit is atomic across members: if the shared Pebble commit fails, every member gets an error and the materializer rebuilds from durable state (the same "SQL ahead of durable" recovery as the single path). A failed group never partially acknowledges.
-- The ambiguous-commit rule is unchanged: crash after the shared fsync leaves every member durable, so duplicates must stay idempotent (duplicate TxIDs are acknowledged without reapplying).
-- Isolated writes pay up to `MaxDelay` (default one millisecond) with no batching benefit; throughput scales with concurrency (about one fsync per group). A negative `MaxDelay` disables grouping and restores the one-batch-per-transaction path.
-- `Metrics().GroupCommits` and `GroupCommitMembers` report group count and total carried transactions; divide for mean group size.
-
----
-
-## 17. Alternative Write Optimization
+## 17. Durability Modes
 
 Write optimizations must not compromise CRDT invariants or crash consistency.
 
-```text
-SQL transaction
-      |
-      v
-committed local delta
-      |
-      v
-Pebble commit (pebble.Sync or pebble.NoSync)
-```
+Synchronous durability is the default. Managed writes return only after Spool
+sync and RIME publication; asynchronous mode acknowledges before its next
+explicit or scheduled sync.
 
-Acknowledging before Pebble durability changes the durability contract. Murmur-SQL provides an explicit configuration:
+Acknowledging before Spool durability changes the durability contract. Murmur-SQL provides an explicit configuration:
 
 ```go
-DurabilitySynchronous // Default: fsync before acknowledging commit (pebble.Sync)
-DurabilityAsync       // Asynchronous: acknowledged at memory/WAL speed without waiting for fsync (pebble.NoSync)
+DurabilitySynchronous // Default: fsync before acknowledging commit
+DurabilityAsync       // Asynchronous: acknowledged at memory/WAL speed without waiting for fsync
 ```
 
 Default is synchronous (`DurabilitySynchronous`).
 
 When `DurabilityAsync` is explicitly configured:
-- Transactions commit at RAM speed via `pebble.NoSync` without blocking on disk sync.
+- Transactions commit at RAM speed without blocking on disk sync.
 - Acknowledgements explicitly carry a weaker durability contract: in an ungraceful crash or power-loss scenario, transactions acknowledged since the last sync may not have reached disk.
 - Applications can invoke `db.Sync(ctx)` at any time to establish an explicit durable sync point to disk.
-- Sync uses a WAL-only Pebble record with `pebble.Sync`; an empty Pebble batch would be skipped and would not establish a durability barrier.
-- Set `Durability.SyncInterval = time.Second` to schedule a Pebble sync about once per second. The interval is opt-in, valid only with `DurabilityAsync`, and zero leaves synchronization manual. A slow or failed sync can extend the loss window; a failed scheduled sync makes the database fail closed. Graceful close performs a final sync and reports an error if it fails.
-- `pebble.NoSync` still appends each commit to the WAL. The interval reduces fsync frequency; it does not guarantee exactly one physical disk write per second.
-- Replica convergence and CRDT invariants remain intact: query engine rebuilds and version ordering remain authoritative from the persisted Pebble state.
+- Sync appends an explicit sync barrier record and performs a segment sync.
+- Set `Durability.SyncInterval = time.Second` to schedule a Spool sync about once per second. The interval is opt-in, valid only with `DurabilityAsync`, and zero leaves synchronization manual. A slow or failed sync can extend the loss window; a failed scheduled sync makes the database fail closed. Graceful close performs a final sync and reports an error if it fails.
+- Async commits still append each mutation to Spool's active segment. The interval reduces fsync frequency; it does not guarantee exactly one physical disk write per second.
+- Replica convergence and CRDT invariants remain intact: RIME rebuilds and
+  version ordering remain authoritative from persisted Spool state.
 
 ---
 
@@ -299,73 +151,36 @@ When `DurabilityAsync` is explicitly configured:
 
 Remote apply order is different.
 
-Pebble is authoritative, so:
+Spool is authoritative, so:
 
 ```text
 1. Receive a complete MutationBatch, or durably stage and validate all its chunks before entering this apply path.
 2. Validate protocol/schema/origin/sequence.
 3. Check duplicate TxID/sequence.
 4. Observe remote HLC.
-5. Merge mutations against Pebble current state.
-6. Atomically store winners + log + receive watermark.
-7. Commit Pebble.
-8. Add winning row identities to the in-memory materialization map.
-9. Send the durable-receive acknowledgement.
-10. At the next one-second tick or when 1,000 received transactions are queued, read each affected row's final state from Pebble and apply all rows in one SQLite transaction.
+5. Merge mutations against current authoritative state in RAM.
+6. Atomically commit winners, log, receipt, watermark and generation to Spool.
+7. Publish the winning typed records through the managed RIME adapter.
+8. Acknowledge the apply after RIME publication completes.
 ```
 
-The interval and transaction threshold are configurable through `QueryStore.RemoteApplyInterval` and `QueryStore.RemoteApplyMaxTransactions`. The map coalesces repeated writes to a row. A local SQL write flushes pending remote rows before it starts, and again at commit if remote data arrived during the transaction. Queries may see the previous SQLite state until the flush. `StateGeneration` advances with Pebble commits; the in-memory `MaterializedGeneration` advances only after SQLite catches up. Startup always rebuilds SQLite from Pebble and reinitializes that marker, so an interrupted process cannot lose queued changes or require a separate Pebble marker write.
+RIME is rebuilt from Spool on open and after a completed snapshot. A failure
+after the durable Spool commit cannot undo that commit; the node fails closed
+and reconstructs the materializer from Spool on restart. The former deferred
+SQLite worker and its one-second/1,000-transaction thresholds have been removed.
 
-If the bulk SQLite apply fails:
-
-```text
-Pebble remains correct.
-mark materializer DIRTY.
-rebuild SQLite.
-```
-
-Do not roll back Pebble because of a cache/materialization failure.
-
-Applying several complete remote transactions in one synchronized Pebble commit may amortize fsync costs, but preserve each transaction's identity and all-or-nothing mutation set. Advance only contiguous origin progress for validated complete batches; chunk receipts and gap-buffer entries are not applied transaction acknowledgements.
+Applying several complete remote transactions in one synchronized Spool commit may amortize fsync costs, but preserve each transaction's identity and all-or-nothing mutation set. Advance only contiguous origin progress for validated complete batches; chunk receipts and gap-buffer entries are not applied transaction acknowledgements.
 
 ---
 
 ## 19. Prevent Replication Echo
 
-Applying a remote update to SQLite must not create a new local mutation.
+Remote apply merges accepted batches into authoritative Spool state, then
+publishes winning rows through the RIME adapter. It never calls the local write
+coordinator, so remote updates cannot create new local mutation batches.
 
-With the pre-update-hook implementation, associate an apply mode with the SQL connection:
-
-```go
-type CaptureMode uint8
-
-const (
-    CaptureLocal CaptureMode = iota
-    CaptureSuppressed
-)
-```
-
-During:
-
-- remote apply
-- startup rebuild
-- snapshot restore
-
-set:
-
-```text
-CaptureSuppressed
-```
-
-The callback returns without recording mutations.
-
-For trigger fallback, register a connection-local SQL function such as:
-
-```text
-repl_capture_enabled()
-```
-
-and generate triggers with a guard.
+Startup rebuild and snapshot publication also materialize directly from durable
+state rather than routing rows through application writes.
 
 ---
 
@@ -390,64 +205,21 @@ Sequence identity remains the primary ordered replication identity; TxID protect
 
 ## 81. Example End-to-End Local Write
 
-Application executes:
+Application stages a typed update:
 
-```sql
-UPDATE contacts
-SET phone = '613-555-0100',
-    email = 'marc@example.test'
-WHERE id = ?;
+```go
+err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+    return contacts.Update(tx, id, func(row *Contact) error {
+        row.Phone = "613-555-0100"
+        row.Email = "marc@example.test"
+        return nil
+    })
+})
 ```
 
-Flow:
-
-```text
-SQLite UPDATE
-      |
-      v
-pre-update hook
-      |
-      +-- phone old/new
-      +-- email old/new
-      |
-      v
-TxDelta coalescer
-      |
-      v
-SQL COMMIT succeeds
-      |
-      v
-allocate:
-    TxID
-    local sequence 82911
-    HLC 0x...
-      |
-      v
-MutationBatch {
-    origin = A
-    seq = 82911
-    changes = [
-        phone,
-        email
-    ]
-}
-      |
-      v
-Pebble synchronized batch
-    merge current cells
-    write log/A/82911
-    write tx receipt
-    advance local seq
-    advance state generation
-      |
-      v
-Pebble batch.Commit(pebble.Sync)
-      |
-      v
-application receives success
-      |
-      v
-replication sender wakes
-```
+The managed coordinator prepares coalesced field changes, writes the mutation
+batch and receipt to Spool, then publishes the RIME transaction. Synchronous
+mode returns success after durable Spool commit and required RIME publication;
+replication is notified after the local commit completes.
 
 ---

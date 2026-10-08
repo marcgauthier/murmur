@@ -16,28 +16,20 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func TestExcludePersistsAndReleasesRetention(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "churn-retirement",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "ch_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:         "churn-retirement",
+		NumNodes:     3,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 	id2 := cluster.Nodes[2].NodeID.String()
 
 	for i := 0; i < 5; i++ {
-		if err := cluster.ExecSQL(0, "INSERT INTO ch_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 3000+i), fmt.Sprintf("a-%d", i)); err != nil {
+		if err := cluster.TypedInsert(0, fmt.Sprintf("a-%d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -70,13 +62,13 @@ func TestExcludePersistsAndReleasesRetention(t *testing.T) {
 		t.Fatalf("gating members = %v, want below baseline %v", got, gatingBefore)
 	}
 	// Node3's writes no longer arrive on survivors.
-	if err := cluster.ExecSQL(2, "INSERT INTO ch_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 3999), "isolated"); err != nil {
+	if err := cluster.TypedInsert(2, "isolated"); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(5 * time.Second)
 	for _, i := range []int{0, 1} {
-		if n, _ := cluster.QueryRowCount(i, "ch_rows"); n != 5 {
-			t.Fatalf("node %d count = %d after isolation, want 5", i, n)
+		if names, err := cluster.TypedNames(i); err != nil || len(names) != 5 {
+			t.Fatalf("node %d names after isolation = %v, err=%v; want five survivors", i, names, err)
 		}
 	}
 
@@ -110,16 +102,12 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "ch_rows")
-			if err != nil || n != want {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, "ch_rows", "name")
-			if err != nil {
-				ok = false
-				break
-			}
+			d := strings.Join(names, "\x00")
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -149,16 +137,8 @@ func waitCondition(t *testing.T, timeout time.Duration, what string, fn func() b
 
 func metricValue(t *testing.T, apiAddr, name string) float64 {
 	t.Helper()
-	for _, line := range strings.Split(scrape(t, apiAddr), "\n") {
-		if !strings.HasPrefix(line, name+" ") && !strings.HasPrefix(line, name+"{") {
-			continue
-		}
-		fields := strings.Fields(line)
-		var v float64
-		if _, err := fmt.Sscanf(fields[len(fields)-1], "%g", &v); err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		return v
+	if value, ok := harness.MetricValueFrom(scrape(t, apiAddr), name); ok {
+		return value
 	}
 	t.Fatalf("metric %s not found", name)
 	return 0
@@ -166,13 +146,8 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 
 func peerConnected(t *testing.T, apiAddr, peerID string) bool {
 	t.Helper()
-	want := fmt.Sprintf("spedsql_peer_connected{peer=%q} 1", peerID)
-	for _, line := range strings.Split(scrape(t, apiAddr), "\n") {
-		if strings.TrimSpace(line) == want {
-			return true
-		}
-	}
-	return false
+	value, ok := harness.MetricValueWithLabels(scrape(t, apiAddr), "spedsql_peer_connected", map[string]string{"peer": peerID})
+	return ok && value == 1
 }
 
 func scrape(t *testing.T, apiAddr string) string {

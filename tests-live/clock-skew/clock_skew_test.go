@@ -19,14 +19,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -43,25 +41,17 @@ func TestClockSkewKeepsLWWDeterministic(t *testing.T) {
 	t.Logf("using libfaketime at %s", lib)
 
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "clock-skew",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{
-			{Name: "skew_rows", Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			}},
-			{Name: "skew_probe", Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			}},
-		}},
+		Name:            "clock-skew",
+		NumNodes:        3,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 	baseID := fmt.Sprintf("%032x", 1)
-	if err := cluster.ExecSQL(0, "INSERT INTO skew_rows (id, name) VALUES (?, ?)", baseID, "baseline"); err != nil {
+	if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: baseID, Name: "baseline"}); err != nil {
 		t.Fatalf("baseline insert: %v", err)
 	}
-	waitConverged(t, cluster, "skew_rows", 1, 30*time.Second)
+	waitConverged(t, cluster, 1, 30*time.Second)
 
 	// Restart node3 under libfaketime, calibrating the offset syntax:
 	// the winner is the first spec whose probe write observably moves
@@ -72,11 +62,11 @@ func TestClockSkewKeepsLWWDeterministic(t *testing.T) {
 
 	// Phase A: a skewed write deterministically beats a real-time
 	// write on the same cell (its HLC leads by ~10min).
-	if err := cluster.ExecSQL(0, "UPDATE skew_rows SET name = ? WHERE id = ?", "realtime-1", baseID); err != nil {
+	if err := cluster.TypedContentionUpdate(0, baseID, "name", "realtime-1"); err != nil {
 		t.Fatalf("realtime write: %v", err)
 	}
 	waitCellValue(t, cluster, baseID, "realtime-1", 20*time.Second)
-	if err := cluster.ExecSQL(skewed, "UPDATE skew_rows SET name = ? WHERE id = ?", "skewed-1", baseID); err != nil {
+	if err := cluster.TypedContentionUpdate(skewed, baseID, "name", "skewed-1"); err != nil {
 		t.Fatalf("skewed write: %v", err)
 	}
 	waitCellValue(t, cluster, baseID, "skewed-1", 20*time.Second)
@@ -84,14 +74,13 @@ func TestClockSkewKeepsLWWDeterministic(t *testing.T) {
 
 	// Phase B: concurrent writes on all nodes (one shared cell plus
 	// disjoint cells) resolve identically everywhere.
-	disjointIDs := make([]string, len(cluster.Nodes))
 	for i := range cluster.Nodes {
-		disjointIDs[i] = fmt.Sprintf("%032x", 100+i)
-		if err := cluster.ExecSQL(i, "INSERT INTO skew_rows (id, name) VALUES (?, ?)", disjointIDs[i], "disjoint"); err != nil {
+		id := fmt.Sprintf("%032x", 100+i)
+		if err := cluster.TypedContentionInsert(i, harness.TypedContentionRow{ID: id, Name: "disjoint"}); err != nil {
 			t.Fatalf("node %d disjoint insert: %v", i, err)
 		}
 	}
-	waitConverged(t, cluster, "skew_rows", 1+len(cluster.Nodes), 30*time.Second)
+	waitConverged(t, cluster, 1+len(cluster.Nodes), 30*time.Second)
 
 	const updatesPerNode = 12
 	var wg sync.WaitGroup
@@ -102,7 +91,7 @@ func TestClockSkewKeepsLWWDeterministic(t *testing.T) {
 			defer wg.Done()
 			for seq := 0; seq < updatesPerNode; seq++ {
 				v := fmt.Sprintf("node%d-skew-%03d", node+1, seq)
-				if err := cluster.ExecSQL(node, "UPDATE skew_rows SET name = ? WHERE id = ?", v, baseID); err != nil {
+				if err := cluster.TypedContentionUpdate(node, baseID, "name", v); err != nil {
 					errCh <- err
 					return
 				}
@@ -119,7 +108,7 @@ func TestClockSkewKeepsLWWDeterministic(t *testing.T) {
 		t.Fatalf("shared-cell winner %q did not come from the concurrent write set", winner)
 	}
 	t.Logf("concurrent skewed contention converged to %q on all nodes", winner)
-	waitConverged(t, cluster, "skew_rows", 1+len(cluster.Nodes), 30*time.Second)
+	waitConverged(t, cluster, 1+len(cluster.Nodes), 30*time.Second)
 
 	// Phase C: no cert-validity flapping. Peering is stable and no
 	// handshake/accept failure counter moved on any node.
@@ -139,10 +128,10 @@ func TestClockSkewKeepsLWWDeterministic(t *testing.T) {
 	}
 
 	// Post-skew write on a real-time node replicates everywhere.
-	if err := cluster.ExecSQL(0, "INSERT INTO skew_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 999), "post-skew"); err != nil {
+	if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 999), Name: "post-skew"}); err != nil {
 		t.Fatalf("post-skew insert: %v", err)
 	}
-	waitConverged(t, cluster, "skew_rows", 2+len(cluster.Nodes), 30*time.Second)
+	waitConverged(t, cluster, 2+len(cluster.Nodes), 30*time.Second)
 }
 
 // calibrateSkew restarts node `skewed` under each candidate FAKETIME
@@ -171,8 +160,7 @@ func calibrateSkew(t *testing.T, c *harness.Cluster, lib string, hlcPre uint64) 
 		})
 		c.UnlockNode(skewed, c.Nodes[skewed].KeyHex)
 		c.WaitNodeReady(skewed)
-		probeID := fmt.Sprintf("%032x", 5000+i)
-		if err := c.ExecSQL(skewed, "INSERT INTO skew_probe (id, name) VALUES (?, ?)", probeID, spec); err != nil {
+		if err := c.TypedLocalInsert(skewed, fmt.Sprintf("clock-probe-%d-%s", i, spec)); err != nil {
 			t.Logf("spec %q: probe write failed: %v", spec, err)
 			continue
 		}
@@ -292,8 +280,8 @@ func waitCellValue(t *testing.T, c *harness.Cluster, id, want string, timeout ti
 	for time.Now().Before(deadline) {
 		ok := true
 		for i := range c.Nodes {
-			res, err := c.QuerySQL(i, "SELECT name FROM skew_rows WHERE id = ?", id)
-			if err != nil || len(res.Rows) != 1 || len(res.Rows[0]) == 0 || fmt.Sprint(res.Rows[0][0]) != want {
+			row, err := c.TypedContentionRead(i, id)
+			if err != nil || row.Name != want {
 				ok = false
 				break
 			}
@@ -313,12 +301,12 @@ func waitCellConverged(t *testing.T, c *harness.Cluster, id string, timeout time
 		var winner string
 		converged := true
 		for i := range c.Nodes {
-			res, err := c.QuerySQL(i, "SELECT name FROM skew_rows WHERE id = ?", id)
-			if err != nil || len(res.Rows) != 1 || len(res.Rows[0]) == 0 {
+			row, err := c.TypedContentionRead(i, id)
+			if err != nil {
 				converged = false
 				break
 			}
-			name := fmt.Sprint(res.Rows[0][0])
+			name := row.Name
 			if i == 0 {
 				winner = name
 			} else if name != winner {
@@ -335,23 +323,19 @@ func waitCellConverged(t *testing.T, c *harness.Cluster, id string, timeout time
 	return ""
 }
 
-func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, timeout time.Duration) {
+func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, table)
-			if err != nil || n != want {
+			rows, err := c.TypedContentionRows(i)
+			if err != nil || len(rows) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, table, "id")
-			if err != nil {
-				ok = false
-				break
-			}
+			d := contentionDigest(rows)
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -365,11 +349,19 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 		time.Sleep(100 * time.Millisecond)
 	}
 	for i := range c.Nodes {
-		n, _ := c.QueryRowCount(i, table)
-		d, _ := c.ComputeTableDigest(i, table, "id")
-		t.Logf("node %d at timeout: count=%d digest=%s", i, n, d)
+		rows, err := c.TypedContentionRows(i)
+		t.Logf("node %d at timeout: count=%d err=%v digest=%s", i, len(rows), err, contentionDigest(rows))
 	}
-	t.Fatalf("nodes did not converge on %d %s rows with equal digests within %v", want, table, timeout)
+	t.Fatalf("nodes did not converge on %d typed records with equal digests within %v", want, timeout)
+}
+
+func contentionDigest(rows []harness.TypedContentionRow) string {
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	var b strings.Builder
+	for _, row := range rows {
+		fmt.Fprintf(&b, "%s:%s:%s:%d\n", row.ID, row.Name, row.Phone, row.Score)
+	}
+	return b.String()
 }
 
 func waitConnectedPeers(t *testing.T, c *harness.Cluster, idx, want int, timeout time.Duration) {
@@ -415,19 +407,8 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line == "" || line[0] == '#' || !strings.HasPrefix(line, name) {
-			continue
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(line, name))
-		if i := strings.LastIndex(rest, " "); i >= 0 {
-			rest = rest[i+1:]
-		}
-		v, err := strconv.ParseFloat(rest, 64)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		return v
+	if value, ok := harness.MetricValueFrom(string(raw), name); ok {
+		return value
 	}
 	t.Fatalf("counter %s not present in /metrics", name)
 	return 0

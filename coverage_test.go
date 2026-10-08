@@ -2,13 +2,7 @@ package murmur
 
 import (
 	"context"
-	"database/sql/driver"
-	"errors"
-	"fmt"
 	"testing"
-	"time"
-
-	"github.com/cockroachdb/pebble/v2/sstable/block"
 
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/objectstore"
@@ -16,7 +10,10 @@ import (
 
 func openCoverageDB(t *testing.T) *DB {
 	t.Helper()
-	db, err := openSignedFixture(context.Background(), testConfig(t.TempDir()))
+	cfg := testConfig(t.TempDir())
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	db, err := Open(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,135 +53,45 @@ func TestDBStateStrings(t *testing.T) {
 	l.Error("e")
 }
 
-// TestIsReadOnlyStatementTable pins the read/write routing classifier,
-// including comment-prefix handling.
-func TestIsReadOnlyStatementTable(t *testing.T) {
-	for _, tc := range []struct {
-		q    string
-		want bool
-	}{
-		{"SELECT 1", true},
-		{"  select a from t", true},
-		{"EXPLAIN SELECT 1", true},
-		{"PRAGMA table_info(t)", true},
-		{"VALUES (1), (2)", true},
-		{"TABLE t", true},
-		{"-- just a comment", true},
-		{"-- lead comment\nSELECT 1", true},
-		{"/* block */ SELECT 1", true},
-		{"INSERT INTO t VALUES (1)", false},
-		{"UPDATE t SET a = 1", false},
-		{"DELETE FROM t", false},
-		{"CREATE TABLE t (a)", false},
-		{"WITH x AS (SELECT 1) SELECT * FROM x", false},
-		{"", false},
-		{"/* unclosed", false},
-	} {
-		if got := IsReadOnlyStatement(tc.q); got != tc.want {
-			t.Fatalf("IsReadOnlyStatement(%q) = %v, want %v", tc.q, got, tc.want)
-		}
-	}
-}
-
-// TestTxAccessors covers the explicit-transaction surface: idempotency key,
-// single-row reads, in-tx reads, prepared-statement shims, and post-commit
-// rejection.
-func TestTxAccessors(t *testing.T) {
+// TestTypedTxAccessors covers read-your-writes, staged query overlay, and
+// post-commit rejection.
+func TestTypedTxAccessors(t *testing.T) {
 	ctx := context.Background()
 	db := openCoverageDB(t)
-	id := NewRowID()
-	tx, err := db.BeginTx(ctx, nil)
+	table, err := TableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tx.TxID() == (TxID{}) {
-		t.Fatal("zero TxID")
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "ann"); err != nil {
-		t.Fatal(err)
-	}
-	trow := tx.QueryRowContext(ctx, `SELECT name FROM contacts WHERE id = ?`, id[:])
-	var name string
-	if err := trow.Scan(&name); err != nil || name != "ann" {
-		t.Fatalf("tx row = %q/%v", name, err)
-	}
-	rows, err := tx.QueryContext(ctx, `SELECT COUNT(*) FROM contacts`)
+	id := ids.NewRowID()
+	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var n int
-	for rows.Next() {
-		if err := rows.Scan(&n); err != nil {
-			t.Fatal(err)
-		}
+	if err := table.Insert(tx, &facadeRecord{ID: id, Name: "ann"}); err != nil {
+		t.Fatal(err)
 	}
-	_ = rows.Close()
-	if n != 1 {
-		t.Fatalf("count = %d", n)
+	got, err := table.GetTx(tx, id)
+	if err != nil || got.Name != "ann" {
+		t.Fatalf("transaction read-your-writes = %+v/%v", got, err)
+	}
+	query, err := table.WhereTx(tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, err := query.Count()
+	if err != nil || count != 1 {
+		t.Fatalf("staged query count = %d/%v", count, err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.ExecContext(ctx, `SELECT 1`); !errors.Is(err, ErrTxDone) {
-		t.Fatalf("post-commit exec = %v", err)
+	if _, err := table.GetTx(tx, id); err == nil {
+		t.Fatal("post-commit transaction read succeeded")
 	}
-	if _, err := tx.QueryContext(ctx, `SELECT 1`); !errors.Is(err, ErrTxDone) {
-		t.Fatalf("post-commit query = %v", err)
+	rows, err := table.Where().Find()
+	if err != nil || len(rows) != 1 || rows[0].ID != id {
+		t.Fatalf("committed typed rows = %+v/%v", rows, err)
 	}
-	if err := tx.QueryRowContext(ctx, `SELECT 1`).Scan(&n); !errors.Is(err, ErrTxDone) {
-		t.Fatalf("post-commit row scan = %v", err)
-	}
-
-	stmt, err := db.PrepareContext(ctx, `SELECT name FROM contacts WHERE id = ?`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stmt.Close()
-	srows, err := stmt.QueryContext(ctx, id[:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = srows.Close()
-	if err := stmt.QueryRowContext(ctx, id[:]).Scan(&name); err != nil || name != "ann" {
-		t.Fatalf("stmt row = %q/%v", name, err)
-	}
-	if _, err := stmt.ExecContext(ctx, id[:]); err == nil {
-		// A SELECT through the exec shim fails: the statement is read-only
-		// but exec requires the write path; either way it must not panic.
-		t.Log("select-via-exec unexpectedly succeeded")
-	}
-	dbRow := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM contacts`)
-	if err := dbRow.Err(); err != nil {
-		t.Fatalf("Row.Err = %v", err)
-	}
-	if err := dbRow.Scan(&n); err != nil || n != 1 {
-		t.Fatalf("db row = %d/%v", n, err)
-	}
-}
-
-// TestSubscriptionAccessors pins the subscription metadata surface.
-func TestSubscriptionAccessors(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	db := openCoverageDB(t)
-	const q = "SELECT name FROM contacts ORDER BY name"
-	sub, err := db.Subscribe(ctx, q)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sub.Close()
-	select {
-	case <-sub.Events():
-	case <-time.After(10 * time.Second):
-		t.Fatal("no initial event")
-	}
-	if sub.Query() != q {
-		t.Fatalf("Query = %q", sub.Query())
-	}
-	if cols := sub.Columns(); len(cols) != 1 || cols[0] != "name" {
-		t.Fatalf("Columns = %v", cols)
-	}
-	_ = sub.Cursor()
 }
 
 // TestDBReceiptsAndBridgeProgress covers the durable receipt and bridge
@@ -225,118 +132,6 @@ func TestCurrentSchemaMatchesStore(t *testing.T) {
 	}
 }
 
-// TestDriverLegacyMethods drives the non-context database/sql surface:
-// connector driver, handle open, legacy begin, and legacy exec/query.
-func TestDriverLegacyMethods(t *testing.T) {
-	ctx := context.Background()
-	db := openCoverageDB(t)
-	conn, err := NewConnector(db).Connect(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := conn.(*driverConn)
-	if NewConnector(db).Driver() == nil {
-		t.Fatal("Connector.Driver is nil")
-	}
-	dtx, err := c.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := NewRowID()
-	stmt, err := c.Prepare(`INSERT INTO contacts (id, name) VALUES (?, ?)`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := stmt.Exec([]driver.Value{id[:], "zed"}); err != nil {
-		t.Fatal(err)
-	}
-	_ = stmt.Close()
-	if err := dtx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	qstmt, err := c.Prepare(`SELECT name FROM contacts WHERE id = ?`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	drows, err := qstmt.Query([]driver.Value{id[:]})
-	if err != nil {
-		t.Fatal(err)
-	}
-	cols := drows.Columns()
-	vals := make([]driver.Value, len(cols))
-	if err := drows.Next(vals); err != nil {
-		t.Fatal(err)
-	}
-	_ = drows.Close()
-	_ = qstmt.Close()
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	var drv sqlDriver
-	if _, err := drv.Open("coverage-missing-handle"); err == nil {
-		t.Fatal("unknown handle accepted")
-	}
-	handle := fmt.Sprintf("coverage-%d", time.Now().UnixNano())
-	RegisterDriverDB(handle, db)
-	rc, err := drv.Open(handle)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = rc.Close()
-}
-
-// TestToDriverValueTable pins integer-width normalization and overflow.
-func TestToDriverValueTable(t *testing.T) {
-	now := time.Now()
-	for _, tc := range []struct {
-		name string
-		in   any
-		want any
-	}{
-		{"nil", nil, nil},
-		{"int64", int64(-1), int64(-1)},
-		{"float64", 1.5, 1.5},
-		{"bool", true, true},
-		{"string", "s", "s"},
-		{"time", now, now},
-		{"int", int(2), int64(2)},
-		{"int8", int8(3), int64(3)},
-		{"int16", int16(4), int64(4)},
-		{"int32", int32(5), int64(5)},
-		{"uint", uint(6), int64(6)},
-		{"uint8", uint8(7), int64(7)},
-		{"uint16", uint16(8), int64(8)},
-		{"uint32", uint32(9), int64(9)},
-		{"uint64", uint64(10), int64(10)},
-		{"float32", float32(1.5), float64(float32(1.5))},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := toDriverValue(tc.in)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if fmt.Sprintf("%v|%T", got, got) != fmt.Sprintf("%v|%T", tc.want, tc.want) {
-				t.Fatalf("= %#v, want %#v", got, tc.want)
-			}
-		})
-	}
-	if _, err := toDriverValue(uint64(1) << 63); err == nil {
-		t.Fatal("uint64 overflow accepted")
-	}
-	if _, err := toDriverValue(uint(1) << 63); err == nil {
-		t.Fatal("uint overflow accepted")
-	}
-	if _, err := toDriverValue(struct{}{}); err == nil {
-		t.Fatal("unsupported type accepted")
-	}
-	var nilBytes []byte
-	if got, err := toDriverValue(nilBytes); err != nil || got != nil {
-		t.Fatalf("nil bytes = %#v/%v", got, err)
-	}
-}
-
-// TestWriterClassString pins scheduler class names and ticket class.
 func TestWriterClassString(t *testing.T) {
 	for _, tc := range []struct {
 		class WriterClass
@@ -378,6 +173,8 @@ func TestBridgeThinWrappers(t *testing.T) {
 		t.Fatal("nil files returned an object store")
 	}
 	cfg := testConfig(t.TempDir())
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
 	cfg.Files.Enabled = true
 	cfg.Files.ObjectKey = append([]byte(nil), testObjectKey...)
 	fdb, err := openSignedFixture(ctx, cfg)
@@ -396,10 +193,10 @@ func TestBridgeThinWrappers(t *testing.T) {
 	if _, err := plain.BridgeHighOwnedColumns("nope", row); err == nil {
 		t.Fatal("unknown table accepted")
 	}
-	if cols, err := plain.BridgeHighOwnedColumns("contacts", row); err != nil || len(cols) != 0 {
+	if cols, err := plain.BridgeHighOwnedColumns("records", row); err != nil || len(cols) != 0 {
 		t.Fatalf("fresh row owned columns = %v/%v", cols, err)
 	}
-	if err := plain.ReleaseBridgeRowOwnership(ctx, "contacts", row); err == nil {
+	if err := plain.ReleaseBridgeRowOwnership(ctx, "records", row); err == nil {
 		t.Fatal("release without provenance succeeded")
 	}
 	if err := fdb.ReleaseBridgeFileRowOwnership(ctx, row); err == nil {
@@ -408,101 +205,81 @@ func TestBridgeThinWrappers(t *testing.T) {
 	if _, err := bridgeShadowClearsForRow(plain, 0xBEEF, row); err == nil {
 		t.Fatal("shadow clear for unknown table succeeded")
 	}
-	clears, err := bridgeShadowClearsForRow(plain, bridgeContactsID(t, plain), row)
+	clears, err := bridgeShadowClearsForRow(plain, bridgeRecordsID(t, plain), row)
 	if err != nil || len(clears) == 0 {
 		t.Fatalf("shadow clears = %d/%v", len(clears), err)
 	}
 }
 
-func bridgeContactsID(t *testing.T, db *DB) uint32 {
+func bridgeRecordsID(t *testing.T, db *DB) uint32 {
 	t.Helper()
-	tt, err := db.bridgeTable("contacts")
+	tt, err := db.bridgeTable("records")
 	if err != nil {
 		t.Fatal(err)
 	}
 	return tt.ID
 }
 
-// TestPebbleZstdLevelValidation pins the supported Zstd levels: 3 (default),
-// 9, and 12. Level 0 defaults to 3; anything else fails closed.
-func TestPebbleZstdLevelValidation(t *testing.T) {
+// TestSpoolCompressionValidation tests supported Spool compression options.
+func TestSpoolCompressionValidation(t *testing.T) {
 	for _, tc := range []struct {
-		level int
-		want  bool
+		algo CompressionAlgorithm
+		want bool
 	}{
-		{0, true}, {3, true}, {9, true}, {12, true},
-		{1, false}, {2, false}, {5, false}, {7, false}, {13, false}, {22, false}, {-1, false},
+		{CompressionNone, true},
+		{CompressionDeflate, true},
+		{"", true},
+		{"zstd", false},
+		{"zstd-fast", false},
+		{"snappy", false},
+		{"lz4", false},
 	} {
-		t.Run(fmt.Sprintf("level-%d", tc.level), func(t *testing.T) {
+		t.Run(string(tc.algo), func(t *testing.T) {
 			cfg := testConfig(t.TempDir())
-			cfg.Pebble.Compression = CompressionConfig{Algorithm: CompressionZstd, ZstdLevel: tc.level}
+			cfg.Spool.Compression = tc.algo
 			cfg.withDefaults()
 			err := cfg.validate()
 			if tc.want && err != nil {
-				t.Fatalf("level %d rejected: %v", tc.level, err)
+				t.Fatalf("algorithm %q rejected: %v", tc.algo, err)
 			}
 			if !tc.want && err == nil {
-				t.Fatalf("level %d accepted", tc.level)
+				t.Fatalf("algorithm %q accepted", tc.algo)
 			}
 		})
 	}
 }
 
-// TestZstdProfileForLevel proves level 3 reuses Pebble's shared profile
-// while 9/12 get copies with the level overridden, never mutating the
-// shared profile.
-func TestZstdProfileForLevel(t *testing.T) {
-	builtin := block.CompressionProfileByName("zstd")
-	if zstdProfileForLevel(3) != builtin {
-		t.Fatal("level 3 does not reuse the built-in profile")
-	}
-	for _, level := range []int{9, 12} {
-		prof := zstdProfileForLevel(level)
-		if prof == builtin {
-			t.Fatalf("level %d aliases the shared profile", level)
-		}
-		if prof.Name != fmt.Sprintf("zstd-%d", level) {
-			t.Fatalf("name = %q", prof.Name)
-		}
-		if prof.DataBlocks.Level != uint8(level) || prof.ValueBlocks.Level != uint8(level) || prof.OtherBlocks.Level != uint8(level) {
-			t.Fatalf("level %d not applied to all block kinds", level)
-		}
-		if prof.MinReductionPercent != builtin.MinReductionPercent {
-			t.Fatal("reduction threshold differs from built-in")
-		}
-	}
-	if builtin.DataBlocks.Level != 3 {
-		t.Fatalf("shared profile mutated: level %d", builtin.DataBlocks.Level)
-	}
-}
-
-// TestOpenWithZstdLevels proves databases open, write, and close on every
-// supported compression mode.
-func TestOpenWithZstdLevels(t *testing.T) {
+// TestOpenWithSpoolCompression proves databases open, write, and close on every
+// supported Spool compression mode.
+func TestOpenWithSpoolCompression(t *testing.T) {
 	ctx := context.Background()
-	modes := []CompressionConfig{
-		{Algorithm: CompressionNone},
-		{Algorithm: CompressionZstd, ZstdLevel: 3},
-		{Algorithm: CompressionZstd, ZstdLevel: 9},
-		{Algorithm: CompressionZstd, ZstdLevel: 12},
-		{Algorithm: CompressionSnappy},
+	modes := []CompressionAlgorithm{
+		CompressionNone,
+		CompressionDeflate,
 	}
 	for _, mode := range modes {
-		t.Run(fmt.Sprintf("%s-%d", mode.Algorithm, mode.ZstdLevel), func(t *testing.T) {
+		t.Run(string(mode), func(t *testing.T) {
 			cfg := testConfig(t.TempDir())
-			cfg.Pebble.Compression = mode
-			db, err := openSignedFixture(ctx, cfg)
+			cfg.Schema.Tables = nil
+			cfg.Tables = []TableDefinition{recordDefinition(t)}
+			cfg.Spool.Compression = mode
+			db, err := Open(ctx, cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer db.Close()
-			id := NewRowID()
-			if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "z"); err != nil {
+			table, err := TableOf[facadeRecord](db, "records")
+			if err != nil {
 				t.Fatal(err)
 			}
-			var n int
-			if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM contacts`).Scan(&n); err != nil || n != 1 {
-				t.Fatalf("count = %d/%v", n, err)
+			id := ids.NewRowID()
+			if err := db.WriteTxContext(ctx, func(tx *Tx) error {
+				return table.Insert(tx, &facadeRecord{ID: id, Name: "z"})
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := table.Get(id); err != nil || got.Name != "z" {
+				t.Fatalf("compressed typed row = %+v/%v", got, err)
 			}
 		})
 	}

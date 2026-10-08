@@ -5,31 +5,22 @@
 package loadshare_test
 
 import (
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/ids"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func TestWriterSharesUnderLoad(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:     "loadshare",
-		NumNodes: 2,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{Name: "load", Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "w", Type: schema.ColText, Nullable: true},
-		}}}},
+		Name:         "loadshare",
+		NumNodes:     2,
+		TypedRecords: true,
 	})
 
 	const writers = 4
@@ -43,9 +34,8 @@ func TestWriterSharesUnderLoad(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			for i := 0; i < perWriter; i++ {
-				id := ids.NewRowID()
 				start := time.Now()
-				err := cluster.ExecSQL(0, `INSERT INTO load (id, w) VALUES (?, ?)`, hex.EncodeToString(id[:]), "local")
+				err := cluster.TypedInsert(0, fmt.Sprintf("local-%d-%d", w, i))
 				mu.Lock()
 				lat = append(lat, time.Since(start))
 				mu.Unlock()
@@ -57,8 +47,7 @@ func TestWriterSharesUnderLoad(t *testing.T) {
 		}(w)
 	}
 	for i := 0; i < remote; i++ {
-		id := ids.NewRowID()
-		if err := cluster.ExecSQL(1, `INSERT INTO load (id, w) VALUES (?, ?)`, hex.EncodeToString(id[:]), "remote"); err != nil {
+		if err := cluster.TypedInsert(1, fmt.Sprintf("remote-%d", i)); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -96,12 +85,11 @@ func TestWriterSharesUnderLoad(t *testing.T) {
 
 func rowCount(t *testing.T, cluster *harness.Cluster, idx int) int {
 	t.Helper()
-	res, err := cluster.QuerySQL(idx, `SELECT count(*) FROM load`)
-	if err != nil || len(res.Rows) != 1 {
-		t.Fatalf("row count: %+v %v", res, err)
+	names, err := cluster.TypedNames(idx)
+	if err != nil {
+		t.Fatalf("typed row count: %v", err)
 	}
-	count, _ := res.Rows[0][0].(float64)
-	return int(count)
+	return len(names)
 }
 
 func scrapeMetrics(t *testing.T, cluster *harness.Cluster, idx int) string {
@@ -120,22 +108,19 @@ func scrapeMetrics(t *testing.T, cluster *harness.Cluster, idx int) string {
 
 func schedAcquisitions(t *testing.T, cluster *harness.Cluster, idx int) (local, remote uint64) {
 	t.Helper()
-	for _, line := range strings.Split(scrapeMetrics(t, cluster, idx), "\n") {
-		if !strings.HasPrefix(line, "spedsql_sched_acquisitions_total") {
+	samples, ok := harness.MetricSamples(scrapeMetrics(t, cluster, idx))
+	if !ok {
+		t.Fatal("decode metrics JSON")
+	}
+	for _, sample := range samples {
+		if sample.Name != "spedsql_sched_acquisitions_total" {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-		v, err := strconv.ParseUint(fields[1], 10, 64)
-		if err != nil {
-			continue
-		}
-		switch {
-		case strings.Contains(line, `class="local"`):
+		v := uint64(sample.Value)
+		switch sample.Labels["class"] {
+		case "local":
 			local = v
-		case strings.Contains(line, `class="remote"`):
+		case "remote":
 			remote = v
 		}
 	}
@@ -144,18 +129,7 @@ func schedAcquisitions(t *testing.T, cluster *harness.Cluster, idx int) (local, 
 
 func schedDebt(t *testing.T, cluster *harness.Cluster, idx int) float64 {
 	t.Helper()
-	for _, line := range strings.Split(scrapeMetrics(t, cluster, idx), "\n") {
-		if !strings.HasPrefix(line, "spedsql_sched_debt_seconds") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-		v, err := strconv.ParseFloat(fields[1], 64)
-		if err != nil {
-			continue
-		}
+	if v, ok := harness.MetricValueFrom(scrapeMetrics(t, cluster, idx), "spedsql_sched_debt_seconds"); ok {
 		return v
 	}
 	t.Fatal("sched debt metric missing")

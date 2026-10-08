@@ -9,15 +9,12 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
-	"runtime"
 
-	"github.com/ericlagergren/aegis"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
-	"golang.org/x/sys/cpu"
 )
 
-// AlgorithmID identifies one of the seven supported AEADs.
+// AlgorithmID identifies one of the five supported AEADs.
 type AlgorithmID uint16
 
 const (
@@ -27,8 +24,6 @@ const (
 	AlgorithmAES256GCM
 	AlgorithmChaCha20Poly1305
 	AlgorithmXChaCha20Poly1305
-	AlgorithmAEGIS128L
-	AlgorithmAEGIS256
 )
 
 // DefaultAlgorithm is AES-256-GCM.
@@ -41,8 +36,6 @@ var algorithmNames = map[AlgorithmID]string{
 	AlgorithmAES256GCM:         "AES-256-GCM",
 	AlgorithmChaCha20Poly1305:  "ChaCha20-Poly1305",
 	AlgorithmXChaCha20Poly1305: "XChaCha20-Poly1305",
-	AlgorithmAEGIS128L:         "AEGIS-128L",
-	AlgorithmAEGIS256:          "AEGIS-256",
 }
 
 // String returns the canonical algorithm name.
@@ -74,12 +67,12 @@ func ParseAlgorithm(s string) (AlgorithmID, error) {
 // KeySize returns the required key length in bytes.
 func (a AlgorithmID) KeySize() (int, error) {
 	switch a {
-	case AlgorithmAES128GCM, AlgorithmAEGIS128L:
+	case AlgorithmAES128GCM:
 		return 16, nil
 	case AlgorithmAES192GCM:
 		return 24, nil
 	case AlgorithmAES256GCM, AlgorithmChaCha20Poly1305,
-		AlgorithmXChaCha20Poly1305, AlgorithmAEGIS256:
+		AlgorithmXChaCha20Poly1305:
 		return 32, nil
 	}
 	return 0, fmt.Errorf("crypto: unknown algorithm %q", a.String())
@@ -94,7 +87,7 @@ func (a AlgorithmID) mustKeySize() int {
 	return n
 }
 
-// MaxNonceSize bounds every supported nonce (AEGIS-256 uses 32).
+// MaxNonceSize bounds every supported nonce (the largest in use is 24 bytes).
 const MaxNonceSize = 32
 
 // NewAEAD builds the AEAD for alg from a full-size key.
@@ -117,34 +110,8 @@ func (a AlgorithmID) NewAEAD(key []byte) (cipher.AEAD, error) {
 		return chacha20poly1305.New(key)
 	case AlgorithmXChaCha20Poly1305:
 		return chacha20poly1305.NewX(key)
-	case AlgorithmAEGIS128L, AlgorithmAEGIS256:
-		return aegis.New(key)
 	}
 	return nil, fmt.Errorf("crypto: unknown algorithm %q", a.String())
-}
-
-// AEGISHardwareAccelerated reports whether the AEGIS implementation can use
-// hardware acceleration on this machine, mirroring the dependency's own
-// selection (amd64 with AES+SSE4.1, arm64 with AES/SHA3, or 32-bit ARM with
-// AES+NEON).
-func AEGISHardwareAccelerated() bool {
-	switch runtime.GOARCH {
-	case "amd64":
-		return cpu.X86.HasAES && cpu.X86.HasSSE41
-	case "arm64":
-		return cpu.ARM64.HasAES
-	case "arm":
-		return cpu.ARM.HasAES && cpu.ARM.HasNEON
-	}
-	return false
-}
-
-// AEGISBackend describes which AEGIS code path is active.
-func AEGISBackend() string {
-	if AEGISHardwareAccelerated() {
-		return "asm(" + runtime.GOARCH + ")"
-	}
-	return "generic(" + runtime.GOARCH + ")"
 }
 
 // DeriveSubkey derives a per-algorithm subkey from a 256-bit master key with

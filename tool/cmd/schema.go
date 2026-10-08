@@ -12,7 +12,7 @@ import (
 type SchemaCommand struct{}
 
 func (c *SchemaCommand) Name() string        { return "schema" }
-func (c *SchemaCommand) Description() string { return "Inspect schema definitions, column stable IDs, and history" }
+func (c *SchemaCommand) Description() string { return "Inspect table definitions and stable IDs" }
 func (c *SchemaCommand) Usage() string {
 	return "murmur schema <data-dir | node-url> [--table=NAME] [--history] [--json]"
 }
@@ -32,7 +32,7 @@ type columnInfo struct {
 
 type tableSchemaInfo struct {
 	TableName string       `json:"table_name"`
-	SQL       string       `json:"sql"`
+	TableID   uint32       `json:"table_id"`
 	Columns   []columnInfo `json:"columns"`
 }
 
@@ -60,95 +60,63 @@ func (c *SchemaCommand) Run(ctx context.Context, globalOpts GlobalOptions, args 
 		if err != nil {
 			return err
 		}
-
-		query := "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-		if filterTable != "" {
-			query += fmt.Sprintf(" AND name='%s'", filterTable)
-		}
-		query += " ORDER BY name;"
-
-		res, err := client.Query(ctx, query)
+		manifestTables, err := client.SchemaTables(ctx)
 		if err != nil {
-			return fmt.Errorf("remote schema query failed: %w", err)
+			return fmt.Errorf("remote schema request failed: %w", err)
 		}
-
-		for _, row := range res.Rows {
-			if len(row) < 2 {
+		for _, table := range manifestTables {
+			if filterTable != "" && !strings.EqualFold(table.Name, filterTable) {
 				continue
 			}
-			tblName := row[0]
-			tblSQL := row[1]
-
 			info := tableSchemaInfo{
-				TableName: tblName,
-				SQL:       tblSQL,
+				TableName: table.Name,
+				TableID:   table.ID,
 			}
-
-			pragmaRes, err := client.Query(ctx, fmt.Sprintf("PRAGMA table_info(%s);", tblName))
-			if err == nil {
-				for _, pRow := range pragmaRes.Rows {
-					if len(pRow) >= 6 {
-						info.Columns = append(info.Columns, columnInfo{
-							Name:       pRow[1],
-							Type:       pRow[2],
-							NotNull:    pRow[3] == "1",
-							DefaultVal: pRow[4],
-							PK:         pRow[5] == "1",
-						})
-					}
-				}
+			for i, column := range table.Columns {
+				info.Columns = append(info.Columns, columnInfo{
+					CID:     i,
+					Name:    column.Name,
+					Type:    column.Type.String(),
+					NotNull: !column.Nullable,
+					PK:      column.ID == table.PK,
+				})
 			}
 			tables = append(tables, info)
 		}
 	} else {
-		db, err := openLocalDB(ctx, target, globalOpts, true)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		store, err := openOfflineStore(target, globalOpts)
 		if err != nil {
-			return fmt.Errorf("open database: %w", err)
+			return fmt.Errorf("open durable state: %w", err)
 		}
-		defer db.Close()
+		defer store.Close()
 
-		query := "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-		if filterTable != "" {
-			query += fmt.Sprintf(" AND name='%s'", filterTable)
-		}
-		query += " ORDER BY name;"
-
-		rows, err := db.QueryContext(ctx, query)
+		manifest, err := store.LoadSchemaManifest()
 		if err != nil {
-			return fmt.Errorf("query schema: %w", err)
+			return fmt.Errorf("read schema manifest: %w", err)
 		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var tblName, tblSQL string
-			if err := rows.Scan(&tblName, &tblSQL); err != nil {
-				continue
-			}
-			info := tableSchemaInfo{
-				TableName: tblName,
-				SQL:       tblSQL,
-			}
-
-			pRows, err := db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s);", tblName))
-			if err == nil {
-				for pRows.Next() {
-					var cid int
-					var name, colType, dflt string
-					var notnull, pk int
-					if err := pRows.Scan(&cid, &name, &colType, &notnull, &dflt, &pk); err == nil {
-						info.Columns = append(info.Columns, columnInfo{
-							CID:        cid,
-							Name:       name,
-							Type:       colType,
-							NotNull:    notnull == 1,
-							DefaultVal: dflt,
-							PK:         pk == 1,
-						})
-					}
+		if manifest != nil {
+			for _, table := range manifest.Tables {
+				if filterTable != "" && !strings.EqualFold(table.Name, filterTable) {
+					continue
 				}
-				pRows.Close()
+				info := tableSchemaInfo{
+					TableName: table.Name,
+					TableID:   table.ID,
+				}
+				for i, column := range table.Columns {
+					info.Columns = append(info.Columns, columnInfo{
+						CID:     i,
+						Name:    column.Name,
+						Type:    column.Type.String(),
+						NotNull: !column.Nullable,
+						PK:      column.ID == table.PK,
+					})
+				}
+				tables = append(tables, info)
 			}
-			tables = append(tables, info)
 		}
 	}
 
@@ -162,7 +130,7 @@ func (c *SchemaCommand) Run(ctx context.Context, globalOpts GlobalOptions, args 
 	}
 
 	for _, tbl := range tables {
-		fmt.Fprintf(stdout, "Table: %s\n", tbl.TableName)
+		fmt.Fprintf(stdout, "Table: %s (ID %d)\n", tbl.TableName, tbl.TableID)
 		var headers = []string{"Column", "Type", "Not Null", "Default", "Primary Key"}
 		var rows [][]string
 		for _, col := range tbl.Columns {
@@ -175,7 +143,7 @@ func (c *SchemaCommand) Run(ctx context.Context, globalOpts GlobalOptions, args 
 			})
 		}
 		format.RenderTable(stdout, headers, rows, globalOpts.Markdown)
-		fmt.Fprintf(stdout, "\nDDL:\n%s;\n\n", tbl.SQL)
+		fmt.Fprintln(stdout)
 	}
 
 	return nil

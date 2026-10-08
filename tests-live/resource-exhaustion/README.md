@@ -11,7 +11,7 @@ every time: fail closed under pressure, stay exactly converged after.
 bash tests-live/run.sh resource-exhaustion
 
 # One leg, e.g. the slow peer with a tighter throttle
-MURMUR_RX_SLOW_RATE=8192 go test -tags "sqlite_preupdate_hook sqlite_fts5" \
+MURMUR_RX_SLOW_RATE=8192 go test \
   ./tests-live/resource-exhaustion/ -run TestSlowPeer -v -count=1 -timeout=10m
 ```
 
@@ -54,8 +54,6 @@ tc-impaired networks (`impaired-network`), small-budget rejection
 
 ## Plumbing
 
-The suite needed two small harness additions (`PebbleOptions` /
-`PebbleByNode` storage overrides and per-node `NodeEnv`), a `pebble`
-section in the test daemon config, and one product knob:
-`PebbleConfig.DisableAutomaticCompactions` (production default false),
-mapped to Pebble's native option.
+The suite needed two small harness additions (`SpoolOptions` /
+`SpoolByNode` storage overrides and per-node `NodeEnv`), a `spool`
+section in the test daemon config, and storage sizing options.

@@ -5,12 +5,10 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -19,25 +17,55 @@ import (
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/origin"
 	"github.com/marcgauthier/murmur/replication"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 	"github.com/marcgauthier/murmur/transport"
 	"github.com/quic-go/quic-go"
 )
 
-func schemaConfig() *db.SchemaConfig {
-	return &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{Name: "signed_rows", Columns: []schema.ColumnSchema{{Name: "id", Type: schema.ColBlob}, {Name: "name", Type: schema.ColText, Nullable: true}}}}}
+type signedRecord struct {
+	ID    ids.RowID `rime:"primary"`
+	Name  string
+	Count int64
+	Tags  []string
+	Peak  int64
+	Floor float64
+}
+
+type signedLocalRecord struct {
+	ID   ids.RowID `rime:"primary"`
+	Name string
+}
+
+func signedTableDefinitions() ([]db.TableDefinition, error) {
+	replicated, err := db.Define[signedRecord]("live_typed_records", 901, db.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
+		MergePolicies: map[string]db.RecordMergePolicy{
+			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
+			"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	local, err := db.Define[signedLocalRecord]("live_node_local_records", 902, db.RecordOptions{
+		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Name": 2}, Scope: db.TableScopeNodeLocal,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []db.TableDefinition{replicated, local}, nil
 }
 
 func TestForwardedOriginSurvivesOfflineOriginAndHostileRelay(t *testing.T) {
-	c := harness.NewCluster(t, harness.ClusterOptions{Name: "origin-signatures", NumNodes: 3, AwaitUnlock: true, ManualPeers: true, Schema: schemaConfig(), TrustedSnapshotSourcesByNode: map[int][]int{2: {}}})
+	c := harness.NewCluster(t, harness.ClusterOptions{Name: "origin-signatures", NumNodes: 3, AwaitUnlock: true, ManualPeers: true, TypedRecords: true, TrustedSnapshotSourcesByNode: map[int][]int{2: {}}})
 	if err := c.AddPeer(0, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.AddPeer(1, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.ExecSQL(0, "INSERT INTO signed_rows (id,name) VALUES (?,?)", fmt.Sprintf("%032x", 1), "from-A"); err != nil {
+	if err := c.TypedInsertWithID(0, db.NewRowID(), "from-A"); err != nil {
 		t.Fatal(err)
 	}
 	waitRows(t, c, 1, 1)
@@ -53,7 +81,11 @@ func TestForwardedOriginSurvivesOfflineOriginAndHostileRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	local, err := db.Open(context.Background(), db.Config{Path: c.Nodes[0].PebbleDir, NodeID: c.Nodes[0].NodeID, DBID: c.DBID, OriginSigning: db.OriginSigningConfig{PrivateKey: c.Nodes[0].OriginKey, TrustedKeys: registry}, Schema: *schemaConfig(), Encryption: db.EncryptionConfig{Key: storageKey, KeyID: "remote-unlock-key"}})
+	tables, err := signedTableDefinitions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, err := db.Open(context.Background(), db.Config{Path: c.Nodes[0].Dir, NodeID: c.Nodes[0].NodeID, DBID: c.DBID, OriginSigning: db.OriginSigningConfig{PrivateKey: c.Nodes[0].OriginKey, TrustedKeys: registry}, Tables: tables, Encryption: db.EncryptionConfig{Key: storageKey, KeyID: "remote-unlock-key"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,9 +115,9 @@ func TestForwardedOriginSurvivesOfflineOriginAndHostileRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitRows(t, c, 2, 1)
-	aDigest, _ := c.ComputeTableDigest(1, "signed_rows", "id")
-	cDigest, _ := c.ComputeTableDigest(2, "signed_rows", "id")
-	if aDigest != cDigest {
+	aNames, aErr := c.TypedNames(1)
+	cNames, cErr := c.TypedNames(2)
+	if aErr != nil || cErr != nil || len(aNames) != 1 || len(cNames) != 1 || aNames[0] != cNames[0] {
 		t.Fatal("forwarded state differs")
 	}
 	c.StopNode(1)
@@ -278,13 +310,8 @@ func receipt(t *testing.T, n *harness.Node, id ids.TxID) bool {
 }
 func metric(t *testing.T, n *harness.Node, name string) float64 {
 	t.Helper()
-	for _, line := range strings.Split(string(get(t, n, "/metrics")), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 2 && fields[0] == name {
-			var value float64
-			_, _ = fmt.Sscan(fields[1], &value)
-			return value
-		}
+	if value, ok := harness.MetricValueFrom(string(get(t, n, "/metrics")), name); ok {
+		return value
 	}
 	t.Fatalf("missing metric %s", name)
 	return 0
@@ -304,7 +331,7 @@ func waitRows(t *testing.T, c *harness.Cluster, node, want int) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		if n, err := c.QueryRowCount(node, "signed_rows"); err == nil && n == want {
+		if names, err := c.TypedNames(node); err == nil && len(names) == want {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)

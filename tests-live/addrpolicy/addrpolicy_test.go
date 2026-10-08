@@ -2,7 +2,6 @@ package addrpolicy_test
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -11,17 +10,14 @@ import (
 )
 
 // TestAddressPolicyAcrossProcesses exercises address admission through the
-// shipped daemon configuration, QUIC listeners, and SQL service. Each node
+// shipped daemon configuration, QUIC listeners, and typed RIME service. Each node
 // owns a separate process and node directory.
 func TestAddressPolicyAcrossProcesses(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "addrpolicy",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		SchemaSQL: `CREATE TABLE IF NOT EXISTS items (
-  id BLOB PRIMARY KEY NOT NULL,
-  name TEXT NOT NULL DEFAULT ''
-);`,
+		Name:         "addrpolicy",
+		NumNodes:     3,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 		// node1 admits loopback peers; node2's TEST-NET policy excludes every
 		// actual loopback socket address. node3 is unrestricted and can provide
 		// the allowed path between node1 and itself.
@@ -40,27 +36,24 @@ func TestAddressPolicyAcrossProcesses(t *testing.T) {
 	// session while the denied node has no admitted path to either peer.
 	waitForPeers(t, cluster, []int{1, 0, 1}, 20*time.Second)
 
-	if err := cluster.ExecSQL(0, "INSERT INTO items (id, name) VALUES (?, ?)",
-		fmt.Sprintf("%032x", 71001), "allowed-loopback"); err != nil {
+	if err := cluster.TypedInsert(0, "allowed-loopback"); err != nil {
 		t.Fatal(err)
 	}
-	if err := cluster.ExecSQL(1, "INSERT INTO items (id, name) VALUES (?, ?)",
-		fmt.Sprintf("%032x", 71002), "denied-testnet"); err != nil {
+	if err := cluster.TypedInsert(1, "denied-testnet"); err != nil {
 		t.Fatal(err)
 	}
-	if err := cluster.ExecSQL(2, "INSERT INTO items (id, name) VALUES (?, ?)",
-		fmt.Sprintf("%032x", 71003), "unrestricted-loopback"); err != nil {
+	if err := cluster.TypedInsert(2, "unrestricted-loopback"); err != nil {
 		t.Fatal(err)
 	}
 
 	waitForCount(t, cluster, 0, 2, 20*time.Second)
 	waitForCount(t, cluster, 2, 2, 20*time.Second)
 	time.Sleep(750 * time.Millisecond) // several dial/accept retries
-	if got, err := cluster.QueryRowCount(1, "items"); err != nil || got != 1 {
-		t.Fatalf("denied node state changed across network: count=%d err=%v; want only its local row", got, err)
+	if got, err := cluster.TypedNames(1); err != nil || len(got) != 1 || got[0] != "denied-testnet" {
+		t.Fatalf("denied node state changed across network: names=%v err=%v; want only its local row", got, err)
 	}
-	if got, err := cluster.QueryRowCount(0, "items"); err != nil || got != 2 {
-		t.Fatalf("admitted node did not receive both its local and node3-origin row: count=%d err=%v", got, err)
+	if got, err := cluster.TypedNames(0); err != nil || len(got) != 2 {
+		t.Fatalf("admitted node did not receive both its local and node3-origin row: names=%v err=%v", got, err)
 	}
 
 	for i := range cluster.Nodes {
@@ -110,11 +103,11 @@ func waitForCount(t *testing.T, cluster *harness.Cluster, node, want int, timeou
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if got, err := cluster.QueryRowCount(node, "items"); err == nil && got == want {
+		if got, err := cluster.TypedNames(node); err == nil && len(got) == want {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	got, err := cluster.QueryRowCount(node, "items")
-	t.Fatalf("%s row count=%d err=%v, want %d", cluster.Nodes[node].Label, got, err, want)
+	got, err := cluster.TypedNames(node)
+	t.Fatalf("%s record names=%v err=%v, want %d", cluster.Nodes[node].Label, got, err, want)
 }

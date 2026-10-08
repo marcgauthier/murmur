@@ -457,15 +457,21 @@ func TestSchedulerExclusion(t *testing.T) {
 // admits through the coordinator under its class.
 func TestCoordinatorCoversMutationPaths(t *testing.T) {
 	ctx := context.Background()
-	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
+	cfg := testConfig(t.TempDir())
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	acq := func() SchedulerSnapshot { return db.Metrics().Scheduler }
 
-	id := NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "ann"); err != nil {
+	if err := insertRecord(ctx, db, table, &facadeRecord{ID: NewRowID(), Name: "ann"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := acq().Local.Acquisitions; got != 1 {
@@ -480,7 +486,7 @@ func TestCoordinatorCoversMutationPaths(t *testing.T) {
 		t.Fatalf("remote acquisitions = %d, want 2", got)
 	}
 
-	_ = db.Migrate(ctx, migrateTestTables())
+	_ = db.MigrateRecords(ctx, []TableDefinition{recordDefinitionV2(t)})
 	db.gcOnce(false)
 	if got := acq().Maintenance.Acquisitions; got < 2 {
 		t.Fatalf("maintenance acquisitions = %d, want >= 2 (migrate + GC)", got)

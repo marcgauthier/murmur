@@ -6,8 +6,6 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -17,25 +15,20 @@ import (
 // restart N still healing wedged one link forever).
 func TestRollingRestartChurn(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "rolling-churn",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "ch_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:            "rolling-churn",
+		NumNodes:        3,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 
 	for i := 0; i < 5; i++ {
 		id := fmt.Sprintf("%032x", i)
-		if err := cluster.ExecSQL(0, "INSERT INTO ch_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("base-%d", i)); err != nil {
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: id, Name: fmt.Sprintf("base-%d", i)}); err != nil {
 			t.Fatalf("baseline write: %v", err)
 		}
 	}
-	waitCounts(t, cluster, "ch_rows", 5, 60*time.Second)
+	waitCounts(t, cluster, 5, 60*time.Second)
 
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -57,7 +50,7 @@ func TestRollingRestartChurn(t *testing.T) {
 						continue
 					}
 					id := fmt.Sprintf("cc%02x%028x", n, seq)
-					_ = cluster.ExecSQL(n, "INSERT INTO ch_rows (id, name) VALUES (?, ?)", id, "flow")
+					_ = cluster.TypedContentionInsert(n, harness.TypedContentionRow{ID: id, Name: "flow"})
 				}
 				seq++
 			}
@@ -85,23 +78,23 @@ func TestRollingRestartChurn(t *testing.T) {
 		t.Logf("churn: restart %d (node%d) complete", i+1, node+1)
 	}
 
-	quiesce(t, cluster, "ch_rows", &paused, 150*time.Second)
+	quiesce(t, cluster, &paused, 150*time.Second)
 	// quiesce resumes writers on success; stop them before the final
 	// digest proof (digests under active writers never agree).
 	close(stop)
 	<-done
-	waitConvergedCounts(t, cluster, "ch_rows", 150*time.Second)
-	want, err := cluster.ComputeTableDigest(0, "ch_rows", "id")
+	waitConvergedCounts(t, cluster, 150*time.Second)
+	want, err := rrDigest(cluster, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for idx := 1; idx < 3; idx++ {
-		d, err := cluster.ComputeTableDigest(idx, "ch_rows", "id")
+		d, err := rrDigest(cluster, idx)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if d != want {
-			dumpIDDiff(t, cluster, "ch_rows")
+			dumpIDDiff(t, cluster)
 			t.Fatalf("node%d digest %s != node1 %s after churn", idx+1, d, want)
 		}
 	}

@@ -1,7 +1,7 @@
 // Certificate-lifecycle acceptance: a node whose certificate expires is
 // rejected on fresh replication handshakes, and rotation restores the mesh.
 //
-// Flow (2 nodes, structured Schema marker table):
+// Flow (2 nodes, managed typed marker records):
 //  1. Converge a marker (positive control: healthy mesh).
 //  2. Stop node B, replace tls/node.crt + tls/node.key with a short-expiry
 //     certificate minted via cluster.CA.IssueNode for the SAME NodeID,
@@ -14,7 +14,7 @@
 //     B actually serves is parsed at assert time and its NotAfter must be
 //     in the past.
 //  4. Rotate (fresh 24h cert + restart) and assert full reconvergence
-//     with equal ordered digests.
+//     with equal ordered typed-record names.
 //
 // Why step 3 restarts B: an already-established QUIC/TLS session is not
 // re-validated mid-connection (TLS property), and the replication dial
@@ -33,16 +33,14 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
-	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -54,25 +52,19 @@ func TestCertExpiryRejectsAndRotationHeals(t *testing.T) {
 	}
 
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "cert-lifecycle",
-		NumNodes:    2,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "markers",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "val", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:         "cert-lifecycle",
+		NumNodes:     2,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 	a, b := 0, 1
 	nodeB := cluster.Nodes[b]
 
 	// Phase 0: positive control, healthy mesh converges.
-	if err := cluster.ExecSQL(a, "INSERT INTO markers (id, val) VALUES (?, ?)", fmt.Sprintf("%032x", 0), "init"); err != nil {
+	if err := cluster.TypedInsert(a, "marker-init"); err != nil {
 		t.Fatalf("phase0 insert: %v", err)
 	}
-	waitConverged(t, cluster, "markers", 1, 60*time.Second)
+	waitConverged(t, cluster, 1, 60*time.Second)
 	waitPeerConnected(t, cluster.Nodes[a].APIAddr, nodeB.NodeID.String(), true, 30*time.Second)
 	if got := connectedPeers(t, cluster.Nodes[a].APIAddr); got != 1 {
 		t.Fatalf("pre-expiry connected_peers(A) = %d, want 1", got)
@@ -107,10 +99,10 @@ func TestCertExpiryRejectsAndRotationHeals(t *testing.T) {
 		t.Fatalf("no pre-expiry budget left (NotAfter %s)", served.NotAfter)
 	}
 	waitPeerConnected(t, cluster.Nodes[a].APIAddr, nodeB.NodeID.String(), true, preDeadline)
-	if err := cluster.ExecSQL(a, "INSERT INTO markers (id, val) VALUES (?, ?)", fmt.Sprintf("%032x", 1), "pre-expiry"); err != nil {
+	if err := cluster.TypedInsert(a, "marker-pre-expiry"); err != nil {
 		t.Fatalf("phase1 insert: %v", err)
 	}
-	waitConverged(t, cluster, "markers", 2, preDeadline)
+	waitConverged(t, cluster, 2, preDeadline)
 
 	// Phase 2: wait out the TTL, then force fresh handshakes by
 	// restarting B. B's daemon starts fine with an expired cert (PEM
@@ -143,13 +135,15 @@ func TestCertExpiryRejectsAndRotationHeals(t *testing.T) {
 
 	// A-side marker written post-expiry must never reach B during the
 	// isolation window, while A keeps serving it.
-	if err := cluster.ExecSQL(a, "INSERT INTO markers (id, val) VALUES (?, ?)", fmt.Sprintf("%032x", 2), "post-expiry"); err != nil {
+	if err := cluster.TypedInsert(a, "marker-post-expiry"); err != nil {
 		t.Fatalf("phase2 insert: %v", err)
 	}
 	assertNeverOnB := func() {
 		t.Helper()
-		if n := queryCountVia(t, insecure, nodeB.APIAddr, "SELECT count(*) FROM markers WHERE id = '00000000000000000000000000000002'"); n != 0 {
-			t.Fatalf("post-expiry marker reached expired node B (count=%d)", n)
+		for _, name := range typedNamesVia(t, insecure, nodeB.APIAddr) {
+			if name == "marker-post-expiry" {
+				t.Fatal("post-expiry marker reached expired node B")
+			}
 		}
 	}
 	windowEnd := time.Now().Add(window)
@@ -161,8 +155,8 @@ func TestCertExpiryRejectsAndRotationHeals(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 	}
 	assertNeverOnB()
-	if n, err := cluster.QueryRowCount(a, "markers"); err != nil || n != 3 {
-		t.Fatalf("A markers = %d (err=%v), want 3", n, err)
+	if names, err := cluster.TypedNames(a); err != nil || len(names) != 3 {
+		t.Fatalf("A markers = %d (err=%v), want 3", len(names), err)
 	}
 
 	// Phase 3: rotate to a fresh cert and assert full reconvergence.
@@ -176,24 +170,24 @@ func TestCertExpiryRejectsAndRotationHeals(t *testing.T) {
 	cluster.UnlockNode(b, nodeB.KeyHex)
 	cluster.WaitNodeReady(b)
 	waitPeerConnected(t, cluster.Nodes[a].APIAddr, nodeB.NodeID.String(), true, 60*time.Second)
-	waitConverged(t, cluster, "markers", 3, 60*time.Second)
+	waitConverged(t, cluster, 3, 60*time.Second)
 	// Bidirectional proof: a B-side write converges too.
-	if err := cluster.ExecSQL(b, "INSERT INTO markers (id, val) VALUES (?, ?)", fmt.Sprintf("%032x", 3), "rotated"); err != nil {
+	if err := cluster.TypedInsert(b, "marker-rotated"); err != nil {
 		t.Fatalf("phase3 insert: %v", err)
 	}
-	waitConverged(t, cluster, "markers", 4, 60*time.Second)
-	d0, err := cluster.ComputeTableDigest(a, "markers", "id")
+	waitConverged(t, cluster, 4, 60*time.Second)
+	d0, err := cluster.TypedNames(a)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d1, err := cluster.ComputeTableDigest(b, "markers", "id")
+	d1, err := cluster.TypedNames(b)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d0 != d1 {
-		t.Fatalf("post-rotation digests differ: A=%s B=%s", d0, d1)
+	if strings.Join(d0, "\x00") != strings.Join(d1, "\x00") {
+		t.Fatalf("post-rotation names differ: A=%v B=%v", d0, d1)
 	}
-	t.Logf("rotation healed mesh; digest=%s", d0)
+	t.Logf("rotation healed mesh; names=%v", d0)
 }
 
 func writeCertPair(t *testing.T, n *harness.Node, certPEM, keyPEM []byte) {
@@ -287,26 +281,24 @@ func waitReadyVia(t *testing.T, client *http.Client, apiAddr string) {
 	t.Fatalf("insecure readiness of %s timed out", apiAddr)
 }
 
-func queryCountVia(t *testing.T, client *http.Client, apiAddr, query string) int {
+func typedNamesVia(t *testing.T, client *http.Client, apiAddr string) []string {
 	t.Helper()
-	payload, _ := json.Marshal(map[string]any{"query": query})
-	resp, err := client.Post("https://"+apiAddr+"/v1/query", "application/json", bytes.NewReader(payload))
+	payload, _ := json.Marshal(map[string]any{})
+	resp, err := client.Post("https://"+apiAddr+"/v1/typed/names", "application/json", bytes.NewReader(payload))
 	if err != nil {
-		t.Fatalf("insecure query %s: %v", apiAddr, err)
+		t.Fatalf("insecure typed read %s: %v", apiAddr, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("insecure query %s status=%d", apiAddr, resp.StatusCode)
+		t.Fatalf("insecure typed read %s status=%d", apiAddr, resp.StatusCode)
 	}
-	var res harness.QueryResult
+	var res struct {
+		Names []string `json:"names"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		t.Fatalf("decode insecure query: %v", err)
+		t.Fatalf("decode insecure typed read: %v", err)
 	}
-	if len(res.Rows) == 0 || len(res.Rows[0]) == 0 {
-		return 0
-	}
-	n, _ := strconv.Atoi(fmt.Sprint(res.Rows[0][0]))
-	return n
+	return res.Names
 }
 
 type peerJSON struct {
@@ -382,23 +374,19 @@ func waitConnectedPeers(t *testing.T, apiAddr string, want int, timeout time.Dur
 	t.Fatalf("connected_peers != %d on %s within %v", want, apiAddr, timeout)
 }
 
-func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, timeout time.Duration) {
+func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, table)
-			if err != nil || n != want {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, table, "id")
-			if err != nil {
-				ok = false
-				break
-			}
+			d := strings.Join(names, "\x00")
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -411,7 +399,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("nodes did not converge on %d %s rows with equal digests within %v", want, table, timeout)
+	t.Fatalf("nodes did not converge on %d typed records with equal names within %v", want, timeout)
 }
 
 func envInt(name string, fallback int) int {

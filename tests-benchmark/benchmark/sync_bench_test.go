@@ -11,8 +11,9 @@ import (
 	"github.com/marcgauthier/murmur/transport"
 )
 
-// BenchmarkRebuild times Open (Pebble open + full SQL rebuild from current
-// state) on a pre-populated store. Single-shot per size with explicit metrics.
+// BenchmarkRebuild times Open (Spool open + full typed rebuild from
+// current state) on a pre-populated store. Single-shot per size with
+// explicit metrics.
 func BenchmarkRebuild(b *testing.B) {
 	for _, n := range datasetSizes(b) {
 		b.Run(sizeName(n), func(b *testing.B) {
@@ -22,10 +23,8 @@ func BenchmarkRebuild(b *testing.B) {
 				return testdb.Configure(murmur.Config{
 					Path:   dir,
 					NodeID: node,
-					Schema: murmur.SchemaConfig{
-						Version: 1, Tables: benchSchema(), LocalDDL: benchLocalDDL(),
-					},
-					Pebble: murmur.DefaultPebbleConfig(),
+					Tables: mustBenchTables(),
+					Spool:  murmur.DefaultSpoolConfig(),
 					Encryption: murmur.EncryptionConfig{
 						Key: bytes.Repeat([]byte{0x62}, 32), KeyID: "bench",
 					},
@@ -48,17 +47,16 @@ func BenchmarkRebuild(b *testing.B) {
 				b.Fatal(err)
 			}
 			defer db.Close()
-			// Time to first query.
-			qstart := time.Now()
-			rows, err := db.QueryContext(context.Background(), `SELECT COUNT(*) FROM contacts`)
+			contacts, err := murmur.TableOf[benchContact](db, "contacts")
 			if err != nil {
 				b.Fatal(err)
 			}
-			var count int
-			for rows.Next() {
-				_ = rows.Scan(&count)
+			// Time to first query.
+			qstart := time.Now()
+			count, err := contacts.Where().Count()
+			if err != nil {
+				b.Fatal(err)
 			}
-			rows.Close()
 			if count != n {
 				b.Fatalf("rebuilt %d rows, want %d", count, n)
 			}
@@ -98,10 +96,8 @@ func BenchmarkReplicationSync(b *testing.B) {
 					Path:   path,
 					NodeID: node,
 					DBID:   dbid,
-					Schema: murmur.SchemaConfig{
-						Version: 1, Tables: benchSchema(), LocalDDL: benchLocalDDL(),
-					},
-					Pebble: murmur.DefaultPebbleConfig(),
+					Tables: mustBenchTables(),
+					Spool:  murmur.DefaultSpoolConfig(),
 					Encryption: murmur.EncryptionConfig{
 						Key: bytes.Repeat([]byte{0x62}, 32), KeyID: "bench",
 					},
@@ -157,14 +153,13 @@ func BenchmarkReplicationSync(b *testing.B) {
 
 func countContacts(b *testing.B, db *murmur.DB) int {
 	b.Helper()
-	rows, err := db.QueryContext(context.Background(), `SELECT COUNT(*) FROM contacts`)
+	contacts, err := murmur.TableOf[benchContact](db, "contacts")
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer rows.Close()
-	var n int
-	for rows.Next() {
-		_ = rows.Scan(&n)
+	n, err := contacts.Where().Count()
+	if err != nil {
+		b.Fatal(err)
 	}
 	return n
 }

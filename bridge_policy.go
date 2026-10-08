@@ -156,21 +156,6 @@ func (db *DB) bridgePolicy(table uint32, row ids.RowID, column uint32) (BridgePr
 	return policy, err == nil, err
 }
 
-// BeginBridgeImportTx begins a High-side SQL transaction tagged with the
-// verified Low bundle identity. Its row/field provenance mutations are
-// committed atomically with imported values.
-func (db *DB) BeginBridgeImportTx(ctx context.Context, txID ids.TxID, source ids.DBID, stream string, bundle ids.TxID, first, last uint64, allowHighDelete bool, opts *TxOptions) (*Tx, error) {
-	if source.IsZero() || stream == "" || len(stream) > 1024 || first == 0 || last < first {
-		return nil, fmt.Errorf("murmur: invalid bridge import provenance")
-	}
-	tx, err := db.BeginTxWithID(ctx, txID, opts)
-	if err != nil {
-		return nil, err
-	}
-	tx.bridgeImport = &bridgeImportInfo{SourceDomain: source, Stream: stream, BundleID: bundle, FirstSeq: first, LastSeq: last, AllowHighDelete: allowHighDelete}
-	return tx, nil
-}
-
 // ReleaseBridgeOwnership explicitly returns a High-overridden imported field
 // to Low ownership. The policy change is replicated and durable.
 func (db *DB) ReleaseBridgeOwnership(ctx context.Context, tableName string, row ids.RowID, columnName string) error {
@@ -239,37 +224,25 @@ func (db *DB) commitBridgePolicy(ctx context.Context, mutations ...codec.Mutatio
 	defer db.writeMu.Unlock()
 	db.applyMu.Lock()
 	defer db.applyMu.Unlock()
-	if err := db.flushRemoteLocked(); err != nil {
-		return err
-	}
 	identity := db.schemaIdentity()
 	batch := &codec.MutationBatch{ProtocolVersion: replication.ProtocolVersion, TxID: ids.NewTxID(), OriginNode: db.cfg.NodeID, HLC: db.store.ClockNow(), SchemaEpoch: identity.Epoch, SchemaHash: identity.Hash, Mutations: mutations}
 	result, err := db.store.CommitLocal(ctx, batch)
 	if err != nil {
+		if db.store.Failed() != nil {
+			db.setState(StateFailed)
+			return &CommitOutcomeUncertainError{TxID: batch.TxID, Cause: err}
+		}
 		return err
 	}
-	// Shadow clears/sets change effective SQL state without SQL writes of
-	// their own: materialize the resolved winners so local reads converge
-	// immediately (release flips to Low bytes, row release resurrects).
-	if len(result.Winners) > 0 {
-		resolved, rerr := resolveBridgeWinners(db, result.Winners)
-		if rerr != nil {
-			db.log.Warn("bridge policy apply failed; rebuilding materializer", "err", rerr.Error())
-			if rerr := db.rebuildLocked(); rerr != nil {
-				return rerr
-			}
-		} else if len(resolved) > 0 {
-			if err := db.engine.ApplyWinners(db.shadowReader(), resolved); err != nil {
-				db.log.Warn("bridge policy apply failed; rebuilding materializer", "err", err.Error())
-				if rerr := db.rebuildLocked(); rerr != nil {
-					return rerr
-				}
-			}
-		}
+	previousGeneration := db.materializedGeneration.Load()
+	if err := db.applyRecordWinners(ctx, result, false); err != nil {
+		db.setState(StateFailed)
+		return &CommitOutcomeUncertainError{TxID: batch.TxID, Cause: err}
 	}
-	db.materializedGeneration.Store(result.Generation)
-	if manager := db.replManager(); manager != nil {
-		manager.NotifyLocal()
+	if result.Generation > previousGeneration {
+		if manager := db.replManager(); manager != nil {
+			manager.NotifyLocal()
+		}
 	}
 	return nil
 }
@@ -359,7 +332,7 @@ func decodeBridgeProvenance(b []byte) (BridgeProvenance, error) {
 	return policy, nil
 }
 
-func policyMutationsForTx(db *DB, tx *Tx, mutations []codec.Mutation) ([]codec.Mutation, error) {
+func policyMutationsForTx(db *DB, tx *policyTx, mutations []codec.Mutation) ([]codec.Mutation, error) {
 	var out []codec.Mutation
 	if tx.bridgeImport == nil {
 		seenRows := make(map[string]bool)
@@ -489,6 +462,13 @@ func policyMutationsForTx(db *DB, tx *Tx, mutations []codec.Mutation) ([]codec.M
 		old, ok, err := db.bridgePolicy(mutation.TableID, mutation.RowID, mutation.ColumnID)
 		if err != nil {
 			return nil, err
+		}
+		if ok && old.Owner == BridgeOwnerHigh && old.SourceDomain == info.SourceDomain && old.Stream == info.Stream {
+			// The typed value cell tracks the latest Low state even while a
+			// High shadow wins reads. Keep High provenance so release still
+			// exposes that retained value and subsequent High writes remain
+			// protected.
+			continue
 		}
 		if ok && old.SourceDomain == info.SourceDomain && old.Stream == info.Stream {
 			policy.FirstSeq = old.FirstSeq

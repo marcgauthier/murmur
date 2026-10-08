@@ -122,9 +122,9 @@ Handshake validation and State-Based Schema Exchange:
 
 Peers advertising optional `CapProgressPages` exchange sorted, cursor-paginated progress records. The handshake carries at most 128 origin watermarks; each progress record reports applied and observed heads plus contiguous retained-log bounds. Observed is the highest durable staged sequence seen for an origin, or applied when staging has no newer transaction. Peers advertising `CapTransactionChunks` also exchange cursor-paginated chunk bitmaps for durable incomplete transactions. Advertisements are hints, never applied acknowledgements or GC watermarks. If a peer cannot serve requested chunks it returns `ErrRangeUnavailable`; the receiver tries another advertised or retained source and requests a current snapshot when none remains. Peers without these optional capabilities keep legacy ACK behavior.
 
-`CapTransactionChunks` enables oversized transaction transfer with canonical 64 KiB `TXCH` frames. Receivers validate and durably stage each fragment before acknowledging anything, request missing indexes from the supplier and alternate peers, then verify the complete digest and apply the original transaction through the normal atomic commit path. Staging inherits the configured Pebble filesystem encryption and has a 256 MiB global byte ceiling. Peers without this optional capability receive ordinary batches only; a transaction larger than the frame limit cannot be sent to them.
+`CapTransactionChunks` enables oversized transaction transfer with canonical 64 KiB `TXCH` frames. Receivers validate and durably stage each fragment before acknowledging anything, request missing indexes from the supplier and alternate peers, then verify the complete digest and apply the original transaction through the normal atomic commit path. Staging inherits Spool's AES-256-GCM storage encryption and has a 256 MiB global byte ceiling. A count-complete set that fails verification is dropped as a whole and every chunk is re-requested (throttled, alternates included): per-chunk bytes are not covered by the origin signature, so a first-arriving forged fragment must never wedge the transfer against the later valid one. Peers without this optional capability receive ordinary batches only; a transaction larger than the frame limit cannot be sent to them.
 
-Do not exchange the Pebble at-rest encryption key.
+Do not exchange the at-rest storage encryption key.
 
 ---
 
@@ -175,7 +175,7 @@ B > 812
 C > 92
 ```
 
-The sender performs Pebble range scans by origin.
+The sender performs state store range scans by origin.
 
 ### Optional Plumtree dissemination
 
@@ -188,7 +188,7 @@ Keep bounded gossip as the default. `ReplicationConfig.Dissemination = Dissemina
 The `plumtree` package implements the bounded eager/lazy state machine and `replication.Manager` connects it to framed QUIC delivery. Committed batches use eager `MsgPlumtreeData` frames or lazy `MsgPlumtreeIHave` announcements. Receivers wait 75 ms before `GRAFT`, cancel a queued graft if eager data arrives, and answer cache hits with the retained batch. Cache misses request the origin/sequence through ordinary `Need` repair; anti-entropy and snapshots remain active as fallback. Duplicate eager deliveries send `PRUNE`. The current payload cache is bounded to 256 entries, 32 MiB, and one minute. The active stable-NodeID ring predecessor/successor are prioritized as protected eager neighbors; selected replication peers follow them. Both paths use established sessions and keep the same transport limits. A three-node test verifies that a batch reaches a non-selected neighbor through Plumtree forwarding.
 - Promotions obey the existing replication-session/connection limits. Replace an unlocked eager route or defer the promotion when the eager budget is full; do not grow connections for every lazy member. Requests and lazy announcements use transient/reused authenticated QUIC control streams and the same work admission/bandwidth limits.
 - Bound the seen-identity and payload caches by entries, bytes, and age. A seen entry alone cannot suppress retrieval/application of an incomplete transaction. Cached payload eviction permits lookup from retained origin logs; if unavailable, request missing ranges from another peer or use snapshot recovery. `IHAVE`, `GRAFT`, `PRUNE`, and staging receipts never count as durable transaction acknowledgements.
-- Prefer retaining locally originated pending notifications over redundant forwarding or optimization messages during shedding. Accepted local mutations remain durable in Pebble regardless of dissemination-cache eviction. Rotation and periodic anti-entropy continue to repair missed announcements and broken eager routes.
+- Prefer retaining locally originated pending notifications over redundant forwarding or optimization messages during shedding. Accepted local mutations remain durable in Spool regardless of dissemination-cache eviction. Rotation and periodic anti-entropy continue to repair missed announcements and broken eager routes.
 
 ---
 

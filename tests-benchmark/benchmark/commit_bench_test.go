@@ -6,18 +6,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/codec"
-	"github.com/marcgauthier/murmur/crypto"
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/internal/testidentity"
+	"github.com/marcgauthier/murmur/spool"
 	"github.com/marcgauthier/murmur/state"
 )
 
 // openTemplateStore opens a copy of the n-row template directly at the
-// state layer (registry + encrypted FS + Pebble, no SQL engine), for
-// storage-component benchmarks.
+// state layer, for storage-component benchmarks.
 func openTemplateStore(b *testing.B, n int) (*state.Store, func()) {
 	b.Helper()
 	tmpl := templateFor(b, n)
@@ -25,30 +23,27 @@ func openTemplateStore(b *testing.B, n int) (*state.Store, func()) {
 	if err := copyDir(tmpl.dir, dest); err != nil {
 		b.Fatal(err)
 	}
-	var dbid [16]byte
-	copy(dbid[:], tmpl.dbid[:])
-	prov := benchProvider()
-	reg, err := crypto.OpenRegistry(filepath.Join(dest, "keys"), prov, dbid)
+	dataPath := filepath.Join(dest, "data")
+	st, err := state.Open(dataPath, tmpl.node, tmpl.dbid,
+		state.Options{
+			Spool: spool.Options{
+				Path:          dataPath,
+				MasterKey:     append([]byte(nil), benchKey...),
+				WrappingKeyID: "bench",
+				Encryption:    spool.EncryptionAES256GCM,
+			},
+			Limits:        codec.DefaultLimits(),
+			OriginSigning: testidentity.Config(tmpl.node),
+		})
 	if err != nil {
 		b.Fatal(err)
 	}
-	efs, err := crypto.NewEncryptedFS(crypto.FSOptions{Base: vfs.Default, Registry: reg, DBID: dbid})
-	if err != nil {
-		reg.Close()
-		b.Fatal(err)
-	}
-	st, err := state.Open(filepath.Join(dest, "data"), tmpl.node, tmpl.dbid,
-		state.Options{FS: efs, Limits: codec.DefaultLimits(), OriginSigning: testidentity.Config(tmpl.node)})
-	if err != nil {
-		reg.Close()
-		b.Fatal(err)
-	}
-	return st, func() { _ = st.Close(); reg.Close() }
+	return st, func() { _ = st.Close() }
 }
 
-// BenchmarkPebbleCommitLatency commits single-mutation batches directly
-// to the store and reports commit latency plus WAL bytes per second.
-func BenchmarkPebbleCommitLatency(b *testing.B) {
+// BenchmarkSpoolCommitLatency commits single-mutation batches directly
+// to the store and reports commit latency plus bytes per second.
+func BenchmarkSpoolCommitLatency(b *testing.B) {
 	for _, n := range datasetSizes(b) {
 		b.Run(sizeName(n), func(b *testing.B) {
 			st, cleanup := openTemplateStore(b, n)
@@ -91,6 +86,9 @@ func BenchmarkRemoteApplyRate(b *testing.B) {
 			defer cleanup()
 			ctx := context.Background()
 			remote := ids.NewNodeID()
+			// Register the remote origin as trusted (Key adds it to the
+			// shared test registry) so origin verification passes.
+			_ = testidentity.Key(remote)
 			var lat latency
 			const mutsPerBatch = 10
 			b.ReportAllocs()
@@ -99,7 +97,7 @@ func BenchmarkRemoteApplyRate(b *testing.B) {
 				muts := make([]codec.Mutation, 0, mutsPerBatch)
 				for r := 0; r < mutsPerBatch; r++ {
 					muts = append(muts, codec.Mutation{
-						TableID: 1, RowID: ids.NewRowID(), ColumnID: 1,
+						TableID: 91, RowID: ids.NewRowID(), ColumnID: 2,
 						Value: codec.Text("remote-apply-probe"),
 					})
 				}
@@ -110,6 +108,7 @@ func BenchmarkRemoteApplyRate(b *testing.B) {
 					HLC:        st.ClockNow(),
 					Mutations:  muts,
 				}
+				testidentity.Sign(batch, st.DBID())
 				start := time.Now()
 				if _, err := st.CommitRemote(ctx, batch); err != nil {
 					b.Fatal(err)

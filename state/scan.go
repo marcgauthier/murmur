@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/cockroachdb/pebble/v2"
-
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crdt"
 	"github.com/marcgauthier/murmur/ids"
@@ -45,8 +43,8 @@ func (r *Row) Visible() bool {
 }
 
 // prefixIter opens a snapshot iterator bounded to prefix.
-func prefixIter(snap *pebble.Snapshot, prefix []byte) (*pebble.Iterator, error) {
-	return snap.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixEnd(prefix)})
+func prefixIter(snap *snapshot, prefix []byte) (*iterator, error) {
+	return snap.NewIter(&iterOptions{LowerBound: prefix, UpperBound: prefixEnd(prefix)})
 }
 
 // IterateTable assembles every row of one table in row-UUID order, calling
@@ -55,12 +53,12 @@ func prefixIter(snap *pebble.Snapshot, prefix []byte) (*pebble.Iterator, error) 
 func (s *Store) IterateTable(tableID uint32, fn func(*Row) error) error {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
-	return s.snapshot(func(snap *pebble.Snapshot) error {
+	return s.snapshot(func(snap *snapshot) error {
 		return s.iterateTableSnapshot(context.Background(), snap, tableID, fn, nil)
 	})
 }
 
-func (s *Store) iterateTableSnapshot(ctx context.Context, snap *pebble.Snapshot, tableID uint32, fn func(*Row) error, onCell func()) error {
+func (s *Store) iterateTableSnapshot(ctx context.Context, snap *snapshot, tableID uint32, fn func(*Row) error, onCell func()) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -124,7 +122,7 @@ func (s *Store) GetRow(table uint32, row ids.RowID) (map[uint32]codec.CellState,
 	s.gate.RLock()
 	defer s.gate.RUnlock()
 	out := make(map[uint32]codec.CellState)
-	err := s.snapshot(func(snap *pebble.Snapshot) error {
+	err := s.snapshot(func(snap *snapshot) error {
 		prefix := CellRowPrefix(table, row)
 		it, err := prefixIter(snap, prefix)
 		if err != nil {
@@ -156,12 +154,12 @@ func (s *Store) IterateCells(fn func(codec.SnapshotCell) error) error {
 }
 
 func (s *Store) iterateCellsCore(fn func(codec.SnapshotCell) error) error {
-	return s.snapshot(func(snap *pebble.Snapshot) error {
+	return s.snapshot(func(snap *snapshot) error {
 		return s.iterateCellsSnap(snap, fn)
 	})
 }
 
-func (s *Store) iterateCellsSnap(snap *pebble.Snapshot, fn func(codec.SnapshotCell) error) error {
+func (s *Store) iterateCellsSnap(snap *snapshot, fn func(codec.SnapshotCell) error) error {
 	// Cells.
 	cprefix := []byte{prefixCell}
 	it, err := prefixIter(snap, cprefix)
@@ -244,7 +242,7 @@ func (s *Store) LogScan(origin ids.NodeID, fromSeq uint64, maxBatches int, maxBy
 	s.gate.RLock()
 	defer s.gate.RUnlock()
 	last := fromSeq - 1
-	err := s.snapshot(func(snap *pebble.Snapshot) error {
+	err := s.snapshot(func(snap *snapshot) error {
 		prefix := LogOriginPrefix(origin)
 		// Watermarks advance only on contiguous commits, so every sequence
 		// at or below the watermark existed; a missing one was collected.
@@ -318,7 +316,7 @@ func (s *Store) FirstRetainedSeq(origin ids.NodeID) (uint64, error) {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
 	var first uint64
-	err := s.snapshot(func(snap *pebble.Snapshot) error {
+	err := s.snapshot(func(snap *snapshot) error {
 		wm, err := recvWatermarkSnap(snap, origin)
 		if err != nil {
 			return err
@@ -329,7 +327,7 @@ func (s *Store) FirstRetainedSeq(origin ids.NodeID) (uint64, error) {
 	return first, err
 }
 
-func firstRetainedSeqSnap(snap *pebble.Snapshot, origin ids.NodeID, watermark uint64) (uint64, error) {
+func firstRetainedSeqSnap(snap *snapshot, origin ids.NodeID, watermark uint64) (uint64, error) {
 	prefix := LogOriginPrefix(origin)
 	it, err := prefixIter(snap, prefix)
 	if err != nil {
@@ -349,7 +347,7 @@ func firstRetainedSeqSnap(snap *pebble.Snapshot, origin ids.NodeID, watermark ui
 }
 
 // ReceiveProgressPage returns at most limit sorted origin records strictly
-// after afterOrigin. One Pebble snapshot keeps applied and retained-history
+// after afterOrigin. One memory snapshot keeps applied and retained-history
 // bounds consistent within the page.
 func (s *Store) ReceiveProgressPage(afterOrigin ids.NodeID, limit int) ([]OriginProgress, bool, error) {
 	if limit <= 0 || limit > 1024 {
@@ -359,7 +357,7 @@ func (s *Store) ReceiveProgressPage(afterOrigin ids.NodeID, limit int) ([]Origin
 	defer s.gate.RUnlock()
 	var out []OriginProgress
 	more := false
-	err := s.snapshot(func(snap *pebble.Snapshot) error {
+	err := s.snapshot(func(snap *snapshot) error {
 		progress := make(map[ids.NodeID]OriginProgress)
 		recv, err := prefixIter(snap, []byte{prefixRecv})
 		if err != nil {
@@ -495,7 +493,7 @@ func (s *Store) CollectLog(origin ids.NodeID, throughSeq uint64, keepNewerThanMi
 		return 0, nil
 	}
 	var keys [][]byte
-	err = s.snapshot(func(snap *pebble.Snapshot) error {
+	err = s.snapshot(func(snap *snapshot) error {
 		prefix := LogOriginPrefix(origin)
 		it, err := prefixIter(snap, prefix)
 		if err != nil {
@@ -532,14 +530,14 @@ func (s *Store) CollectLog(origin ids.NodeID, throughSeq uint64, keepNewerThanMi
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
 	for _, k := range keys {
-		if err := b.Delete(k, nil); err != nil {
+		if err := b.Delete(k); err != nil {
 			return 0, err
 		}
 	}
-	if err := s.commitBatch(b, s.writeOpts); err != nil {
+	if err := s.commitBatch(b, s.syncCommits); err != nil {
 		return 0, err
 	}
 	return len(keys), nil
@@ -567,7 +565,7 @@ func (s *Store) CollectReceipts(floors map[ids.NodeID]uint64) (int, error) {
 		}
 	}
 	var keys [][]byte
-	err := s.snapshot(func(snap *pebble.Snapshot) error {
+	err := s.snapshot(func(snap *snapshot) error {
 		prefix := []byte{prefixReceipt}
 		it, err := prefixIter(snap, prefix)
 		if err != nil {
@@ -599,15 +597,15 @@ func (s *Store) CollectReceipts(floors map[ids.NodeID]uint64) (int, error) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
 	for _, k := range keys {
-		// Pebble deletes are idempotent; missing keys are fine.
-		if err := b.Delete(k, nil); err != nil {
+		// Deletes are idempotent; missing keys are fine.
+		if err := b.Delete(k); err != nil {
 			return 0, err
 		}
 	}
-	if err := s.commitBatch(b, s.writeOpts); err != nil {
+	if err := s.commitBatch(b, s.syncCommits); err != nil {
 		return 0, err
 	}
 	return len(keys), nil

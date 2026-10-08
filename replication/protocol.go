@@ -17,20 +17,26 @@ import (
 	"github.com/marcgauthier/murmur/schema"
 )
 
-// Protocol version 4 requires immutable Ed25519 origin signatures.
+// Protocol version 6 identifies the managed RIME record runtime and refuses
+// peers from the removed SQL cell protocol.
 const (
-	ProtocolVersion    uint16 = 5
-	MinProtocolVersion uint16 = 5
+	ProtocolVersion    uint16 = 6
+	MinProtocolVersion uint16 = 6
 )
 
 // Capability bits.
 const (
-	CapOriginSignatures  uint64 = 1 << 4
-	CapMergePolicies     uint64 = 1 << 5
-	CapZstd              uint64 = 1 << 0
+	CapOriginSignatures uint64 = 1 << 4
+	CapMergePolicies    uint64 = 1 << 5
+	// Bit 0 was CapZstd and is retired: zstd was removed, and the bit
+	// is never reused so an old zstd peer cannot misread deflate
+	// frames as zstd.
 	CapPlumtree          uint64 = 1 << 1
 	CapProgressPages     uint64 = 1 << 2
 	CapTransactionChunks uint64 = 1 << 3
+	// CapCompression advertises frame compression through the
+	// compression.Codec registry (codec id carried in the frame flags).
+	CapCompression uint64 = 1 << 6
 )
 
 // CapRequiredMask marks a handshake's capabilities as required: when the
@@ -45,7 +51,7 @@ const (
 const CapRequiredMask uint64 = 1 << 63
 
 // KnownCaps is every capability bit this binary understands.
-const KnownCaps uint64 = CapMergePolicies | CapOriginSignatures | CapZstd | CapPlumtree | CapProgressPages | CapTransactionChunks
+const KnownCaps uint64 = CapMergePolicies | CapOriginSignatures | CapCompression | CapPlumtree | CapProgressPages | CapTransactionChunks
 
 // NegotiateCapabilities intersects peer-advertised capabilities with local
 // support. Unknown bits are ignored unless the peer marks its set required
@@ -83,9 +89,21 @@ const (
 )
 
 // Frame flags.
+//
+// Bit 0 was FlagZstd and is retired (never reused). Bit 1 marks a
+// compressed payload and bits 8-15 carry the compression.Codec wire id.
 const (
-	FlagZstd uint16 = 1 << 0
+	FlagCompressed uint16 = 1 << 1
+
+	flagCodecShift = 8
 )
+
+// CompressedFlags returns the frame flags for a payload compressed with
+// codec id.
+func CompressedFlags(id uint8) uint16 { return FlagCompressed | uint16(id)<<flagCodecShift }
+
+// FlagCodecID extracts the compression codec id from frame flags.
+func FlagCodecID(flags uint16) uint8 { return uint8(flags >> flagCodecShift) }
 
 // Message types.
 const (
@@ -581,7 +599,7 @@ func DecodeError(src []byte) (uint16, string, error) {
 	return code, string(src[4 : 4+n]), nil
 }
 
-// SnapshotChunk is one MsgSnapshotChunk payload (before optional zstd).
+// SnapshotChunk is one MsgSnapshotChunk payload (before optional compression).
 type SnapshotChunk struct {
 	Index uint64
 	Last  bool

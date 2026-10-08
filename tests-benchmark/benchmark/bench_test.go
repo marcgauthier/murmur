@@ -6,6 +6,9 @@ import (
 	"math/rand"
 	"testing"
 	"time"
+
+	"github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // --- point and indexed reads ---
@@ -14,7 +17,10 @@ func BenchmarkPKLookup(b *testing.B) {
 	for _, n := range datasetSizes(b) {
 		b.Run(sizeName(n), func(b *testing.B) {
 			db, ids := openTemplateDB(b, n)
-			ctx := context.Background()
+			contacts, err := murmur.TableOf[benchContact](db, "contacts")
+			if err != nil {
+				b.Fatal(err)
+			}
 			rng := rand.New(rand.NewSource(7))
 			var lat latency
 			trackPeakAlloc(b)
@@ -22,13 +28,12 @@ func BenchmarkPKLookup(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				start := time.Now()
-				rows, err := db.QueryContext(ctx,
-					`SELECT name, phone, score FROM contacts WHERE id = ?`, ids[rng.Intn(len(ids))][:])
+				got, err := contacts.Get(ids[rng.Intn(len(ids))])
 				if err != nil {
 					b.Fatal(err)
 				}
-				if got := drainRows(b, rows); got != 1 {
-					b.Fatalf("got %d rows", got)
+				if got.Name == "" && got.Phone == "" && got.Score == 0 {
+					b.Fatal("empty row")
 				}
 				lat.record(time.Since(start))
 			}
@@ -41,19 +46,23 @@ func BenchmarkIndexedEquality(b *testing.B) {
 	for _, n := range datasetSizes(b) {
 		b.Run(sizeName(n), func(b *testing.B) {
 			db, _ := openTemplateDB(b, n)
-			ctx := context.Background()
+			contacts, err := murmur.TableOf[benchContact](db, "contacts")
+			if err != nil {
+				b.Fatal(err)
+			}
+			nameField := murmur.FieldOf[benchContact, string](contacts, "Name")
 			var lat latency
 			trackPeakAlloc(b)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				start := time.Now()
-				rows, err := db.QueryContext(ctx,
-					`SELECT id FROM contacts WHERE name = ?`, fmt.Sprintf("ann smith %d", (i*7919)%n))
+				rows, err := contacts.Where(nameField.Eq(fmt.Sprintf("ann smith %d", (i*7919)%n))).Find()
 				if err != nil {
 					b.Fatal(err)
 				}
-				drainRows(b, rows)
+				for range rows {
+				}
 				lat.record(time.Since(start))
 			}
 			lat.report(b, 1, "ops")
@@ -65,20 +74,24 @@ func BenchmarkIndexedRange(b *testing.B) {
 	for _, n := range datasetSizes(b) {
 		b.Run(sizeName(n), func(b *testing.B) {
 			db, _ := openTemplateDB(b, n)
-			ctx := context.Background()
+			contacts, err := murmur.TableOf[benchContact](db, "contacts")
+			if err != nil {
+				b.Fatal(err)
+			}
+			scoreField := murmur.NumericFieldOf[benchContact, int64](contacts, "Score")
 			var lat latency
 			trackPeakAlloc(b)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				lo := (i * 131) % 900
+				lo := int64((i * 131) % 900)
 				start := time.Now()
-				rows, err := db.QueryContext(ctx,
-					`SELECT id FROM contacts WHERE score BETWEEN ? AND ? LIMIT 100`, lo, lo+100)
+				rows, err := contacts.Where(scoreField.Between(lo, lo+100)).Limit(100).Find()
 				if err != nil {
 					b.Fatal(err)
 				}
-				drainRows(b, rows)
+				for range rows {
+				}
 				lat.record(time.Since(start))
 			}
 			lat.report(b, 1, "ops")
@@ -90,20 +103,23 @@ func BenchmarkOrderLimit(b *testing.B) {
 	for _, n := range datasetSizes(b) {
 		b.Run(sizeName(n), func(b *testing.B) {
 			db, _ := openTemplateDB(b, n)
-			ctx := context.Background()
+			contacts, err := murmur.TableOf[benchContact](db, "contacts")
+			if err != nil {
+				b.Fatal(err)
+			}
+			scoreField := murmur.FieldOf[benchContact, int64](contacts, "Score")
 			var lat latency
 			trackPeakAlloc(b)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				start := time.Now()
-				rows, err := db.QueryContext(ctx,
-					`SELECT name, score FROM contacts ORDER BY score DESC LIMIT 20`)
+				rows, err := contacts.Where().OrderByDesc(scoreField).Limit(20).Find()
 				if err != nil {
 					b.Fatal(err)
 				}
-				if got := drainRows(b, rows); got != 20 {
-					b.Fatalf("got %d rows", got)
+				if len(rows) != 20 {
+					b.Fatalf("got %d rows", len(rows))
 				}
 				lat.record(time.Since(start))
 			}
@@ -116,6 +132,16 @@ func BenchmarkJoin(b *testing.B) {
 	for _, n := range datasetSizes(b) {
 		b.Run(sizeName(n), func(b *testing.B) {
 			db, _ := openTemplateDB(b, n)
+			contacts, err := murmur.TableOf[benchContact](db, "contacts")
+			if err != nil {
+				b.Fatal(err)
+			}
+			orders, err := murmur.TableOf[benchOrder](db, "orders")
+			if err != nil {
+				b.Fatal(err)
+			}
+			idField := murmur.FieldOf[benchContact, ids.RowID](contacts, "ID")
+			contactField := murmur.FieldOf[benchOrder, ids.RowID](orders, "ContactID")
 			ctx := context.Background()
 			var lat latency
 			trackPeakAlloc(b)
@@ -123,14 +149,29 @@ func BenchmarkJoin(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				start := time.Now()
-				rows, err := db.QueryContext(ctx,
-					`SELECT c.name, SUM(o.amount) FROM contacts c
-					 JOIN orders o ON o.contact_id = c.id
-					 WHERE c.score > ? GROUP BY c.id LIMIT 100`, (i*17)%500)
+				rtx, err := db.ReadTxContext(ctx)
 				if err != nil {
 					b.Fatal(err)
 				}
-				drainRows(b, rows)
+				pairs, err := murmur.InnerJoinReadTx(rtx, contacts, idField, orders, contactField)
+				if err != nil {
+					_ = rtx.Close()
+					b.Fatal(err)
+				}
+				// Filter + group + limit client-side (score > ? GROUP BY id LIMIT 100).
+				threshold := int64((i * 17) % 500)
+				sums := make(map[ids.RowID]int64, 128)
+				for _, pair := range pairs {
+					if pair.Left.Score > threshold {
+						sums[pair.Left.ID] += pair.Right.Amount
+					}
+					if len(sums) >= 100 {
+						break
+					}
+				}
+				if err := rtx.Close(); err != nil {
+					b.Fatal(err)
+				}
 				lat.record(time.Since(start))
 			}
 			lat.report(b, 1, "ops")
@@ -142,69 +183,26 @@ func BenchmarkGroupBy(b *testing.B) {
 	for _, n := range datasetSizes(b) {
 		b.Run(sizeName(n), func(b *testing.B) {
 			db, _ := openTemplateDB(b, n)
-			ctx := context.Background()
-			var lat latency
-			trackPeakAlloc(b)
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				start := time.Now()
-				rows, err := db.QueryContext(ctx,
-					`SELECT score / 100 AS bucket, COUNT(*) FROM contacts GROUP BY bucket`)
-				if err != nil {
-					b.Fatal(err)
-				}
-				drainRows(b, rows)
-				lat.record(time.Since(start))
+			contacts, err := murmur.TableOf[benchContact](db, "contacts")
+			if err != nil {
+				b.Fatal(err)
 			}
-			lat.report(b, 1, "ops")
-		})
-	}
-}
-
-// --- FTS ---
-
-func BenchmarkFTSTerm(b *testing.B) {
-	for _, n := range datasetSizes(b) {
-		b.Run(sizeName(n), func(b *testing.B) {
-			db, _ := openTemplateDB(b, n)
-			ctx := context.Background()
 			var lat latency
 			trackPeakAlloc(b)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				start := time.Now()
-				rows, err := db.QueryContext(ctx,
-					`SELECT rowid FROM contacts_fts WHERE contacts_fts MATCH 'smith' LIMIT 100`)
+				rows, err := contacts.Where().Find()
 				if err != nil {
 					b.Fatal(err)
 				}
-				drainRows(b, rows)
-				lat.record(time.Since(start))
-			}
-			lat.report(b, 1, "ops")
-		})
-	}
-}
-
-func BenchmarkFTSPrefix(b *testing.B) {
-	for _, n := range datasetSizes(b) {
-		b.Run(sizeName(n), func(b *testing.B) {
-			db, _ := openTemplateDB(b, n)
-			ctx := context.Background()
-			var lat latency
-			trackPeakAlloc(b)
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				start := time.Now()
-				rows, err := db.QueryContext(ctx,
-					`SELECT rowid FROM contacts_fts WHERE contacts_fts MATCH 'smi*' LIMIT 100`)
-				if err != nil {
-					b.Fatal(err)
+				// Bucket by score/100, mirroring GROUP BY bucket.
+				var buckets [10]int
+				for _, row := range rows {
+					buckets[row.Score/100]++
 				}
-				drainRows(b, rows)
+				_ = buckets
 				lat.record(time.Since(start))
 			}
 			lat.report(b, 1, "ops")
@@ -218,6 +216,10 @@ func BenchmarkSingleCellUpdate(b *testing.B) {
 	for _, n := range datasetSizes(b) {
 		b.Run(sizeName(n), func(b *testing.B) {
 			db, ids := openTemplateDB(b, n)
+			contacts, err := murmur.TableOf[benchContact](db, "contacts")
+			if err != nil {
+				b.Fatal(err)
+			}
 			ctx := context.Background()
 			rng := rand.New(rand.NewSource(9))
 			var lat latency
@@ -226,9 +228,18 @@ func BenchmarkSingleCellUpdate(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				start := time.Now()
-				if _, err := db.ExecContext(ctx,
-					`UPDATE contacts SET phone = ? WHERE id = ?`,
-					fmt.Sprintf("555-%04d", i%10000), ids[rng.Intn(len(ids))][:]); err != nil {
+				phone := fmt.Sprintf("555-%04d", i%10000)
+				tx, err := db.BeginTx(ctx)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := contacts.Update(tx, ids[rng.Intn(len(ids))], func(c *benchContact) error {
+					c.Phone = phone
+					return nil
+				}); err != nil {
+					b.Fatal(err)
+				}
+				if err := tx.Commit(); err != nil {
 					b.Fatal(err)
 				}
 				lat.record(time.Since(start))
@@ -242,6 +253,10 @@ func BenchmarkMultiColumnUpdate(b *testing.B) {
 	for _, n := range datasetSizes(b) {
 		b.Run(sizeName(n), func(b *testing.B) {
 			db, ids := openTemplateDB(b, n)
+			contacts, err := murmur.TableOf[benchContact](db, "contacts")
+			if err != nil {
+				b.Fatal(err)
+			}
 			ctx := context.Background()
 			rng := rand.New(rand.NewSource(11))
 			var lat latency
@@ -250,10 +265,20 @@ func BenchmarkMultiColumnUpdate(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				start := time.Now()
-				if _, err := db.ExecContext(ctx,
-					`UPDATE contacts SET name = ?, phone = ?, score = ? WHERE id = ?`,
-					fmt.Sprintf("upd %d", i), fmt.Sprintf("555-%04d", i%10000), i%1000,
-					ids[rng.Intn(len(ids))][:]); err != nil {
+				name := fmt.Sprintf("upd %d", i)
+				phone := fmt.Sprintf("555-%04d", i%10000)
+				score := int64(i % 1000)
+				tx, err := db.BeginTx(ctx)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := contacts.Update(tx, ids[rng.Intn(len(ids))], func(c *benchContact) error {
+					c.Name, c.Phone, c.Score = name, phone, score
+					return nil
+				}); err != nil {
+					b.Fatal(err)
+				}
+				if err := tx.Commit(); err != nil {
 					b.Fatal(err)
 				}
 				lat.record(time.Since(start))
@@ -265,6 +290,10 @@ func BenchmarkMultiColumnUpdate(b *testing.B) {
 
 func benchmarkTxnRows(b *testing.B, n, rowsPerTx int) {
 	db, ids := openTemplateDB(b, n)
+	contacts, err := murmur.TableOf[benchContact](db, "contacts")
+	if err != nil {
+		b.Fatal(err)
+	}
 	ctx := context.Background()
 	var lat latency
 	trackPeakAlloc(b)
@@ -272,14 +301,17 @@ func benchmarkTxnRows(b *testing.B, n, rowsPerTx int) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		start := time.Now()
-		tx, err := db.BeginTx(ctx, nil)
+		tx, err := db.BeginTx(ctx)
 		if err != nil {
 			b.Fatal(err)
 		}
 		for r := 0; r < rowsPerTx; r++ {
 			id := ids[(i*rowsPerTx+r)%len(ids)]
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE contacts SET score = ? WHERE id = ?`, (i+r)%1000, id[:]); err != nil {
+			score := int64((i + r) % 1000)
+			if err := contacts.Update(tx, id, func(c *benchContact) error {
+				c.Score = score
+				return nil
+			}); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -314,6 +346,10 @@ func BenchmarkMixedReadWrite(b *testing.B) {
 	for _, n := range datasetSizes(b) {
 		b.Run(sizeName(n), func(b *testing.B) {
 			db, ids := openTemplateDB(b, n)
+			contacts, err := murmur.TableOf[benchContact](db, "contacts")
+			if err != nil {
+				b.Fatal(err)
+			}
 			ctx := context.Background()
 			rng := rand.New(rand.NewSource(13))
 			var lat latency
@@ -323,20 +359,28 @@ func BenchmarkMixedReadWrite(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				start := time.Now()
 				if i%10 == 9 {
-					if _, err := db.ExecContext(ctx,
-						`UPDATE contacts SET score = ? WHERE id = ?`,
-						i%1000, ids[rng.Intn(len(ids))][:]); err != nil {
+					score := int64(i % 1000)
+					tx, err := db.BeginTx(ctx)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if err := contacts.Update(tx, ids[rng.Intn(len(ids))], func(c *benchContact) error {
+						c.Score = score
+						return nil
+					}); err != nil {
+						b.Fatal(err)
+					}
+					if err := tx.Commit(); err != nil {
 						b.Fatal(err)
 					}
 					lat.record(time.Since(start))
 					continue
 				}
-				rows, err := db.QueryContext(ctx,
-					`SELECT name, score FROM contacts WHERE id = ?`, ids[rng.Intn(len(ids))][:])
+				got, err := contacts.Get(ids[rng.Intn(len(ids))])
 				if err != nil {
 					b.Fatal(err)
 				}
-				drainRows(b, rows)
+				_ = got
 				lat.record(time.Since(start))
 			}
 			lat.report(b, 1, "ops")

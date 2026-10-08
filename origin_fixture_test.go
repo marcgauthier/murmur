@@ -5,6 +5,7 @@ import (
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/internal/testidentity"
+	"github.com/marcgauthier/murmur/spool"
 	"github.com/marcgauthier/murmur/state"
 )
 
@@ -36,5 +37,10 @@ func commitRemoteGroupFixture(s *state.Store, ctx context.Context, bs []*codec.M
 
 func openStateSignedFixture(path string, node ids.NodeID, dbid ids.DBID, opt state.Options) (*state.Store, error) {
 	opt.OriginSigning = testidentity.Config(node)
+	if opt.Spool.Encryption == 0 && len(opt.Spool.MasterKey) == 0 && opt.Spool.Passphrase == "" {
+		opt.Spool.Encryption = spool.EncryptionAES256GCM
+		opt.Spool.MasterKey = append([]byte(nil), testKey...)
+		opt.Spool.WrappingKeyID = testKeyID
+	}
 	return state.Open(path, node, dbid, opt)
 }

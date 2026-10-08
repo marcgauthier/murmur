@@ -18,6 +18,8 @@ func openPairForMembership(t *testing.T, mutate func(*Config)) (nodeA, nodeB Nod
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
 	cfgA := replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil)
+	cfgA.Schema.Tables = nil
+	cfgA.Tables = []TableDefinition{recordDefinition(t)}
 	if mutate != nil {
 		mutate(&cfgA)
 	}
@@ -30,6 +32,8 @@ func openPairForMembership(t *testing.T, mutate func(*Config)) (nodeA, nodeB Nod
 
 	cfgB := replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
+	cfgB.Schema.Tables = nil
+	cfgB.Tables = []TableDefinition{recordDefinition(t)}
 	dbB, err = openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
@@ -129,12 +133,20 @@ func TestAckDeadlineRenewalOnlyOnAdvance(t *testing.T) {
 	nodeA, _, dbA, dbB := openPairForMembership(t, nil)
 	defer dbA.Close()
 	defer dbB.Close()
-
-	id1 := NewRowID()
-	if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`, id1[:], "ann", "111"); err != nil {
+	tableA, err := TableOf[facadeRecord](dbA, "records")
+	if err != nil {
 		t.Fatal(err)
 	}
-	waitForValue(t, dbB, id1, "111", 15*time.Second)
+	tableB, err := TableOf[facadeRecord](dbB, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id1 := NewRowID()
+	if err := insertRecord(ctx, dbA, tableA, &facadeRecord{ID: id1, Name: "111"}); err != nil {
+		t.Fatal(err)
+	}
+	waitForRecordName(t, tableB, id1, "111", 15*time.Second)
 
 	rec1 := pollMember(t, dbA, dbB.cfg.NodeID, 10*time.Second, func(r state.MemberRecord) bool {
 		return r.LastProgressAt > 0
@@ -150,10 +162,10 @@ func TestAckDeadlineRenewalOnlyOnAdvance(t *testing.T) {
 	}
 
 	id2 := NewRowID()
-	if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`, id2[:], "bob", "222"); err != nil {
+	if err := insertRecord(ctx, dbA, tableA, &facadeRecord{ID: id2, Name: "222"}); err != nil {
 		t.Fatal(err)
 	}
-	waitForValue(t, dbB, id2, "222", 15*time.Second)
+	waitForRecordName(t, tableB, id2, "222", 15*time.Second)
 	rec2 := pollMember(t, dbA, dbB.cfg.NodeID, 10*time.Second, func(r state.MemberRecord) bool {
 		return r.LastProgressAt > rec1.LastProgressAt
 	})
@@ -175,13 +187,21 @@ func TestGCRetentionDeadlineIndependentOfLastSeen(t *testing.T) {
 	})
 	defer dbA.Close()
 	defer dbB.Close()
+	tableA, err := TableOf[facadeRecord](dbA, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tableB, err := TableOf[facadeRecord](dbB, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for _, tc := range [][2]string{{"ann", "111"}, {"bob", "222"}} {
 		id := NewRowID()
-		if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`, id[:], tc[0], tc[1]); err != nil {
+		if err := insertRecord(ctx, dbA, tableA, &facadeRecord{ID: id, Name: tc[1]}); err != nil {
 			t.Fatal(err)
 		}
-		waitForValue(t, dbB, id, tc[1], 15*time.Second)
+		waitForRecordName(t, tableB, id, tc[1], 15*time.Second)
 	}
 	peerB := dbB.cfg.NodeID
 	rec := pollMember(t, dbA, peerB, 10*time.Second, func(r state.MemberRecord) bool {
@@ -244,6 +264,8 @@ func TestRemovePeerRetiresAcrossRestart(t *testing.T) {
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
 	cfgA := replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil)
+	cfgA.Schema.Tables = nil
+	cfgA.Tables = []TableDefinition{recordDefinition(t)}
 	dbA, err := openSignedFixture(ctx, cfgA)
 	if err != nil {
 		t.Fatal(err)
@@ -251,6 +273,8 @@ func TestRemovePeerRetiresAcrossRestart(t *testing.T) {
 	addrA := waitForAddr(t, dbA, 5*time.Second)
 	cfgB := replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
+	cfgB.Schema.Tables = nil
+	cfgB.Tables = []TableDefinition{recordDefinition(t)}
 	dbB, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)

@@ -24,15 +24,13 @@ func BenchmarkCipherMatrix(b *testing.B) {
 		alg  murmur.EncryptionAlgorithm
 	}{
 		{"aes256gcm", murmur.AES256GCM},
-		{"chacha20", murmur.ChaCha20Poly1305},
-		{"aegis256", murmur.AEGIS256},
 	}
 	compression := []struct {
 		name string
-		cfg  murmur.CompressionConfig
+		algo murmur.CompressionAlgorithm
 	}{
-		{"zstd3", murmur.CompressionConfig{Algorithm: murmur.CompressionZstd, ZstdLevel: 3}},
-		{"none", murmur.CompressionConfig{Algorithm: murmur.CompressionNone}},
+		{"deflate", murmur.CompressionDeflate},
+		{"none", murmur.CompressionNone},
 	}
 	values := []struct {
 		name string
@@ -50,22 +48,35 @@ func BenchmarkCipherMatrix(b *testing.B) {
 					ctx := context.Background()
 					cfg := benchConfig(b.TempDir(), murmur.NewNodeID(), murmur.NewDBID())
 					cfg.Encryption.Algorithm = c.alg
-					cfg.Pebble.Compression = comp.cfg
+					cfg.Spool.Compression = comp.algo
 					db, err := murmur.Open(ctx, cfg)
 					if err != nil {
 						b.Fatal(err)
 					}
 					defer db.Close()
-					ids := populateValues(b, db, n, v.blob)
+					contacts, err := murmur.TableOf[benchContact](db, "contacts")
+					if err != nil {
+						b.Fatal(err)
+					}
+					ids := populateValues(b, db, contacts, n, v.blob)
 					populateBytes := dirBytes(b, cfg.Path)
 					var lat latency
 					b.ReportAllocs()
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
 						start := time.Now()
-						if _, err := db.ExecContext(ctx,
-							`UPDATE contacts SET phone = ? WHERE id = ?`,
-							matrixValue(v.blob, i), ids[i%len(ids)][:]); err != nil {
+						phone := matrixValue(v.blob, i)
+						tx, err := db.BeginTx(ctx)
+						if err != nil {
+							b.Fatal(err)
+						}
+						if err := contacts.Update(tx, ids[i%len(ids)], func(c *benchContact) error {
+							c.Phone = phone
+							return nil
+						}); err != nil {
+							b.Fatal(err)
+						}
+						if err := tx.Commit(); err != nil {
 							b.Fatal(err)
 						}
 						lat.record(time.Since(start))
@@ -81,13 +92,13 @@ func BenchmarkCipherMatrix(b *testing.B) {
 
 // populateValues inserts n contacts with compressible text or random
 // 64-byte hex values, returning row IDs.
-func populateValues(b *testing.B, db *murmur.DB, n int, blob bool) []murmur.RowID {
+func populateValues(b *testing.B, db *murmur.DB, contacts *murmur.RecordTable[benchContact], n int, blob bool) []murmur.RowID {
 	b.Helper()
 	ctx := context.Background()
 	ids := make([]murmur.RowID, 0, n)
 	const perTx = 1000
 	for base := 0; base < n; base += perTx {
-		tx, err := db.BeginTx(ctx, nil)
+		tx, err := db.BeginTx(ctx)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -98,9 +109,10 @@ func populateValues(b *testing.B, db *murmur.DB, n int, blob bool) []murmur.RowI
 		for i := base; i < end; i++ {
 			id := murmur.NewRowID()
 			ids = append(ids, id)
-			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO contacts (id, name, phone, score) VALUES (?, ?, ?, ?)`,
-				id[:], fmt.Sprintf("matrix %d", i), matrixValue(blob, i), i%1000); err != nil {
+			if err := contacts.Insert(tx, &benchContact{
+				ID: id, Name: fmt.Sprintf("matrix %d", i),
+				Phone: matrixValue(blob, i), Score: int64(i % 1000),
+			}); err != nil {
 				b.Fatal(err)
 			}
 		}

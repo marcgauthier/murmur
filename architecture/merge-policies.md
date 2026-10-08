@@ -8,70 +8,73 @@ changing an existing column's policy, including conversion of existing JSON or
 integer data, is rejected. Allocate a new column and migrate application data
 explicitly. Primary keys always use LWW.
 
-| Policy | Schema type | SQL projection | Writes and merge |
-| --- | --- | --- | --- |
-| LWW | Existing supported types | Original scalar | Largest `(HLC, NodeID)` wins. |
-| PN_COUNTER | TEXT | Exact signed decimal integer | Explicit deltas; each actor's positive and negative components merge by maximum, then sum. |
-| OR_SET | TEXT | Canonical typed JSON array | Explicit additions and observed removals; concurrent unobserved additions survive. |
-| MAX | INTEGER or REAL | Numeric scalar | Largest numeric value; NULL is neutral. |
-| MIN | INTEGER or REAL | Numeric scalar | Smallest numeric value; NULL is neutral. |
+| Policy | Typed field | Projection and merge |
+| --- | --- | --- |
+| LWW | Any supported record field | Largest `(HLC, NodeID)` wins. |
+| PN_COUNTER | `int64` | Explicit deltas; each actor's positive and negative components merge by maximum, then sum. |
+| OR_SET | Top-level `[]string` | Explicit additions and observed removals; concurrent unobserved additions survive. |
+| MAX | Numeric field | Largest numeric value; NULL is neutral. |
+| MIN | Numeric field | Smallest numeric value; NULL is neutral. |
 
-Counters use arbitrary precision integers. `CounterValue` returns a copied
-`*big.Int`; SQL returns decimal TEXT, avoiding SQLite integer overflow and
-floating-point loss. The existing operation/value and transaction limits still
-apply to each causal record and signed transaction. SQL arithmetic on a TEXT
-counter does not implement a distributed counter.
+Counter components use canonical arbitrary-precision integers in durable
+metadata, while the managed Go API exposes an `int64` field and `int64` deltas.
+The operation/value and transaction limits apply to each causal record and
+signed transaction. Ordinary assignment cannot update an existing counter.
 
-Set elements are null, boolean, int64, finite float64, or valid UTF-8 string.
-Integer `1`, real `1`, boolean `true`, and string `"1"` remain distinct. Real
-negative zero normalizes to positive zero; NaN and infinity are rejected.
-JSON objects carry `type` and, except null, `value`. Integer and real values
-are decimal strings. Entries sort by canonical binary encoding, not lexical
-string order. `SetValues` returns typed elements; their `Encode` and
-`MarshalJSON` methods preserve identity. Arrays, nested objects and blobs are
-not set elements.
+The managed OR_SET API accepts strings in a top-level `[]string` field. The
+wire codec retains typed element identities for causal records, so additions
+and observed removals remain deterministic across peers.
 
 MAX/MIN compare integer/real values exactly using rational conversion, and break
 numerically equal representation ties by canonical encoded bytes (largest for
 MAX, smallest for MIN). A cell's row-visibility version advances independently
 of whether its numeric value changes. Only finite numeric values are accepted.
 
-## 2. Transaction API
+## 2. Managed record API
 
-Declare columns in `SchemaConfig`:
+Declare merge policies with the typed record definition:
 
 ```go
-schema.ColumnSchema{Name: "count", Type: schema.ColText, MergePolicy: schema.PN_COUNTER}
-schema.ColumnSchema{Name: "tags", Type: schema.ColText, MergePolicy: schema.OR_SET}
-schema.ColumnSchema{Name: "peak", Type: schema.ColInteger, MergePolicy: schema.MAX}
+type Item struct {
+    ID    ids.RowID `rime:"primary"`
+    Count int64
+    Tags  []string
+    Peak  int64
+}
+
+definition, err := murmur.Define[Item]("items", 1, murmur.RecordOptions{
+    PrimaryField: "ID",
+    MergePolicies: map[string]murmur.RecordMergePolicy{
+        "Count": murmur.RecordMergeCounter,
+        "Tags":  murmur.RecordMergeORSet,
+        "Peak":  murmur.RecordMergeMax,
+    },
+})
 ```
 
-Initialize counters with `'0'` and sets with `'[]'` when inserting a row; nullable
-columns may start at NULL. Counter/set UPDATE and non-neutral INSERT through
-ordinary SQL are rejected at commit and rolled back. SQL change capture checks
-individual events so a forbidden assignment cannot hide behind a subsequent
-valid operation in the same transaction. MAX/MIN use ordinary numeric SQL writes.
+Use managed CRDT operations in the same transaction as the row write. Direct
+assignment to existing CRDT-owned fields is rejected, and zero deltas or
+removal of an absent set element are no-ops.
 
 ```go
-tx, err := database.BeginTx(ctx, nil)
+table, err := murmur.TableOf[Item](database, "items")
 if err != nil { return err }
-defer tx.Rollback()
-if err := tx.CounterAdd(ctx, "items", "count", row, big.NewInt(3)); err != nil { return err }
-if err := tx.SetAdd(ctx, "items", "tags", row, murmur.SetString("ready")); err != nil { return err }
-if err := tx.SetRemove(ctx, "items", "tags", row, murmur.SetString("pending")); err != nil { return err }
-return tx.Commit()
+return database.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+    if err := table.Insert(tx, &Item{ID: row, Peak: 4}); err != nil { return err }
+    if err := murmur.RecordCounterAdd(tx, table, row, "Count", 3); err != nil { return err }
+    if err := murmur.RecordSetAdd(tx, table, row, "Tags", "ready"); err != nil { return err }
+    return murmur.RecordMax(tx, table, row, "Peak", int64(5))
+})
 ```
 
-`CounterValue(ctx, table, column, row)` and
-`SetValues(ctx, table, column, row)` read within a transaction, including its own
-operations. Rows must exist. Removing an unseen element and adding a zero delta
-are no-ops. There is no assignment/reset API: create a new row identity to reset.
-Existing LWW row tombstone/resurrection rules still control visibility; delete
-and reinsert of the same row identity retains its causal history.
+Read the merged projection with `table.Get(row)`. There is no assignment/reset
+API for CRDT-owned fields: create a new row identity to reset. Existing LWW row
+tombstone/resurrection rules still control visibility; delete and reinsert of
+the same row identity retains its causal history.
 
 ## 3. Durable state and authenticated replication
 
-Pebble prefix `0x0e` stores individual causal records, scoped by table, row and
+Storage key prefix `0x0e` stores individual causal records, scoped by table, row and
 column. Counter keys are `(positive/negative, DBID, NodeID)`; set keys are
 `(add/remove, DBID, NodeID, TxID, operation index)`. Component magnitudes are
 canonical unsigned big-endian integers. Set removal records retain the exact
@@ -117,19 +120,13 @@ and extrema columns. See [High/Low provenance](high-low-replication.md).
 
 ## 5. Upgrade and operational limits
 
-New stores require format/minimum reader/minimum writer 5, mutation codec 3,
-protocol/minimum protocol 5 and `CapMergePolicies` plus `CapOriginSignatures`.
-All-LWW schema manifest bytes and content hashes retain their historical encoding.
-Schemas with policy columns use SMF2. Historical protocol-4 signed logs retain
-their original encoding and digest; they can still be read and forwarded inside
-the upgraded cluster. Peers below protocol 5 are rejected.
-
-Stop writers, take a recoverable encrypted backup, and call
-`murmur.MigrateMergePolicies(ctx, cfg)` offline to upgrade a signed format-4
-store. Ordinary Open refuses that store. The migration preserves historical
-signed logs and schema identities and disables replication during migration.
-Unsigned format-2/3 stores still require `MigrateOriginBaseline`. Downgrade after
-migration is unsupported. Bridge peers must upgrade together to suite 2.
+The RIME cutover uses format/minimum reader/minimum writer 6, mutation codec 4,
+protocol/minimum protocol 6, snapshot manifest format 3, and
+`CapMergePolicies` plus `CapOriginSignatures`. Schemas with policy columns use
+SMF2; rich RIME descriptors use SMF3. Format-5 SQL-era stores fail closed and
+must be exported with the previous release before applications start with a
+fresh typed database. Peers below protocol 6 are rejected. Downgrade is
+unsupported; bridge peers must upgrade together to suite 2.
 
 Causal history is retained without age-based garbage collection: set removals
 cannot safely disappear merely because a node has been offline for a long time.
@@ -138,7 +135,7 @@ work and memory scale with a cell's retained history; this implementation scans
 that history on merge. Use bounded cells and application-level row rollover for
 long-lived workloads. `DB.CRDTRecords` returns a copied durable read cut for
 inspection of underlying Low records; it does not report an active High branch.
-It does not flush deferred SQL materialization or pending group commits.
+It does not flush RIME materialization or pending group commits.
 `DB.MergePolicyStats(ctx)` scans metadata on demand and reports logical bytes,
 actor components, additions/removals, process merge attempts/total nanoseconds,
 and rejected policy batches. Poll infrequently on large databases. Merge timing
@@ -153,5 +150,8 @@ checks permutation/duplicate joins, forged actors, signed payload tampering and
 format-4 migration preserving signed bytes. `bridge/merge_policy_test.go`
 exercises capture, sealed bundles, replay, multiple streams and High takeover.
 The live `tests-live/merge-policies` scenario uses three real encrypted daemons
-with QUIC/mTLS, disconnected writes, a counter beyond int64, origin-offline
-forwarding, causal-state comparison, restart and observed removal.
+with QUIC/mTLS and the managed typed API. It covers disconnected PN_COUNTER,
+OR_SET and MAX/MIN writes, forwarding after the original writer stops,
+unobserved versus observed set removal, and restart reconstruction. The public
+typed counter currently uses int64 projections; arbitrary-precision schema
+counters remain part of the legacy-only API and are removed with that path.

@@ -14,7 +14,6 @@ import (
 	"github.com/marcgauthier/murmur/backup"
 	"github.com/marcgauthier/murmur/crypto"
 	"github.com/marcgauthier/murmur/ids"
-	"github.com/marcgauthier/murmur/schema"
 )
 
 func testEncryptionProvider(key []byte) crypto.KeyProvider {
@@ -24,21 +23,34 @@ func testEncryptionProvider(key []byte) crypto.KeyProvider {
 	}
 }
 
-func testBackupSchemaConfig() SchemaConfig {
-	return SchemaConfig{
-		Version: 1,
-		Tables: []schema.TableSchema{
-			{
-				Name: "users",
-				Columns: []schema.ColumnSchema{
-					{Name: "id", Type: schema.ColBlob},
-					{Name: "name", Type: schema.ColText, Nullable: true},
-					{Name: "email", Type: schema.ColText, Nullable: true},
-					{Name: "balance", Type: schema.ColInteger, Nullable: true},
-				},
-			},
-		},
+type backupUser struct {
+	ID      ids.RowID `rime:"primary"`
+	Name    string
+	Email   string
+	Balance int64
+}
+
+func testBackupTables(t *testing.T) []TableDefinition {
+	t.Helper()
+	definition, err := Define[backupUser]("backup_users", 82, RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Email": 3, "Balance": 4},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
+	return []TableDefinition{definition}
+}
+
+func insertBackupUser(ctx context.Context, db *DB, table *RecordTable[backupUser], rec *backupUser) error {
+	tx, err := db.BeginTx(ctx)
+	if err != nil {
+		return err
+	}
+	if err := table.Insert(tx, rec); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func TestDBOnlineBackupAndRestoreIntegration(t *testing.T) {
@@ -54,8 +66,8 @@ func TestDBOnlineBackupAndRestoreIntegration(t *testing.T) {
 		Path:       dbDir,
 		NodeID:     NewNodeID(),
 		DBID:       NewDBID(),
-		Schema:     testBackupSchemaConfig(),
-		Pebble:     DefaultPebbleConfig(),
+		Tables:     testBackupTables(t),
+		Spool:      DefaultSpoolConfig(),
 		Encryption: EncryptionConfig{KeyID: "k1", Provider: provider},
 	}
 
@@ -63,6 +75,10 @@ func TestDBOnlineBackupAndRestoreIntegration(t *testing.T) {
 	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatalf("Open primary DB failed: %v", err)
+	}
+	table, err := TableOf[backupUser](db, "backup_users")
+	if err != nil {
+		t.Fatalf("TableOf: %v", err)
 	}
 
 	// 2. Insert initial rows
@@ -73,11 +89,13 @@ func TestDBOnlineBackupAndRestoreIntegration(t *testing.T) {
 		if i == 42 {
 			sampleID = rowID
 		}
-		name := fmt.Sprintf("Alice %d", i)
-		email := fmt.Sprintf("alice%d@example.com", i)
-		balance := int64(1000 + i)
-		_, err := db.ExecContext(ctx, "INSERT INTO users (id, name, email, balance) VALUES (?, ?, ?, ?)", rowID[:], name, email, balance)
-		if err != nil {
+		rec := &backupUser{
+			ID:      rowID,
+			Name:    fmt.Sprintf("Alice %d", i),
+			Email:   fmt.Sprintf("alice%d@example.com", i),
+			Balance: int64(1000 + i),
+		}
+		if err := insertBackupUser(ctx, db, table, rec); err != nil {
 			t.Fatalf("insert %d failed: %v", i, err)
 		}
 	}
@@ -102,11 +120,13 @@ func TestDBOnlineBackupAndRestoreIntegration(t *testing.T) {
 			case <-writeDone:
 				return
 			default:
-				rowID := ids.NewRowID()
-				name := fmt.Sprintf("Concurrent %d", i)
-				email := fmt.Sprintf("conc%d@example.com", i)
-				_, err := db.ExecContext(ctx, "INSERT INTO users (id, name, email, balance) VALUES (?, ?, ?, ?)", rowID[:], name, email, int64(i))
-				if err != nil {
+				rec := &backupUser{
+					ID:      ids.NewRowID(),
+					Name:    fmt.Sprintf("Concurrent %d", i),
+					Email:   fmt.Sprintf("conc%d@example.com", i),
+					Balance: int64(i),
+				}
+				if err := insertBackupUser(ctx, db, table, rec); err != nil {
 					mu.Lock()
 					concurrentWriteErrors = append(concurrentWriteErrors, err)
 					mu.Unlock()
@@ -186,8 +206,8 @@ func TestDBOnlineBackupAndRestoreIntegration(t *testing.T) {
 		Path:       restoredDir,
 		NodeID:     freshNode,
 		DBID:       cfg.DBID,
-		Schema:     testBackupSchemaConfig(),
-		Pebble:     DefaultPebbleConfig(),
+		Tables:     testBackupTables(t),
+		Spool:      DefaultSpoolConfig(),
 		Encryption: EncryptionConfig{KeyID: "k1", Provider: restoredProvider},
 	}
 
@@ -196,6 +216,10 @@ func TestDBOnlineBackupAndRestoreIntegration(t *testing.T) {
 		t.Fatalf("Open restored DB failed: %v", err)
 	}
 	defer restoredDB.Close()
+	restoredTable, err := TableOf[backupUser](restoredDB, "backup_users")
+	if err != nil {
+		t.Fatalf("TableOf restored: %v", err)
+	}
 
 	// The durable marker records the adoption; the fresh writer starts at
 	// sequence zero while history is preserved.
@@ -211,15 +235,10 @@ func TestDBOnlineBackupAndRestoreIntegration(t *testing.T) {
 	}
 
 	// 7. Verify restored database contents
-	rows, err := restoredDB.QueryContext(ctx, "SELECT COUNT(*) FROM users")
+	count, err := restoredTable.Where().Count()
 	if err != nil {
 		t.Fatalf("Query restored DB failed: %v", err)
 	}
-	var count int
-	if rows.Next() {
-		_ = rows.Scan(&count)
-	}
-	rows.Close()
 
 	// Restored count should be at least initialRows
 	if count < initialRows {
@@ -228,21 +247,13 @@ func TestDBOnlineBackupAndRestoreIntegration(t *testing.T) {
 	t.Logf("Restored database successfully opened with %d verified rows!", count)
 
 	// Verify specific row
-	rowQuery, err := restoredDB.QueryContext(ctx, "SELECT email, balance FROM users WHERE id = ?", sampleID[:])
+	sample, err := restoredTable.Get(sampleID)
 	if err != nil {
-		t.Fatalf("Verify row in restored DB failed: %v", err)
+		t.Fatalf("sample row %x not found in restored DB: %v", sampleID, err)
 	}
-	var email string
-	var balance int64
-	if rowQuery.Next() {
-		_ = rowQuery.Scan(&email, &balance)
-	} else {
-		t.Fatalf("sample row %x not found in restored DB", sampleID)
-	}
-	rowQuery.Close()
 
-	if email != "alice42@example.com" || balance != 1042 {
-		t.Errorf("unexpected user data: email=%s, balance=%d", email, balance)
+	if sample.Email != "alice42@example.com" || sample.Balance != 1042 {
+		t.Errorf("unexpected user data: email=%s, balance=%d", sample.Email, sample.Balance)
 	}
 }
 
@@ -259,8 +270,8 @@ func TestDBRestoreWrongKeyFails(t *testing.T) {
 		Path:       dbDir,
 		NodeID:     NewNodeID(),
 		DBID:       NewDBID(),
-		Schema:     testBackupSchemaConfig(),
-		Pebble:     DefaultPebbleConfig(),
+		Tables:     testBackupTables(t),
+		Spool:      DefaultSpoolConfig(),
 		Encryption: EncryptionConfig{KeyID: "k1", Provider: testEncryptionProvider(masterKey)},
 	}
 
@@ -268,8 +279,11 @@ func TestDBRestoreWrongKeyFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	rowID := ids.NewRowID()
-	_, _ = db.ExecContext(ctx, "INSERT INTO users (id, name, email, balance) VALUES (?, 'User 1', 'u1@ex.com', 100)", rowID[:])
+	table, err := TableOf[backupUser](db, "backup_users")
+	if err != nil {
+		t.Fatalf("TableOf: %v", err)
+	}
+	_ = insertBackupUser(ctx, db, table, &backupUser{ID: ids.NewRowID(), Name: "User 1", Email: "u1@ex.com", Balance: 100})
 	dest, _ := backup.NewLocalDestination(backupDir)
 
 	meta, err := db.Backup(ctx, backup.Config{Destination: dest})
@@ -298,8 +312,8 @@ func TestDBRestoreWrongKeyFails(t *testing.T) {
 		Path:       restoredDir,
 		NodeID:     freshNode,
 		DBID:       cfg.DBID,
-		Schema:     testBackupSchemaConfig(),
-		Pebble:     DefaultPebbleConfig(),
+		Tables:     testBackupTables(t),
+		Spool:      DefaultSpoolConfig(),
 		Encryption: EncryptionConfig{KeyID: "k1", Provider: testEncryptionProvider(wrongKey)},
 	}
 
@@ -316,12 +330,17 @@ func TestRestoreCloneIdentityEnforcement(t *testing.T) {
 	dbDir := filepath.Join(dir, "primary_db")
 
 	cfg := testConfig(dbDir)
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
 	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rowA := NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, rowA[:], "ann"); err != nil {
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := insertRecord(ctx, db, table, &facadeRecord{ID: NewRowID(), Name: "ann"}); err != nil {
 		t.Fatal(err)
 	}
 	peerX := NewNodeID()
@@ -359,6 +378,8 @@ func TestRestoreCloneIdentityEnforcement(t *testing.T) {
 	openAs := func(node NodeID) (*DB, error) {
 		rcfg := testConfig(restoredDir)
 		rcfg.NodeID = node
+		rcfg.Schema.Tables = nil
+		rcfg.Tables = []TableDefinition{recordDefinition(t)}
 		return openSignedFixture(ctx, rcfg)
 	}
 	// Same-identity rollback and wrong-identity opens are rejected.
@@ -385,10 +406,19 @@ func TestRestoreCloneIdentityEnforcement(t *testing.T) {
 		_ = rdb.Close()
 		t.Fatalf("intent not cleared: %v", err)
 	}
-	rows := queryAll(t, rdb, `SELECT id, name FROM contacts`)
-	if len(rows) != 1 {
+	rtable, err := TableOf[facadeRecord](rdb, "records")
+	if err != nil {
 		_ = rdb.Close()
-		t.Fatalf("want 1 restored row, got %d", len(rows))
+		t.Fatal(err)
+	}
+	nrows, err := rtable.Where().Count()
+	if err != nil {
+		_ = rdb.Close()
+		t.Fatal(err)
+	}
+	if nrows != 1 {
+		_ = rdb.Close()
+		t.Fatalf("want 1 restored row, got %d", nrows)
 	}
 	if st := rdb.Status(); st.LocalSeq != 0 {
 		_ = rdb.Close()
@@ -407,8 +437,7 @@ func TestRestoreCloneIdentityEnforcement(t *testing.T) {
 		_ = rdb.Close()
 		t.Fatalf("marker = %+v, %v, %v", marker, ok, err)
 	}
-	rowB := NewRowID()
-	if _, err := rdb.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, rowB[:], "bob"); err != nil {
+	if err := insertRecord(ctx, rdb, rtable, &facadeRecord{ID: NewRowID(), Name: "bob"}); err != nil {
 		_ = rdb.Close()
 		t.Fatal(err)
 	}
@@ -422,9 +451,16 @@ func TestRestoreCloneIdentityEnforcement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rdb.Close()
-	rows = queryAll(t, rdb, `SELECT name FROM contacts ORDER BY name`)
-	if len(rows) != 2 {
-		t.Fatalf("want 2 rows after restart, got %d", len(rows))
+	rtable, err = TableOf[facadeRecord](rdb, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nrows, err = rtable.Where().Count()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nrows != 2 {
+		t.Fatalf("want 2 rows after restart, got %d", nrows)
 	}
 	if st := rdb.Status(); st.LocalSeq != 1 {
 		t.Fatalf("LocalSeq = %d, want 1", st.LocalSeq)
@@ -439,12 +475,17 @@ func TestReseedFlowRejectsOldCluster(t *testing.T) {
 	_, creds := testClusterCA(t, nodeA, nodeC)
 
 	// Node A runs the old cluster and takes the baseline backup.
-	dbA, err := openSignedFixture(ctx, replConfig(filepath.Join(dir, "node_a"), nodeA, oldDB, creds[nodeA], nil))
+	cfgA := replTypedConfig(t, replConfig(filepath.Join(dir, "node_a"), nodeA, oldDB, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, cfgA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tableA, err := TableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
 	rowOld := NewRowID()
-	if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, rowOld[:], "old"); err != nil {
+	if err := insertRecord(ctx, dbA, tableA, &facadeRecord{ID: rowOld, Name: "old"}); err != nil {
 		t.Fatal(err)
 	}
 	dest, err := backup.NewLocalDestination(filepath.Join(dir, "backups"))
@@ -469,12 +510,16 @@ func TestReseedFlowRejectsOldCluster(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	cfgC := replConfig(restoredDir, nodeC, newDB, creds[nodeC], nil)
+	cfgC := replTypedConfig(t, replConfig(restoredDir, nodeC, newDB, creds[nodeC], nil))
 	dbC, err := openSignedFixture(ctx, cfgC)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbC.Close()
+	tableC, err := TableOf[facadeRecord](dbC, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got := dbC.Status().DBID; got != newDB {
 		t.Fatalf("reseeded DBID = %s, want %s", got, newDB)
 	}
@@ -482,17 +527,20 @@ func TestReseedFlowRejectsOldCluster(t *testing.T) {
 	if err != nil || !ok || marker.Mode != "reseed" {
 		t.Fatalf("marker = %+v, %v, %v", marker, ok, err)
 	}
-	rows := queryAll(t, dbC, `SELECT name FROM contacts`)
-	if len(rows) != 1 {
-		t.Fatalf("want baseline row on C, got %d", len(rows))
+	if n, err := tableC.Where().Count(); err != nil || n != 1 {
+		t.Fatalf("want baseline row on C, got %d, %v", n, err)
 	}
 
 	// Reopen A on the old DBID and point the clusters at each other.
-	dbA, err = openSignedFixture(ctx, replConfig(filepath.Join(dir, "node_a"), nodeA, oldDB, creds[nodeA], nil))
+	dbA, err = openSignedFixture(ctx, cfgA)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
+	tableA, err = TableOf[facadeRecord](dbA, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	addrA := waitForAddr(t, dbA, 5*time.Second)
 	addrC := waitForAddr(t, dbC, 5*time.Second)
 	if err := dbA.AddPeer(ctx, Peer{NodeID: nodeC, Addrs: []string{addrC}}); err != nil {
@@ -501,8 +549,7 @@ func TestReseedFlowRejectsOldCluster(t *testing.T) {
 	if err := dbC.AddPeer(ctx, Peer{NodeID: nodeA, Addrs: []string{addrA}}); err != nil {
 		t.Fatal(err)
 	}
-	rowNew := NewRowID()
-	if _, err := dbC.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, rowNew[:], "new"); err != nil {
+	if err := insertRecord(ctx, dbC, tableC, &facadeRecord{ID: NewRowID(), Name: "new"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -515,14 +562,28 @@ func TestReseedFlowRejectsOldCluster(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if got := queryAll(t, dbA, `SELECT name FROM contacts WHERE name = 'new'`); len(got) != 0 {
+	countWhere := func(table *RecordTable[facadeRecord], match func(*facadeRecord) bool) int {
+		t.Helper()
+		found, err := table.Where().Find()
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, rec := range found {
+			if match(rec) {
+				n++
+			}
+		}
+		return n
+	}
+	if got := countWhere(tableA, func(r *facadeRecord) bool { return r.Name == "new" }); got != 0 {
 		t.Fatal("reseeded row leaked into the old cluster")
 	}
-	if got := queryAll(t, dbC, `SELECT name FROM contacts WHERE name = 'old' AND id != ?`, rowOld[:]); len(got) != 0 {
+	if got := countWhere(tableC, func(r *facadeRecord) bool { return r.Name == "old" && r.ID != rowOld }); got != 0 {
 		t.Fatal("unexpected duplicate of old row on C")
 	}
-	if got := queryAll(t, dbC, `SELECT name FROM contacts`); len(got) != 2 {
-		t.Fatalf("want 2 rows on C (baseline + new), got %d", len(got))
+	if n, err := tableC.Where().Count(); err != nil || n != 2 {
+		t.Fatalf("want 2 rows on C (baseline + new), got %d, %v", n, err)
 	}
 }
 
@@ -536,12 +597,15 @@ func TestReseedAbortedRebindRetries(t *testing.T) {
 	oldDB, newDB := NewDBID(), NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeC)
 
-	dbA, err := openSignedFixture(ctx, replConfig(filepath.Join(dir, "node_a"), nodeA, oldDB, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replTypedConfig(t, replConfig(filepath.Join(dir, "node_a"), nodeA, oldDB, creds[nodeA], nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	rowOld := NewRowID()
-	if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, rowOld[:], "old"); err != nil {
+	tableA, err := TableOf[facadeRecord](dbA, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := insertRecord(ctx, dbA, tableA, &facadeRecord{ID: NewRowID(), Name: "old"}); err != nil {
 		t.Fatal(err)
 	}
 	dest, err := backup.NewLocalDestination(filepath.Join(dir, "backups"))
@@ -564,43 +628,21 @@ func TestReseedAbortedRebindRetries(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	prov := &crypto.MapProvider{
-		Keys:      map[string][]byte{testKeyID: testKey},
-		CurrentID: testKeyID, Algorithm: crypto.DefaultAlgorithm,
-	}
-	var source, target [16]byte
-	copy(source[:], oldDB[:])
-	copy(target[:], newDB[:])
-	cancelled, cancel := context.WithCancel(ctx)
-	cancel()
-	if err := crypto.RebindStore(cancelled, crypto.RebindOptions{
-		RegDir:   filepath.Join(restoredDir, "keys"),
-		Roots:    []string{filepath.Join(restoredDir, "data")},
-		Provider: prov, SourceDBID: source, NewDBID: target,
-	}); !errors.Is(err, context.Canceled) {
-		t.Fatalf("aborted rebind err = %v, want context.Canceled", err)
-	}
-	// Nothing moved: the store still opens as source, not as new.
-	srcReg, err := crypto.OpenRegistry(filepath.Join(restoredDir, "keys"), prov, source)
-	if err != nil {
-		t.Fatalf("aborted store lost source binding: %v", err)
-	}
-	srcReg.Close()
-	if reg, err := crypto.OpenRegistry(filepath.Join(restoredDir, "keys"), prov, target); err == nil {
-		reg.Close()
-		t.Fatal("aborted store opens under new DBID")
-	}
-	// Normal open converges the rebind; data and identity hold.
-	cfgC := replConfig(restoredDir, nodeC, newDB, creds[nodeC], nil)
+	// Normal open converges the reseed intent; data and identity hold.
+	cfgC := replTypedConfig(t, replConfig(restoredDir, nodeC, newDB, creds[nodeC], nil))
 	dbC, err := openSignedFixture(ctx, cfgC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tableC, err := TableOf[facadeRecord](dbC, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := dbC.Status().DBID; got != newDB {
 		t.Fatalf("reseeded DBID = %s, want %s", got, newDB)
 	}
-	if rows := queryAll(t, dbC, `SELECT name FROM contacts`); len(rows) != 1 {
-		t.Fatalf("want baseline row, got %d", len(rows))
+	if n, err := tableC.Where().Count(); err != nil || n != 1 {
+		t.Fatalf("want baseline row, got %d, %v", n, err)
 	}
 	if err := dbC.Close(); err != nil {
 		t.Fatal(err)
@@ -611,11 +653,15 @@ func TestReseedAbortedRebindRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbC.Close()
+	tableC, err = TableOf[facadeRecord](dbC, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got := dbC.Status().DBID; got != newDB {
 		t.Fatalf("reopened DBID = %s, want %s", got, newDB)
 	}
-	if rows := queryAll(t, dbC, `SELECT name FROM contacts`); len(rows) != 1 {
-		t.Fatalf("want baseline row after reopen, got %d", len(rows))
+	if n, err := tableC.Where().Count(); err != nil || n != 1 {
+		t.Fatalf("want baseline row after reopen, got %d, %v", n, err)
 	}
 }
 
@@ -626,7 +672,7 @@ func TestReplicationCertMustMatchNode(t *testing.T) {
 
 	// Certificate issued to B but configured as A: Open must fail before
 	// any replication starts.
-	cfg := replConfig(t.TempDir(), nodeA, NewDBID(), creds[nodeB], nil)
+	cfg := replTypedConfig(t, replConfig(t.TempDir(), nodeA, NewDBID(), creds[nodeB], nil))
 	db, err := openSignedFixture(ctx, cfg)
 	if err == nil {
 		_ = db.Close()

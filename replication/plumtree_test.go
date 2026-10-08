@@ -41,7 +41,7 @@ func TestPlumtreeFramesAndNegotiation(t *testing.T) {
 	if _, err := DecodePlumtreeHint([]byte{1}); err == nil {
 		t.Fatal("accepted truncated hint")
 	}
-	if caps, err := NegotiateCapabilities(CapZstd | CapPlumtree); err != nil || caps != CapZstd|CapPlumtree {
+	if caps, err := NegotiateCapabilities(CapCompression | CapPlumtree); err != nil || caps != CapCompression|CapPlumtree {
 		t.Fatalf("negotiated caps=%#x err=%v", caps, err)
 	}
 	if _, err := NegotiateCapabilities(CapRequiredMask | CapPlumtree | (uint64(1) << 40)); err == nil {

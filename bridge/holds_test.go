@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/schema"
@@ -25,19 +26,19 @@ func holdTestContacts(extra ...schema.ColumnSchema) schema.TableSchema {
 
 func TestSchemaHoldOrderedRetry(t *testing.T) {
 	ctx := context.Background()
-	high := openHighDB(t)
+	high := openTypedContactDBAt(t, t.TempDir(), db.NewNodeID())
 	signer, recip, trust := inboxKeys(t, "s")
 	inbox, err := OpenInbox(t.TempDir(), trust, Limits{}.withDefaults())
 	if err != nil {
 		t.Fatal(err)
 	}
 	row1, row2 := ids.NewRowID(), ids.NewRowID()
-	head := sealForInbox(t, signer, recip, "s", 1, []Batch{
+	head := sealTypedContactsForInbox(t, signer, recip, "s", 1, []Batch{
 		putBatch(1, row1,
 			ColumnValue{Column: "name", Value: codec.Text("ann")},
 			ColumnValue{Column: "email", Value: codec.Text("a@x")}),
 	})
-	tail := sealForInbox(t, signer, recip, "s", 2, []Batch{
+	tail := sealTypedContactsForInbox(t, signer, recip, "s", 2, []Batch{
 		putBatch(2, row2, ColumnValue{Column: "name", Value: codec.Text("bob")}),
 	})
 	if err := inbox.Receive(head); err != nil {
@@ -57,7 +58,7 @@ func TestSchemaHoldOrderedRetry(t *testing.T) {
 	if n != 0 || !errors.As(err, &held) {
 		t.Fatalf("drain = %d, %v", n, err)
 	}
-	if len(held.Missing) != 1 || held.Missing[0] != `table "contacts" column "email"` {
+	if len(held.Missing) != 1 || held.Missing[0] != `table "contacts" column "Email"` {
 		t.Fatalf("missing = %q", held.Missing)
 	}
 	prog := inbox.Progress()
@@ -76,9 +77,7 @@ func TestSchemaHoldOrderedRetry(t *testing.T) {
 	}
 	// The administrator's migration releases both bundles in order on the
 	// next drain, with no manual replay step.
-	if err := high.Migrate(ctx, []schema.TableSchema{holdTestContacts(
-		schema.ColumnSchema{Name: "email", Type: schema.ColText, Nullable: true},
-	)}); err != nil {
+	if err := high.MigrateRecords(ctx, []db.TableDefinition{defineExpandedContact(t)}); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := im.Drain(ctx, inbox); err != nil || n != 2 {
@@ -95,19 +94,19 @@ func TestSchemaHoldOrderedRetry(t *testing.T) {
 
 func TestSchemaHoldMissingTable(t *testing.T) {
 	ctx := context.Background()
-	high := openHighDB(t)
+	high := openTypedContactDBAt(t, t.TempDir(), db.NewNodeID())
 	signer, recip, trust := inboxKeys(t, "s")
 	inbox, err := OpenInbox(t.TempDir(), trust, Limits{}.withDefaults())
 	if err != nil {
 		t.Fatal(err)
 	}
 	row := ids.NewRowID()
-	put := sealForInbox(t, signer, recip, "s", 1, []Batch{{
+	put := sealTypedContactsForInbox(t, signer, recip, "s", 1, []Batch{{
 		TxID: ids.NewTxID(), Origin: ids.NewNodeID(), Sequence: 1, HLC: 1,
 		Records: []Record{{Table: "nope", Row: row, Op: RecordPut,
 			Columns: []ColumnValue{{Column: "c", Value: codec.Text("x")}}}},
 	}})
-	del := sealForInbox(t, signer, recip, "s", 2, []Batch{{
+	del := sealTypedContactsForInbox(t, signer, recip, "s", 2, []Batch{{
 		TxID: ids.NewTxID(), Origin: ids.NewNodeID(), Sequence: 2, HLC: 2,
 		Records: []Record{{Table: "nope", Row: row, Op: RecordDelete}},
 	}})
@@ -130,35 +129,29 @@ func TestSchemaHoldMissingTable(t *testing.T) {
 		t.Fatalf("missing = %q", held.Missing)
 	}
 	// Deletes gate on the table too, so the delete cannot run first.
-	if err := high.Migrate(ctx, []schema.TableSchema{holdTestContacts(), {
-		Name: "nope",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "c", Type: schema.ColText, Nullable: true},
-		},
-	}}); err != nil {
+	if err := high.MigrateRecords(ctx, []db.TableDefinition{defineBaseContact(t), defineTypedNope(t)}); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := im.Drain(ctx, inbox); err != nil || n != 2 {
 		t.Fatalf("redrain = %d, %v", n, err)
 	}
 	// Put-then-delete in order leaves the table empty.
-	rows, err := high.QueryContext(ctx, `SELECT c FROM nope`)
+	rows, err := db.TableOf[typedBridgeNopeRecord](high, "nope")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
-	if rows.Next() {
-		t.Fatal("delete did not follow put in order")
-	}
-	if err := rows.Err(); err != nil {
+	values, err := rows.Where().Find()
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(values) != 0 {
+		t.Fatal("delete did not follow put in order")
 	}
 }
 
 func TestSchemaHoldDurable(t *testing.T) {
 	ctx := context.Background()
-	high := openHighDB(t)
+	high := openTypedContactDBAt(t, t.TempDir(), db.NewNodeID())
 	signer, recip, trust := inboxKeys(t, "s")
 	dir := t.TempDir()
 	inbox, err := OpenInbox(dir, trust, Limits{}.withDefaults())
@@ -295,23 +288,20 @@ func TestRecheckHoldsOrdered(t *testing.T) {
 
 func TestSchemaHoldTypeMismatch(t *testing.T) {
 	ctx := context.Background()
-	high := openHighDB(t)
+	high := openTypedContactDBAt(t, t.TempDir(), db.NewNodeID())
 	signer, recip, trust := inboxKeys(t, "s")
 	inbox, err := OpenInbox(t.TempDir(), trust, Limits{}.withDefaults())
 	if err != nil {
 		t.Fatal(err)
 	}
-	// One bundle, two batches: compatible INTEGER alongside an
-	// incompatible TEXT for the same INTEGER column. Checking is
-	// per value, and the whole bundle waits with no partial apply.
-	b := sealForInbox(t, signer, recip, "s", 1, []Batch{
-		putBatch(1, ids.NewRowID(),
-			ColumnValue{Column: "name", Value: codec.Text("ann")},
-			ColumnValue{Column: "score", Value: codec.Int(7)}),
-		putBatch(2, ids.NewRowID(),
-			ColumnValue{Column: "name", Value: codec.Text("bob")},
-			ColumnValue{Column: "score", Value: codec.Text("seven")}),
-	})
+	// One bundle, two batches: a canonical field alongside a scalar where
+	// the typed manifest requires a canonical field blob. Checking remains
+	// per value, and neither batch applies when the second fails.
+	firstRow, secondRow := ids.NewRowID(), ids.NewRowID()
+	first := encodeTypedContactsBatches(t, []Batch{putBatch(1, firstRow,
+		ColumnValue{Column: "name", Value: codec.Text("ann")})})[0]
+	second := putBatch(2, secondRow, ColumnValue{Column: "Name", Value: codec.Text("bob")})
+	b := sealForInbox(t, signer, recip, "s", 1, []Batch{first, second})
 	if err := inbox.Receive(b); err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +314,7 @@ func TestSchemaHoldTypeMismatch(t *testing.T) {
 	if n != 0 || !errors.As(err, &held) {
 		t.Fatalf("drain = %d, %v", n, err)
 	}
-	want := `table "contacts" column "score" expects INTEGER, got TEXT`
+	want := `table "contacts" column "Name" expects BLOB, got TEXT`
 	if len(held.Missing) != 1 || held.Missing[0] != want {
 		t.Fatalf("missing = %q", held.Missing)
 	}
@@ -335,7 +325,7 @@ func TestSchemaHoldTypeMismatch(t *testing.T) {
 
 func TestSchemaHoldNullability(t *testing.T) {
 	ctx := context.Background()
-	high := openHighDB(t)
+	high := openTypedContactDBAt(t, t.TempDir(), db.NewNodeID())
 	signer, recip, trust := inboxKeys(t, "s")
 	inbox, err := OpenInbox(t.TempDir(), trust, Limits{}.withDefaults())
 	if err != nil {
@@ -343,7 +333,7 @@ func TestSchemaHoldNullability(t *testing.T) {
 	}
 	// NULL satisfies the nullable name column but violates the NOT NULL
 	// primary key: the first bundle applies, the second waits.
-	ok := sealForInbox(t, signer, recip, "s", 1, []Batch{
+	ok := sealTypedContactsForInbox(t, signer, recip, "s", 1, []Batch{
 		putBatch(1, ids.NewRowID(),
 			ColumnValue{Column: "name", Value: codec.Null()},
 			ColumnValue{Column: "score", Value: codec.Int(1)}),
@@ -352,7 +342,7 @@ func TestSchemaHoldNullability(t *testing.T) {
 	bad := sealForInbox(t, signer, recip, "s", 2, []Batch{{
 		TxID: ids.NewTxID(), Origin: ids.NewNodeID(), Sequence: 2, HLC: 2,
 		Records: []Record{{Table: "contacts", Row: row, Op: RecordPut,
-			Columns: []ColumnValue{{Column: "id", Value: codec.Null()}}}},
+			Columns: []ColumnValue{{Column: "ID", Value: codec.Null()}}}},
 	}})
 	if err := inbox.Receive(ok); err != nil {
 		t.Fatal(err)
@@ -369,7 +359,7 @@ func TestSchemaHoldNullability(t *testing.T) {
 	if n != 1 || !errors.As(err, &held) {
 		t.Fatalf("drain = %d, %v", n, err)
 	}
-	want := `table "contacts" column "id" must not be NULL`
+	want := `table "contacts" column "ID" must not be NULL`
 	if len(held.Missing) != 1 || held.Missing[0] != want {
 		t.Fatalf("missing = %q", held.Missing)
 	}
@@ -381,10 +371,8 @@ func TestSchemaHoldNullability(t *testing.T) {
 
 func TestSchemaHoldIntegerWidening(t *testing.T) {
 	ctx := context.Background()
-	high := openHighDB(t)
-	if err := high.Migrate(ctx, []schema.TableSchema{holdTestContacts(
-		schema.ColumnSchema{Name: "ratio", Type: schema.ColReal, Nullable: true},
-	)}); err != nil {
+	high := openTypedContactDBAt(t, t.TempDir(), db.NewNodeID())
+	if err := high.MigrateRecords(ctx, []db.TableDefinition{defineContactRatio(t)}); err != nil {
 		t.Fatal(err)
 	}
 	signer, recip, trust := inboxKeys(t, "s")
@@ -392,16 +380,17 @@ func TestSchemaHoldIntegerWidening(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Lossless INTEGER into REAL applies; REAL into INTEGER waits.
-	wide := sealForInbox(t, signer, recip, "s", 1, []Batch{
+	// Lossless INTEGER input widens into a typed REAL extrema field; a TEXT
+	// value for the same field is held before any row from the bundle applies.
+	wide := sealTypedContactsForInbox(t, signer, recip, "s", 1, []Batch{
 		putBatch(1, ids.NewRowID(),
 			ColumnValue{Column: "name", Value: codec.Text("ann")},
-			ColumnValue{Column: "ratio", Value: codec.Int(5)}),
+			ColumnValue{Column: "ratio", Policy: schema.MAX, Value: codec.Int(5)}),
 	})
-	narrow := sealForInbox(t, signer, recip, "s", 2, []Batch{
+	narrow := sealTypedContactsForInbox(t, signer, recip, "s", 2, []Batch{
 		putBatch(2, ids.NewRowID(),
 			ColumnValue{Column: "name", Value: codec.Text("bob")},
-			ColumnValue{Column: "score", Value: codec.Real(1.5)}),
+			ColumnValue{Column: "ratio", Policy: schema.MAX, Value: codec.Text("five")}),
 	})
 	if err := inbox.Receive(wide); err != nil {
 		t.Fatal(err)
@@ -418,7 +407,7 @@ func TestSchemaHoldIntegerWidening(t *testing.T) {
 	if n != 1 || !errors.As(err, &held) {
 		t.Fatalf("drain = %d, %v", n, err)
 	}
-	want := `table "contacts" column "score" expects INTEGER, got REAL`
+	want := `table "contacts" column "Ratio" expects REAL, got TEXT`
 	if len(held.Missing) != 1 || held.Missing[0] != want {
 		t.Fatalf("missing = %q", held.Missing)
 	}
@@ -429,7 +418,7 @@ func TestSchemaHoldIntegerWidening(t *testing.T) {
 
 func TestHeldStreamDoesNotBlockOthers(t *testing.T) {
 	ctx := context.Background()
-	high := openHighDB(t)
+	high := openTypedContactDBAt(t, t.TempDir(), db.NewNodeID())
 	signer, recip, trust := inboxKeys(t, "a")
 	if err := trust.AddSigner(signer.ID, "a", "b"); err != nil {
 		t.Fatal(err)
@@ -444,7 +433,7 @@ func TestHeldStreamDoesNotBlockOthers(t *testing.T) {
 			Columns: []ColumnValue{{Column: "c", Value: codec.Int(1)}}}},
 	}})
 	row := ids.NewRowID()
-	free := sealForInbox(t, signer, recip, "b", 1, []Batch{
+	free := sealTypedContactsForInbox(t, signer, recip, "b", 1, []Batch{
 		putBatch(1, row, ColumnValue{Column: "name", Value: codec.Text("ann")}),
 	})
 	if err := inbox.Receive(stuck); err != nil {

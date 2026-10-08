@@ -65,7 +65,7 @@ func TestNodeMetadataEncoding(t *testing.T) {
 	dbid := fixtureDBID
 	meta := &NodeMetadata{
 		DBID:         dbid,
-		Capabilities: CapZstd,
+		Capabilities: CapCompression,
 		Endpoint:     "192.0.2.1:8443",
 	}
 
@@ -78,8 +78,8 @@ func TestNodeMetadataEncoding(t *testing.T) {
 	if decoded.DBID != dbid {
 		t.Errorf("expected DBID %s, got %s", dbid, decoded.DBID)
 	}
-	if decoded.Capabilities != CapZstd {
-		t.Errorf("expected Caps %d, got %d", CapZstd, decoded.Capabilities)
+	if decoded.Capabilities != CapCompression {
+		t.Errorf("expected Caps %d, got %d", CapCompression, decoded.Capabilities)
 	}
 	if decoded.Endpoint != "192.0.2.1:8443" {
 		t.Errorf("expected endpoint %s, got %s", "192.0.2.1:8443", decoded.Endpoint)

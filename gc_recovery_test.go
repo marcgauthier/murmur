@@ -31,11 +31,39 @@ func scanOriginLog(t *testing.T, db *DB, origin NodeID) int {
 
 // gcTestConfig returns a single-node config with GC floors that collect
 // everything eligible: near-zero retention and no minimum retention.
-func gcTestConfig(path string) Config {
+func gcTestConfig(t *testing.T, path string) Config {
+	t.Helper()
 	cfg := testConfig(path)
 	cfg.Replication.MinLogRetention = time.Nanosecond
 	cfg.Replication.MinRetainedBatches = 0
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
 	return cfg
+}
+
+// gcInsert writes one record per transaction so each insert lands in its
+// own origin-log batch, mirroring the original per-statement commits.
+func gcInsert(t *testing.T, ctx context.Context, db *DB, table *RecordTable[facadeRecord], name string) {
+	t.Helper()
+	tx, err := db.BeginTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := table.Insert(tx, &facadeRecord{ID: NewRowID(), Name: name}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func gcRowCount(t *testing.T, table *RecordTable[facadeRecord]) int {
+	t.Helper()
+	n, err := table.Where().Count()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 // TestGCDrainsPastUnitCap proves one gcOnce collects past the per-call
@@ -45,24 +73,26 @@ func gcTestConfig(path string) Config {
 // and the retained log grows without bound under any sustained workload.
 func TestGCDrainsPastUnitCap(t *testing.T) {
 	ctx := context.Background()
-	db, err := openSignedFixture(ctx, gcTestConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, gcTestConfig(t, t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	const batches = 6000
 	for i := 0; i < batches; i++ {
-		id := NewRowID()
-		if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`,
-			id[:], fmt.Sprintf("d%d", i)); err != nil {
-			t.Fatal(err)
-		}
+		gcInsert(t, ctx, db, table, fmt.Sprintf("d%d", i))
 	}
 	past := time.Now().Add(-time.Hour).UnixMilli()
 	if _, err := db.store.EnsureMemberAdmitted(NewNodeID(), past, 60_000); err != nil {
 		t.Fatal(err)
 	}
-	db.gcOnce(false)
+	if err := db.GC(ctx); err != nil {
+		t.Fatalf("operator-triggered GC: %v", err)
+	}
 	const want = batches - 1000 // minimum retention keeps the newest 1000
 	if got := db.metrics.gcLogCollected.Load(); got != want {
 		t.Fatalf("one gcOnce collected %d batches, want %d (drain loop)", got, want)
@@ -71,30 +101,30 @@ func TestGCDrainsPastUnitCap(t *testing.T) {
 	if err != nil || first != want+1 {
 		t.Fatalf("first retained seq = %d, %v; want %d", first, err, want+1)
 	}
-	if got := queryAll(t, db, `SELECT id FROM contacts`); len(got) != batches {
-		t.Fatalf("rows after GC = %d, want %d", len(got), batches)
+	if got := gcRowCount(t, table); got != batches {
+		t.Fatalf("rows after GC = %d, want %d", got, batches)
 	}
 }
 
 // TestGCExpiredObligationReleasesHistory proves retention deadlines gate
 // log collection: an expired member pins nothing (its history collects
-// while SQL keeps serving), and a live member without acks pins everything.
+// while typed reads keep serving), and a live member without acks pins everything.
 func TestGCExpiredObligationReleasesHistory(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("expired", func(t *testing.T) {
-		db, err := openSignedFixture(ctx, gcTestConfig(t.TempDir()))
+		db, err := openSignedFixture(ctx, gcTestConfig(t, t.TempDir()))
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer db.Close()
+		table, err := TableOf[facadeRecord](db, "records")
+		if err != nil {
+			t.Fatal(err)
+		}
 		nodeA := db.cfg.NodeID
 		for i := 0; i < 10; i++ {
-			id := NewRowID()
-			if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`,
-				id[:], fmt.Sprintf("g%d", i)); err != nil {
-				t.Fatal(err)
-			}
+			gcInsert(t, ctx, db, table, fmt.Sprintf("g%d", i))
 		}
 		// Obligation already expired an hour ago: deterministic, no waiting.
 		past := time.Now().Add(-time.Hour).UnixMilli()
@@ -114,8 +144,8 @@ func TestGCExpiredObligationReleasesHistory(t *testing.T) {
 			func(*codec.MutationBatch) error { return nil }); !errors.Is(err, state.ErrLogGone) {
 			t.Fatalf("collected prefix scan err = %v, want ErrLogGone", err)
 		}
-		if got := queryAll(t, db, `SELECT id FROM contacts`); len(got) != 10 {
-			t.Fatalf("rows after GC = %d, want 10", len(got))
+		if got := gcRowCount(t, table); got != 10 {
+			t.Fatalf("rows after GC = %d, want 10", got)
 		}
 		members, err := db.store.ListMembers()
 		if err != nil || len(members) != 1 {
@@ -127,18 +157,18 @@ func TestGCExpiredObligationReleasesHistory(t *testing.T) {
 	})
 
 	t.Run("live-pins", func(t *testing.T) {
-		db, err := openSignedFixture(ctx, gcTestConfig(t.TempDir()))
+		db, err := openSignedFixture(ctx, gcTestConfig(t, t.TempDir()))
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer db.Close()
+		table, err := TableOf[facadeRecord](db, "records")
+		if err != nil {
+			t.Fatal(err)
+		}
 		nodeA := db.cfg.NodeID
 		for i := 0; i < 10; i++ {
-			id := NewRowID()
-			if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`,
-				id[:], fmt.Sprintf("h%d", i)); err != nil {
-				t.Fatal(err)
-			}
+			gcInsert(t, ctx, db, table, fmt.Sprintf("h%d", i))
 		}
 		// Live obligation, no acks: floor stays zero, nothing collects.
 		if _, err := db.store.EnsureMemberAdmitted(NewNodeID(), time.Now().UnixMilli(), 3_600_000); err != nil {

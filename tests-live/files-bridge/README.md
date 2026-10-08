@@ -1,6 +1,7 @@
 # Two-Low/two-High encrypted file bridge (multi-process)
 
-Run with `go test -count=1 ./tests-live/files-bridge`. Four Murmur-SQL
+Run with `CGO_ENABLED=0 go test -count=1 ./tests-live/files-bridge` or
+`CGO_ENABLED=0 bash tests-live/run.sh files-bridge`. Four Murmur-SQL
 daemon processes (two Low mesh peers, two High mesh peers) run in discrete
 `node1`/`node2` directories per domain; the test drives them only through
 their HTTPS APIs with client certificates, replicating how the application works.
@@ -26,6 +27,7 @@ The Low and High domains use separate DBIDs, CAs, storage keys, object
 keys, and directories, with one source stream and one file transfer. It is
 an integration acceptance scenario, not an impaired-network or throughput
 test.
+The rehearsal uses managed typed records and runs without SQLite or CGO.
 
 Node ports come from the shared harness allocator, which claims each
 ephemeral port once per test process: parallel daemon suites churn enough

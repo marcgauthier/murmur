@@ -35,10 +35,12 @@ func TestConfigMaxTransactionBytesValidation(t *testing.T) {
 	}
 }
 
-func TestLocalTransactionMaxTransactionBytesEnforced(t *testing.T) {
+func TestTypedTransactionMaxTransactionBytesEnforced(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir)
-	// Allow one encoded contact while rejecting the multi-row transaction.
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	// Allow one encoded record while rejecting multi-row batches.
 	cfg.MaxTransactionBytes = 600
 	cfg.MaxReplicatedValueBytes = 300
 
@@ -47,77 +49,79 @@ func TestLocalTransactionMaxTransactionBytesEnforced(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	ctx := context.Background()
-
-	// 1. Transaction within limit: 1 contact
-	id1 := NewRowID()
-	if _, err := db.ExecContext(ctx, "INSERT INTO contacts (id, name, score) VALUES (?, ?, ?)", id1[:], "Alice", 10); err != nil {
-		t.Fatalf("Insert 1 within limit failed: %v", err)
-	}
-
-	// Verify Alice exists
-	var count int
-	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM contacts").Scan(&count); err != nil || count != 1 {
-		t.Fatalf("expected 1 contact, got %d (err: %v)", count, err)
-	}
-
-	// 2. Transaction exceeding MaxTransactionBytes:
-	// A transaction with multiple rows exceeding the 400-byte limit
-	tx, err := db.BeginTx(ctx, nil)
+	table, err := TableOf[facadeRecord](db, "records")
 	if err != nil {
-		t.Fatalf("BeginTx: %v", err)
+		t.Fatal(err)
 	}
-	for i := 0; i < 5; i++ {
-		rowID := NewRowID()
-		// each row will have ~50-80 bytes encoded
-		if _, err := tx.ExecContext(ctx, "INSERT INTO contacts (id, name, score) VALUES (?, ?, ?)", rowID[:], fmt.Sprintf("long_contact_name_entry_%d", i), i*10); err != nil {
-			t.Fatalf("tx.Exec %d: %v", i, err)
+
+	// One record commits within the configured encoded transaction limit.
+	first := &facadeRecord{ID: NewRowID(), Name: "Alice"}
+	if err := db.WriteTxContext(context.Background(), func(tx *Tx) error {
+		return table.Insert(tx, first)
+	}); err != nil {
+		t.Fatalf("insert within limit: %v", err)
+	}
+
+	// Five individually valid records exceed the transaction total.
+	err = db.WriteTxContext(context.Background(), func(tx *Tx) error {
+		for i := 0; i < 5; i++ {
+			value := &facadeRecord{ID: NewRowID(), Name: fmt.Sprintf("entry-%d", i)}
+			if err := table.Insert(tx, value); err != nil {
+				return err
+			}
 		}
-	}
-	err = tx.Commit()
+		return nil
+	})
 	if err == nil {
-		t.Fatal("expected oversize transaction to fail commit")
+		t.Fatal("expected oversized transaction to fail")
 	}
-	if !errors.Is(err, ErrTransactionTooLarge) && !errors.Is(err, ErrBatchTooLarge) {
-		t.Fatalf("expected ErrTransactionTooLarge or ErrBatchTooLarge, got %v", err)
-	}
-
-	// Verify SQL state was rolled back cleanly and still has only 1 row
-	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM contacts").Scan(&count); err != nil || count != 1 {
-		t.Fatalf("expected count 1 after rolled back oversize transaction, got %d (err: %v)", count, err)
+	if !errors.Is(err, ErrBatchTooLarge) {
+		t.Fatalf("expected ErrBatchTooLarge, got %v", err)
 	}
 
-	// 3. Single large string within value limit but combined transaction exceeding MaxTransactionBytes
-	tx2, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatalf("BeginTx: %v", err)
+	rows, err := table.Where().Find()
+	if err != nil || len(rows) != 1 || rows[0].ID != first.ID {
+		t.Fatalf("rows after rejected batch = %#v, %v; want only first row", rows, err)
 	}
-	id2 := NewRowID()
-	largeName := strings.Repeat("x", 250)
-	if _, err := tx2.ExecContext(ctx, "INSERT INTO contacts (id, name, phone, score) VALUES (?, ?, ?, ?)", id2[:], largeName, strings.Repeat("y", 100), 20); err != nil {
-		t.Fatalf("tx2.Exec: %v", err)
-	}
-	err = tx2.Commit()
+
+	// Each 250-byte field fits the value limit, but the pair exceeds the
+	// transaction limit and must leave the committed state unchanged.
+	err = db.WriteTxContext(context.Background(), func(tx *Tx) error {
+		for i := 0; i < 2; i++ {
+			value := &facadeRecord{ID: NewRowID(), Name: strings.Repeat("x", 250)}
+			if err := table.Insert(tx, value); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	if err == nil {
-		t.Fatal("expected combined transaction size > 350 bytes to fail")
+		t.Fatal("expected combined transaction size to fail")
 	}
-	if !errors.Is(err, ErrTransactionTooLarge) {
-		t.Fatalf("expected ErrTransactionTooLarge, got %v", err)
+	if !errors.Is(err, ErrBatchTooLarge) {
+		t.Fatalf("expected ErrBatchTooLarge, got %v", err)
 	}
 
-	// Verify database is still clean and operational
-	id3 := NewRowID()
-	if _, err := db.ExecContext(ctx, "INSERT INTO contacts (id, name, score) VALUES (?, ?, ?)", id3[:], "Bob", 30); err != nil {
-		t.Fatalf("subsequent small insert failed: %v", err)
+	rows, err = table.Where().Find()
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("rows after oversized-value batch = %d, %v; want 1", len(rows), err)
 	}
-	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM contacts").Scan(&count); err != nil || count != 2 {
-		t.Fatalf("expected count 2, got %d (err: %v)", count, err)
+	if err := db.WriteTxContext(context.Background(), func(tx *Tx) error {
+		return table.Insert(tx, &facadeRecord{ID: NewRowID(), Name: "Bob"})
+	}); err != nil {
+		t.Fatalf("subsequent small insert: %v", err)
+	}
+	rows, err = table.Where().Find()
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("rows after subsequent write = %d, %v; want 2", len(rows), err)
 	}
 }
 
 func TestStoreCommitRemoteEnforcesMaxTransactionBytes(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir)
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
 	cfg.MaxTransactionBytes = 200
 	cfg.MaxReplicatedValueBytes = 150
 
@@ -132,10 +136,9 @@ func TestStoreCommitRemoteEnforcesMaxTransactionBytes(t *testing.T) {
 	rowID := NewRowID()
 
 	// Create remote batch exceeding 200 bytes
-	batch := remoteBatchCells(db, peer, 1, 1000<<16, "contacts", rowID, map[string]codec.Value{
-		"id":    codec.Blob(rowID[:]),
-		"name":  codec.Text(strings.Repeat("a", 150)),
-		"phone": codec.Text(strings.Repeat("b", 150)),
+	batch := remoteBatchCells(db, peer, 1, 1000<<16, "records", rowID, map[string]codec.Value{
+		"ID":   codec.Blob(rowID[:]),
+		"Name": codec.Text(strings.Repeat("a", 150)),
 	})
 
 	err = applyRemoteFixture(db, ctx, batch)

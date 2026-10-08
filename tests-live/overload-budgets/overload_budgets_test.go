@@ -9,6 +9,8 @@
 package overloadbudgets_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -17,51 +19,45 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func TestBudgetRejectionAndPressureConvergence(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "overload-budgets",
-		NumNodes:    2,
-		AwaitUnlock: true,
+		Name:            "overload-budgets",
+		NumNodes:        2,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 		Limits: &harness.LimitsOptions{
 			MaxValueBytes:       4 << 10,
 			MaxTransactionBytes: 64 << 10,
 		},
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "ol_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
 	})
 
 	// Past the 1 MiB HTTP body cap: clean rejection, node unharmed.
 	huge := strings.Repeat("H", 2<<20)
-	if err := cluster.ExecSQL(0, "INSERT INTO ol_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 1), huge); err == nil {
+	if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 1), Name: huge}); err == nil {
 		t.Fatal("2 MiB POST accepted, want HTTP body rejection")
 	}
 	cluster.WaitNodeReady(0)
 
 	// Past the 4 KiB commit value budget: "too large", no partial row.
 	big := strings.Repeat("V", (4<<10)+1)
-	if err := cluster.ExecSQL(0, "INSERT INTO ol_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 2), big); err == nil {
+	if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 2), Name: big}); err == nil {
 		t.Fatal("5 KiB value accepted, want budget rejection")
 	} else if !strings.Contains(strings.ToLower(err.Error()), "too large") {
 		t.Fatalf("rejection error %q does not name the budget", err)
 	}
 	for i := range cluster.Nodes {
-		if n, _ := cluster.QueryRowCount(i, "ol_rows"); n != 0 {
-			t.Fatalf("node %d has %d rows after rejections, want 0 (partial apply?)", i, n)
+		rows, _ := cluster.TypedContentionRows(i)
+		if len(rows) != 0 {
+			t.Fatalf("node %d has %d rows after rejections, want 0 (partial apply?)", i, len(rows))
 		}
 	}
 
 	// Writer not poisoned: a small write works and converges.
-	if err := cluster.ExecSQL(0, "INSERT INTO ol_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 3), "ok"); err != nil {
+	if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 3), Name: "ok"}); err != nil {
 		t.Fatalf("post-rejection write: %v", err)
 	}
 	waitConverged(t, cluster, 1, 30*time.Second)
@@ -80,7 +76,7 @@ func TestBudgetRejectionAndPressureConvergence(t *testing.T) {
 			for i := 0; i < perWriter; i++ {
 				id := fmt.Sprintf("%032x", 10000+w*1000+i)
 				start := time.Now()
-				err := cluster.ExecSQL(0, "INSERT INTO ol_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("w%d-%d", w, i))
+				err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: id, Name: fmt.Sprintf("w%d-%d", w, i)})
 				el := time.Since(start)
 				mu.Lock()
 				lat = append(lat, el)
@@ -114,16 +110,22 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "ol_rows")
-			if err != nil || n != want {
+			rows, err := c.TypedContentionRows(i)
+			if err != nil || len(rows) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, "ol_rows", "name")
-			if err != nil {
-				ok = false
-				break
+			sort.Slice(rows, func(a, b int) bool {
+				if rows[a].Name != rows[b].Name {
+					return rows[a].Name < rows[b].Name
+				}
+				return rows[a].ID < rows[b].ID
+			})
+			h := sha256.New()
+			for _, row := range rows {
+				fmt.Fprintf(h, "%s:%s:%s:%d\n", row.ID, row.Name, row.Phone, row.Score)
 			}
+			d := hex.EncodeToString(h.Sum(nil))
 			if i == 0 {
 				first = d
 			} else if d != first {

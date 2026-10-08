@@ -13,8 +13,8 @@ import (
 	"github.com/marcgauthier/murmur"
 )
 
-// TestLocalTransactionBatchThroughput compares rows per SQL transaction on
-// one encrypted database. Each SQL transaction becomes one Pebble batch.
+// TestLocalTransactionBatchThroughput compares rows per typed transaction
+// on one encrypted database. Each typed transaction becomes one Spool batch.
 func TestLocalTransactionBatchThroughput(t *testing.T) {
 	if testing.Short() {
 		t.Skip("local transaction-size benchmark runs outside -short")
@@ -53,6 +53,10 @@ func TestLocalTransactionBatchThroughput(t *testing.T) {
 							_ = db.Close()
 						}
 					}()
+					table, err := murmur.TableOf[writerBenchRow](db, "writer_bench")
+					if err != nil {
+						t.Fatal(err)
+					}
 
 					type result struct {
 						worker int
@@ -70,18 +74,17 @@ func TestLocalTransactionBatchThroughput(t *testing.T) {
 							<-startGate
 							var txns, sequence int
 							for time.Now().Before(deadline) {
-								tx, err := db.BeginTx(ctx, nil)
+								tx, err := db.BeginTx(ctx)
 								if err != nil {
 									results <- result{worker: worker, txns: txns, err: err}
 									return
 								}
 								for row := 0; row < rowsPerTx; row++ {
 									sequence++
-									var id [16]byte
+									var id murmur.RowID
 									binary.BigEndian.PutUint64(id[:8], uint64(worker+1))
 									binary.BigEndian.PutUint64(id[8:], uint64(sequence))
-									if _, err := tx.ExecContext(ctx,
-										`INSERT INTO writer_bench (id, val) VALUES (?, ?)`, id[:], "writer-throughput"); err != nil {
+									if err := table.Insert(tx, &writerBenchRow{ID: id, Val: "writer-throughput"}); err != nil {
 										_ = tx.Rollback()
 										results <- result{worker: worker, txns: txns, err: err}
 										return
@@ -135,8 +138,12 @@ func TestLocalTransactionBatchThroughput(t *testing.T) {
 					if err != nil {
 						t.Fatalf("reopen after writes: %v", err)
 					}
-					var count int
-					if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM writer_bench`).Scan(&count); err != nil {
+					table, err = murmur.TableOf[writerBenchRow](db, "writer_bench")
+					if err != nil {
+						t.Fatal(err)
+					}
+					count, err := table.Where().Count()
+					if err != nil {
 						t.Fatal(err)
 					}
 					if count != totalRows {

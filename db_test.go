@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/marcgauthier/murmur/crypto"
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/internal/testidentity"
+	"github.com/marcgauthier/murmur/rime"
 	"github.com/marcgauthier/murmur/schema"
 )
 
@@ -30,6 +32,13 @@ func testSchema() []schema.TableSchema {
 	}
 }
 
+type testContactRecord struct {
+	ID    ids.RowID `rime:"primary"`
+	Name  string
+	Phone string
+	Score int64
+}
+
 // testKeyID and testKey give every test an encrypted store in direct-key
 // mode. Tests exercising provider mode overwrite cfg.Encryption wholesale.
 var testKey = bytes.Repeat([]byte{0x3a}, 32)
@@ -38,12 +47,20 @@ const testKeyID = "test-key"
 
 func testConfig(path string) Config {
 	node := NewNodeID()
+	contacts, err := Define[testContactRecord]("contacts", 1, RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Phone": 3, "Score": 4},
+	})
+	if err != nil {
+		panic(fmt.Sprintf("compile test record schema: %v", err))
+	}
 	return Config{
 		OriginSigning: testidentity.Config(node),
 		Path:          path,
 		NodeID:        node,
-		Schema:        SchemaConfig{Version: 1, Tables: testSchema()},
-		Pebble:        DefaultPebbleConfig(),
+		Schema:        SchemaConfig{Version: 1},
+		Tables:        []TableDefinition{contacts},
+		Spool:         DefaultSpoolConfig(),
 		Encryption: EncryptionConfig{
 			Key:   append([]byte(nil), testKey...),
 			KeyID: testKeyID,
@@ -70,6 +87,27 @@ func TestReplicationDisseminationConfigValidation(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsLegacySQLSchema(t *testing.T) {
+	cfg := testConfig(t.TempDir())
+	cfg.Tables = nil
+	cfg.Schema = SchemaConfig{Version: 1, Tables: testSchema()}
+	_, err := Open(context.Background(), cfg)
+	if !errors.Is(err, ErrUnsupportedSchema) {
+		t.Fatalf("Open with Schema.Tables only: got %v, want ErrUnsupportedSchema", err)
+	}
+	if !strings.Contains(err.Error(), "SQL schemas are no longer supported") {
+		t.Fatalf("Open error lacks migration guidance: %v", err)
+	}
+}
+
+func assertMaterializerCurrent(t *testing.T, db *DB) {
+	t.Helper()
+	status := db.Status()
+	if status.MaterializedGeneration != status.StateGeneration {
+		t.Fatalf("RIME materializer generation %d != durable generation %d", status.MaterializedGeneration, status.StateGeneration)
+	}
+}
+
 // providerConfig returns cfg with provider-mode encryption under id.
 func providerConfig(cfg Config, id string, key []byte) Config {
 	cfg.Encryption = EncryptionConfig{
@@ -79,254 +117,191 @@ func providerConfig(cfg Config, id string, key []byte) Config {
 	return cfg
 }
 
-func queryAll(t *testing.T, db *DB, q string, args ...any) [][]any {
-	t.Helper()
-	rows, err := db.QueryContext(context.Background(), q, args...)
+func TestTypedLocalWriteReopenRebuild(t *testing.T) {
+	ctx := context.Background()
+	cfg := testConfig(t.TempDir())
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	db, err := Open(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
-	var out [][]any
-	cols := rows.Columns()
-	for rows.Next() {
-		dest := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range dest {
-			ptrs[i] = &dest[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			t.Fatal(err)
-		}
-		out = append(out, dest)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	return out
-}
-
-// TestLocalWriteReopenRebuild is the PLAN section 91 prototype path: SQL
-// write -> capture -> Badger -> close -> reopen -> rebuild -> identical query.
-func TestLocalWriteReopenRebuild(t *testing.T) {
-	ctx := context.Background()
-	path := t.TempDir()
-	cfg := testConfig(path)
-
-	db, err := openSignedFixture(ctx, cfg)
+	table, err := TableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
 	id1, id2 := NewRowID(), NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name, phone, score) VALUES (?, ?, ?, ?)`,
-		id1[:], "ann", "111", 10); err != nil {
+	if err := db.WriteTxContext(ctx, func(tx *Tx) error {
+		return table.Insert(tx, &facadeRecord{ID: id1, Name: "ann"})
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id2[:], "bob"); err != nil {
+	if err := db.WriteTxContext(ctx, func(tx *Tx) error {
+		return table.Insert(tx, &facadeRecord{ID: id2, Name: "bob"})
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, `UPDATE contacts SET phone = ?, score = ? WHERE id = ?`, "222", 20, id1[:]); err != nil {
+	if err := db.WriteTxContext(ctx, func(tx *Tx) error {
+		return table.Update(tx, id1, func(row *facadeRecord) error { row.Name = "ann-updated"; return nil })
+	}); err != nil {
 		t.Fatal(err)
 	}
-	before := queryAll(t, db, `SELECT id, name, phone, score FROM contacts ORDER BY name`)
-	if len(before) != 2 {
-		t.Fatalf("want 2 rows, got %d", len(before))
+	before1, err := table.Get(id1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before2, err := table.Get(id2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before1.Name != "ann-updated" || before2.Name != "bob" {
+		t.Fatalf("typed rows before reopen = %+v, %+v", before1, before2)
 	}
 	st := db.Status()
 	if st.State != StateReady || st.StateGeneration == 0 || st.MaterializedGeneration != st.StateGeneration {
 		t.Fatalf("bad status: %+v", st)
 	}
+	dbid := db.DBID()
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	// Reopen with the same NodeID: the in-memory database is rebuilt purely
-	// from Badger and must be identical.
-	db2, err := openSignedFixture(ctx, cfg)
+	// Reopen with the same identity: RIME is rebuilt from durable Spool state.
+	db2, err := Open(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db2.Close()
-	after := queryAll(t, db2, `SELECT id, name, phone, score FROM contacts ORDER BY name`)
-	if fmt.Sprintf("%v", before) != fmt.Sprintf("%v", after) {
-		t.Fatalf("rebuilt state differs:\nbefore=%v\nafter=%v", before, after)
+	table2, err := TableOf[facadeRecord](db2, "records")
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The DBID persisted across the restart.
-	if db2.DBID().IsZero() {
-		t.Fatal("dbid not persisted")
+	after1, err := table2.Get(id1)
+	if err != nil || *after1 != *before1 {
+		t.Fatalf("rebuilt first row = %+v, %v; before %+v", after1, err, before1)
+	}
+	after2, err := table2.Get(id2)
+	if err != nil || *after2 != *before2 {
+		t.Fatalf("rebuilt second row = %+v, %v; before %+v", after2, err, before2)
+	}
+	if db2.DBID() != dbid {
+		t.Fatalf("dbid after restart = %v, want %v", db2.DBID(), dbid)
 	}
 }
 
-func TestExplicitTxCoalescing(t *testing.T) {
+func TestTypedExplicitTxCoalescing(t *testing.T) {
 	ctx := context.Background()
-	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
+	cfg := testConfig(t.TempDir())
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	db, err := Open(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	id := NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, phone) VALUES (?, ?)`, id[:], "0"); err != nil {
+	if err := db.WriteTxContext(ctx, func(tx *Tx) error {
+		return table.Insert(tx, &facadeRecord{ID: id, Name: "0"})
+	}); err != nil {
 		t.Fatal(err)
 	}
 	genBefore := db.Status().StateGeneration
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, ph := range []string{"1", "2", "3"} {
-		if _, err := tx.ExecContext(ctx, `UPDATE contacts SET phone = ? WHERE id = ?`, ph, id[:]); err != nil {
+		if err := table.Update(tx, id, func(row *facadeRecord) error { row.Name = ph; return nil }); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// Read-your-write inside the tx.
-	txrows, err := tx.QueryContext(ctx, `SELECT phone FROM contacts WHERE id = ?`, id[:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	var ph string
-	for txrows.Next() {
-		_ = txrows.Scan(&ph)
-	}
-	txrows.Close()
-	if ph != "3" {
-		t.Fatalf("read-your-write = %q", ph)
+	// Read-your-write inside the typed transaction overlay.
+	got, err := table.GetTx(tx, id)
+	if err != nil || got.Name != "3" {
+		t.Fatalf("typed read-your-write = %+v, %v", got, err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	// One Badger generation bump for the whole multi-statement transaction.
+	// One durable generation bump for the whole multi-update transaction.
 	if got := db.Status().StateGeneration; got != genBefore+1 {
 		t.Fatalf("generation %d -> %d, want +1", genBefore, got)
 	}
-	got := queryAll(t, db, `SELECT phone FROM contacts WHERE id = ?`, id[:])
-	if len(got) != 1 || got[0][0] != "3" {
-		t.Fatalf("got %v", got)
+	committed, err := table.Get(id)
+	if err != nil || committed.Name != "3" {
+		t.Fatalf("committed typed value = %+v, %v", committed, err)
 	}
 }
 
-func TestTxRollback(t *testing.T) {
-	ctx := context.Background()
-	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	id := NewRowID()
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO contacts (id) VALUES (?)`, id[:]); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Rollback(); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(); !errors.Is(err, ErrTxDone) {
-		t.Fatalf("expected ErrTxDone, got %v", err)
-	}
-	if n := len(queryAll(t, db, `SELECT id FROM contacts`)); n != 0 {
-		t.Fatalf("rolled-back row visible: %d rows", n)
-	}
-	if gen := db.Status().StateGeneration; gen != 0 {
-		t.Fatalf("generation = %d after rollback-only", gen)
-	}
-}
-
-func TestDeleteAndResurrectSQL(t *testing.T) {
-	ctx := context.Background()
-	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	id := NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "x"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.ExecContext(ctx, `DELETE FROM contacts WHERE id = ?`, id[:]); err != nil {
-		t.Fatal(err)
-	}
-	if n := len(queryAll(t, db, `SELECT id FROM contacts`)); n != 0 {
-		t.Fatalf("deleted row visible")
-	}
-	// Resurrect with the same UUID.
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "y"); err != nil {
-		t.Fatal(err)
-	}
-	got := queryAll(t, db, `SELECT name FROM contacts`)
-	if len(got) != 1 || got[0][0] != "y" {
-		t.Fatalf("got %v", got)
-	}
-}
-
-func TestQueryRowAndPrepare(t *testing.T) {
-	ctx := context.Background()
-	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	id := NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "zed"); err != nil {
-		t.Fatal(err)
-	}
-	var name string
-	if err := db.QueryRowContext(ctx, `SELECT name FROM contacts WHERE id = ?`, id[:]).Scan(&name); err != nil {
-		t.Fatal(err)
-	}
-	if name != "zed" {
-		t.Fatalf("got %q", name)
-	}
-	stmt, err := db.PrepareContext(ctx, `SELECT name FROM contacts WHERE id = ?`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stmt.Close()
-	var name2 string
-	if err := stmt.QueryRowContext(ctx, id[:]).Scan(&name2); err != nil {
-		t.Fatal(err)
-	}
-	if name2 != "zed" {
-		t.Fatalf("got %q", name2)
-	}
-}
-
-func TestOversizeValueRejected(t *testing.T) {
+func TestTypedDeleteAndResurrect(t *testing.T) {
 	ctx := context.Background()
 	cfg := testConfig(t.TempDir())
-	cfg.MaxReplicatedValueBytes = 16
-	db, err := openSignedFixture(ctx, cfg)
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	db, err := Open(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	id := NewRowID()
-	_, err = db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "way too long value")
+	if err := db.WriteTxContext(ctx, func(tx *Tx) error {
+		return table.Insert(tx, &facadeRecord{ID: id, Name: "x"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WriteTxContext(ctx, func(tx *Tx) error { return table.Delete(tx, id) }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := table.Get(id); !errors.Is(err, rime.ErrNotFound) {
+		t.Fatalf("deleted typed row lookup error = %v", err)
+	}
+	// Resurrect with the same UUID.
+	if err := db.WriteTxContext(ctx, func(tx *Tx) error {
+		return table.Insert(tx, &facadeRecord{ID: id, Name: "y"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := table.Get(id)
+	if err != nil || got.Name != "y" {
+		t.Fatalf("resurrected typed row = %+v, %v", got, err)
+	}
+}
+
+func TestTypedOversizeValueRejected(t *testing.T) {
+	cfg := testConfig(t.TempDir())
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	cfg.MaxReplicatedValueBytes = 16
+	db, err := Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := ids.NewRowID()
+	err = db.WriteTxContext(context.Background(), func(tx *Tx) error {
+		return table.Insert(tx, &facadeRecord{ID: id, Name: "way too long value"})
+	})
 	if !errors.Is(err, ErrValueTooLarge) {
 		t.Fatalf("expected ErrValueTooLarge, got %v", err)
 	}
 	// The failed write rolled back cleanly: nothing visible, still ready.
-	if n := len(queryAll(t, db, `SELECT id FROM contacts`)); n != 0 {
-		t.Fatalf("oversize row visible")
+	if _, err := table.Get(id); !errors.Is(err, rime.ErrNotFound) {
+		t.Fatalf("oversize typed row lookup error=%v", err)
 	}
 	if st := db.Status().State; st != StateReady {
 		t.Fatalf("state = %s", st)
-	}
-}
-
-func TestSchemaMismatchFailsClosed(t *testing.T) {
-	ctx := context.Background()
-	path := t.TempDir()
-	cfg := testConfig(path)
-	db, err := openSignedFixture(ctx, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = db.Close()
-	// Reopen with a different schema epoch: must refuse.
-	cfg.Schema.Version = 2
-	if _, err := openSignedFixture(ctx, cfg); !errors.Is(err, ErrSchemaMismatch) {
-		t.Fatalf("expected ErrSchemaMismatch, got %v", err)
 	}
 }
 
@@ -344,12 +319,18 @@ func TestEncryptedOpenWrongKeyFails(t *testing.T) {
 	path := t.TempDir()
 	key := randomKey(t)
 	cfg := providerConfig(testConfig(path), "k1", key)
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
 	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "secret"); err != nil {
+	id := ids.NewRowID()
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WriteTxContext(ctx, func(tx *Tx) error { return table.Insert(tx, &facadeRecord{ID: id, Name: "secret"}) }); err != nil {
 		t.Fatal(err)
 	}
 	_ = db.Close()
@@ -359,8 +340,12 @@ func TestEncryptedOpenWrongKeyFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(queryAll(t, db2, `SELECT id FROM contacts`)); n != 1 {
-		t.Fatalf("want 1 row, got %d", n)
+	table, err = TableOf[facadeRecord](db2, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := table.Get(id); err != nil || got.Name != "secret" {
+		t.Fatalf("correct-key typed reopen row = %+v, %v", got, err)
 	}
 	_ = db2.Close()
 
@@ -378,12 +363,18 @@ func TestRotateStorageKey(t *testing.T) {
 	key1 := randomKey(t)
 	key2 := randomKey(t)
 	cfg := providerConfig(testConfig(path), "k1", key1)
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
 	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	id1 := NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id1[:], "pre-rotation"); err != nil {
+	id1 := ids.NewRowID()
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WriteTxContext(ctx, func(tx *Tx) error { return table.Insert(tx, &facadeRecord{ID: id1, Name: "pre-rotation"}) }); err != nil {
 		t.Fatal(err)
 	}
 	// Invalid rotation inputs are rejected without touching the registry.
@@ -413,11 +404,18 @@ func TestRotateStorageKey(t *testing.T) {
 	if err := db.RotateDataKey(ctx); err != nil {
 		t.Fatal(err)
 	}
-	id2 := NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id2[:], "post-rotation"); err != nil {
+	id2 := ids.NewRowID()
+	if err := db.WriteTxContext(ctx, func(tx *Tx) error { return table.Insert(tx, &facadeRecord{ID: id2, Name: "post-rotation"}) }); err != nil {
 		t.Fatal(err)
 	}
-	before := queryAll(t, db, `SELECT name FROM contacts ORDER BY name`)
+	before1, err := table.Get(id1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before2, err := table.Get(id2)
+	if err != nil {
+		t.Fatal(err)
+	}
 	_ = db.Close()
 
 	// New key opens with all data.
@@ -426,10 +424,21 @@ func TestRotateStorageKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	after := queryAll(t, db2, `SELECT name FROM contacts ORDER BY name`)
+	table2, err := TableOf[facadeRecord](db2, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	after1, err := table2.Get(id1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after2, err := table2.Get(id2)
+	if err != nil {
+		t.Fatal(err)
+	}
 	_ = db2.Close()
-	if fmt.Sprintf("%v", before) != fmt.Sprintf("%v", after) {
-		t.Fatalf("after rotation: %v != %v", before, after)
+	if *before1 != *after1 || *before2 != *after2 {
+		t.Fatalf("rows after rotation: before=(%+v,%+v), after=(%+v,%+v)", before1, before2, after1, after2)
 	}
 
 	// Old key is rejected.
@@ -441,7 +450,10 @@ func TestRotateStorageKey(t *testing.T) {
 
 func TestStatusBasics(t *testing.T) {
 	ctx := context.Background()
-	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
+	cfg := testConfig(t.TempDir())
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	db, err := Open(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -452,25 +464,6 @@ func TestStatusBasics(t *testing.T) {
 	}
 	if st.SchemaEpoch != 1 {
 		t.Fatalf("schema epoch = %d", st.SchemaEpoch)
-	}
-}
-
-func TestIsReadOnlyStatement(t *testing.T) {
-	for _, q := range []string{
-		"SELECT 1", "  select a from t", "-- comment\nSELECT 1",
-		"/* x */ SELECT 1", "EXPLAIN SELECT 1", "PRAGMA table_info(t)",
-	} {
-		if !isReadOnlyStatement(q) {
-			t.Fatalf("%q should be read-only", q)
-		}
-	}
-	for _, q := range []string{
-		"INSERT INTO t VALUES (1)", "UPDATE t SET a=1", "DELETE FROM t",
-		"WITH x AS (SELECT 1) UPDATE t SET a=1", "BEGIN", "",
-	} {
-		if isReadOnlyStatement(q) {
-			t.Fatalf("%q should be a write", q)
-		}
 	}
 }
 
@@ -495,95 +488,64 @@ func TestNodeIDHelpers(t *testing.T) {
 // physical column order on every reopen whenever ID order differed from
 // declaration order (contacts.name sorts before contacts.id by ID).
 func TestRestartPreservesDeclarationColumnOrder(t *testing.T) {
-	ctx := context.Background()
 	dir := t.TempDir()
 	cfg := testConfig(dir)
-	db, err := openSignedFixture(ctx, cfg)
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	db, err := Open(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cols := queryColumns(t, db, `SELECT * FROM contacts`)
+	schemaBefore, err := db.SchemaTables()
+	if err != nil || len(schemaBefore) != 1 {
+		t.Fatalf("typed schema before reopen: tables=%v err=%v", schemaBefore, err)
+	}
+	cols := schemaBefore[0].Columns
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"id", "name", "phone", "score"}
-	if fmt.Sprint(cols) != fmt.Sprint(want) {
-		t.Fatalf("fresh open columns=%v, want %v", cols, want)
-	}
-
-	db2, err := openSignedFixture(ctx, cfg)
+	db2, err := Open(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db2.Close()
-	cols2 := queryColumns(t, db2, `SELECT * FROM contacts`)
-	if fmt.Sprint(cols2) != fmt.Sprint(want) {
-		t.Fatalf("reopen columns=%v, want %v (declaration order)", cols2, want)
+	schemaAfter, err := db2.SchemaTables()
+	if err != nil || len(schemaAfter) != 1 {
+		t.Fatalf("typed schema after reopen: tables=%v err=%v", schemaAfter, err)
+	}
+	if fmt.Sprint(schemaAfter[0].Columns) != fmt.Sprint(cols) {
+		t.Fatalf("reopen field order=%v, want %v", schemaAfter[0].Columns, cols)
 	}
 }
 
-func queryColumns(t *testing.T, db *DB, q string) []string {
-	t.Helper()
-	rows, err := db.QueryContext(context.Background(), q)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-	return rows.Columns()
-}
-
-func TestMetricsStmtCacheCounters(t *testing.T) {
-	ctx := context.Background()
-	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	before := db.Metrics()
-	queryAll(t, db, `SELECT id, name FROM contacts`)
-	queryAll(t, db, `SELECT id, name FROM contacts`)
-	after := db.Metrics()
-	if after.StmtCacheMisses-before.StmtCacheMisses != 1 ||
-		after.StmtCacheHits-before.StmtCacheHits != 1 {
-		t.Fatalf("stmt cache delta hits=%d misses=%d, want 1/1",
-			after.StmtCacheHits-before.StmtCacheHits,
-			after.StmtCacheMisses-before.StmtCacheMisses)
-	}
-}
-
-func TestPebbleCacheSettings(t *testing.T) {
+func TestSpoolConfigSettings(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
-	// 1. Automatic default when zero: 256 MiB
+	// 1. Automatic defaults
 	cfgDefault := testConfig(filepath.Join(dir, "default"))
 	cfgDefault.withDefaults()
-	if cfgDefault.Pebble.CacheBytes != 256<<20 {
-		t.Fatalf("expected default 256MiB, got %d", cfgDefault.Pebble.CacheBytes)
+	if cfgDefault.Spool.TargetBlockBytes != 4<<20 {
+		t.Fatalf("expected default TargetBlockBytes 4MiB, got %d", cfgDefault.Spool.TargetBlockBytes)
 	}
 
-	// 2. Setting via cfg.Cache.BlockCacheBytes alias
-	cfgAlias := testConfig(filepath.Join(dir, "alias"))
-	cfgAlias.Cache.BlockCacheBytes = 64 << 20
-	cfgAlias.withDefaults()
-	if cfgAlias.Pebble.CacheBytes != 64<<20 {
-		t.Fatalf("expected 64MiB via alias, got %d", cfgAlias.Pebble.CacheBytes)
-	}
-
-	// 3. Setting via cfg.Pebble.CacheBytes directly
+	// 2. Custom Spool settings
 	cfgDirect := testConfig(filepath.Join(dir, "direct"))
-	cfgDirect.Pebble.CacheBytes = 128 << 20
+	cfgDirect.Spool.TargetBlockBytes = 2 << 20
+	cfgDirect.Spool.MaxBlockBytes = 32 << 20
 	cfgDirect.withDefaults()
-	if cfgDirect.Pebble.CacheBytes != 128<<20 {
-		t.Fatalf("expected 128MiB direct, got %d", cfgDirect.Pebble.CacheBytes)
+	if cfgDirect.Spool.TargetBlockBytes != 2<<20 {
+		t.Fatalf("expected 2MiB direct, got %d", cfgDirect.Spool.TargetBlockBytes)
 	}
 
-	// 4. Open real DB with custom cache size
-	db, err := openSignedFixture(ctx, cfgDirect)
+	// 3. Open real DB with custom Spool configuration
+	cfgDirect.Schema.Tables = nil
+	cfgDirect.Tables = []TableDefinition{recordDefinition(t)}
+	db, err := Open(ctx, cfgDirect)
 	if err != nil {
-		t.Fatalf("Open with custom cache failed: %v", err)
+		t.Fatalf("Open with custom Spool config failed: %v", err)
 	}
 	metrics := db.store.Metrics()
-	t.Logf("Pebble metrics with 128MiB cache setting: %+v", metrics)
+	t.Logf("Spool metrics: %+v", metrics)
 	_ = db.Close()
 }

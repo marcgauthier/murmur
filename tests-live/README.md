@@ -1,11 +1,9 @@
 # MURMUR-SQL Live Multi-Process Node Tests
 
-The explicit [reload benchmark](reload-benchmark/README.md) generates a
-10 GB in-memory SQLite dataset across ten realistic log tables, persists
-encrypted Pebble under `/media/marc/2TB/TEST`, and measures fresh-process
-reopen and SQLite reconstruction. Run `bash tests-live/run.sh reload-benchmark`;
-it is excluded from `all` and `gate`. Completed datasets and JSON reports
-are retained for reuse.
+The separate [RIME workload](rime/README.md) runs one standalone in-memory
+engine process: `RIME_DURATION=30m bash tests-live/run.sh rime`. It is
+qualified by its own nightly workflow and is excluded from the daemon
+`all` and `gate` scenarios.
 
 Run `bash tests-live/run.sh all` or an individual scenario runner:
 
@@ -13,47 +11,96 @@ Run `bash tests-live/run.sh all` or an individual scenario runner:
 - `bash tests-live/run.sh resource-exhaustion`
 - `bash tests-live/run.sh endurance-chaos`
 - `bash tests-live/run.sh open-progress`
+- `bash tests-live/run.sh churn-retirement`
+- `bash tests-live/run.sh addrpolicy`
 - `bash tests-live/run.sh encryption`
 - `bash tests-live/run.sh api-mtls`
 - `bash tests-live/run.sh crash-recovery`
 - `bash tests-live/run.sh three-node-sync`
 - `bash tests-live/run.sh partition`
 - `bash tests-live/run.sh chaos-load`
-- `bash tests-live/run.sh addrpolicy`
 - `bash tests-live/run.sh allow-nodes`
 - `bash tests-live/run.sh crdt-contention`
+- `bash tests-live/run.sh graceful-shutdown`
+- `bash tests-live/run.sh plaintext-audit`
+- `bash tests-live/run.sh delete-pruning`
+- `bash tests-live/run.sh typed-records`
+- `bash tests-live/run.sh backup-restore`
+- `bash tests-live/run.sh version-skew`
+- `bash tests-live/run.sh tls-floor`
+- `bash tests-live/run.sh cert-lifecycle`
+- `bash tests-live/run.sh dbid-isolation`
+- `bash tests-live/run.sh merge-policies`
+- `bash tests-live/run.sh origin-signatures`
+- `bash tests-live/run.sh file-permissions`
+- `bash tests-live/run.sh files-bridge`
+- `bash tests-live/run.sh files-soak`
+- `bash tests-live/run.sh files-crash`
+- `bash tests-live/run.sh files-corrupt-source`
+- `bash tests-live/run.sh maintenance-under-load`
+- `bash tests-live/run.sh snapshot-resync`
+- `bash tests-live/run.sh tail-repair`
+- `bash tests-live/run.sh three-way-heal`
+- `bash tests-live/run.sh migration-concurrency`
+- `bash tests-live/run.sh migration-crash`
+- `bash tests-live/run.sh rekey`
 - `bash tests-live/run.sh soak-slo`
 - `bash tests-live/run.sh long-running-five-node`
+- `bash tests-live/run.sh spool`
 
 The allow-nodes scenario writes concurrently for three minutes by default; use
 `MURMUR_ALLOW_NODES_WRITE_SECONDS` to select a shorter development run.
 
-Or run via standard Go test (tags required):
+The [`migration-crash` scenario](migration-crash/README.md) exercises exact
+before/after schema-manifest crash recovery on an isolated node in a three-node
+cluster, followed by peer convergence.
+
+All maintained database scenarios use managed typed records and RIME. The
+`sqli-api` scenario verifies that removed SQL endpoints reject requests without
+changing typed records. Run one scenario at a time while qualifying the shared
+runtime and fixture binary:
+
 ```sh
-go test -tags "sqlite_preupdate_hook sqlite_fts5" -v ./tests-live/...
+CGO_ENABLED=0 GOMAXPROCS=2 bash tests-live/run.sh typed-records
 ```
 
-`run.sh` and the test harness build the Murmur-SQL daemon with
-`MURMUR_TAGS` (default `"sqlite_preupdate_hook sqlite_fts5"`; use
-`MURMUR_TAGS=modernc` with `CGO_ENABLED=0` for the pure-Go backend).
-For daemon scenarios, `run.sh` rebuilds `tests-live/bin/testnode` on every invocation; bare
-`go test` reuses the existing `tests-live/bin/testnode` only while it is
-fresh (a `testnode.tags` stamp records the build tags, and the harness
-rebuilds when any `.go`/`go.mod`/`go.sum` input is newer than the
-binary, logging the reason). A stale daemon can no longer silently test
-old behavior.
+RIME scenarios (`typed-records`, `typed-bridge`, `views`,
+`three-node-sync`, `open-progress`, `crash-recovery`, `graceful-shutdown`,
+`plaintext-audit`, `delete-pruning`, `crdt-contention`, `schema-evolution`, `merge-policies`,
+`origin-signatures`, `rekey`, `highlow`,
+`file-permissions`, `backup-restore`, `version-skew`, `tls-floor`, `cert-lifecycle`,
+`churn-retirement`, `addrpolicy`, `dbid-isolation`, `allow-nodes`, `files-bridge`,
+`files-soak`, `files-crash`, `files-corrupt-source`,
+`maintenance-under-load`, `partition`, `snapshot-resync`,
+`tail-repair`,
+`three-way-heal`,
+`migration-concurrency`, `migration-crash`,
+`backup-under-fire`, `tampered-backup`, and `bridge-two-streams`)
+compile with CGO disabled and no extra build tags. Their child
+fixture is cached separately as
+`tests-live/bin/testnode-typed`; set `MURMUR_TYPED_TAGS` only when a native
+fixture needs additional build tags. `MURMUR_RACE=1` enables CGO for Go's race
+detector. This ensures typed live rehearsals also qualify the CGO-free build.
+
+`run.sh` builds the test fixture with `MURMUR_TAGS` (default `""`). For daemon
+scenarios, `run.sh` rebuilds
+`tests-live/bin/testnode` on each invocation; bare `go test` reuses that binary
+only while it is fresh. A `testnode.tags` stamp records the tags, and the
+harness rebuilds when any `.go`/`go.mod`/`go.sum` input is newer than the
+binary, logging the reason. Typed runs use their separate no-tag binary and
+freshness stamp.
 Set `MURMUR_RACE=1` with `run.sh` to build the child node with `go build -race`
 and run scenario tests with `go test -race`; instrumenting only the test process
 does not instrument the separately built node.
 
 CI runs `bash tests-live/run.sh gate` (release acceptance: API mTLS, smoke,
 encryption, backup/restore, partitions, High/Low, files, upgrades,
-snapshot resync, crash recovery, discovery mesh, migration crash,
+snapshot resync, crash recovery, discovery mesh, typed migration concurrency,
 pause/resume, graceful shutdown, plus delete/crash/discovery/partition
 hardening, backup integrity, security posture, and
 subscription/migration suites — see the `GATE_SCENARIOS` comment in
-`run.sh` for the full list) on every push/PR, plus pure-Go (`modernc`) and `-race`
-matrices over `three-node-sync`, `rolling-restart`, and `partition`.
+`run.sh` for the full list) on every push/PR, plus a `-race`
+matrix over `three-node-sync`, `rolling-restart`, and `partition`.
 A privileged CI step runs the env-gated suites (`clock-skew` with
 libfaketime, `impaired-network` with tc/netem, `diskfull-live` with a
 tmpfs mount); locally they skip with a message when the capability is
@@ -74,14 +121,7 @@ directory and a private `MURMUR_BIN` path. Ephemeral ports need no isolation:
 the harness coordinates them across processes (and checkouts) with
 claim files under `${TMPDIR:-/tmp}/spedsql-portclaims` (4h TTL).
 
-Daemon scenarios spin up discrete node instances (e.g. `./node1`, `./node2`, `./node3`, `./node4`) running the internal test fixture binary (`tests-live/harness/testnode`) with isolated Pebble storage, certificates, log files (`node.log`), and HTTPS service/admin endpoints. API requests use a CA-signed client certificate; only `GET /healthz` permits a client without a certificate. Encrypted nodes start with `await-unlock = true` and receive their encryption key through the HTTPS Remote Unlock API (`/v1/admin/unlock`).
-
-Exception: the `gorm-sync`, `gorm-migrate`, and `gorm-tx` suites run
-their engines in-process (GORM requires an embedded engine handle)
-with isolated directories, generated cluster certificates, and the
-same on-disk encrypted state, replicating over real QUIC on
-localhost. All database access in those suites goes through the
-GORM dialect (`tests-live/gormharness` wraps each node).
+Daemon scenarios spin up discrete node instances (e.g. `./node1`, `./node2`, `./node3`, `./node4`) running the internal test fixture binary (`tests-live/harness/testnode`) with isolated Spool storage, certificates, log files (`node.log`), and HTTPS service/admin endpoints. API requests use a CA-signed client certificate; only `GET /healthz` permits a client without a certificate. Encrypted nodes start with `await-unlock = true` and receive their encryption key through the HTTPS Remote Unlock API (`/v1/admin/unlock`).
 
 Successful runtime directories under `tests-live/runtime/` are automatically removed. Failures are preserved under `tests-live/failures/<timestamp>-<scenario>/` with full node directories and log files for inspection.
 
@@ -101,7 +141,7 @@ find leftovers with `pgrep -af 'testnode agent --config <root>'`.
 
 ## Embedded startup progress
 
-`open-progress` populates encrypted Pebble, then opens it in fresh embedded
+`open-progress` populates encrypted Spool, then opens it in fresh embedded
 processes to validate progress callbacks, processed cells without a counting pass, committed rows,
 indexes, cancellation, failure reporting, and recovery through later reopens.
 It is included in `all` and `gate` and uses its own test worker binary.

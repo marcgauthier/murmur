@@ -14,21 +14,20 @@ package endurancechaos_test
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	mrand "math/rand"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
-
-const tableName = "endurance_rows"
 
 type enduranceConfig struct {
 	nodes         int
@@ -90,9 +89,11 @@ func TestEnduranceChaos(t *testing.T) {
 	cfg := loadConfig(t)
 
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "endurance-chaos",
-		NumNodes:    cfg.nodes,
-		AwaitUnlock: true,
+		Name:            "endurance-chaos",
+		NumNodes:        cfg.nodes,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 		// Aggressive retention keeps log GC running under the sustained
 		// workload and lets bounded offline windows force real snapshot
 		// resyncs instead of log catch-up.
@@ -101,14 +102,6 @@ func TestEnduranceChaos(t *testing.T) {
 			MaxOfflineLogRetentionMs: 20000,
 			MinRetainedBatches:       10,
 		},
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: tableName,
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-				{Name: "val", Type: schema.ColText, Nullable: true},
-			},
-		}}},
 	})
 
 	rep := newReporter(t)
@@ -119,8 +112,7 @@ func TestEnduranceChaos(t *testing.T) {
 		cfg.impairOn, cfg.impairOff, cfg.diskEvery, cfg.diskHold, cfg.skewDur)
 
 	// Baseline: one row everywhere before chaos starts.
-	if err := cluster.ExecSQL(0, "INSERT INTO "+tableName+" (id, name, val) VALUES (?, ?, ?)",
-		fmt.Sprintf("%032x", 0), "baseline", "baseline"); err != nil {
+	if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 0), Name: "baseline", Phone: "baseline"}); err != nil {
 		t.Fatalf("baseline insert: %v", err)
 	}
 	if err := waitAgreement(cluster, cfg.nodes, 1, 2*time.Minute); err != nil {
@@ -318,8 +310,7 @@ func TestEnduranceChaos(t *testing.T) {
 	}
 
 	// A post-chaos write must traverse the healed mesh.
-	if err := cluster.ExecSQL(0, "INSERT INTO "+tableName+" (id, name, val) VALUES (?, ?, ?)",
-		fmt.Sprintf("%032x", 999_999_999), "post-chaos", "post-chaos"); err != nil {
+	if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 999_999_999), Name: "post-chaos", Phone: "post-chaos"}); err != nil {
 		rep.verdict(false, cluster, "post-chaos write rejected")
 		t.Fatalf("post-chaos write: %v", err)
 	}
@@ -684,8 +675,7 @@ func calibrateSkew(t *testing.T, cluster *harness.Cluster, rep *reporter, idx in
 		cluster.UnlockNode(idx, cluster.Nodes[idx].KeyHex)
 		cluster.WaitNodeReady(idx)
 		probeID := fmt.Sprintf("%032x", 7000+i)
-		if err := cluster.ExecSQL(idx, "INSERT INTO "+tableName+" (id, name, val) VALUES (?, ?, ?)",
-			probeID, "skew-probe", spec); err != nil {
+		if err := cluster.TypedContentionInsert(idx, harness.TypedContentionRow{ID: probeID, Name: "skew-probe", Phone: spec}); err != nil {
 			rep.logf("skew preflight: spec %q probe write failed: %v", spec, err)
 			continue
 		}
@@ -779,8 +769,7 @@ func writerLoop(cluster *harness.Cluster, ctl *chaosControl, reg *idRegistry, re
 		case reg.len() < cfg.maxRows && roll < 0.7:
 			seq++
 			id := fmt.Sprintf("%08x%024x", w, seq)
-			err = cluster.ExecSQL(target, "INSERT INTO "+tableName+" (id, name, val) VALUES (?, ?, ?)",
-				id, fmt.Sprintf("writer-%d", w), fmt.Sprintf("v-%d-%d", w, seq))
+			err = cluster.TypedContentionInsert(target, harness.TypedContentionRow{ID: id, Name: fmt.Sprintf("writer-%d", w), Phone: fmt.Sprintf("v-%d-%d", w, seq)})
 			if err == nil {
 				reg.add(id)
 			}
@@ -790,14 +779,19 @@ func writerLoop(cluster *harness.Cluster, ctl *chaosControl, reg *idRegistry, re
 				continue
 			}
 			seq++
-			err = cluster.ExecSQL(target, "UPDATE "+tableName+" SET name = ?, val = ? WHERE id = ?",
-				fmt.Sprintf("writer-%d", w), fmt.Sprintf("u-%d-%d", w, seq), id)
+			// The typed API updates one field per call; name and val
+			// (Phone) land as two transactions. Convergence verdicts
+			// hash actual state, so the split is unobservable there.
+			err = cluster.TypedContentionUpdate(target, id, "name", fmt.Sprintf("writer-%d", w))
+			if err == nil {
+				err = cluster.TypedContentionUpdate(target, id, "phone", fmt.Sprintf("u-%d-%d", w, seq))
+			}
 		default:
 			id, ok := reg.pick(rng)
 			if !ok {
 				continue
 			}
-			err = cluster.ExecSQL(target, "DELETE FROM "+tableName+" WHERE id = ?", id)
+			err = cluster.TypedContentionDelete(target, id)
 			if err == nil {
 				reg.remove(id)
 			}
@@ -912,11 +906,12 @@ func statusLoop(cluster *harness.Cluster, ctl *chaosControl, rep *reporter, cfg 
 		case <-ticker.C:
 			min, max, down := -1, -1, 0
 			for i := range cluster.Nodes {
-				c, err := cluster.QueryRowCount(i, tableName)
+				rows, err := cluster.TypedContentionRows(i)
 				if err != nil {
 					down++
 					continue
 				}
+				c := len(rows)
 				if min < 0 || c < min {
 					min = c
 				}
@@ -924,12 +919,12 @@ func statusLoop(cluster *harness.Cluster, ctl *chaosControl, rep *reporter, cfg 
 					max = c
 				}
 			}
-			var pebbleMax, gcRuns, snaps int64
+			var spoolMax, gcRuns, snaps int64
 			var diskMin uint64
 			for i := range cluster.Nodes {
 				if body, err := scrapeMetrics(cluster.Nodes[i].APIAddr); err == nil {
-					if v, ok := metricInt(body, "spedsql_pebble_size_bytes"); ok && v > pebbleMax {
-						pebbleMax = v
+					if v, ok := metricInt(body, "spedsql_spool_disk_bytes"); ok && v > spoolMax {
+						spoolMax = v
 					}
 					runs, _ := metricInt(body, "spedsql_gc_runs_total")
 					coll, _ := metricInt(body, "spedsql_gc_log_collected_total")
@@ -948,15 +943,30 @@ func statusLoop(cluster *harness.Cluster, ctl *chaosControl, rep *reporter, cfg 
 			}
 			f := rep.faultSnapshot()
 			rep.logf("status: writes ok=%d err=%d | rows min=%d max=%d down=%d/%d | "+
-				"restart=%d rotate=%d impair=%d disk=%d snap=%d skew=%d | gcRuns=%d snaps=%d pebbleMax=%dMiB diskFreeMin=%dMiB",
+				"restart=%d rotate=%d impair=%d disk=%d snap=%d skew=%d | gcRuns=%d snaps=%d spoolMax=%dMiB diskFreeMin=%dMiB",
 				rep.succeeded.Load(), rep.failed.Load(), min, max, down, cfg.nodes,
 				f.restarts, f.rotations, f.impairCycles, f.diskCycles, f.snapshots, f.skews,
-				gcRuns, snaps, pebbleMax>>20, diskMin>>20)
+				gcRuns, snaps, spoolMax>>20, diskMin>>20)
 		}
 	}
 }
 
 // --- convergence waits ---
+
+// enduranceNodeState returns the row count and PK-ordered digest of the
+// typed contention table on one node.
+func enduranceNodeState(cluster *harness.Cluster, idx int) (int, string, error) {
+	rows, err := cluster.TypedContentionRows(idx)
+	if err != nil {
+		return 0, "", err
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	h := sha256.New()
+	for _, row := range rows {
+		fmt.Fprintf(h, "%s:%s:%s:%d\n", row.ID, row.Name, row.Phone, row.Score)
+	}
+	return len(rows), hex.EncodeToString(h.Sum(nil)), nil
+}
 
 func waitAgreement(cluster *harness.Cluster, nodes, want int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
@@ -964,13 +974,8 @@ func waitAgreement(cluster *harness.Cluster, nodes, want int, timeout time.Durat
 		ok := true
 		var first string
 		for i := 0; i < nodes; i++ {
-			n, err := cluster.QueryRowCount(i, tableName)
+			n, d, err := enduranceNodeState(cluster, i)
 			if err != nil || n != want {
-				ok = false
-				break
-			}
-			d, err := cluster.ComputeTableDigest(i, tableName, "id")
-			if err != nil {
 				ok = false
 				break
 			}
@@ -999,9 +1004,8 @@ func waitConverged(cluster *harness.Cluster, nodes int, timeout time.Duration) (
 		digests = make([]string, nodes)
 		ok := true
 		for i := 0; i < nodes; i++ {
-			n, qerr := cluster.QueryRowCount(i, tableName)
-			d, derr := cluster.ComputeTableDigest(i, tableName, "id")
-			if qerr != nil || derr != nil {
+			n, d, serr := enduranceNodeState(cluster, i)
+			if serr != nil {
 				ok = false
 				break
 			}
@@ -1018,13 +1022,10 @@ func waitConverged(cluster *harness.Cluster, nodes int, timeout time.Duration) (
 	counts = make([]int, nodes)
 	digests = make([]string, nodes)
 	for i := 0; i < nodes; i++ {
-		n, qerr := cluster.QueryRowCount(i, tableName)
-		d, derr := cluster.ComputeTableDigest(i, tableName, "id")
-		if qerr != nil {
+		n, d, serr := enduranceNodeState(cluster, i)
+		if serr != nil {
 			n = -1
-		}
-		if derr != nil {
-			d = "unreachable:" + derr.Error()
+			d = "unreachable:" + serr.Error()
 		}
 		counts[i], digests[i] = n, d
 	}

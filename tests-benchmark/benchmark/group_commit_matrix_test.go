@@ -13,15 +13,14 @@ import (
 
 	replicateddb "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/internal/testidentity"
-	"github.com/marcgauthier/murmur/schema"
 )
 
 // TestGroupCommitDurabilityMatrix compares acknowledged single-row write
 // throughput across durability configurations on one encrypted database:
-// synchronous group commit (default) against asynchronous mode (ten-second
-// interval plus ten-megabyte size trigger) with group settings present and
-// absent. Group commit is inactive in asynchronous mode, so the two async
-// arms should measure alike; they are both present to prove it.
+// synchronous (default) against asynchronous mode (ten-second interval
+// plus ten-megabyte size trigger) with group settings present and absent.
+// Group metrics are vestigial on the typed path (no grouper); the arms
+// compare sync-vs-async durability.
 //
 // Every case reopens the store and checks the durable row count: async arms
 // rely on the scheduled syncs plus the graceful-close final sync.
@@ -71,6 +70,10 @@ func runDurabilityMatrixCase(t *testing.T, durability replicateddb.DurabilityCon
 			_ = db.Close()
 		}
 	}()
+	table, err := replicateddb.TableOf[writerBenchRow](db, "writer_bench")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	type result struct {
 		writes int
@@ -87,11 +90,19 @@ func runDurabilityMatrixCase(t *testing.T, durability replicateddb.DurabilityCon
 			<-startGate
 			var writes int
 			for time.Now().Before(deadline) {
-				var id [16]byte
+				var id replicateddb.RowID
 				binary.BigEndian.PutUint64(id[:8], uint64(worker+1))
 				binary.BigEndian.PutUint64(id[8:], uint64(writes+1))
-				if _, err := db.ExecContext(ctx,
-					`INSERT INTO writer_bench (id, val) VALUES (?, ?)`, id[:], "durability-matrix"); err != nil {
+				tx, err := db.BeginTx(ctx)
+				if err != nil {
+					results <- result{writes: writes, err: fmt.Errorf("writer %d: %w", worker+1, err)}
+					return
+				}
+				if err := table.Insert(tx, &writerBenchRow{ID: id, Val: "durability-matrix"}); err != nil {
+					results <- result{writes: writes, err: fmt.Errorf("writer %d: %w", worker+1, err)}
+					return
+				}
+				if err := tx.Commit(); err != nil {
 					results <- result{writes: writes, err: fmt.Errorf("writer %d: %w", worker+1, err)}
 					return
 				}
@@ -135,8 +146,12 @@ func runDurabilityMatrixCase(t *testing.T, durability replicateddb.DurabilityCon
 	if err != nil {
 		t.Fatalf("reopen after writes: %v", err)
 	}
-	var count int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM writer_bench`).Scan(&count); err != nil {
+	table, err = replicateddb.TableOf[writerBenchRow](db, "writer_bench")
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, err := table.Where().Count()
+	if err != nil {
 		t.Fatal(err)
 	}
 	if count != total {
@@ -152,14 +167,9 @@ func matrixBenchConfig(path string, durability replicateddb.DurabilityConfig) re
 		Path:          path,
 		NodeID:        node,
 		OriginSigning: testidentity.Config(node),
-		Schema: replicateddb.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "writer_bench", Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "val", Type: schema.ColText},
-			},
-		}}},
-		Pebble:     replicateddb.DefaultPebbleConfig(),
-		Durability: durability,
+		Tables:        mustWriterBenchTables(),
+		Spool:         replicateddb.DefaultSpoolConfig(),
+		Durability:    durability,
 		Encryption: replicateddb.EncryptionConfig{
 			Key: bytes.Clone(benchKey), KeyID: "bench",
 		},

@@ -1,20 +1,18 @@
 # release-upgrade
 
-Unsigned previous-release peers cannot interoperate with signed protocol v4.
-The suite checks out `MURMUR_PREV_REF` into a scratch worktree, builds its daemon,
-and verifies a coordinated offline cutover, explicit legacy-store migration,
-and legacy-backup restore followed by migration. All current nodes use separate
-Ed25519 origin identities; historical public keys remain available after restore.
+Previous-release peers cannot interoperate with the current signed protocol.
+The suite checks out `MURMUR_PREV_REF` into a scratch worktree and builds its
+daemon. The current binary must reject stores and backups from the legacy
+Pebble format without treating them as current RIME data. Legacy rows are
+seeded through the previous binary only; migration into the new RIME schema is
+not performed in place.
 
 Tests:
 
-- `TestCoordinatedSignedCutoverLosesNoWrites`: legacy writers converge, all stop,
-  and every store migrates explicitly before the signed cluster resumes. Baseline
-  digests remain identical and new signed writes replicate from every node.
-- `TestNewBinaryOpensOldStore`: migrate a stopped legacy store with the fixture's
-  offline `migrate-origin-baseline` command, then verify identical data.
-- `TestOldBackupRestoresOnNewBinary`: restore an old backup under a fresh identity,
-  provision its signing key, migrate its trusted baseline, and verify all rows.
+- `TestNewBinaryRejectsOldPebbleStore`: seed with the previous daemon and verify
+  the current storage engine refuses the legacy directory.
+- `TestOldBackupRejectedOnNewBinary`: verify restore refuses a backup from the
+  old storage format.
 
 Requirements: a git checkout containing the previous ref (CI uses
 `fetch-depth: 0`; a shallow clone fails with an actionable message).
@@ -23,5 +21,7 @@ in `release_upgrade_test.go` to the last release commit on every
 release.
 
 Knobs: `MURMUR_PREV_REF` (previous revision under test),
-`MURMUR_TAGS` (backend tags for the old build, same default as the
-harness).
+`MURMUR_TAGS` (backend tags for the old build; defaults to
+`sqlite_preupdate_hook` for the pinned release). Because that historical
+binary uses SQLite, run this compatibility fixture with CGO enabled. Current
+typed RIME live scenarios are separately compiled with CGO disabled.

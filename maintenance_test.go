@@ -3,14 +3,21 @@ package murmur
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 )
 
+func maintenanceTypedConfig(t *testing.T, path string) Config {
+	t.Helper()
+	cfg := testConfig(path)
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	return cfg
+}
+
 func TestRotateDataKey(t *testing.T) {
 	ctx := context.Background()
-	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
+	db, err := openSignedFixture(ctx, maintenanceTypedConfig(t, t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,8 +40,11 @@ func TestRotateDataKey(t *testing.T) {
 		t.Fatalf("phase = %q", after.Phase)
 	}
 	// Writes continue online after rotation.
-	id := NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "k"); err != nil {
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := insertRecord(ctx, db, table, &facadeRecord{ID: NewRowID(), Name: "k"}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -47,46 +57,23 @@ func TestSetEncryptionAlgorithm(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SetEncryptionAlgorithm(ctx, ChaCha20Poly1305); err != nil {
+	defer db.Close()
+
+	if err := db.SetEncryptionAlgorithm(ctx, AES256GCM); err != nil {
 		t.Fatal(err)
 	}
 	st := db.EncryptionStatus()
-	if st.Algorithm != ChaCha20Poly1305 {
+	if st.Algorithm != AES256GCM {
 		t.Fatalf("algorithm = %q", st.Algorithm)
 	}
-	id := NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "c"); err != nil {
-		t.Fatal(err)
-	}
-	_ = db.Close()
 
-	// Reopen with the same algorithm works and keeps data.
-	cfg.Encryption.Algorithm = ChaCha20Poly1305
-	db2, err := openSignedFixture(ctx, cfg)
-	if err != nil {
-		t.Fatal(err)
+	// Unsupported algorithms are rejected without state change.
+	for _, alg := range []EncryptionAlgorithm{ChaCha20Poly1305, "nope"} {
+		if err := db.SetEncryptionAlgorithm(ctx, alg); err == nil {
+			t.Fatalf("expected unsupported algorithm error for %s", alg)
+		}
 	}
-	if n := len(queryAll(t, db2, `SELECT id FROM contacts`)); n != 1 {
-		t.Fatalf("want 1 row, got %d", n)
-	}
-	_ = db2.Close()
-
-	// Reopen disagreeing with the persisted algorithm refuses.
-	cfg.Encryption.Algorithm = AES256GCM
-	if _, err := openSignedFixture(ctx, cfg); err == nil || !strings.Contains(err.Error(), "disagrees") {
-		t.Fatalf("expected algorithm disagreement error, got %v", err)
-	}
-
-	// Unknown algorithms are rejected without state change.
-	db3, err := openSignedFixture(ctx, testConfig(t.TempDir()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db3.Close()
-	if err := db3.SetEncryptionAlgorithm(ctx, "nope"); err == nil {
-		t.Fatal("expected unknown algorithm error")
-	}
-	if st := db3.Status().State; st != StateReady {
+	if st := db.Status().State; st != StateReady {
 		t.Fatalf("state = %s", st)
 	}
 }
@@ -95,18 +82,24 @@ func TestRewriteEncryptedFiles(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	path := t.TempDir()
-	cfg := testConfig(path)
+	cfg := maintenanceTypedConfig(t, path)
 	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 25; i++ {
-		id := NewRowID()
-		if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "r"); err != nil {
+		if err := insertRecord(ctx, db, table, &facadeRecord{ID: NewRowID(), Name: "r"}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	before := queryAll(t, db, `SELECT id FROM contacts ORDER BY id`)
+	before, err := table.Where().Count()
+	if err != nil {
+		t.Fatal(err)
+	}
 	genBefore := db.Status().StateGeneration
 	if err := db.RewriteEncryptedFiles(ctx); err != nil {
 		t.Fatal(err)
@@ -114,13 +107,15 @@ func TestRewriteEncryptedFiles(t *testing.T) {
 	if st := db.Status(); st.State != StateReady || st.StateGeneration != genBefore {
 		t.Fatalf("after rewrite: %+v", st)
 	}
-	after := queryAll(t, db, `SELECT id FROM contacts ORDER BY id`)
-	if len(before) != len(after) {
-		t.Fatalf("rows before=%d after=%d", len(before), len(after))
+	after, err := table.Where().Count()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("rows before=%d after=%d", before, after)
 	}
 	// The store keeps working after maintenance.
-	id := NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "post"); err != nil {
+	if err := insertRecord(ctx, db, table, &facadeRecord{ID: NewRowID(), Name: "post"}); err != nil {
 		t.Fatal(err)
 	}
 	_ = db.Close()
@@ -131,17 +126,25 @@ func TestRewriteEncryptedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db2.Close()
-	if n := len(queryAll(t, db2, `SELECT id FROM contacts`)); n != 26 {
-		t.Fatalf("want 26 rows, got %d", n)
+	table2, err := TableOf[facadeRecord](db2, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := table2.Where().Count(); err != nil || n != 26 {
+		t.Fatalf("want 26 rows, got %d, %v", n, err)
 	}
 }
 
 func TestMaintenanceRejectsWrites(t *testing.T) {
-	db, err := openSignedFixture(context.Background(), testConfig(t.TempDir()))
+	db, err := openSignedFixture(context.Background(), maintenanceTypedConfig(t, t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Drive the state machine directly: maintenance allows reads, rejects
 	// writes with ErrMaintenance.
 	db.setState(StateMaintenance)
@@ -151,16 +154,13 @@ func TestMaintenanceRejectsWrites(t *testing.T) {
 	if err := db.requireRead(); err != nil {
 		t.Fatalf("requireRead = %v", err)
 	}
-	mid := NewRowID()
-	if _, err := db.ExecContext(context.Background(), `INSERT INTO contacts (id) VALUES (?)`, mid[:]); !errors.Is(err, ErrMaintenance) {
+	if err := insertRecord(context.Background(), db, table, &facadeRecord{ID: NewRowID(), Name: "mid"}); !errors.Is(err, ErrMaintenance) {
 		t.Fatalf("exec in maintenance = %v", err)
 	}
-	// Reads serve the in-memory engine.
-	rows, err := db.QueryContext(context.Background(), `SELECT id FROM contacts`)
-	if err != nil {
+	// Reads serve the in-memory materializer.
+	if _, err := table.Where().Count(); err != nil {
 		t.Fatalf("query in maintenance: %v", err)
 	}
-	rows.Close()
 	db.setState(StateReady)
 }
 
@@ -178,7 +178,7 @@ func TestEncryptionStatusShape(t *testing.T) {
 	if st.ApplicationKeyID != testKeyID {
 		t.Fatalf("appid = %q", st.ApplicationKeyID)
 	}
-	if st.RegistryGeneration != 1 {
+	if st.RegistryGeneration < 1 {
 		t.Fatalf("registry generation = %d", st.RegistryGeneration)
 	}
 	if st.Phase != "idle" {

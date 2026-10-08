@@ -14,64 +14,58 @@ Design risks, non-negotiable architecture invariants, and security review requir
 
 ## 78. Key Risks
 
-### Risk 1: SQLite driver integration
+### Risk 1: Durable commit and RIME publication ordering
 
 Mitigation:
 
-- Prove it first.
-- Pin the mattn driver and use its bundled SQLite build with pre-update
-  capture and FTS5 enabled.
-- Test the default CGO build and optional modernc build in CI on supported OSes.
+- Commit accepted mutations to Spool before acknowledging synchronous writes.
+- Publish candidates in commit order and rebuild RIME from authoritative state after an uncertain publication.
+- Resolve ambiguous outcomes by transaction receipt and exercise process-kill boundaries.
 
-### Risk 2: In-memory SQL connection model
-
-Mitigation:
-
-- Validate connection behavior in Phase 0.
-- Start with one controlled handle if necessary.
-
-### Risk 3: Cross-engine transaction boundary
+### Risk 2: Duplicate in-memory state
 
 Mitigation:
 
-- Pebble authoritative.
-- Do not ACK before Pebble.
-- Mark/rebuild the SQLite materialization on post-SQL/pre-Pebble failures.
-- TxID idempotency.
-- Heavy crash injection.
+- Budget the Spool state index and RIME records, indexes, and MVCC history separately.
+- Measure representative rich records, snapshots, and pinned readers.
+- Bound transient queues, snapshot staging, and transaction reassembly.
 
-### Risk 4: Unique constraints and foreign keys
+### Risk 3: Optimistic conflicts and group commit
 
 Mitigation:
 
-- Restrict v1 schema.
-- Add distributed semantics only deliberately.
+- Keep same-row conflicts retryable before durability.
+- Preserve Spool sequence and RIME publication order across groups.
+- Test contended LWW and CRDT operations, shared-fsync failures, close, cancellation, and restart.
 
-### Risk 5: Unbounded replication log
-
-Mitigation:
-
-- watermarks
-- peer retirement
-- retention window
-- snapshot resync
-
-### Risk 6: Very large startup rebuild
+### Risk 4: Replicated constraints
 
 Mitigation:
 
-- optimized current-state scan
-- bounded multi-row inserts with at most 900 bind parameters per statement and
-  transaction commits in groups of at most 5,000 rows
-- indexes after load
-- optional disposable persistent materialization later
+- Restrict guarantees that cannot be preserved under offline writes.
+- Add distributed uniqueness or referential semantics only with explicit conflict rules.
 
-### Risk 7: Encrypted VFS and key rotation correctness
+### Risk 5: Unbounded replication history
+
+Mitigation:
+
+- Use persisted watermarks, peer retirement, retention windows, and snapshot resync.
+- Do not let SWIM suspicion release durable retention obligations.
+
+### Risk 6: Large startup rebuild
+
+Mitigation:
+
+- Scan current Spool state once into a private RIME generation.
+- Measure rebuild time and retained heap across representative cardinalities and rich values.
+- Publish only after the private materializer is complete.
+
+### Risk 7: Encrypted storage and key rotation
 
 Mitigation:
 
 - Test authenticated registry rewrap and directory sync independently.
-- Test resumable VFS rewrites, links/checkpoints, and key-reference accounting.
+- Test resumable rewrites, links/checkpoints, and key-reference accounting.
 - Retain historical keys until verified reference inventories allow retirement.
 
 ### Risk 8: Membership traffic starvation or accidental full mesh
@@ -91,11 +85,11 @@ Treat these as non-negotiable.
 
 ### Invariant A
 
-Pebble current state can recreate the complete replicated SQL-visible state.
+Spool current state can recreate the complete replicated typed-record state in RIME.
 
 ### Invariant B
 
-SQLite contains no unique authoritative user data.
+RIME contains no unique authoritative user data; Spool is authoritative.
 
 ### Invariant C
 
@@ -107,7 +101,7 @@ Conflict resolution does not depend on message arrival order.
 
 ### Invariant E
 
-Replication acknowledgements are sent only after Pebble durability.
+Replication acknowledgements are sent only after Spool durability.
 
 ### Invariant F
 
@@ -191,7 +185,7 @@ Before stable release:
 - no secrets in panic output where avoidable.
 - wrong storage key fails closed.
 - schema mismatch fails closed.
-- Pebble directory permissions.
+- Spool directory permissions.
 - certificate/key file permissions.
 - fuzz replication decoder.
 - fuzz snapshot decoder.

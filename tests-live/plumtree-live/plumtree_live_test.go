@@ -10,35 +10,22 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
-func schemaConfig() *db.SchemaConfig {
-	return &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-		Name: "pt_rows",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-		},
-	}}}
-}
-
 func TestPlumtreeMeshConverges(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "plumtree-live",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		Replication: &harness.ReplicationOptions{Dissemination: "plumtree"},
-		Schema:      schemaConfig(),
+		Name:         "plumtree-live",
+		NumNodes:     3,
+		AwaitUnlock:  true,
+		Replication:  &harness.ReplicationOptions{Dissemination: "plumtree"},
+		TypedRecords: true,
 	})
 	for i := 0; i < 10; i++ {
-		if err := cluster.ExecSQL(0, "INSERT INTO pt_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 11000+i), fmt.Sprintf("p-%d", i)); err != nil {
+		if err := cluster.TypedInsert(0, fmt.Sprintf("plum-%d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -56,21 +43,22 @@ func TestMixedModeRefusesGossipPeer(t *testing.T) {
 			1: "plumtree",
 			2: "gossip",
 		},
-		Schema: schemaConfig(),
+		TypedRecords: true,
 	})
 	for i := 0; i < 10; i++ {
-		if err := cluster.ExecSQL(0, "INSERT INTO pt_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 12000+i), fmt.Sprintf("p-%d", i)); err != nil {
+		if err := cluster.TypedInsert(0, fmt.Sprintf("mixed-plum-%d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := cluster.ExecSQL(2, "INSERT INTO pt_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 12999), "gossip-only"); err != nil {
+	if err := cluster.TypedInsert(2, "gossip-only"); err != nil {
 		t.Fatal(err)
 	}
 	// The Plumtree pair converges; the gossip node stays isolated.
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		n0, _ := cluster.QueryRowCount(0, "pt_rows")
-		n1, _ := cluster.QueryRowCount(1, "pt_rows")
+		names0, _ := cluster.TypedNames(0)
+		names1, _ := cluster.TypedNames(1)
+		n0, n1 := len(names0), len(names1)
 		if n0 == 10 && n1 == 10 {
 			break
 		}
@@ -78,7 +66,8 @@ func TestMixedModeRefusesGossipPeer(t *testing.T) {
 	}
 	time.Sleep(5 * time.Second) // let any leak arrive
 	for i, want := range []int{10, 10, 1} {
-		if n, _ := cluster.QueryRowCount(i, "pt_rows"); n != want {
+		names, _ := cluster.TypedNames(i)
+		if n := len(names); n != want {
 			t.Fatalf("node %d count = %d, want %d (mode isolation broken?)", i, n, want)
 		}
 	}
@@ -97,21 +86,16 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
-		var first string
+		var first []string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "pt_rows")
-			if err != nil || n != want {
-				ok = false
-				break
-			}
-			d, err := c.ComputeTableDigest(i, "pt_rows", "name")
-			if err != nil {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
 			if i == 0 {
-				first = d
-			} else if d != first {
+				first = names
+			} else if !sameNames(names, first) {
 				ok = false
 				break
 			}
@@ -122,6 +106,18 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("nodes did not converge on %d rows within %v", want, timeout)
+}
+
+func sameNames(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func metricValue(t *testing.T, apiAddr, name string) float64 {
@@ -135,16 +131,8 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if !strings.HasPrefix(line, name+" ") && !strings.HasPrefix(line, name+"{") {
-			continue
-		}
-		fields := strings.Fields(line)
-		var v float64
-		if _, err := fmt.Sscanf(fields[len(fields)-1], "%g", &v); err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		return v
+	if value, ok := harness.MetricValueFrom(string(raw), name); ok {
+		return value
 	}
 	t.Fatalf("metric %s not found", name)
 	return 0

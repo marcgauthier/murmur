@@ -8,6 +8,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/marcgauthier/murmur/schema"
 )
 
 func TestClient_Operations(t *testing.T) {
@@ -22,41 +24,20 @@ func TestClient_Operations(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"admin": true, "connections": 5})
 	})
-
-	mux.HandleFunc("/v1/query", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/admin/gc", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		var req map[string]string
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		if req["query"] == "SELECT error" {
-			http.Error(w, "syntax error", http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(QueryResult{
-			Columns: []string{"id", "val"},
-			Rows:    [][]string{{"1", "a"}},
-		})
+		w.WriteHeader(http.StatusOK)
 	})
-
-	mux.HandleFunc("/v1/exec", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
+	mux.HandleFunc("/v1/schema", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		var req map[string]string
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		if req["query"] == "INVALID" {
-			http.Error(w, "exec failed", http.StatusInternalServerError)
-			return
-		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(ExecResult{
-			RowsAffected: 1,
-			LastInsertID: 42,
-		})
+		_ = json.NewEncoder(w).Encode([]schema.TableSchema{{ID: 7, Name: "records", PK: 1, Columns: []schema.ColumnSchema{{ID: 1, Name: "id", Type: schema.ColBlob}}}})
 	})
 
 	mux.HandleFunc("/v1/debug/peers", func(w http.ResponseWriter, r *http.Request) {
@@ -92,28 +73,15 @@ func TestClient_Operations(t *testing.T) {
 	if err != nil || adminStatus["admin"] != true {
 		t.Errorf("AdminStatus failed: %v, status: %v", err, adminStatus)
 	}
-
-	// 4. Query Success & Error
-	qRes, err := cli.Query(ctx, "SELECT 1")
-	if err != nil || len(qRes.Rows) != 1 {
-		t.Errorf("Query failed: %v, res: %v", err, qRes)
+	if err := cli.TriggerGC(ctx); err != nil {
+		t.Errorf("TriggerGC failed: %v", err)
 	}
-	_, err = cli.Query(ctx, "SELECT error")
-	if err == nil {
-		t.Errorf("expected Query error, got nil")
+	tables, err := cli.SchemaTables(ctx)
+	if err != nil || len(tables) != 1 || tables[0].Name != "records" || tables[0].Columns[0].ID != 1 {
+		t.Errorf("SchemaTables failed: %v, tables: %+v", err, tables)
 	}
 
-	// 5. Exec Success & Error
-	eRes, err := cli.Exec(ctx, "INSERT INTO t VALUES (1)")
-	if err != nil || eRes.RowsAffected != 1 {
-		t.Errorf("Exec failed: %v, res: %v", err, eRes)
-	}
-	_, err = cli.Exec(ctx, "INVALID")
-	if err == nil {
-		t.Errorf("expected Exec error, got nil")
-	}
-
-	// 6. DebugPeers
+	// 4. DebugPeers
 	peers, err := cli.DebugPeers(ctx)
 	if err != nil || len(peers) != 1 {
 		t.Errorf("DebugPeers failed: %v, peers: %v", err, peers)
@@ -167,12 +135,6 @@ func TestClient_ErrorsAndFallbacks(t *testing.T) {
 	if _, err := failCli.Status(ctx); err == nil {
 		t.Errorf("expected Status error on 500")
 	}
-	if _, err := failCli.Query(ctx, "SELECT 1"); err == nil {
-		t.Errorf("expected Query error on 500")
-	}
-	if _, err := failCli.Exec(ctx, "INSERT 1"); err == nil {
-		t.Errorf("expected Exec error on 500")
-	}
 
 	// JSON decode errors (server returns 200 with invalid JSON body)
 	corruptTs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -188,12 +150,6 @@ func TestClient_ErrorsAndFallbacks(t *testing.T) {
 	}
 	if _, err := corruptCli.AdminStatus(ctx); err == nil {
 		t.Errorf("expected AdminStatus decode error")
-	}
-	if _, err := corruptCli.Query(ctx, "SELECT 1"); err == nil {
-		t.Errorf("expected Query decode error")
-	}
-	if _, err := corruptCli.Exec(ctx, "INSERT 1"); err == nil {
-		t.Errorf("expected Exec decode error")
 	}
 	if _, err := corruptCli.DebugPeers(ctx); err == nil {
 		t.Errorf("expected DebugPeers decode error")

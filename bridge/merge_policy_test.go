@@ -2,47 +2,60 @@ package bridge
 
 import (
 	"context"
-	"math/big"
 	"testing"
 
 	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/internal/testdb"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/internal/testidentity"
 )
 
 // Exercise the actual capture, signed envelope, import and provenance paths.
 func TestPolicyBundleReplayAcrossStreamsAndHighOwnership(t *testing.T) {
 	ctx := context.Background()
-	tables := []schema.TableSchema{{Name: "items", Columns: []schema.ColumnSchema{{Name: "id", Type: schema.ColBlob}, {Name: "count", Type: schema.ColText, MergePolicy: schema.PN_COUNTER}, {Name: "tags", Type: schema.ColText, MergePolicy: schema.OR_SET}, {Name: "maxv", Type: schema.ColInteger, MergePolicy: schema.MAX}}}}
-	open := func() (*db.DB, db.DBID) {
-		cfg := testdb.Configure(db.Config{Path: t.TempDir(), DBID: db.NewDBID(), NodeID: db.NewNodeID(), Encryption: db.EncryptionConfig{Key: make([]byte, 32), KeyID: "test"}, Schema: db.SchemaConfig{Version: 1, Tables: tables}})
+	options := db.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "Count": 2, "Tags": 3, "Peak": 4},
+		MergePolicies: map[string]db.RecordMergePolicy{
+			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax,
+		},
+	}
+	definition, err := db.Define[typedBridgeCRDTRecord]("items", 93, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := func(databaseID db.DBID) (*db.DB, *db.RecordTable[typedBridgeCRDTRecord]) {
+		node := db.NewNodeID()
+		cfg := db.Config{Path: t.TempDir(), NodeID: node, DBID: databaseID, OriginSigning: testidentity.Config(node),
+			Encryption: db.EncryptionConfig{Key: make([]byte, 32), KeyID: "test"}, Tables: []db.TableDefinition{definition}}
 		d, err := db.Open(ctx, cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { d.Close() })
-		return d, cfg.DBID
+		table, err := db.TableOf[typedBridgeCRDTRecord](d, "items")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d, table
 	}
-	low, domain := open()
-	high, _ := open()
+	low, lowTable := open(db.NewDBID())
+	high, highTable := open(db.NewDBID())
+	domain := low.DBID()
 	row := db.NewRowID()
-	if _, err := low.ExecContext(ctx, "INSERT INTO items VALUES (?, '0','[]',10)", row[:]); err != nil {
+	if err := low.WriteTxContext(ctx, func(tx *db.Tx) error {
+		return lowTable.Insert(tx, &typedBridgeCRDTRecord{ID: row, Peak: 10})
+	}); err != nil {
 		t.Fatal(err)
 	}
-	tx, err := low.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = tx.CounterAdd(ctx, "items", "count", row, big.NewInt(10)); err != nil {
-		t.Fatal(err)
-	}
-	if err = tx.CounterAdd(ctx, "items", "count", row, big.NewInt(2)); err != nil {
-		t.Fatal(err)
-	}
-	if err = tx.SetAdd(ctx, "items", "tags", row, db.SetString("red")); err != nil {
-		t.Fatal(err)
-	}
-	if err = tx.Commit(); err != nil {
+	if err := low.WriteTxContext(ctx, func(tx *db.Tx) error {
+		if err := db.RecordCounterAdd(tx, lowTable, row, "Count", 10); err != nil {
+			return err
+		}
+		if err := db.RecordCounterAdd(tx, lowTable, row, "Count", 2); err != nil {
+			return err
+		}
+		return db.RecordSetAdd(tx, lowTable, row, "Tags", "red")
+	}); err != nil {
 		t.Fatal(err)
 	}
 	outbox, err := OpenOutbox(t.TempDir(), Limits{})
@@ -93,59 +106,73 @@ func TestPolicyBundleReplayAcrossStreamsAndHighOwnership(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	check := func(count, tags string, max int64) {
+	check := func(count int64, tags []string, max int64) {
 		t.Helper()
-		var c, s string
-		var m int64
-		if err := high.QueryRowContext(ctx, "SELECT count,tags,maxv FROM items WHERE id=?", row[:]).Scan(&c, &s, &m); err != nil {
+		got, err := highTable.Get(row)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if c != count || s != tags || m != max {
-			t.Fatalf("got %s %s %d, want %s %s %d", c, s, m, count, tags, max)
+		if got.Count != count || len(got.Tags) != len(tags) || got.Peak != max {
+			t.Fatalf("got %+v, want count=%d tags=%v peak=%d", got, count, tags, max)
+		}
+		for i := range tags {
+			if got.Tags[i] != tags[i] {
+				t.Fatalf("got tags %v, want %v", got.Tags, tags)
+			}
 		}
 	}
 	deliver("s")
 	deliver("other")
-	check("12", `[{"type":"string","value":"red"}]`, 10)
-	tx, err = high.BeginTx(ctx, nil)
-	if err != nil {
+	check(12, []string{"red"}, 10)
+	if err := high.WriteTxContext(ctx, func(tx *db.Tx) error {
+		if err := db.RecordCounterAdd(tx, highTable, row, "Count", 3); err != nil {
+			return err
+		}
+		if err := db.RecordSetAdd(tx, highTable, row, "Tags", "high"); err != nil {
+			return err
+		}
+		return db.RecordMax(tx, highTable, row, "Peak", int64(5))
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if err = tx.CounterAdd(ctx, "items", "count", row, big.NewInt(3)); err != nil {
-		t.Fatal(err)
+	check(15, []string{"high", "red"}, 10)
+	peer, peerTable := open(high.DBID())
+	defer peer.Close()
+	last, err := high.ScanReplicationLog(ctx, high.NodeID(), 1, 100, 4<<20, func(batch *codec.MutationBatch) error {
+		return peer.ApplyRemote(ctx, batch)
+	})
+	if err != nil || last == 0 {
+		t.Fatalf("replicate typed bridge ownership: last sequence=%d err=%v", last, err)
 	}
-	if err = tx.SetAdd(ctx, "items", "tags", row, db.SetString("high")); err != nil {
-		t.Fatal(err)
+	peerValue, err := peerTable.Get(row)
+	if err != nil || peerValue.Count != 15 || len(peerValue.Tags) != 2 || peerValue.Peak != 10 {
+		t.Fatalf("replicated typed bridge row=%+v err=%v", peerValue, err)
 	}
-	if _, err = tx.ExecContext(ctx, "UPDATE items SET maxv=5 WHERE id=?", row[:]); err != nil {
-		t.Fatal(err)
+	rowPolicy, ok, err := peer.BridgeRowProvenance("items", row)
+	if err != nil || !ok || rowPolicy.SourceDomain != domain || rowPolicy.Stream != "other" {
+		t.Fatalf("replicated typed row provenance=%+v present=%v err=%v", rowPolicy, ok, err)
 	}
-	if err = tx.Commit(); err != nil {
-		t.Fatal(err)
+	fieldPolicy, ok, err := peer.BridgeFieldProvenance("items", row, "Count")
+	if err != nil || !ok || fieldPolicy.Owner != db.BridgeOwnerHigh {
+		t.Fatalf("replicated typed field provenance=%+v present=%v err=%v", fieldPolicy, ok, err)
 	}
-	check("15", `[{"type":"string","value":"red"},{"type":"string","value":"high"}]`, 10)
-	tx, err = low.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = tx.CounterAdd(ctx, "items", "count", row, big.NewInt(8)); err != nil {
-		t.Fatal(err)
-	}
-	if err = tx.SetRemove(ctx, "items", "tags", row, db.SetString("red")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = tx.ExecContext(ctx, "UPDATE items SET maxv=20 WHERE id=?", row[:]); err != nil {
-		t.Fatal(err)
-	}
-	if err = tx.Commit(); err != nil {
+	if err := low.WriteTxContext(ctx, func(tx *db.Tx) error {
+		if err := db.RecordCounterAdd(tx, lowTable, row, "Count", 8); err != nil {
+			return err
+		}
+		if err := db.RecordSetRemove(tx, lowTable, row, "Tags", "red"); err != nil {
+			return err
+		}
+		return db.RecordMax(tx, lowTable, row, "Peak", int64(20))
+	}); err != nil {
 		t.Fatal(err)
 	}
 	deliver("s")
-	check("15", `[{"type":"string","value":"red"},{"type":"string","value":"high"}]`, 10)
-	for _, column := range []string{"count", "tags", "maxv"} {
+	check(15, []string{"high", "red"}, 10)
+	for _, column := range []string{"Count", "Tags", "Peak"} {
 		if err = high.ReleaseBridgeOwnership(ctx, "items", row, column); err != nil {
 			t.Fatal(err)
 		}
 	}
-	check("20", "[]", 20)
+	check(20, nil, 20)
 }

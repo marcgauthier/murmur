@@ -1,18 +1,17 @@
 package gcbalance
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
-	"strings"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -27,31 +26,26 @@ import (
 // is unimplemented); only version churn is asserted.
 func TestLogGCKeepsUpWithChurn(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "gc-balance",
-		NumNodes:    3,
-		AwaitUnlock: true,
+		Name:            "gc-balance",
+		NumNodes:        3,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 		Replication: &harness.ReplicationOptions{
 			MinLogRetentionMs:        1000,
 			MaxOfflineLogRetentionMs: 20000,
 			MinRetainedBatches:       10,
 		},
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "gc_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
 	})
 
 	const keys = 200
 	for i := 0; i < keys; i++ {
 		id := fmt.Sprintf("%032x", i)
-		if err := cluster.ExecSQL(0, "INSERT INTO gc_rows (id, name) VALUES (?, ?)", id, "v-0"); err != nil {
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: id, Name: "v-0"}); err != nil {
 			t.Fatalf("seed %d: %v", i, err)
 		}
 	}
-	waitAllCounts(t, cluster, "gc_rows", keys, 60*time.Second)
+	waitAllCounts(t, cluster, keys, 60*time.Second)
 
 	// Eight updaters over disjoint key ranges: a single sequential
 	// updater cannot sustain enough churn on a loaded box (a full
@@ -74,11 +68,7 @@ func TestLogGCKeepsUpWithChurn(t *testing.T) {
 				for lo := w * keys / updaters; !stopped.Load(); round++ {
 					for i := lo; i < lo+keys/updaters && !stopped.Load(); i++ {
 						id := fmt.Sprintf("%032x", i)
-						// Params, not Sprintf: id is a BLOB column and the
-						// engine converts hex params to blobs, while an
-						// inline 'hex' literal is TEXT and never matches
-						// (silently making every UPDATE a no-op).
-						if err := cluster.ExecSQL(0, "UPDATE gc_rows SET name = ? WHERE id = ?", fmt.Sprintf("v-%d-%d", w, round), id); err != nil {
+						if err := cluster.TypedContentionUpdate(0, id, "name", fmt.Sprintf("v-%d-%d", w, round)); err != nil {
 							updateErrs.Add(1)
 						}
 					}
@@ -178,23 +168,21 @@ func TestLogGCKeepsUpWithChurn(t *testing.T) {
 			commits, collected, gap, commits/10)
 	}
 
-	// End-to-end update flow: a follower must observe a churned value
-	// (param-bound id: an inline hex literal would silently match
-	// nothing on this BLOB column and void the whole suite).
-	waitValueChanged(t, cluster, "gc_rows", fmt.Sprintf("%032x", 0), "v-0", 30*time.Second)
+	// End-to-end update flow: a follower must observe a churned value.
+	waitValueChanged(t, cluster, fmt.Sprintf("%032x", 0), "v-0", 30*time.Second)
 
 	// No data loss: exact key set with identical digests everywhere.
 	// Counts never change for fixed-key updates, so convergence means
 	// digest agreement: poll for it, since followers drain the final
 	// backlog after the updaters stop.
-	waitAllCounts(t, cluster, "gc_rows", keys, 60*time.Second)
-	waitDigestsAgreed(t, cluster, "gc_rows", 60*time.Second)
-	want, err := cluster.ComputeTableDigest(0, "gc_rows", "id")
+	waitAllCounts(t, cluster, keys, 60*time.Second)
+	waitDigestsAgreed(t, cluster, 60*time.Second)
+	want, err := gcDigest(cluster, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for idx := 1; idx < 3; idx++ {
-		d, err := cluster.ComputeTableDigest(idx, "gc_rows", "id")
+		d, err := gcDigest(cluster, idx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -204,14 +192,28 @@ func TestLogGCKeepsUpWithChurn(t *testing.T) {
 	}
 }
 
-func waitAllCounts(t *testing.T, c *harness.Cluster, table string, want int, timeout time.Duration) {
+// gcDigest returns the PK-ordered digest of the contention table on one node.
+func gcDigest(c *harness.Cluster, idx int) (string, error) {
+	rows, err := c.TypedContentionRows(idx)
+	if err != nil {
+		return "", err
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	h := sha256.New()
+	for _, row := range rows {
+		fmt.Fprintf(h, "%s:%s:%s:%d\n", row.ID, row.Name, row.Phone, row.Score)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func waitAllCounts(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
 		ok := true
 		for idx := range c.Nodes {
-			n, err := c.QueryRowCount(idx, table)
-			if err != nil || n != want {
+			rows, err := c.TypedContentionRows(idx)
+			if err != nil || len(rows) != want {
 				ok = false
 				break
 			}
@@ -227,15 +229,15 @@ func waitAllCounts(t *testing.T, c *harness.Cluster, table string, want int, tim
 }
 
 // waitDigestsAgreed polls until every node reports the same table digest.
-func waitDigestsAgreed(t *testing.T, c *harness.Cluster, table string, timeout time.Duration) {
+func waitDigestsAgreed(t *testing.T, c *harness.Cluster, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
-		want, err := c.ComputeTableDigest(0, table, "id")
+		want, err := gcDigest(c, 0)
 		if err == nil {
 			match := true
 			for idx := 1; idx < len(c.Nodes); idx++ {
-				d, err := c.ComputeTableDigest(idx, table, "id")
+				d, err := gcDigest(c, idx)
 				if err != nil || d != want {
 					match = false
 					break
@@ -254,16 +256,14 @@ func waitDigestsAgreed(t *testing.T, c *harness.Cluster, table string, timeout t
 
 // waitValueChanged polls followers until one reports a value other than
 // seed for the given key, proving churned updates flow end to end.
-func waitValueChanged(t *testing.T, c *harness.Cluster, table, id, seed string, timeout time.Duration) {
+func waitValueChanged(t *testing.T, c *harness.Cluster, id, seed string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
 		for idx := 1; idx < len(c.Nodes); idx++ {
-			res, err := c.QuerySQL(idx, "SELECT name FROM "+table+" WHERE id = ?", id)
-			if err == nil && len(res.Rows) > 0 && len(res.Rows[0]) > 0 {
-				if v := fmt.Sprintf("%v", res.Rows[0][0]); v != seed {
-					return
-				}
+			row, err := c.TypedContentionRead(idx, id)
+			if err == nil && row.Name != seed {
+				return
 			}
 		}
 		if time.Now().After(deadline) {
@@ -298,16 +298,13 @@ func gcCounters(t *testing.T, apiAddr string) (out gcSnapshot) {
 	if err != nil {
 		t.Fatalf("metrics %s: %v", apiAddr, err)
 	}
-	for _, line := range strings.Split(string(body), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-		v, err := strconv.ParseInt(fields[1], 10, 64)
-		if err != nil {
-			continue
-		}
-		switch fields[0] {
+	samples, ok := harness.MetricSamples(string(body))
+	if !ok {
+		t.Fatal("decode metrics JSON")
+	}
+	for _, sample := range samples {
+		v := int64(sample.Value)
+		switch sample.Name {
 		case "spedsql_local_commits_total":
 			out.commits = v
 		case "spedsql_gc_log_collected_total":
@@ -317,9 +314,7 @@ func gcCounters(t *testing.T, apiAddr string) (out gcSnapshot) {
 		case "spedsql_gc_failures_total":
 			out.failures = v
 		}
-		// Labeled series carry the metric name plus labels in field 0.
-		if strings.HasPrefix(fields[0], "spedsql_sched_acquisitions_total{") &&
-			strings.Contains(fields[0], `class="maintenance"`) {
+		if sample.Name == "spedsql_sched_acquisitions_total" && sample.Labels["class"] == "maintenance" {
 			out.maintAcq = v
 		}
 	}

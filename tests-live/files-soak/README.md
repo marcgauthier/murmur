@@ -1,6 +1,7 @@
 # Encrypted file transfer soak
 
-Run the smoke version with `go test -count=1 ./tests-live/files-soak`. Two
+Run the smoke version with `CGO_ENABLED=0 bash tests-live/run.sh files-soak`.
+The scenario uses managed typed records without SQLite or CGO. Two
 Murmur-SQL daemon processes in discrete `node1`/`node2` directories form an
 encrypted mesh; the test drives them over HTTP, uploading 64 KiB files
 repeatedly to one node, waiting for replicated metadata, fetching the

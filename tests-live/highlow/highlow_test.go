@@ -8,7 +8,6 @@
 package highlow_test
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -17,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
@@ -37,10 +35,6 @@ func liveContactsSchema(extra ...schema.ColumnSchema) []schema.TableSchema {
 	}}
 }
 
-func liveSchemaConfig(tables []schema.TableSchema) *db.SchemaConfig {
-	return &db.SchemaConfig{Version: 1, Tables: tables}
-}
-
 type liveKeys struct {
 	files harness.BridgeKeyFiles
 }
@@ -52,24 +46,30 @@ func makeLiveKeys(t *testing.T, dir string) liveKeys {
 
 func newLowCluster(t *testing.T, name, staging string, keys liveKeys, tables []schema.TableSchema) *harness.Cluster {
 	t.Helper()
-	return harness.NewCluster(t, harness.ClusterOptions{
-		Name:     name,
-		NumNodes: 1,
-		Schema:   liveSchemaConfig(tables),
+	cluster := harness.NewCluster(t, harness.ClusterOptions{
+		Name:         name,
+		NumNodes:     1,
+		TypedRecords: true,
 		Bridge: &harness.BridgeOptions{
 			Role: "low-exporter", Stream: liveStream, NodeIndex: 0,
 			StagingDir:    staging,
 			SignerKeyFile: keys.files.SignerKeyFile, RecipientPubFile: keys.files.RecipientPubFile,
 		},
 	})
+	if len(tables) > 0 && len(tables[0].Columns) > 3 {
+		if err := cluster.MigrateTypedRecords(0); err != nil {
+			t.Fatalf("migrate Low typed schema: %v", err)
+		}
+	}
+	return cluster
 }
 
 func newHighCluster(t *testing.T, name, staging string, keys liveKeys, tables []schema.TableSchema, nodes int, indices []int) *harness.Cluster {
 	t.Helper()
 	return harness.NewCluster(t, harness.ClusterOptions{
-		Name:     name,
-		NumNodes: nodes,
-		Schema:   liveSchemaConfig(tables),
+		Name:         name,
+		NumNodes:     nodes,
+		TypedRecords: true,
 		Bridge: &harness.BridgeOptions{
 			Role: "high-importer", Stream: liveStream, NodeIndices: indices,
 			StagingDir:       staging,
@@ -80,29 +80,24 @@ func newHighCluster(t *testing.T, name, staging string, keys liveKeys, tables []
 
 func writeContact(t *testing.T, c *harness.Cluster, idx int, row ids.RowID, name string, score int64) {
 	t.Helper()
-	if err := c.ExecSQL(idx, `INSERT INTO contacts (id, name, score) VALUES (?, ?, ?)`, hex.EncodeToString(row[:]), name, score); err != nil {
+	if err := c.TypedInsertScoredWithID(idx, row, name, score); err != nil {
 		t.Fatalf("insert contact: %v", err)
-	}
-}
-
-func updateContact(t *testing.T, c *harness.Cluster, idx int, row ids.RowID, name string, score int64) {
-	t.Helper()
-	if err := c.ExecSQL(idx, `UPDATE contacts SET name=?, score=? WHERE id=?`, name, score, hex.EncodeToString(row[:])); err != nil {
-		t.Fatalf("update contact: %v", err)
 	}
 }
 
 func contacts(t *testing.T, c *harness.Cluster, idx int) map[string]float64 {
 	t.Helper()
-	res, err := c.QuerySQL(idx, `SELECT name, score FROM contacts`)
+	names, err := c.TypedNames(idx)
 	if err != nil {
 		t.Fatalf("query contacts: %v", err)
 	}
-	out := make(map[string]float64)
-	for _, r := range res.Rows {
-		name, _ := r[0].(string)
-		score, _ := r[1].(float64)
-		out[name] = score
+	out := make(map[string]float64, len(names))
+	for _, name := range names {
+		score, err := c.TypedCounterValue(idx, name)
+		if err != nil {
+			t.Fatalf("read typed counter %s: %v", name, err)
+		}
+		out[name] = float64(score)
 	}
 	return out
 }
@@ -335,9 +330,9 @@ func TestHighLowForgeriesRejectedLive(t *testing.T) {
 		t.Fatal(err)
 	}
 	other := harness.NewCluster(t, harness.ClusterOptions{
-		Name:     "highlow-forge-other",
-		NumNodes: 1,
-		Schema:   liveSchemaConfig(liveContactsSchema()),
+		Name:         "highlow-forge-other",
+		NumNodes:     1,
+		TypedRecords: true,
 		Bridge: &harness.BridgeOptions{
 			Role: "low-exporter", Stream: liveStream, NodeIndex: 0,
 			StagingDir:    otherStaging,
@@ -469,9 +464,9 @@ func TestHighLowSchemaHoldMigrationLive(t *testing.T) {
 	high := newHighCluster(t, "highlow-schema-high", staging, keys, liveContactsSchema(), 1, []int{0})
 
 	row := ids.NewRowID()
-	if err := low.ExecSQL(0, `INSERT INTO contacts (id, name, score, email) VALUES (?, ?, ?, ?)`,
-		hex.EncodeToString(row[:]), "ann", 1, "a@x"); err != nil {
-		t.Fatalf("insert with email: %v", err)
+	writeContact(t, low, 0, row, "ann", 1)
+	if err := low.TypedSetNote(0, "ann", "a@x"); err != nil {
+		t.Fatalf("set Low note: %v", err)
 	}
 	if _, published := exportOnce(t, low, 0); published < 1 {
 		t.Fatalf("published %d, want >= 1", published)
@@ -497,26 +492,14 @@ func TestHighLowSchemaHoldMigrationLive(t *testing.T) {
 		t.Fatalf("progress = %+v, want one hold", prog)
 	}
 	// The local migration releases the bundle; nothing crossed the bridge.
-	if err := high.Migrate(0, withEmail); err != nil {
-		t.Fatalf("migrate high: %v", err)
+	if err := high.MigrateTypedRecords(0); err != nil {
+		t.Fatalf("migrate High typed schema: %v", err)
 	}
 	if _, imported := importOnce(t, high, 0); imported != 1 {
 		t.Fatalf("post-migration import applied %d, want 1", imported)
 	}
-	res, err := high.QuerySQL(0, `SELECT name, email FROM contacts`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, r := range res.Rows {
-		if name, _ := r[0].(string); name == "ann" {
-			if email, _ := r[1].(string); email == "a@x" {
-				found = true
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("migrated import rows = %+v, want ann with email", res.Rows)
+	if note, err := high.TypedNote(0, "ann"); err != nil || note != "a@x" {
+		t.Fatalf("migrated typed note = %q, %v; want a@x", note, err)
 	}
 }
 
@@ -579,8 +562,12 @@ func TestHighLowKeyRotationAndOutageResumeLive(t *testing.T) {
 	}
 
 	// Prolonged outage: events queue durably, then catch up completely.
-	for i := 0; i < 5; i++ {
-		writeContact(t, low, 0, ids.NewRowID(), "backlog", int64(i))
+	backlogRow := ids.NewRowID()
+	writeContact(t, low, 0, backlogRow, "backlog", 0)
+	for i := 0; i < 4; i++ {
+		if err := low.TypedCounterAdd(0, "backlog", 1); err != nil {
+			t.Fatalf("increment backlog counter: %v", err)
+		}
 	}
 	res, err := low.BridgeExportWithOptions(0, harness.BridgeExportOptions{CaptureOnly: true})
 	if err != nil {

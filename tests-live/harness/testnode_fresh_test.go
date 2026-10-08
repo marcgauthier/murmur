@@ -12,7 +12,7 @@ import (
 // when sources changed, and only then: silent reuse of a stale binary once
 // masked a real fix during a red/green verification.
 func TestTestNodeStaleReason(t *testing.T) {
-	const tags = "sqlite_preupdate_hook sqlite_fts5"
+	const tags = ""
 	old := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
 	mk := func(t *testing.T, root, name string, mod time.Time) string {
 		t.Helper()
@@ -33,7 +33,7 @@ func TestTestNodeStaleReason(t *testing.T) {
 		root = t.TempDir()
 		bin = mk(t, root, "tests-live/bin/testnode", old)
 		mk(t, root, "tests-live/bin/testnode.tags", old)
-		if err := os.WriteFile(bin+".tags", []byte(tags), 0o644); err != nil {
+		if err := os.WriteFile(bin+".tags", []byte(testNodeBuildStamp(tags, false)), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		mk(t, root, "db.go", old)
@@ -46,14 +46,14 @@ func TestTestNodeStaleReason(t *testing.T) {
 		if err := os.Remove(bin); err != nil {
 			t.Fatal(err)
 		}
-		if got := testNodeStaleReason(bin, root, tags); got != "binary missing" {
+		if got := testNodeStaleReason(bin, root, tags, false); got != "binary missing" {
 			t.Fatalf("got %q", got)
 		}
 	})
 
 	t.Run("tags mismatch rebuilds", func(t *testing.T) {
 		root, bin := fresh(t)
-		if got := testNodeStaleReason(bin, root, "modernc"); got != "build tags changed or unknown" {
+		if got := testNodeStaleReason(bin, root, "other-tags", false); got != "build tags changed or unknown" {
 			t.Fatalf("got %q", got)
 		}
 	})
@@ -61,7 +61,7 @@ func TestTestNodeStaleReason(t *testing.T) {
 	t.Run("newer source rebuilds", func(t *testing.T) {
 		root, bin := fresh(t)
 		mk(t, root, "replication/manager.go", time.Now())
-		got := testNodeStaleReason(bin, root, tags)
+		got := testNodeStaleReason(bin, root, tags, false)
 		if !strings.HasPrefix(got, "source newer than binary: ") {
 			t.Fatalf("got %q", got)
 		}
@@ -72,7 +72,7 @@ func TestTestNodeStaleReason(t *testing.T) {
 
 	t.Run("fresh tree reuses", func(t *testing.T) {
 		root, bin := fresh(t)
-		if got := testNodeStaleReason(bin, root, tags); got != "" {
+		if got := testNodeStaleReason(bin, root, tags, false); got != "" {
 			t.Fatalf("got %q", got)
 		}
 	})
@@ -83,7 +83,14 @@ func TestTestNodeStaleReason(t *testing.T) {
 		mk(t, root, "README.md", now)
 		mk(t, root, ".git/refs/heads/main", now)
 		mk(t, root, "tests-live/failures/note.md", now)
-		if got := testNodeStaleReason(bin, root, tags); got != "" {
+		if got := testNodeStaleReason(bin, root, tags, false); got != "" {
+			t.Fatalf("got %q", got)
+		}
+	})
+
+	t.Run("race mismatch rebuilds", func(t *testing.T) {
+		root, bin := fresh(t)
+		if got := testNodeStaleReason(bin, root, tags, true); got != "build tags changed or unknown" {
 			t.Fatalf("got %q", got)
 		}
 	})

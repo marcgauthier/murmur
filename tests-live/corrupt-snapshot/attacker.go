@@ -84,7 +84,7 @@ func (a *attacker) dialMismatch(t *testing.T, addr string, expect ids.NodeID) *e
 		DBID:                a.dbid,
 		SchemaEpoch:         9999,
 		SchemaHash:          randomHash(),
-		Capabilities:        replication.CapMergePolicies | replication.CapZstd | replication.CapOriginSignatures,
+		Capabilities:        replication.CapMergePolicies | replication.CapCompression | replication.CapOriginSignatures,
 		MaxTransactionBytes: 64 << 20,
 	}
 	if err := replication.WriteFrame(stream, replication.MsgHello, 0, replication.EncodeHello(nil, hello)); err != nil {
@@ -191,7 +191,7 @@ func buildCorruptSnapshot(t *testing.T, a *attacker, welcome *replication.Hello)
 	sort.Slice(wms, func(i, j int) bool { return bytes.Compare(wms[i].Origin[:], wms[j].Origin[:]) < 0 })
 
 	manifest := &codec.SnapshotManifest{
-		FormatVersion:   2,
+		FormatVersion:   3,
 		SnapshotID:      ids.NewTxID(),
 		DBID:            a.dbid,
 		SchemaEpoch:     welcome.SchemaEpoch,

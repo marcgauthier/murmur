@@ -13,8 +13,24 @@ import (
 	"time"
 
 	"github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/ids"
 )
+
+type writerBenchRow struct {
+	ID  ids.RowID `rime:"primary"`
+	Val string
+}
+
+func mustWriterBenchTables() []murmur.TableDefinition {
+	definition, err := murmur.Define[writerBenchRow]("writer_bench", 93, murmur.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "Val": 2},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return []murmur.TableDefinition{definition}
+}
 
 // TestLocalWriterThroughput measures direct Go API writes to one encrypted
 // database. No daemon, HTTP service, peers, or QUIC connections are started.
@@ -53,6 +69,10 @@ func runLocalWriterThroughput(t *testing.T, durability murmur.DurabilityConfig) 
 					_ = db.Close()
 				}
 			}()
+			table, err := murmur.TableOf[writerBenchRow](db, "writer_bench")
+			if err != nil {
+				t.Fatal(err)
+			}
 
 			type result struct {
 				writes int
@@ -69,11 +89,19 @@ func runLocalWriterThroughput(t *testing.T, durability murmur.DurabilityConfig) 
 					<-startGate
 					var writes int
 					for time.Now().Before(deadline) {
-						var id [16]byte
+						var id murmur.RowID
 						binary.BigEndian.PutUint64(id[:8], uint64(worker+1))
 						binary.BigEndian.PutUint64(id[8:], uint64(writes+1))
-						if _, err := db.ExecContext(ctx,
-							`INSERT INTO writer_bench (id, val) VALUES (?, ?)`, id[:], "writer-throughput"); err != nil {
+						tx, err := db.BeginTx(ctx)
+						if err != nil {
+							results <- result{writes: writes, err: fmt.Errorf("writer %d: %w", worker+1, err)}
+							return
+						}
+						if err := table.Insert(tx, &writerBenchRow{ID: id, Val: "writer-throughput"}); err != nil {
+							results <- result{writes: writes, err: fmt.Errorf("writer %d: %w", worker+1, err)}
+							return
+						}
+						if err := tx.Commit(); err != nil {
 							results <- result{writes: writes, err: fmt.Errorf("writer %d: %w", worker+1, err)}
 							return
 						}
@@ -116,8 +144,12 @@ func runLocalWriterThroughput(t *testing.T, durability murmur.DurabilityConfig) 
 			if err != nil {
 				t.Fatalf("reopen after writes: %v", err)
 			}
-			var count int
-			if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM writer_bench`).Scan(&count); err != nil {
+			table, err = murmur.TableOf[writerBenchRow](db, "writer_bench")
+			if err != nil {
+				t.Fatal(err)
+			}
+			count, err := table.Where().Count()
+			if err != nil {
 				t.Fatal(err)
 			}
 			if count != total {
@@ -131,16 +163,11 @@ func runLocalWriterThroughput(t *testing.T, durability murmur.DurabilityConfig) 
 
 func localWriterConfig(path string, durability murmur.DurabilityConfig) murmur.Config {
 	return testdb.Configure(murmur.Config{
-		Path:   path,
-		NodeID: murmur.NewNodeID(),
-		DBID:   murmur.NewDBID(),
-		Schema: murmur.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "writer_bench", Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "val", Type: schema.ColText},
-			},
-		}}},
-		Pebble:     murmur.DefaultPebbleConfig(),
+		Path:       path,
+		NodeID:     murmur.NewNodeID(),
+		DBID:       murmur.NewDBID(),
+		Tables:     mustWriterBenchTables(),
+		Spool:      murmur.DefaultSpoolConfig(),
 		Durability: durability,
 		Encryption: murmur.EncryptionConfig{
 			Key: bytes.Clone(benchKey), KeyID: "bench",

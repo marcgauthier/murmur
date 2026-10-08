@@ -19,13 +19,10 @@ import (
 
 func TestAbruptProcessDeathRecoversCommittedRows(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "crash-recovery",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		SchemaSQL: `CREATE TABLE IF NOT EXISTS crash_rows (
-  id BLOB PRIMARY KEY NOT NULL,
-  value TEXT NOT NULL DEFAULT ''
-);`,
+		Name:         "crash-recovery",
+		NumNodes:     3,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 	for _, node := range cluster.Nodes {
 		t.Logf("%s pid=%d dir=%s repl=%s", node.Label, node.Process.Process.Pid, node.Dir, node.ReplAddr)
@@ -35,7 +32,7 @@ func TestAbruptProcessDeathRecoversCommittedRows(t *testing.T) {
 	var ackMu sync.Mutex
 	for node := range cluster.Nodes {
 		value := fmt.Sprintf("baseline-node%d", node+1)
-		if err := cluster.ExecSQL(node, "INSERT INTO crash_rows (id, value) VALUES (?, ?)", fmt.Sprintf("%032x", node+1), value); err != nil {
+		if err := cluster.TypedInsert(node, value); err != nil {
 			t.Fatalf("%s baseline write: %v", cluster.Nodes[node].Label, err)
 		}
 		acknowledged[value] = struct{}{}
@@ -68,9 +65,8 @@ func TestAbruptProcessDeathRecoversCommittedRows(t *testing.T) {
 					}
 					seq := seqs[node].Add(1)
 					value := fmt.Sprintf("node%d-worker%d-write-%08d", node+1, worker, seq)
-					id := fmt.Sprintf("%032x", int64(node+1)*1_000_000_000_000+seq*10+int64(worker))
 					active[node].Add(1)
-					err := cluster.ExecSQL(node, "INSERT INTO crash_rows (id, value) VALUES (?, ?)", id, value)
+					err := cluster.TypedInsert(node, value)
 					active[node].Add(-1)
 					if err == nil {
 						ackMu.Lock()
@@ -111,8 +107,8 @@ func TestAbruptProcessDeathRecoversCommittedRows(t *testing.T) {
 	t.Logf("all acknowledged application writes survived two SIGKILL restarts (%d acknowledged rows)", len(acknowledged))
 
 	postCrashValue := "post-recovery-write"
-	if err := cluster.ExecSQL(0, "INSERT INTO crash_rows (id, value) VALUES (?, ?)", fmt.Sprintf("%032x", 999_999_999_999), postCrashValue); err != nil {
-		t.Fatalf("post-recovery SQL write: %v", err)
+	if err := cluster.TypedInsert(0, postCrashValue); err != nil {
+		t.Fatalf("post-recovery typed write: %v", err)
 	}
 	acknowledged[postCrashValue] = struct{}{}
 	waitForConvergence(t, cluster, time.Duration(envSeconds("MURMUR_CRASH_SETTLE_SECONDS", 20))*time.Second)
@@ -127,9 +123,9 @@ func killDuringWrites(t *testing.T, cluster *harness.Cluster, node int, active *
 		time.Sleep(time.Millisecond)
 	}
 	if active[node].Load() == 0 {
-		t.Fatalf("%s had no SQL request in flight before SIGKILL", cluster.Nodes[node].Label)
+		t.Fatalf("%s had no typed write in flight before SIGKILL", cluster.Nodes[node].Label)
 	}
-	t.Logf("SIGKILL %s with %d SQL requests in flight", cluster.Nodes[node].Label, active[node].Load())
+	t.Logf("SIGKILL %s with %d typed writes in flight", cluster.Nodes[node].Label, active[node].Load())
 	cluster.KillNode(node)
 }
 
@@ -196,16 +192,11 @@ func waitForAcknowledged(t *testing.T, cluster *harness.Cluster, acknowledged ma
 		time.Sleep(100 * time.Millisecond)
 	}
 	for _, node := range cluster.Nodes {
-		res, err := cluster.QuerySQL(node.Index, "SELECT value FROM crash_rows")
+		got, err := cluster.TypedNames(node.Index)
 		if err != nil {
-			t.Fatalf("%s recovery query: %v", node.Label, err)
+			t.Fatalf("%s typed recovery read: %v", node.Label, err)
 		}
-		present := map[string]struct{}{}
-		for _, row := range res.Rows {
-			if len(row) > 0 {
-				present[fmt.Sprint(row[0])] = struct{}{}
-			}
-		}
+		present := nameSet(got)
 		for value := range acknowledged {
 			if _, ok := present[value]; !ok {
 				t.Fatalf("%s lost acknowledged write %q after restart", node.Label, value)
@@ -217,16 +208,11 @@ func waitForAcknowledged(t *testing.T, cluster *harness.Cluster, acknowledged ma
 func assertAcknowledgedPresent(t *testing.T, cluster *harness.Cluster, acknowledged map[string]struct{}) {
 	t.Helper()
 	for _, node := range cluster.Nodes {
-		res, err := cluster.QuerySQL(node.Index, "SELECT value FROM crash_rows")
+		got, err := cluster.TypedNames(node.Index)
 		if err != nil {
-			t.Fatalf("%s recovery query: %v", node.Label, err)
+			t.Fatalf("%s typed recovery read: %v", node.Label, err)
 		}
-		present := make(map[string]struct{}, len(res.Rows))
-		for _, row := range res.Rows {
-			if len(row) > 0 {
-				present[fmt.Sprint(row[0])] = struct{}{}
-			}
-		}
+		present := nameSet(got)
 		for value := range acknowledged {
 			if _, ok := present[value]; !ok {
 				t.Fatalf("%s lost acknowledged write %q after restart", node.Label, value)
@@ -237,16 +223,11 @@ func assertAcknowledgedPresent(t *testing.T, cluster *harness.Cluster, acknowled
 
 func allNodesHaveAcknowledged(cluster *harness.Cluster, acknowledged map[string]struct{}) bool {
 	for _, node := range cluster.Nodes {
-		res, err := cluster.QuerySQL(node.Index, "SELECT value FROM crash_rows")
+		got, err := cluster.TypedNames(node.Index)
 		if err != nil {
 			return false
 		}
-		present := make(map[string]struct{}, len(res.Rows))
-		for _, row := range res.Rows {
-			if len(row) > 0 {
-				present[fmt.Sprint(row[0])] = struct{}{}
-			}
-		}
+		present := nameSet(got)
 		for value := range acknowledged {
 			if _, ok := present[value]; !ok {
 				return false
@@ -254,6 +235,14 @@ func allNodesHaveAcknowledged(cluster *harness.Cluster, acknowledged map[string]
 		}
 	}
 	return true
+}
+
+func nameSet(names []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		set[name] = struct{}{}
+	}
+	return set
 }
 
 func assertConverged(t *testing.T, cluster *harness.Cluster) {
@@ -280,7 +269,7 @@ func waitForConvergence(t *testing.T, cluster *harness.Cluster, timeout time.Dur
 		var expectedDigest string
 		converged := true
 		for i := range cluster.Nodes {
-			count, err := cluster.QueryRowCount(i, "crash_rows")
+			names, err := cluster.TypedNames(i)
 			if err != nil {
 				converged = false
 				break
@@ -291,8 +280,8 @@ func waitForConvergence(t *testing.T, cluster *harness.Cluster, timeout time.Dur
 				break
 			}
 			if i == 0 {
-				expectedCount, expectedDigest = count, digest
-			} else if count != expectedCount || digest != expectedDigest {
+				expectedCount, expectedDigest = len(names), digest
+			} else if len(names) != expectedCount || digest != expectedDigest {
 				converged = false
 				break
 			}
@@ -303,82 +292,19 @@ func waitForConvergence(t *testing.T, cluster *harness.Cluster, timeout time.Dur
 		time.Sleep(100 * time.Millisecond)
 	}
 	for i, node := range cluster.Nodes {
-		count, _ := cluster.QueryRowCount(i, "crash_rows")
+		names, _ := cluster.TypedNames(i)
 		digest, _ := canonicalTableDigest(cluster, i)
-		t.Logf("%s after recovery rows=%d digest=%s", node.Label, count, digest)
-	}
-	baseline, err := cluster.QuerySQL(0, "SELECT value FROM crash_rows")
-	if err == nil {
-		base := make(map[string]struct{}, len(baseline.Rows))
-		for _, row := range baseline.Rows {
-			if len(row) > 0 {
-				base[fmt.Sprint(row[0])] = struct{}{}
-			}
-		}
-		for node := 1; node < len(cluster.Nodes); node++ {
-			other, queryErr := cluster.QuerySQL(node, "SELECT value FROM crash_rows")
-			if queryErr != nil {
-				continue
-			}
-			otherSet := make(map[string]struct{}, len(other.Rows))
-			for _, row := range other.Rows {
-				if len(row) > 0 {
-					otherSet[fmt.Sprint(row[0])] = struct{}{}
-				}
-			}
-			missing, extra := 0, 0
-			for value := range otherSet {
-				if _, ok := base[value]; !ok {
-					missing++
-				}
-			}
-			for value := range base {
-				if _, ok := otherSet[value]; !ok {
-					extra++
-				}
-			}
-			t.Logf("node1 vs %s content delta: node1-only=%d peer-only=%d", cluster.Nodes[node].Label, extra, missing)
-			leftPairs, leftErr := cluster.QuerySQL(0, "SELECT id, value FROM crash_rows")
-			rightPairs, rightErr := cluster.QuerySQL(node, "SELECT id, value FROM crash_rows")
-			if leftErr == nil && rightErr == nil {
-				leftSet := make(map[string]struct{}, len(leftPairs.Rows))
-				rightSet := make(map[string]struct{}, len(rightPairs.Rows))
-				for _, row := range leftPairs.Rows {
-					leftSet[fmt.Sprint(row[0], "|", row[1])] = struct{}{}
-				}
-				for _, row := range rightPairs.Rows {
-					rightSet[fmt.Sprint(row[0], "|", row[1])] = struct{}{}
-				}
-				leftOnly, rightOnly := 0, 0
-				for key := range leftSet {
-					if _, ok := rightSet[key]; !ok {
-						leftOnly++
-					}
-				}
-				for key := range rightSet {
-					if _, ok := leftSet[key]; !ok {
-						rightOnly++
-					}
-				}
-				t.Logf("node1 vs %s (id,value) rows: node1-only=%d peer-only=%d", cluster.Nodes[node].Label, leftOnly, rightOnly)
-			}
-		}
+		t.Logf("%s after recovery rows=%d digest=%s", node.Label, len(names), digest)
 	}
 	t.Fatalf("three nodes did not converge after recovery within %v", timeout)
 }
 
 func canonicalTableDigest(cluster *harness.Cluster, node int) (string, error) {
-	res, err := cluster.QuerySQL(node, "SELECT id, value FROM crash_rows")
+	names, err := cluster.TypedNames(node)
 	if err != nil {
 		return "", err
 	}
-	rows := make([]string, 0, len(res.Rows))
-	for _, row := range res.Rows {
-		if len(row) < 2 {
-			return "", fmt.Errorf("node %d returned malformed crash_rows row: %v", node, row)
-		}
-		rows = append(rows, fmt.Sprintf("%q|%q", fmt.Sprint(row[0]), fmt.Sprint(row[1])))
-	}
+	rows := append([]string(nil), names...)
 	sort.Strings(rows)
 	h := sha256.New()
 	for _, row := range rows {

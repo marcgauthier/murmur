@@ -25,7 +25,10 @@ store's configured key copy and rejects later operations.
 
 `List(ctx)` authenticates each stored object and returns its digest and
 plaintext length. `Pin(digest)` holds a local reader/export retention pin until
-the returned handle closes. `Collect(referenced, grace)` removes unreferenced,
+the returned handle closes. Object existence validation and pin registration
+hold the same store mutex as collection, so successful acquisition retains an
+openable object even when zero-grace GC races with it. `Read` and `Serve` use
+these pins for their lifetimes. `Collect(referenced, grace)` removes unreferenced,
 unpinned objects only after the retention interval and syncs the directory.
 The caller supplies the reference inventory; replicated reference ownership
 is implemented via `FilesGC` over replicated metadata, and key rotation plus
@@ -38,10 +41,13 @@ object store under `<Path>/files` and enables the file APIs. Metadata (name,
 digest, size) replicates through the normal durable log as cells of the
 reserved `__replicatedb_files` table, which lives outside the application
 schema registry: enabling files never changes the replicated schema identity,
-mixed clusters stay compatible, and the SQL materializer skips the reserved
-table ID. Application schemas must not use the reserved name; `Open` rejects
+and application RIME tables do not expose the reserved table ID. Application
+schemas must not use the reserved name; `Open` rejects
 the collision. Metadata batches carry the current schema epoch/hash so peers
 accept them without waiting for schema sync.
+Managed databases use the same Spool metadata path and do not add file rows to
+application query tables. The `typed-records` live rehearsal
+verifies metadata replication, peer object fetch and deletion in this mode.
 
 `UploadFile(ctx, name, reader)` streams bytes into the local object store
 (first, publish-before-acknowledgement) and then commits the metadata in one

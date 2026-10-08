@@ -16,8 +16,6 @@ const (
 	AES128GCM         EncryptionAlgorithm = "AES-128-GCM"
 	AES192GCM         EncryptionAlgorithm = "AES-192-GCM"
 	AES256GCM         EncryptionAlgorithm = "AES-256-GCM"
-	AEGIS128L         EncryptionAlgorithm = "AEGIS-128L"
-	AEGIS256          EncryptionAlgorithm = "AEGIS-256"
 	ChaCha20Poly1305  EncryptionAlgorithm = "ChaCha20-Poly1305"
 	XChaCha20Poly1305 EncryptionAlgorithm = "XChaCha20-Poly1305"
 )
@@ -104,26 +102,11 @@ func (c EncryptionConfig) validate() error {
 	if alg == "" {
 		alg = AES256GCM
 	}
-	if _, err := parseAlgorithm(alg); err != nil {
-		return fmt.Errorf("murmur: Encryption.Algorithm: %w", err)
+	if alg != AES256GCM {
+		return fmt.Errorf("murmur: Encryption.Algorithm %q unsupported (only %s is supported)", alg, AES256GCM)
 	}
-	keyAlg := c.KeyAlgorithm
-	if keyAlg == "" {
-		keyAlg = alg
-	}
-	keyAlgID, err := parseAlgorithm(keyAlg)
-	if err != nil {
-		return fmt.Errorf("murmur: Encryption.KeyAlgorithm: %w", err)
-	}
-	if hasKey {
-		want, err := keyAlgID.KeySize()
-		if err != nil {
-			return err
-		}
-		if len(c.Key) != want {
-			return fmt.Errorf("murmur: Encryption.Key must be %d bytes for %s, got %d",
-				want, keyAlg, len(c.Key))
-		}
+	if hasKey && len(c.Key) != 32 {
+		return fmt.Errorf("murmur: Encryption.Key must be 32 bytes, got %d", len(c.Key))
 	}
 	if c.DataKeyRotation <= 0 {
 		return fmt.Errorf("murmur: Encryption.DataKeyRotation must be positive")
@@ -133,21 +116,15 @@ func (c EncryptionConfig) validate() error {
 
 // writeAlgorithm resolves the configured write cipher id.
 func (c EncryptionConfig) writeAlgorithm() crypto.AlgorithmID {
-	if c.Algorithm == "" {
-		return crypto.DefaultAlgorithm
-	}
-	return mustParseAlgorithm(c.Algorithm)
+	return crypto.DefaultAlgorithm
 }
 
 // keyAlgorithm resolves the direct-material algorithm id.
 func (c EncryptionConfig) keyAlgorithm() crypto.AlgorithmID {
-	if c.KeyAlgorithm != "" {
-		return mustParseAlgorithm(c.KeyAlgorithm)
-	}
-	return c.writeAlgorithm()
+	return crypto.DefaultAlgorithm
 }
 
-// storageProvider builds the registry's key provider: the configured
+// storageProvider builds the key provider: the configured
 // provider, or a synthetic single-key provider over copied direct material.
 func (c EncryptionConfig) storageProvider() crypto.KeyProvider {
 	if c.Provider != nil {
@@ -157,34 +134,14 @@ func (c EncryptionConfig) storageProvider() crypto.KeyProvider {
 	return &crypto.MapProvider{
 		Keys:      map[string][]byte{c.KeyID: key},
 		CurrentID: c.KeyID,
-		Algorithm: c.keyAlgorithm(),
+		Algorithm: crypto.DefaultAlgorithm,
 	}
 }
 
-// checkOpenKeyMaterial validates open-time storage-key material: an
-// explicit algorithm requires exact length, unspecified ("") accepts the
-// raw 16/24/32-byte lengths (the registry wrap key is always HKDF-derived
-// at 32 bytes regardless of input length).
+// checkOpenKeyMaterial validates open-time storage-key material: 32 bytes.
 func checkOpenKeyMaterial(mat KeyMaterial) error {
-	if mat.Algorithm == "" {
-		for _, n := range []int{16, 24, 32} {
-			if len(mat.Key) == n {
-				return nil
-			}
-		}
-		return fmt.Errorf("storage key must be 16, 24, or 32 bytes, got %d", len(mat.Key))
-	}
-	algID, err := crypto.ParseAlgorithm(mat.Algorithm)
-	if err != nil {
-		return err
-	}
-	want, err := algID.KeySize()
-	if err != nil {
-		return err
-	}
-	if len(mat.Key) != want {
-		return fmt.Errorf("storage key must be %d bytes for %s, got %d",
-			want, mat.Algorithm, len(mat.Key))
+	if len(mat.Key) != 32 {
+		return fmt.Errorf("storage key must be 32 bytes, got %d", len(mat.Key))
 	}
 	return nil
 }
@@ -198,20 +155,11 @@ func validateKeyMaterial(currentID string, m KeyMaterial) error {
 	if m.ID == currentID {
 		return fmt.Errorf("murmur: rotation requires a new application-key ID (got current %q)", currentID)
 	}
-	if m.Algorithm == "" {
-		return fmt.Errorf("murmur: rotation requires an explicit supported algorithm")
+	if m.Algorithm != string(AES256GCM) && m.Algorithm != "AES-GCM-256" {
+		return fmt.Errorf("murmur: rotation algorithm must be %s (got %q)", AES256GCM, m.Algorithm)
 	}
-	algID, err := crypto.ParseAlgorithm(m.Algorithm)
-	if err != nil {
-		return fmt.Errorf("murmur: rotation algorithm: %w", err)
-	}
-	want, err := algID.KeySize()
-	if err != nil {
-		return fmt.Errorf("murmur: rotation algorithm: %w", err)
-	}
-	if len(m.Key) != want {
-		return fmt.Errorf("murmur: rotation key must be %d bytes for %s, got %d",
-			want, m.Algorithm, len(m.Key))
+	if len(m.Key) != 32 {
+		return fmt.Errorf("murmur: rotation key must be 32 bytes, got %d", len(m.Key))
 	}
 	return nil
 }

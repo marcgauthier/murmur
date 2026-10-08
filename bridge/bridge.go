@@ -2,7 +2,7 @@
 //
 // Each domain keeps its own DBID, schema administration, identities, storage
 // keys, and ordinary QUIC mesh. The bridge transports logical records — never
-// raw Pebble files or cross-DBID mesh frames — from a Low exporter to a High
+// raw Spool storage files or cross-DBID mesh frames — from a Low exporter to a High
 // receiver. High may redistribute accepted imports among its own mesh peers;
 // it never exports database changes back to Low through this bridge.
 //
@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/marcgauthier/murmur/compression"
 	"github.com/marcgauthier/murmur/ids"
 )
 
@@ -82,6 +83,12 @@ type Limits struct {
 	MaxQueue int
 	// MaxFileChunkBytes caps one sealed file-object chunk's plaintext.
 	MaxFileChunkBytes int
+	// Codec compresses new bundle payloads. Nil selects the built-in
+	// deflate. A custom codec (id 128-255) must also be registered, via
+	// Codecs, on every node that opens these bundles.
+	Codec compression.Codec
+	// Codecs registers custom codecs for opening bundles.
+	Codecs []compression.Codec
 }
 
 func (l Limits) withDefaults() Limits {

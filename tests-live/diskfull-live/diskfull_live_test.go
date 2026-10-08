@@ -6,35 +6,25 @@
 // Requires tmpfs mount privilege (root in CI). Without it the suite skips
 // with a clear message; it never fails for lack of privilege.
 //
-// The suite uses Schema (replicated registry) tables: tables created only
-// via SchemaSQL DDL are local-only sqlite and would make the test vacuous.
+// The suite writes replicated typed records so the fault exercises the
+// durable replicated path; node-local writes would make it vacuous.
 package diskfulllive_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
-
-func schemaConfig() *db.SchemaConfig {
-	return &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-		Name: "disk_rows",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "val", Type: schema.ColText, Nullable: true},
-		},
-	}}}
-}
 
 func tmpfsMB() int {
 	if v := harness.GetEnv("MURMUR_DISKFULL_TMPFS_MB"); v != "" {
@@ -56,18 +46,18 @@ func fillRowCap() int {
 
 func TestDiskFullFailClosedAndRecover(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "diskfull-live",
-		NumNodes:    2,
-		AwaitUnlock: true,
-		Schema:      schemaConfig(),
+		Name:            "diskfull-live",
+		NumNodes:        2,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 	node0 := cluster.Nodes[0]
 
 	// Baseline: acked rows on both nodes before any fault.
 	const baseline = 20
 	for i := 0; i < baseline; i++ {
-		if err := cluster.ExecSQL(0, "INSERT INTO disk_rows (id, val) VALUES (?, ?)",
-			fmt.Sprintf("%032x", 1000+i), fmt.Sprintf("baseline-%d", i)); err != nil {
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 1000+i), Name: fmt.Sprintf("baseline-%d", i)}); err != nil {
 			t.Fatalf("baseline write: %v", err)
 		}
 	}
@@ -109,11 +99,10 @@ func TestDiskFullFailClosedAndRecover(t *testing.T) {
 
 	// Leave only a sliver of free space so the fill loop hits ENOSPC fast.
 	const reserveFree = 3 << 20
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(node0.Dir, &st); err != nil {
+	free, err := getFreeBytes(node0.Dir)
+	if err != nil {
 		t.Fatal(err)
 	}
-	free := int64(st.Bavail) * int64(st.Bsize)
 	t.Logf("tmpfs free before filler: %d bytes", free)
 	fillerPath := filepath.Join(node0.Dir, "enospc-filler.bin")
 	fillerSize := free - reserveFree
@@ -132,7 +121,7 @@ func TestDiskFullFailClosedAndRecover(t *testing.T) {
 	for i := 0; i < fillRowCap(); i++ {
 		id := fmt.Sprintf("%032x", 5000+i)
 		val := fmt.Sprintf("%s-row%d", bigVal, i)
-		if err := cluster.ExecSQL(0, "INSERT INTO disk_rows (id, val) VALUES (?, ?)", id, val); err != nil {
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: id, Name: val}); err != nil {
 			sawError = true
 			errored = append(errored, id)
 			if len(errored) >= 5 {
@@ -143,8 +132,8 @@ func TestDiskFullFailClosedAndRecover(t *testing.T) {
 		acked[id] = val
 	}
 	if !sawError {
-		if err := syscall.Statfs(node0.Dir, &st); err == nil {
-			t.Logf("tmpfs free after fill: %d bytes", int64(st.Bavail)*int64(st.Bsize))
+		if curFree, err := getFreeBytes(node0.Dir); err == nil {
+			t.Logf("tmpfs free after fill: %d bytes", curFree)
 		}
 		t.Fatalf("fill loop never hit an error in %d rows; ENOSPC not reached", fillRowCap())
 	}
@@ -153,8 +142,7 @@ func TestDiskFullFailClosedAndRecover(t *testing.T) {
 	// Fail-closed: the node must still be alive and answering (errors are
 	// fine, hangs and panics are not).
 	cluster.WaitNodeReady(0)
-	probeErr := cluster.ExecSQL(0, "INSERT INTO disk_rows (id, val) VALUES (?, ?)",
-		fmt.Sprintf("%032x", 99999), "liveness-probe")
+	probeErr := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 99999), Name: "liveness-probe"})
 	t.Logf("liveness probe during ENOSPC: err=%v", probeErr)
 	if probeErr == nil {
 		acked[fmt.Sprintf("%032x", 99999)] = "liveness-probe"
@@ -172,25 +160,25 @@ func TestDiskFullFailClosedAndRecover(t *testing.T) {
 	cluster.WaitNodeReady(0)
 
 	for id, want := range acked {
-		res, err := cluster.QuerySQL(0, "SELECT val FROM disk_rows WHERE id = ?", id)
-		if err != nil || len(res.Rows) != 1 {
-			t.Fatalf("acked row %s missing after recovery: err=%v res=%v", id, err, res)
+		row, err := cluster.TypedContentionRead(0, id)
+		if err != nil {
+			t.Fatalf("acked row %s missing after recovery: err=%v", id, err)
 		}
-		if got := fmt.Sprintf("%v", res.Rows[0][0]); got != want {
-			t.Fatalf("acked row %s corrupted: %d bytes, want %d", id, len(got), len(want))
+		if row.Name != want {
+			t.Fatalf("acked row %s corrupted: %d bytes, want %d", id, len(row.Name), len(want))
 		}
 	}
 	// Errored rows must be absent or whole: never a partial commit.
 	for _, id := range errored {
-		res, err := cluster.QuerySQL(0, "SELECT val FROM disk_rows WHERE id = ?", id)
+		row, err := cluster.TypedContentionRead(0, id)
 		if err != nil {
-			t.Fatalf("errored row %s query: %v", id, err)
-		}
-		if len(res.Rows) == 1 {
-			got := fmt.Sprintf("%v", res.Rows[0][0])
-			if !strings.HasPrefix(got, bigVal) || len(got) <= len(bigVal) {
-				t.Fatalf("errored row %s partially committed (%d bytes)", id, len(got))
+			if !strings.Contains(err.Error(), "404") {
+				t.Fatalf("errored row %s query: %v", id, err)
 			}
+			continue
+		}
+		if !strings.HasPrefix(row.Name, bigVal) || len(row.Name) <= len(bigVal) {
+			t.Fatalf("errored row %s partially committed (%d bytes)", id, len(row.Name))
 		}
 	}
 	t.Logf("recovery: all %d acked rows intact, %d errored rows clean", len(acked), len(errored))
@@ -199,12 +187,10 @@ func TestDiskFullFailClosedAndRecover(t *testing.T) {
 	wantTotal := baseline + len(acked)
 	waitConverged(t, cluster, wantTotal, 90*time.Second)
 	for i := 0; i < 5; i++ {
-		if err := cluster.ExecSQL(0, "INSERT INTO disk_rows (id, val) VALUES (?, ?)",
-			fmt.Sprintf("%032x", 20000+i), "post-a"); err != nil {
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 20000+i), Name: "post-a"}); err != nil {
 			t.Fatalf("post-recovery write node0: %v", err)
 		}
-		if err := cluster.ExecSQL(1, "INSERT INTO disk_rows (id, val) VALUES (?, ?)",
-			fmt.Sprintf("%032x", 21000+i), "post-b"); err != nil {
+		if err := cluster.TypedContentionInsert(1, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 21000+i), Name: "post-b"}); err != nil {
 			t.Fatalf("post-recovery write node1: %v", err)
 		}
 	}
@@ -247,16 +233,22 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "disk_rows")
-			if err != nil || n != want {
+			rows, err := c.TypedContentionRows(i)
+			if err != nil || len(rows) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, "disk_rows", "val")
-			if err != nil {
-				ok = false
-				break
+			sort.Slice(rows, func(a, b int) bool {
+				if rows[a].Name != rows[b].Name {
+					return rows[a].Name < rows[b].Name
+				}
+				return rows[a].ID < rows[b].ID
+			})
+			h := sha256.New()
+			for _, row := range rows {
+				fmt.Fprintf(h, "%s:%s:%s:%d\n", row.ID, row.Name, row.Phone, row.Score)
 			}
+			d := hex.EncodeToString(h.Sum(nil))
 			if i == 0 {
 				first = d
 			} else if d != first {

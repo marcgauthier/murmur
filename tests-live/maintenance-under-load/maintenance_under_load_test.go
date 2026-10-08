@@ -16,23 +16,23 @@
 //   - FilesGC: NOT claimed, manual DB method with no live endpoint.
 //   - Snapshot resync / anti-entropy: NOT claimed, on-demand only (needs a
 //     gap or snapshot-required, not steady load).
-//   - Pebble compaction: NOT claimed, automatic with no action counter
+//   - Spool compaction: NOT claimed, automatic with no action counter
 //     (gauges only).
 package maintenanceunderload_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -41,31 +41,27 @@ func TestMaintenanceUnderSustainedLoad(t *testing.T) {
 	maxInserts := envInt("MURMUR_MAINT_LOAD_MAX_INSERTS", 4000)
 	gcTimeout := envDur("MURMUR_MAINT_LOAD_GC_TIMEOUT", 150*time.Second)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "maintenance-under-load",
-		NumNodes:    3,
-		AwaitUnlock: true,
+		Name:            "maintenance-under-load",
+		NumNodes:        3,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 		Replication: &harness.ReplicationOptions{
 			MinLogRetentionMs:        1000,
 			MaxOfflineLogRetentionMs: 20000,
 			MinRetainedBatches:       10,
 		},
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "m_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
 	})
 
 	// Seed a base row set and converge before the load phase.
 	for i := 0; i < seed; i++ {
-		if err := cluster.ExecSQL(0, "INSERT INTO m_rows (id, name) VALUES (?, ?)",
-			fmt.Sprintf("%032x", i), fmt.Sprintf("seed-%d", i)); err != nil {
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{
+			ID: rowID(i), Name: fmt.Sprintf("seed-%d", i),
+		}); err != nil {
 			t.Fatalf("seed %d: %v", i, err)
 		}
 	}
-	waitConverged(t, cluster, "m_rows", seed, 60*time.Second)
+	waitConverged(t, cluster, seed, 60*time.Second)
 
 	runsBefore := metricAll(t, cluster, "spedsql_gc_runs_total")
 	collectedBefore := metricAll(t, cluster, "spedsql_gc_log_collected_total")
@@ -93,12 +89,12 @@ func TestMaintenanceUnderSustainedLoad(t *testing.T) {
 				var err error
 				if n < maxInserts {
 					id := base + n
-					err = cluster.ExecSQL(w, "INSERT INTO m_rows (id, name) VALUES (?, ?)",
-						fmt.Sprintf("%032x", id), fmt.Sprintf("w%d-%d", w, n))
+					err = cluster.TypedContentionInsert(w, harness.TypedContentionRow{
+						ID: rowID(id), Name: fmt.Sprintf("w%d-%d", w, n),
+					})
 				} else {
 					id := base + (n % maxInserts)
-					err = cluster.ExecSQL(w, "UPDATE m_rows SET name = ? WHERE id = ?",
-						fmt.Sprintf("w%d-u%d", w, n), fmt.Sprintf("%032x", id))
+					err = cluster.TypedContentionUpdate(w, rowID(id), "name", fmt.Sprintf("w%d-u%d", w, n))
 				}
 				if err != nil {
 					errCounts[w].Add(1)
@@ -144,30 +140,15 @@ func TestMaintenanceUnderSustainedLoad(t *testing.T) {
 	for w := range cluster.Nodes {
 		wantCount += minInt(int(okCounts[w].Load()), maxInserts)
 	}
-	waitConverged(t, cluster, "m_rows", wantCount, 90*time.Second)
-	for i := range cluster.Nodes {
-		n, err := cluster.QueryRowCount(i, "m_rows")
-		if err != nil || n != wantCount {
-			t.Fatalf("node %d count = %d (err=%v), want %d", i, n, err, wantCount)
-		}
-	}
-	wantDigest, err := cluster.ComputeTableDigest(0, "m_rows", "id")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 1; i < len(cluster.Nodes); i++ {
-		d, err := cluster.ComputeTableDigest(i, "m_rows", "id")
-		if err != nil || d != wantDigest {
-			t.Fatalf("node %d digest = %s (err=%v), want %s", i, d, err, wantDigest)
-		}
-	}
+	waitConverged(t, cluster, wantCount, 90*time.Second)
 
 	// A post-maintenance write replicates everywhere.
-	if err := cluster.ExecSQL(2, "INSERT INTO m_rows (id, name) VALUES (?, ?)",
-		fmt.Sprintf("%032x", seed+1<<22), "post-maint"); err != nil {
+	if err := cluster.TypedContentionInsert(2, harness.TypedContentionRow{
+		ID: rowID(seed + 1<<22), Name: "post-maint",
+	}); err != nil {
 		t.Fatalf("post-maintenance insert: %v", err)
 	}
-	waitConverged(t, cluster, "m_rows", wantCount+1, 30*time.Second)
+	waitConverged(t, cluster, wantCount+1, 30*time.Second)
 	t.Log("maintenance-under-load proven: GC ran on every node under zero-error load, full convergence")
 }
 
@@ -207,23 +188,23 @@ func waitMaintenance(t *testing.T, c *harness.Cluster, runsBefore, collectedBefo
 	t.Fatalf("log-GC maintenance did not run+collect on every node within %v", timeout)
 }
 
-func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, timeout time.Duration) {
+func rowID(n int) string {
+	return fmt.Sprintf("%08x-0000-4000-8000-%012x", n, n)
+}
+
+func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, table)
-			if err != nil || n != want {
+			rows, err := c.TypedContentionRows(i)
+			if err != nil || len(rows) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, table, "id")
-			if err != nil {
-				ok = false
-				break
-			}
+			d := contentionDigest(rows)
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -237,11 +218,19 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 		time.Sleep(100 * time.Millisecond)
 	}
 	for i := range c.Nodes {
-		n, _ := c.QueryRowCount(i, table)
-		d, _ := c.ComputeTableDigest(i, table, "id")
-		t.Logf("node %d at timeout: count=%d digest=%s", i, n, d)
+		rows, _ := c.TypedContentionRows(i)
+		t.Logf("node %d at timeout: count=%d digest=%s", i, len(rows), contentionDigest(rows))
 	}
-	t.Fatalf("nodes did not converge on %d %s rows with equal digests within %v", want, table, timeout)
+	t.Fatalf("nodes did not converge on %d typed rows with equal digests within %v", want, timeout)
+}
+
+func contentionDigest(rows []harness.TypedContentionRow) string {
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	h := sha256.New()
+	for _, row := range rows {
+		_, _ = fmt.Fprintf(h, "%q\x00%q\x00%q\x00%d\n", row.ID, row.Name, row.Phone, row.Score)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func metricAll(t *testing.T, c *harness.Cluster, name string) []int64 {
@@ -264,23 +253,8 @@ func metricInt(t *testing.T, apiAddr, name string) int64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line == "" || line[0] == '#' || !strings.HasPrefix(line, name) {
-			continue
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(line, name))
-		if i := strings.LastIndex(rest, " "); i >= 0 {
-			rest = rest[i+1:]
-		}
-		v, err := strconv.ParseInt(rest, 10, 64)
-		if err != nil {
-			f, ferr := strconv.ParseFloat(rest, 64)
-			if ferr != nil {
-				t.Fatalf("parse %s: %v", name, err)
-			}
-			return int64(f)
-		}
-		return v
+	if value, ok := harness.MetricValueFrom(string(raw), name); ok {
+		return int64(value)
 	}
 	t.Fatalf("counter %s not present in /metrics", name)
 	return 0
@@ -298,9 +272,11 @@ func metricRaw(t *testing.T, apiAddr, name string) string {
 	if err != nil {
 		return "unreadable: " + err.Error()
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if strings.HasPrefix(line, name) {
-			return line
+	if samples, ok := harness.MetricSamples(string(raw)); ok {
+		for _, sample := range samples {
+			if sample.Name == name {
+				return fmt.Sprintf("%s labels=%v value=%g", sample.Name, sample.Labels, sample.Value)
+			}
 		}
 	}
 	return "absent"

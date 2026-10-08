@@ -17,15 +17,15 @@ bash tests-live/run.sh endurance-chaos
 # Short development pass: 3 nodes, 3 min of chaos
 MURMUR_ENDURANCE_NODES=3 MURMUR_ENDURANCE_DURATION_SECONDS=180 \
 MURMUR_ENDURANCE_SETTLE_SECONDS=120 \
-  go test -tags "sqlite_preupdate_hook sqlite_fts5" ./tests-live/endurance-chaos/ -v -count=1 -timeout=15m
+  go test ./tests-live/endurance-chaos/ -v -count=1 -timeout=15m
 
 # 24-hour acceptance (privileged box: tc + libfaketime for the full mix)
 MURMUR_ENDURANCE_DURATION_SECONDS=86400 MURMUR_ENDURANCE_SETTLE_SECONDS=1800 \
-  go test -tags "sqlite_preupdate_hook sqlite_fts5" ./tests-live/endurance-chaos/ -v -count=1 -timeout=26h
+  go test ./tests-live/endurance-chaos/ -v -count=1 -timeout=26h
 
 # 72-hour acceptance
 MURMUR_ENDURANCE_DURATION_SECONDS=259200 MURMUR_ENDURANCE_SETTLE_SECONDS=3600 \
-  go test -tags "sqlite_preupdate_hook sqlite_fts5" ./tests-live/endurance-chaos/ -v -count=1 -timeout=76h
+  go test ./tests-live/endurance-chaos/ -v -count=1 -timeout=76h
 ```
 
 `go test -timeout` must exceed duration + settle + restart/restart-down

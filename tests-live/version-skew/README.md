@@ -1,7 +1,7 @@
 # Protocol version skew (multi-process)
 
-Run with `go test -count=1 ./tests-live/version-skew` (tags required; or
-`bash tests-live/run.sh version-skew`). Three Murmur-SQL daemons mesh, but
+Run with `bash tests-live/run.sh version-skew`. Three encrypted Murmur daemons
+use the managed typed API, with CGO disabled, but
 the third advertises handshake protocol version 99 via the
 `protocol_version_override` testing knob.
 

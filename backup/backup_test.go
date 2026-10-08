@@ -23,7 +23,6 @@ import (
 type mockDB struct {
 	mu          sync.Mutex
 	dataDir     string
-	keysDir     string
 	filesDir    string
 	dbID        string
 	nodeID      string
@@ -31,52 +30,39 @@ type mockDB struct {
 	schemaVer   uint64
 	schemaHash  string
 
-	pinnedPaths  []string
 	checkpointed bool
 }
 
-func (m *mockDB) Checkpoint(stagingDataDir string) error {
+func (m *mockDB) HoldCommits() func() {
+	return func() {}
+}
+
+func (m *mockDB) Checkpoint(_ context.Context, stagingDataDir string) (func() error, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.checkpointed = true
 
-	// Simulate Pebble hard-links: create dummy encrypted SSTables and MANIFEST
 	if err := os.MkdirAll(stagingDataDir, 0o700); err != nil {
-		return err
+		return nil, err
 	}
-	// Mimic NOMADSQL Encrypted VFS container header (magic: NMC1)
-	header := []byte("NMC1" + strings.Repeat("\x00", 24))
+	manifestPath := filepath.Join(stagingDataDir, "manifest.enc")
+	if err := os.WriteFile(manifestPath, []byte("spool-manifest-bytes"), 0o600); err != nil {
+		return nil, err
+	}
+	keysPath := filepath.Join(stagingDataDir, "keys.enc")
+	if err := os.WriteFile(keysPath, []byte("spool-keys-bytes"), 0o600); err != nil {
+		return nil, err
+	}
 	for i := 1; i <= 3; i++ {
-		sstPath := filepath.Join(stagingDataDir, fmt.Sprintf("%06d.sst", i))
-		content := append(header, []byte(fmt.Sprintf("encrypted-payload-data-%d", i))...)
-		if err := os.WriteFile(sstPath, content, 0o600); err != nil {
-			return err
+		segPath := filepath.Join(stagingDataDir, fmt.Sprintf("%06d.seg", i))
+		content := []byte(fmt.Sprintf("spool-segment-data-%d", i))
+		if err := os.WriteFile(segPath, content, 0o600); err != nil {
+			return nil, err
 		}
 	}
-	manifestPath := filepath.Join(stagingDataDir, "MANIFEST-000001")
-	return os.WriteFile(manifestPath, append(header, []byte("manifest-bytes")...), 0o600)
+	return func() error { return nil }, nil
 }
 
-func (m *mockDB) Pin(_ context.Context, path, kind string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.pinnedPaths = append(m.pinnedPaths, path)
-	return nil
-}
-
-func (m *mockDB) Unpin(_ context.Context, path string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for i, p := range m.pinnedPaths {
-		if p == path {
-			m.pinnedPaths = append(m.pinnedPaths[:i], m.pinnedPaths[i+1:]...)
-			break
-		}
-	}
-	return nil
-}
-
-func (m *mockDB) KeysDir() string     { return m.keysDir }
 func (m *mockDB) ClusterID() string   { return m.dbID }
 func (m *mockDB) LocalNodeID() string { return m.nodeID }
 func (m *mockDB) SchemaInfo() (uint64, uint64, string) {
@@ -93,18 +79,10 @@ func setupMockDB(t *testing.T) *mockDB {
 	t.Helper()
 	root := t.TempDir()
 	dataDir := filepath.Join(root, "data")
-	keysDir := filepath.Join(root, "keys")
 	_ = os.MkdirAll(dataDir, 0o700)
-	_ = os.MkdirAll(keysDir, 0o700)
-
-	// Create fake KEYREGISTRY sealed file (magic: NMKR)
-	regHeader := []byte("NMKR" + strings.Repeat("\x01", 28))
-	regContent := append(regHeader, []byte("sealed-keys-material-content")...)
-	_ = os.WriteFile(filepath.Join(keysDir, "KEYREGISTRY"), regContent, 0o600)
 
 	return &mockDB{
 		dataDir:     dataDir,
-		keysDir:     keysDir,
 		dbID:        "db-test-12345",
 		nodeID:      "node-test-67890",
 		schemaEpoch: 3,
@@ -135,13 +113,8 @@ func TestLocalBackupAndRestoreRoundTrip(t *testing.T) {
 	if meta.DBID != db.dbID {
 		t.Errorf("meta.DBID = %s, want %s", meta.DBID, db.dbID)
 	}
-	if meta.DataFilesCount != 5 { // 3 SSTables + 1 MANIFEST + 1 KEYREGISTRY
+	if meta.DataFilesCount != 5 { // 3 Segments + 1 manifest.enc + 1 keys.enc
 		t.Errorf("meta.DataFilesCount = %d, want 5", meta.DataFilesCount)
-	}
-
-	// Verify key unpinned and staging directory cleaned up
-	if len(db.pinnedPaths) != 0 {
-		t.Errorf("pinnedPaths not unpinned: %+v", db.pinnedPaths)
 	}
 
 	// Verify files in backup directory
@@ -165,13 +138,11 @@ func TestLocalBackupAndRestoreRoundTrip(t *testing.T) {
 
 	// 3. Restore to target directory
 	targetDir := filepath.Join(t.TempDir(), "restored")
-	keysTarget := filepath.Join(targetDir, "keys")
 
 	restoredMeta, err := Restore(ctx, RestoreConfig{
 		Source:       localDest,
 		BackupName:   backups[0].Name,
 		TargetPath:   targetDir,
-		KeysPath:     keysTarget,
 		ExpectedDBID: db.dbID,
 		FreshNodeID:  testFreshNodeID,
 	})
@@ -183,22 +154,29 @@ func TestLocalBackupAndRestoreRoundTrip(t *testing.T) {
 		t.Errorf("restored backupID = %s, want %s", restoredMeta.BackupID, meta.BackupID)
 	}
 
-	// Verify restored KEYREGISTRY
-	restoredReg, err := os.ReadFile(filepath.Join(keysTarget, "KEYREGISTRY"))
+	// Verify restored Spool files
+	restoredKeys, err := os.ReadFile(filepath.Join(targetDir, "data", "keys.enc"))
 	if err != nil {
-		t.Fatalf("restored KEYREGISTRY missing: %v", err)
+		t.Fatalf("restored keys.enc missing: %v", err)
 	}
-	if !bytes.HasPrefix(restoredReg, []byte("NMKR")) {
-		t.Error("restored KEYREGISTRY missing NMKR magic")
+	if string(restoredKeys) != "spool-keys-bytes" {
+		t.Errorf("unexpected keys.enc content: %q", string(restoredKeys))
 	}
 
-	// Verify restored SSTables
-	sst1, err := os.ReadFile(filepath.Join(targetDir, "data", "000001.sst"))
+	restoredManifest, err := os.ReadFile(filepath.Join(targetDir, "data", "manifest.enc"))
 	if err != nil {
-		t.Fatalf("restored 000001.sst missing: %v", err)
+		t.Fatalf("restored manifest.enc missing: %v", err)
 	}
-	if !bytes.HasPrefix(sst1, []byte("NMC1")) {
-		t.Error("restored 000001.sst missing NMC1 container magic")
+	if string(restoredManifest) != "spool-manifest-bytes" {
+		t.Errorf("unexpected manifest.enc content: %q", string(restoredManifest))
+	}
+
+	seg1, err := os.ReadFile(filepath.Join(targetDir, "data", "000001.seg"))
+	if err != nil {
+		t.Fatalf("restored 000001.seg missing: %v", err)
+	}
+	if string(seg1) != "spool-segment-data-1" {
+		t.Errorf("unexpected 000001.seg content: %q", string(seg1))
 	}
 
 	// 4. Test non-empty directory restore protection
@@ -384,8 +362,9 @@ func TestArchiveStreamStructure(t *testing.T) {
 
 	tr := tar.NewReader(gr)
 	foundMeta := false
-	foundReg := false
-	var sstCount int
+	foundKeys := false
+	foundManifest := false
+	var segCount int
 
 	for {
 		hdr, err := tr.Next()
@@ -405,20 +384,25 @@ func TestArchiveStreamStructure(t *testing.T) {
 			if m.BackupID != meta.BackupID {
 				t.Errorf("meta mismatch: %s != %s", m.BackupID, meta.BackupID)
 			}
-		} else if hdr.Name == "keys/KEYREGISTRY" {
-			foundReg = true
-		} else if strings.HasPrefix(hdr.Name, "data/") && strings.HasSuffix(hdr.Name, ".sst") {
-			sstCount++
+		} else if hdr.Name == "data/keys.enc" {
+			foundKeys = true
+		} else if hdr.Name == "data/manifest.enc" {
+			foundManifest = true
+		} else if strings.HasPrefix(hdr.Name, "data/") && strings.HasSuffix(hdr.Name, ".seg") {
+			segCount++
 		}
 	}
 
 	if !foundMeta {
 		t.Error("backup-metadata.json not found in tar archive")
 	}
-	if !foundReg {
-		t.Error("keys/KEYREGISTRY not found in tar archive")
+	if !foundKeys {
+		t.Error("data/keys.enc not found in tar archive")
 	}
-	if sstCount != 3 {
-		t.Errorf("expected 3 sstables, got %d", sstCount)
+	if !foundManifest {
+		t.Error("data/manifest.enc not found in tar archive")
+	}
+	if segCount != 3 {
+		t.Errorf("expected 3 segments, got %d", segCount)
 	}
 }

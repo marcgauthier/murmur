@@ -1,11 +1,11 @@
 # Distributed merge policies
 
-Run `go test -tags modernc -v ./tests-live/merge-policies` or
-`bash tests-live/run.sh merge-policies`.
+Run `bash tests-live/run.sh merge-policies`. This scenario uses the managed
+typed API and builds its node fixture with CGO disabled.
 
-Three encrypted daemons start with manual peer connections. They write a
-counter beyond int64, observed-remove sets and MAX/MIN while disconnected.
-After two nodes connect, the original writer stops; another node must forward
-its signed causal operations to the third. The scenario checks projections,
-retained causal-record hashes, restart recovery and observed removal after
-restart. Communication uses QUIC/mTLS and separately provisioned origin keys.
+Three encrypted daemons start with manual peer connections. They write
+PN_COUNTER values, OR_SET values and MAX/MIN fields while disconnected. After
+two nodes connect, the original writer stops; the second node forwards its
+causal operations to the third. The scenario checks typed projections,
+unobserved versus observed set removal, and restart recovery. Communication
+uses QUIC/mTLS and separately provisioned origin keys.

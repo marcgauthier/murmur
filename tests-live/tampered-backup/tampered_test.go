@@ -15,59 +15,64 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/backup"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
-func schemaConfig() *db.SchemaConfig {
-	return &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-		Name: "tb_rows",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-		},
-	}}}
+type tamperedTypedRecord struct {
+	ID    ids.RowID `rime:"primary"`
+	Name  string
+	Count int64
+	Tags  []string
+	Peak  int64
+	Floor float64
+}
+
+func typedDefinition(t *testing.T) db.TableDefinition {
+	t.Helper()
+	definition, err := db.Define[tamperedTypedRecord]("live_typed_records", 901, db.RecordOptions{
+		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
+		MergePolicies: map[string]db.RecordMergePolicy{"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return definition
 }
 
 func TestTamperedBackupsFailClosed(t *testing.T) {
 	ctx := context.Background()
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "tampered-backup",
-		NumNodes:    1,
-		AwaitUnlock: true,
-		Schema:      schemaConfig(),
+		Name: "tampered-backup", NumNodes: 1, AwaitUnlock: true, TypedRecords: true,
 	})
 
 	const rows = 30
 	for i := 0; i < rows; i++ {
-		id := fmt.Sprintf("%032x", 9000+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO tb_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("row-%d", i)); err != nil {
+		if err := cluster.TypedInsert(0, fmt.Sprintf("row-%d", i)); err != nil {
 			t.Fatalf("seed write: %v", err)
 		}
 	}
-	if n, err := cluster.QueryRowCount(0, "tb_rows"); err != nil || n != rows {
-		t.Fatalf("seeded count = %d, %v; want %d", n, err, rows)
+	names, err := cluster.TypedNames(0)
+	if err != nil || len(names) != rows {
+		t.Fatalf("seeded count = %d, %v; want %d", len(names), err, rows)
 	}
-	wantDigest, err := cluster.ComputeTableDigest(0, "tb_rows", "id")
-	if err != nil {
-		t.Fatalf("pre-backup digest: %v", err)
-	}
+	wantDigest := namesDigest(names)
 
 	cluster.StopNode(0)
 	node := cluster.Nodes[0]
 
 	backupDir := t.TempDir()
-	offline := openNodeDir(t, ctx, cluster, node.PebbleDir, node.NodeID.String())
+	offline := openNodeDir(t, ctx, cluster, node.Dir, node.NodeID.String())
 	if _, err := offline.Backup(ctx, backup.Config{Destination: mustLocalDest(t, backupDir)}); err != nil {
 		t.Fatalf("backup: %v", err)
 	}
@@ -292,7 +297,7 @@ func keyBytes(t *testing.T, keyHex string) []byte {
 	return raw
 }
 
-func offlineConfig(t *testing.T, pebbleDir string, cluster *harness.Cluster, nodeID string) db.Config {
+func offlineConfig(t *testing.T, nodeDir string, cluster *harness.Cluster, nodeID string) db.Config {
 	t.Helper()
 	node, err := db.ParseNodeID(nodeID)
 	if err != nil {
@@ -300,20 +305,21 @@ func offlineConfig(t *testing.T, pebbleDir string, cluster *harness.Cluster, nod
 	}
 	return db.Config{
 		OriginSigning: cluster.OriginSigning(node),
-		Path:          pebbleDir,
+		Path:          nodeDir,
 		NodeID:        node,
 		DBID:          cluster.DBID,
-		Schema:        *schemaConfig(),
-		Pebble:        db.DefaultPebbleConfig(),
+		Schema:        db.SchemaConfig{Version: 1},
+		Tables:        []db.TableDefinition{typedDefinition(t)},
+		Spool:         db.DefaultSpoolConfig(),
 		// The daemon unlocks with key_id "remote-unlock-key" (see
 		// handleAdminUnlock); the offline open must use the same ID.
 		Encryption: db.EncryptionConfig{Key: keyBytes(t, cluster.Nodes[0].KeyHex), KeyID: "remote-unlock-key"},
 	}
 }
 
-func openNodeDir(t *testing.T, ctx context.Context, cluster *harness.Cluster, pebbleDir, nodeID string) *db.DB {
+func openNodeDir(t *testing.T, ctx context.Context, cluster *harness.Cluster, nodeDir, nodeID string) *db.DB {
 	t.Helper()
-	handle, err := db.Open(ctx, offlineConfig(t, pebbleDir, cluster, nodeID))
+	handle, err := db.Open(ctx, offlineConfig(t, nodeDir, cluster, nodeID))
 	if err != nil {
 		t.Fatalf("open node dir: %v", err)
 	}
@@ -322,57 +328,38 @@ func openNodeDir(t *testing.T, ctx context.Context, cluster *harness.Cluster, pe
 
 func countRows(ctx context.Context, t *testing.T, handle *db.DB) (int, error) {
 	t.Helper()
-	rows, err := handle.QueryContext(ctx, "SELECT count(*) FROM tb_rows")
+	_ = ctx
+	rows, err := db.TableOf[tamperedTypedRecord](handle, "live_typed_records")
 	if err != nil {
 		return 0, err
 	}
-	defer rows.Close()
-	if !rows.Next() {
-		return 0, fmt.Errorf("no count row")
-	}
-	var n int
-	if err := rows.Scan(&n); err != nil {
-		return 0, err
-	}
-	return n, rows.Err()
+	return rows.Where().Count()
 }
 
-// offlineDigest mirrors harness.ComputeTableDigest exactly, including its
-// JSON value rendering: scanned cells take the same marshal/unmarshal
-// round trip the daemon HTTP path applies before %v formatting.
+// offlineDigest uses the same canonical unique-name digest as TypedNames.
 func offlineDigest(ctx context.Context, t *testing.T, handle *db.DB) string {
 	t.Helper()
-	rows, err := handle.QueryContext(ctx, "SELECT * FROM tb_rows ORDER BY id")
+	_ = ctx
+	rows, err := db.TableOf[tamperedTypedRecord](handle, "live_typed_records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
-	cols := rows.Columns()
-	h := sha256.New()
-	for rows.Next() {
-		dest := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range dest {
-			ptrs[i] = &dest[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			t.Fatal(err)
-		}
-		for _, cell := range dest {
-			raw, err := json.Marshal(cell)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var v any
-			if err := json.Unmarshal(raw, &v); err != nil {
-				t.Fatal(err)
-			}
-			h.Write([]byte(fmt.Sprintf("%v:", v)))
-		}
-		h.Write([]byte("\n"))
-	}
-	if err := rows.Err(); err != nil {
+	records, err := rows.Where().Find()
+	if err != nil {
 		t.Fatal(err)
+	}
+	names := make([]string, 0, len(records))
+	for _, row := range records {
+		names = append(names, row.Name)
+	}
+	return namesDigest(names)
+}
+
+func namesDigest(names []string) string {
+	sort.Strings(names)
+	h := sha256.New()
+	for _, name := range names {
+		fmt.Fprintf(h, "%s\n", name)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

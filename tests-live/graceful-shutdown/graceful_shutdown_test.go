@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,8 +22,6 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -36,24 +35,19 @@ func TestGracefulShutdownMidWriteAndMidSnapshot(t *testing.T) {
 			MaxOfflineLogRetentionMs: 20000,
 			MinRetainedBatches:       10,
 		},
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "gs_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-				{Name: "payload", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 
 	// Baseline: 5 rows converge before any shutdown.
 	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("%032x", i)
-		if err := cluster.ExecSQL(0, "INSERT INTO gs_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("base-%d", i)); err != nil {
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{
+			ID: gsRowID(uint64(i)), Name: fmt.Sprintf("base-%d", i),
+		}); err != nil {
 			t.Fatalf("baseline write: %v", err)
 		}
 	}
-	waitConverged(t, cluster, "gs_rows", 5, 30*time.Second)
+	waitConverged(t, cluster, 5, 30*time.Second)
 
 	// Phase A: all three nodes under write load; SIGTERM node1 mid-write.
 	acknowledged := map[string]struct{}{}
@@ -81,9 +75,9 @@ func TestGracefulShutdownMidWriteAndMidSnapshot(t *testing.T) {
 				}
 				seq := seqs[node].Add(1)
 				value := fmt.Sprintf("load-n%d-%08d", node+1, seq)
-				id := fmt.Sprintf("%032x", int64(node+1)*1_000_000_000+seq)
+				id := gsRowID(uint64(int64(node+1)*1_000_000_000 + seq))
 				active[node].Add(1)
-				err := cluster.ExecSQL(node, "INSERT INTO gs_rows (id, name) VALUES (?, ?)", id, value)
+				err := cluster.TypedContentionInsert(node, harness.TypedContentionRow{ID: id, Name: value})
 				active[node].Add(-1)
 				if err == nil {
 					ackMu.Lock()
@@ -127,7 +121,7 @@ func TestGracefulShutdownMidWriteAndMidSnapshot(t *testing.T) {
 	ackMu.Lock()
 	total := len(acknowledged)
 	ackMu.Unlock()
-	waitConverged(t, cluster, "gs_rows", total, 90*time.Second)
+	waitConverged(t, cluster, total, 90*time.Second)
 	assertAcknowledgedPresent(t, cluster, acknowledged)
 
 	// Phase B: node3 goes stale under aggressive retention while the
@@ -136,8 +130,9 @@ func TestGracefulShutdownMidWriteAndMidSnapshot(t *testing.T) {
 	cluster.StopNode(2)
 	const bulkRows = 100
 	for i := 0; i < bulkRows; i++ {
-		id := fmt.Sprintf("%032x", 5000+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO gs_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("fresh-%d", i)); err != nil {
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{
+			ID: gsRowID(uint64(5000 + i)), Name: fmt.Sprintf("fresh-%d", i),
+		}); err != nil {
 			t.Fatalf("survivor write: %v", err)
 		}
 		ackMu.Lock()
@@ -146,13 +141,14 @@ func TestGracefulShutdownMidWriteAndMidSnapshot(t *testing.T) {
 	}
 	// Fat values widen the snapshot transfer window so SIGTERM can land
 	// inside it deterministically: ~2MB across 8 rows keeps the chunked
-	// transfer + SQLite apply busy long past the first 5ms poll, on a
+	// transfer + RIME apply busy long past the first 5ms poll, on a
 	// fast box as well as under contention.
 	big := strings.Repeat("SPeD-SQL-snapshot-filler-", 256*1024/len("SPeD-SQL-snapshot-filler-"))
 	for i := 0; i < 8; i++ {
-		id := fmt.Sprintf("%032x", 6000+i)
 		name := fmt.Sprintf("fat-%d", i)
-		if err := cluster.ExecSQL(1, "INSERT INTO gs_rows (id, name, payload) VALUES (?, ?, ?)", id, name, big); err != nil {
+		if err := cluster.TypedContentionInsert(1, harness.TypedContentionRow{
+			ID: gsRowID(uint64(6000 + i)), Name: name, Phone: big,
+		}); err != nil {
 			t.Fatalf("fat write: %v", err)
 		}
 		ackMu.Lock()
@@ -162,8 +158,8 @@ func TestGracefulShutdownMidWriteAndMidSnapshot(t *testing.T) {
 	ackMu.Lock()
 	want := len(acknowledged)
 	ackMu.Unlock()
-	waitRowCount(t, cluster, 0, "gs_rows", want, 30*time.Second)
-	waitRowCount(t, cluster, 1, "gs_rows", want, 30*time.Second)
+	waitRowCount(t, cluster, 0, want, 30*time.Second)
+	waitRowCount(t, cluster, 1, want, 30*time.Second)
 
 	// Member-deadline expiry plus a polled GC pass (not a fixed sleep:
 	// under contention the 30s GC tick slips, so a fixed wait can elapse
@@ -210,22 +206,23 @@ func TestGracefulShutdownMidWriteAndMidSnapshot(t *testing.T) {
 		t.Fatalf("node3 restart took %v, want fast restart under 60s", restartElapsed)
 	}
 
-	waitConverged(t, cluster, "gs_rows", want, 120*time.Second)
+	waitConverged(t, cluster, want, 120*time.Second)
 	if got := metricValue(t, cluster.Nodes[2].APIAddr, "spedsql_repl_snapshots_received_total"); got < 1 {
 		t.Fatalf("node3 snapshots received = %v, want >= 1 (log catch-up would hide a snapshot-path regression)", got)
 	}
 	assertAcknowledgedPresent(t, cluster, acknowledged)
 
 	// Post-recovery honest write still replicates everywhere.
-	postID := fmt.Sprintf("%032x", 999_999)
-	if err := cluster.ExecSQL(0, "INSERT INTO gs_rows (id, name) VALUES (?, ?)", postID, "post-recovery"); err != nil {
+	if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{
+		ID: gsRowID(999_999), Name: "post-recovery",
+	}); err != nil {
 		t.Fatalf("post-recovery write: %v", err)
 	}
 	ackMu.Lock()
 	acknowledged["post-recovery"] = struct{}{}
 	want = len(acknowledged)
 	ackMu.Unlock()
-	waitConverged(t, cluster, "gs_rows", want, 60*time.Second)
+	waitConverged(t, cluster, want, 60*time.Second)
 	assertAcknowledgedPresent(t, cluster, acknowledged)
 	t.Logf("graceful shutdown proven: 2 SIGTERM restarts, %d rows intact, digests converge", want)
 }
@@ -294,37 +291,42 @@ func assertCleanShutdown(t *testing.T, logFile string, before int, what string) 
 	}
 }
 
-func waitRowCount(t *testing.T, c *harness.Cluster, idx int, table string, want int, timeout time.Duration) {
+func gsRowID(n uint64) string {
+	return fmt.Sprintf("%08x-0000-4000-8000-%012x", n>>32, n&0xffffffffffff)
+}
+
+func waitRowCount(t *testing.T, c *harness.Cluster, idx, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		n, err := c.QueryRowCount(idx, table)
-		if err == nil && n == want {
+		rows, err := c.TypedContentionRows(idx)
+		if err == nil && len(rows) == want {
 			return
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	n, _ := c.QueryRowCount(idx, table)
-	t.Fatalf("node %d %s count = %d, want %d within %v", idx, table, n, want, timeout)
+	rows, _ := c.TypedContentionRows(idx)
+	t.Fatalf("node %d typed row count = %d, want %d within %v", idx, len(rows), want, timeout)
 }
 
-func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, timeout time.Duration) {
+func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, table)
-			if err != nil || n != want {
+			rows, err := c.TypedContentionRows(i)
+			if err != nil || len(rows) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, table, "id")
-			if err != nil {
-				ok = false
-				break
+			names := make([]string, len(rows))
+			for j := range rows {
+				names[j] = rows[j].Name
 			}
+			sort.Strings(names)
+			d := strings.Join(names, "\x00")
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -337,25 +339,19 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	for i := range c.Nodes {
-		n, _ := c.QueryRowCount(i, "gs_rows")
-		t.Logf("node %d at timeout: count=%d", i, n)
-	}
-	t.Fatalf("nodes did not converge on %d %s rows with equal digests within %v", want, table, timeout)
+	t.Fatalf("nodes did not converge on %d typed rows with equal contents within %v", want, timeout)
 }
 
 func assertAcknowledgedPresent(t *testing.T, c *harness.Cluster, acknowledged map[string]struct{}) {
 	t.Helper()
 	for _, node := range c.Nodes {
-		res, err := c.QuerySQL(node.Index, "SELECT name FROM gs_rows")
+		rows, err := c.TypedContentionRows(node.Index)
 		if err != nil {
 			t.Fatalf("%s recovery query: %v", node.Label, err)
 		}
-		present := make(map[string]struct{}, len(res.Rows))
-		for _, row := range res.Rows {
-			if len(row) > 0 {
-				present[fmt.Sprint(row[0])] = struct{}{}
-			}
+		present := make(map[string]struct{}, len(rows))
+		for _, row := range rows {
+			present[row.Name] = struct{}{}
 		}
 		for value := range acknowledged {
 			if _, ok := present[value]; !ok {
@@ -376,22 +372,8 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line == "" || line[0] == '#' {
-			continue
-		}
-		if !strings.HasPrefix(line, name) {
-			continue
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(line, name))
-		if i := strings.LastIndex(rest, " "); i >= 0 {
-			rest = rest[i+1:]
-		}
-		v, err := strconv.ParseFloat(rest, 64)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		return v
+	if value, ok := harness.MetricValueFrom(string(raw), name); ok {
+		return value
 	}
 	t.Fatalf("counter %s not present in /metrics", name)
 	return 0

@@ -1,6 +1,7 @@
 # File crash leaves no partials or phantoms
 
-Run with `go test -count=1 ./tests-live/files-crash`. The uploader is
+Run with `CGO_ENABLED=0 bash tests-live/run.sh files-crash`. The test uses
+managed typed records without SQLite or CGO. The uploader is
 SIGKILLed mid-upload and the fetcher mid-fetch (a kill only counts
 when the op was in flight, else the round retries and the test fails
 loudly if no valid kill lands). Afterwards every listed object must

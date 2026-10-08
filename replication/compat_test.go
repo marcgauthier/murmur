@@ -18,13 +18,13 @@ func TestNegotiateCapabilities(t *testing.T) {
 		wantErr bool
 	}{
 		{"none", 0, 0, false},
-		{"known", CapZstd, CapZstd, false},
+		{"known", CapCompression, CapCompression, false},
 		{"unknown optional ignored", futureOptional, 0, false},
-		{"known plus unknown optional", CapZstd | futureOptional, CapZstd, false},
+		{"known plus unknown optional", CapCompression | futureOptional, CapCompression, false},
 		{"required marker alone", CapRequiredMask, 0, false},
-		{"required known", CapRequiredMask | CapZstd, CapZstd, false},
+		{"required known", CapRequiredMask | CapCompression, CapCompression, false},
 		{"required unknown refused", CapRequiredMask | futureOptional, 0, true},
-		{"required known plus unknown refused", CapRequiredMask | CapZstd | futureOptional, 0, true},
+		{"required known plus unknown refused", CapRequiredMask | CapCompression | futureOptional, 0, true},
 	} {
 		got, err := NegotiateCapabilities(tc.peer)
 		if tc.wantErr != (err != nil) {
@@ -69,10 +69,10 @@ func TestDisseminationCapabilityMismatchRefuses(t *testing.T) {
 		local   bool
 		wantErr bool
 	}{
-		{"gossip peers agree", CapZstd, false, false},
-		{"plumtree peers agree", CapZstd | CapPlumtree | CapRequiredMask, true, false},
-		{"enabled local rejects gossip peer", CapZstd, true, true},
-		{"gossip local rejects enabled peer", CapZstd | CapPlumtree | CapRequiredMask, false, true},
+		{"gossip peers agree", CapCompression, false, false},
+		{"plumtree peers agree", CapCompression | CapPlumtree | CapRequiredMask, true, false},
+		{"enabled local rejects gossip peer", CapCompression, true, true},
+		{"gossip local rejects enabled peer", CapCompression | CapPlumtree | CapRequiredMask, false, true},
 	} {
 		if _, err := NegotiateDisseminationCapabilities(tc.peer, tc.local); tc.wantErr != (err != nil) {
 			t.Fatalf("%s: err=%v wantErr=%t", tc.name, err, tc.wantErr)
@@ -130,7 +130,7 @@ func TestHandshakeCapabilityNegotiation(t *testing.T) {
 	}
 
 	// Unknown optional: normal welcome and session.
-	fr = dial(t, ids.NewNodeID(), CapZstd|(uint64(1)<<40))
+	fr = dial(t, ids.NewNodeID(), CapCompression|(uint64(1)<<40))
 	if fr == nil || fr.Type != MsgWelcome {
 		t.Fatalf("optional-unknown handshake reply = %v, want MsgWelcome", fr)
 	}

@@ -22,10 +22,10 @@ func openGroupTestStore(t *testing.T, node ids.NodeID) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(t.TempDir(), node, ids.DBID{}, Options{
+	s, err := Open(t.TempDir(), node, ids.DBID{}, withTestKey(Options{
 		Limits:        codec.DefaultLimits(),
 		OriginSigning: origin.Config{PrivateKey: priv, TrustedKeys: reg},
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}

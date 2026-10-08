@@ -4,7 +4,7 @@
 //
 // Run it:
 //
-//	go run -tags "sqlite_preupdate_hook sqlite_fts5" ./examples/offline-partition
+//	go run ./examples/offline-partition
 package main
 
 import (
@@ -17,9 +17,14 @@ import (
 	"time"
 
 	"github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/transport"
 )
+
+type note struct {
+	ID   ids.RowID `rime:"primary"`
+	Body string
+}
 
 func freePort() int {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -30,13 +35,13 @@ func freePort() int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-func waitCounts(ctx context.Context, dbs []*murmur.DB, want int, timeout time.Duration, what string) {
+func waitCounts(tables []*murmur.RecordTable[note], want int, timeout time.Duration, what string) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
-		for _, db := range dbs {
-			var n int
-			if err := db.QueryRowContext(ctx, `SELECT count(*) FROM notes`).Scan(&n); err != nil || n != want {
+		for _, table := range tables {
+			n, err := table.Where().Count()
+			if err != nil || n != want {
 				ok = false
 				break
 			}
@@ -47,6 +52,12 @@ func waitCounts(ctx context.Context, dbs []*murmur.DB, want int, timeout time.Du
 		time.Sleep(100 * time.Millisecond)
 	}
 	log.Fatalf("timed out waiting for %s (want %d rows everywhere)", what, want)
+}
+
+func insertNote(ctx context.Context, db *murmur.DB, table *murmur.RecordTable[note], body string) error {
+	return db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+		return table.Insert(tx, &note{ID: murmur.NewRowID(), Body: body})
+	})
 }
 
 func main() {
@@ -67,6 +78,13 @@ func main() {
 	ids := make([]murmur.NodeID, nodes)
 	addrs := make([]string, nodes)
 	dbs := make([]*murmur.DB, nodes)
+	tables := make([]*murmur.RecordTable[note], nodes)
+	definition, err := murmur.Define[note]("notes", 8, murmur.RecordOptions{
+		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	for i := range ids {
 		ids[i] = murmur.NewNodeID()
 		addrs[i] = fmt.Sprintf("127.0.0.1:%d", freePort())
@@ -90,17 +108,9 @@ func main() {
 			Path:   dir,
 			NodeID: ids[i],
 			DBID:   dbid,
-			Schema: murmur.SchemaConfig{
-				Version: 1,
-				Tables: []schema.TableSchema{{
-					Name: "notes",
-					Columns: []schema.ColumnSchema{
-						{Name: "id", Type: schema.ColBlob},
-						{Name: "body", Type: schema.ColText, Nullable: true},
-					},
-				}},
-			},
-			Pebble: murmur.DefaultPebbleConfig(),
+			Schema: murmur.SchemaConfig{Version: 1},
+			Tables: []murmur.TableDefinition{definition},
+			Spool:  murmur.DefaultSpoolConfig(),
 			Encryption: murmur.EncryptionConfig{
 				Key:   []byte("0123456789abcdef0123456789abcdef"),
 				KeyID: "partition-key",
@@ -117,17 +127,19 @@ func main() {
 			log.Fatal(err)
 		}
 		defer dbs[i].Close()
+		tables[i], err = murmur.TableOf[note](dbs[i], "notes")
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	// Baseline converges, then node 3 is cut off in both directions.
 	for r := 0; r < 6; r++ {
-		id := murmur.NewRowID()
-		if _, err := dbs[0].ExecContext(ctx,
-			`INSERT INTO notes (id, body) VALUES (?, ?)`, id[:], fmt.Sprintf("base-%d", r)); err != nil {
+		if err := insertNote(ctx, dbs[0], tables[0], fmt.Sprintf("base-%d", r)); err != nil {
 			log.Fatal(err)
 		}
 	}
-	waitCounts(ctx, dbs, 6, 60*time.Second, "baseline")
+	waitCounts(tables, 6, 60*time.Second, "baseline")
 	for _, db := range []*murmur.DB{dbs[0], dbs[1]} {
 		if err := db.RemovePeer(ctx, ids[2]); err != nil {
 			log.Fatal(err)
@@ -142,19 +154,15 @@ func main() {
 
 	// Offline writes on both sides: neither fails, neither crosses yet.
 	for r := 0; r < 4; r++ {
-		id := murmur.NewRowID()
-		if _, err := dbs[0].ExecContext(ctx,
-			`INSERT INTO notes (id, body) VALUES (?, ?)`, id[:], fmt.Sprintf("online-%d", r)); err != nil {
+		if err := insertNote(ctx, dbs[0], tables[0], fmt.Sprintf("online-%d", r)); err != nil {
 			log.Fatal(err)
 		}
-		id = murmur.NewRowID()
-		if _, err := dbs[2].ExecContext(ctx,
-			`INSERT INTO notes (id, body) VALUES (?, ?)`, id[:], fmt.Sprintf("offline-%d", r)); err != nil {
+		if err := insertNote(ctx, dbs[2], tables[2], fmt.Sprintf("offline-%d", r)); err != nil {
 			log.Fatal(err)
 		}
 	}
-	waitCounts(ctx, dbs[:2], 10, 30*time.Second, "survivor side")
-	waitCounts(ctx, dbs[2:], 10, 30*time.Second, "isolated side")
+	waitCounts(tables[:2], 10, 30*time.Second, "survivor side")
+	waitCounts(tables[2:], 10, 30*time.Second, "isolated side")
 
 	// Rejoin: AddPeer clears the exclusion and the mesh heals to 14 rows.
 	for i, db := range dbs {
@@ -166,6 +174,6 @@ func main() {
 			}
 		}
 	}
-	waitCounts(ctx, dbs, 14, 60*time.Second, "healed mesh")
+	waitCounts(tables, 14, 60*time.Second, "healed mesh")
 	fmt.Println("healed: all 14 rows on all 3 nodes")
 }

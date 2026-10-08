@@ -1,33 +1,49 @@
-// Command backup-restore shows online backup and clone restore: back up
-// a live node to a local directory, restore under a fresh writer
-// identity, and prove the clone carries every row and accepts writes.
+// Command backup-restore demonstrates typed online backup and clone restore
+// under a fresh writer identity.
 //
-// Run it:
+// Run it with:
 //
-//	go run -tags "sqlite_preupdate_hook sqlite_fts5" ./examples/backup-restore
+//	go run ./examples/backup-restore
 package main
 
 import (
 	"context"
 	"fmt"
-	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 	"path/filepath"
 
 	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/backup"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
+	"github.com/marcgauthier/murmur/ids"
 )
 
-func schemaTables() []schema.TableSchema {
-	return []schema.TableSchema{{
-		Name: "records",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "body", Type: schema.ColText, Nullable: true},
-		},
-	}}
+type record struct {
+	ID   ids.RowID `rime:"primary"`
+	Body string
+}
+
+func definition() murmur.TableDefinition {
+	d, err := murmur.Define[record]("records", 4, murmur.RecordOptions{
+		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	return d
+}
+
+func open(ctx context.Context, path string, nodeID murmur.NodeID) *murmur.DB {
+	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
+		Path: path, NodeID: nodeID, Schema: murmur.SchemaConfig{Version: 1},
+		Tables: []murmur.TableDefinition{definition()}, Spool: murmur.DefaultSpoolConfig(),
+		Encryption: murmur.EncryptionConfig{Key: []byte("0123456789abcdef0123456789abcdef"), KeyID: "backup-key"},
+	}))
+	if err != nil {
+		log.Fatal(err)
+	}
+	return db
 }
 
 func main() {
@@ -38,80 +54,58 @@ func main() {
 	}
 	defer os.RemoveAll(base)
 
-	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
-		Path:   filepath.Join(base, "node"),
-		NodeID: murmur.NewNodeID(),
-		Schema: murmur.SchemaConfig{Version: 1, Tables: schemaTables()},
-		Pebble: murmur.DefaultPebbleConfig(),
-		Encryption: murmur.EncryptionConfig{
-			Key:   []byte("0123456789abcdef0123456789abcdef"),
-			KeyID: "backup-key",
-		},
-	}))
+	source := open(ctx, filepath.Join(base, "node"), murmur.NewNodeID())
+	records, err := murmur.TableOf[record](source, "records")
 	if err != nil {
 		log.Fatal(err)
 	}
-	for i := 0; i < 5; i++ {
-		id := murmur.NewRowID()
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO records (id, body) VALUES (?, ?)`,
-			id[:], fmt.Sprintf("record-%d", i)); err != nil {
-			log.Fatal(err)
+	if err := source.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+		batch := make([]*record, 5)
+		for i := range batch {
+			batch[i] = &record{ID: murmur.NewRowID(), Body: fmt.Sprintf("record-%d", i)}
 		}
+		return records.InsertMany(tx, batch)
+	}); err != nil {
+		log.Fatal(err)
 	}
 
-	// Online backup while the node keeps running.
 	dest, err := backup.NewLocalDestination(filepath.Join(base, "backups"))
 	if err != nil {
 		log.Fatal(err)
 	}
-	meta, err := backup.CreateBackup(ctx, db, backup.Config{Destination: dest})
+	meta, err := backup.CreateBackup(ctx, source, backup.Config{Destination: dest})
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("backup %s at %s\n", meta.BackupID, meta.CreatedAt.Format("15:04:05"))
-	if err := db.Close(); err != nil {
+	if err := source.Close(); err != nil {
 		log.Fatal(err)
 	}
 
-	// Clone restore under a fresh writer identity: reusing the source
-	// NodeID is rejected so origin sequences can never repeat.
 	fresh := murmur.NewNodeID()
 	restored := filepath.Join(base, "restored")
 	if _, err := backup.Restore(ctx, backup.RestoreConfig{
-		Source:      dest,
-		TargetPath:  restored,
-		KeysPath:    filepath.Join(restored, "keys"),
-		FreshNodeID: fresh.String(),
+		Source: dest, TargetPath: restored, KeysPath: filepath.Join(restored, "keys"), FreshNodeID: fresh.String(),
 	}); err != nil {
 		log.Fatal(err)
 	}
-	clone, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
-		Path:   restored,
-		NodeID: fresh,
-		Schema: murmur.SchemaConfig{Version: 1, Tables: schemaTables()},
-		Pebble: murmur.DefaultPebbleConfig(),
-		Encryption: murmur.EncryptionConfig{
-			Key:   []byte("0123456789abcdef0123456789abcdef"),
-			KeyID: "backup-key",
-		},
-	}))
+	clone := open(ctx, restored, fresh)
+	defer clone.Close()
+	clonedRecords, err := murmur.TableOf[record](clone, "records")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer clone.Close()
-
-	var n int
-	if err := clone.QueryRowContext(ctx, `SELECT count(*) FROM records`).Scan(&n); err != nil {
+	n, err := clonedRecords.Where().Count()
+	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("rows in clone: %d\n", n)
 	if n != 5 {
 		log.Fatalf("want 5 restored rows, got %d", n)
 	}
-	id := murmur.NewRowID()
-	if _, err := clone.ExecContext(ctx,
-		`INSERT INTO records (id, body) VALUES (?, ?)`, id[:], "post-restore"); err != nil {
+	if err := clone.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+		return clonedRecords.Insert(tx, &record{ID: murmur.NewRowID(), Body: "post-restore"})
+	}); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("clone accepts fresh writes")

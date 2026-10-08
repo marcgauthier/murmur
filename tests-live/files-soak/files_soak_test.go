@@ -33,9 +33,10 @@ func TestEncryptedFileFetchSoak(t *testing.T) {
 	duration := envSeconds(t, "MURMUR_FILES_SOAK_DURATION_SECONDS", 5)
 	interval := envSeconds(t, "MURMUR_FILES_SOAK_INTERVAL_SECONDS", 1)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:     "files-soak",
-		NumNodes: 2,
-		Files:    &harness.FilesOptions{ObjectKeyHex: soakObjectKey, MaxFileBytes: 4 << 20, FetchIntervalMs: -1},
+		Name:         "files-soak",
+		NumNodes:     2,
+		TypedRecords: true,
+		Files:        &harness.FilesOptions{ObjectKeyHex: soakObjectKey, MaxFileBytes: 4 << 20, FetchIntervalMs: -1},
 	})
 
 	deadline := time.Now().Add(duration)

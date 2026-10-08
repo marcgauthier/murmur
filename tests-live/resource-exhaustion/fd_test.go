@@ -31,16 +31,16 @@ func TestFDExhaustionFailClosed(t *testing.T) {
 	maxHold := harness.EnvInt("MURMUR_RX_FD_MAXHOLD", 300)
 
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "resource-fd",
-		NumNodes:    2,
-		AwaitUnlock: true,
-		Schema:      rxSchema(),
+		Name:            "resource-fd",
+		NumNodes:        2,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 
 	// Baseline: 50 rows converged everywhere before the squeeze.
 	for i := 0; i < 50; i++ {
-		if err := cluster.ExecSQL(0, "INSERT INTO rx_rows (id, name) VALUES (?, ?)",
-			fmt.Sprintf("%032x", i+1), fmt.Sprintf("base-%d", i)); err != nil {
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", i+1), Name: fmt.Sprintf("base-%d", i)}); err != nil {
 			t.Fatalf("baseline insert %d: %v", i, err)
 		}
 	}
@@ -79,8 +79,7 @@ hold:
 		held = append(held, conn)
 		if len(held)%10 == 0 {
 			seq++
-			if err := cluster.ExecSQL(1, "INSERT INTO rx_rows (id, name) VALUES (?, ?)",
-				fmt.Sprintf("%032x", seq), "probe"); err != nil {
+			if err := cluster.TypedContentionInsert(1, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", seq), Name: "probe"}); err != nil {
 				t.Logf("probe write failed after %d held conns (%v): exhausted", len(held), err)
 				exhausted = true
 				break hold

@@ -20,6 +20,8 @@
 package impairednetwork_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -31,12 +33,8 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
-
-const tableName = "imp_rows"
 
 func TestImpairedNetworkConverges(t *testing.T) {
 	force := harness.GetEnv("MURMUR_IMPAIRED_NETWORK_FORCE") == "1"
@@ -50,9 +48,11 @@ func TestImpairedNetworkConverges(t *testing.T) {
 	rows := envInt("MURMUR_IMPAIRED_NETWORK_ROWS", 8)
 
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "impaired-network",
-		NumNodes:    3,
-		AwaitUnlock: true,
+		Name:            "impaired-network",
+		NumNodes:        3,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 		// Aggressive retention so phase (c) can force a snapshot resync
 		// after a short offline window; harmless to phases (a)/(b).
 		Replication: &harness.ReplicationOptions{
@@ -61,13 +61,6 @@ func TestImpairedNetworkConverges(t *testing.T) {
 			MinRetainedBatches:       10,
 		},
 		BootstrapSeeds: []int{0},
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: tableName,
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
 	})
 	replPorts := clusterReplPorts(t, cluster)
 	t.Cleanup(func() { clearImpairment() })
@@ -76,8 +69,7 @@ func TestImpairedNetworkConverges(t *testing.T) {
 	// Baseline converges unimpaired (honest-path control).
 	base := 10
 	for i := 0; i < base; i++ {
-		if err := cluster.ExecSQL(0, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)",
-			fmt.Sprintf("%032x", 1000+i), fmt.Sprintf("base-%d", i)); err != nil {
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 1000+i), Name: fmt.Sprintf("base-%d", i)}); err != nil {
 			t.Fatalf("baseline write: %v", err)
 		}
 	}
@@ -132,8 +124,7 @@ func TestImpairedNetworkConverges(t *testing.T) {
 		}
 		// Stale rows on node3, then it stops with acknowledged state.
 		for i := 0; i < 5; i++ {
-			if err := cluster.ExecSQL(2, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)",
-				fmt.Sprintf("%032x", 5000+i), fmt.Sprintf("stale-%d", i)); err != nil {
+			if err := cluster.TypedContentionInsert(2, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 5000+i), Name: fmt.Sprintf("stale-%d", i)}); err != nil {
 				t.Fatalf("stale write: %v", err)
 			}
 		}
@@ -143,8 +134,7 @@ func TestImpairedNetworkConverges(t *testing.T) {
 		// Survivors write far past the short retention while node3 is
 		// offline (sustained writes start here and continue below).
 		for i := 0; i < 60; i++ {
-			if err := cluster.ExecSQL(0, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)",
-				fmt.Sprintf("%032x", 6000+i), fmt.Sprintf("fresh-%d", i)); err != nil {
+			if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 6000+i), Name: fmt.Sprintf("fresh-%d", i)}); err != nil {
 				t.Fatalf("survivor write: %v", err)
 			}
 		}
@@ -165,8 +155,7 @@ func TestImpairedNetworkConverges(t *testing.T) {
 		cluster.UnlockNode(2, cluster.Nodes[2].KeyHex)
 		cluster.WaitNodeReady(2)
 		for i := 0; i < 20; i++ {
-			if err := cluster.ExecSQL(1, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)",
-				fmt.Sprintf("%032x", 8000+i), fmt.Sprintf("sustain-%d", i)); err != nil {
+			if err := cluster.TypedContentionInsert(1, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 8000+i), Name: fmt.Sprintf("sustain-%d", i)}); err != nil {
 				t.Fatalf("sustained write: %v", err)
 			}
 		}
@@ -188,7 +177,7 @@ func timedWrites(t *testing.T, c *harness.Cluster, prefix string, base, n int, p
 		name := fmt.Sprintf("%s-%d", prefix, i)
 		id := fmt.Sprintf("%032x", int64(base+1)*100000+int64(i))
 		start := time.Now()
-		if err := c.ExecSQL(i%len(c.Nodes), "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)", id, name); err != nil {
+		if err := c.TypedContentionInsert(i%len(c.Nodes), harness.TypedContentionRow{ID: id, Name: name}); err != nil {
 			t.Fatalf("%s write %d: %v", prefix, i, err)
 		}
 		waitRowVisible(t, c, name, perRow)
@@ -220,15 +209,16 @@ func waitRowVisible(t *testing.T, c *harness.Cluster, name string, timeout time.
 
 func countWhere(t *testing.T, c *harness.Cluster, idx int, name string) (int, error) {
 	t.Helper()
-	res, err := c.QuerySQL(idx, "SELECT count(*) FROM "+tableName+" WHERE name = ?", name)
+	rows, err := c.TypedContentionRows(idx)
 	if err != nil {
 		return 0, err
 	}
-	if len(res.Rows) == 0 || len(res.Rows[0]) == 0 {
-		return 0, nil
+	n := 0
+	for _, row := range rows {
+		if row.Name == name {
+			n++
+		}
 	}
-	var n int
-	_, _ = fmt.Sscanf(fmt.Sprintf("%v", res.Rows[0][0]), "%d", &n)
 	return n, nil
 }
 
@@ -360,6 +350,28 @@ func waitMembership(t *testing.T, c *harness.Cluster, want int, timeout time.Dur
 	t.Fatalf("nodes did not reach membership %d within %v", want, timeout)
 }
 
+// impDigest returns the PK-ordered digest of the contention table on one node.
+func impDigest(c *harness.Cluster, idx int) (string, error) {
+	rows, err := c.TypedContentionRows(idx)
+	if err != nil {
+		return "", err
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	h := sha256.New()
+	for _, row := range rows {
+		fmt.Fprintf(h, "%s:%s:%s:%d\n", row.ID, row.Name, row.Phone, row.Score)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func impCount(c *harness.Cluster, idx int) (int, error) {
+	rows, err := c.TypedContentionRows(idx)
+	if err != nil {
+		return 0, err
+	}
+	return len(rows), nil
+}
+
 func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -368,12 +380,12 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, tableName)
+			n, err := impCount(c, i)
 			if err != nil || n != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, tableName, "id")
+			d, err := impDigest(c, i)
 			if err != nil {
 				ok = false
 				break
@@ -392,7 +404,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 			lastLog = time.Now()
 			counts := make([]int, len(c.Nodes))
 			for i := range c.Nodes {
-				n, _ := c.QueryRowCount(i, tableName)
+				n, _ := impCount(c, i)
 				counts[i] = n
 			}
 			t.Logf("converge progress: counts=%v want=%d", counts, want)
@@ -406,12 +418,12 @@ func waitRowCount(t *testing.T, c *harness.Cluster, idx int, want int, timeout t
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if n, err := c.QueryRowCount(idx, tableName); err == nil && n == want {
+		if n, err := impCount(c, idx); err == nil && n == want {
 			return
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	n, _ := c.QueryRowCount(idx, tableName)
+	n, _ := impCount(c, idx)
 	t.Fatalf("node %d count = %d, want %d within %v", idx, n, want, timeout)
 }
 
@@ -446,20 +458,8 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line == "" || line[0] == '#' {
-			continue
-		}
-		if !strings.HasPrefix(line, name) {
-			continue
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(line, name))
-		if i := strings.LastIndex(rest, " "); i >= 0 {
-			rest = rest[i+1:]
-		}
-		if v, err := strconv.ParseFloat(rest, 64); err == nil {
-			return v
-		}
+	if value, ok := harness.MetricValueFrom(string(raw), name); ok {
+		return value
 	}
 	t.Fatalf("metric %s not found", name)
 	return 0

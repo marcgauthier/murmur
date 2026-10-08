@@ -13,13 +13,12 @@ on:
 
 jobs:
   test-linux:
-    name: Test Linux amd64 (Go ${{ matrix.go-version }}, CGO=${{ matrix.cgo }})
+    name: Test Linux amd64 (Go ${{ matrix.go-version }}, RIME)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         go-version: ['1.26.x']
-        cgo: ['0', '1']
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -37,31 +36,33 @@ jobs:
 
       - name: Go vet
         env:
-          CGO_ENABLED: ${{ matrix.cgo }}
+          CGO_ENABLED: 1
+        run: go vet ./...
+
+      - name: Test vendored thirdparty forks
+        # Nested modules: excluded from the parent ./... runs above.
+        # Every entry in thirdparty/ is a Go module with its own suite.
         run: |
-          if [ "${{ matrix.cgo }}" = "0" ]; then
-            go vet -tags "modernc" ./...
-          else
-            go vet -tags "sqlite_preupdate_hook sqlite_fts5" ./...
-          fi
+          set -e
+          for m in thirdparty/*/; do
+            (cd "$m" && go test ./...)
+          done
 
-      - name: Run tests (pure Go modernc)
-        if: matrix.cgo == '0'
-        env:
-          CGO_ENABLED: 0
-        run: go test -tags "modernc" -v ./...
-
-      - name: Run tests with race detector (CGO enabled, default mattn SQLite)
-        if: matrix.cgo == '1'
+      - name: Run tests with race detector
         env:
           CGO_ENABLED: 1
-        run: go test -tags "sqlite_preupdate_hook sqlite_fts5" -race -v ./...
+        run: go test -race -v ./...
 
-      - name: Run mattn SQLite preupdate validation
-        if: matrix.cgo == '1'
+      - name: Test isolated benchmark module
         env:
           CGO_ENABLED: 1
-        run: go test -tags "sqlite_preupdate_hook sqlite_fts5" -run '^TestMattnSQLitePreUpdatePreservesTextAndBlobTypes|TestPreUpdateCaptureInsertUpdateDelete$' ./sqlengine
+        run: |
+          set -e
+          for m in tests-benchmark/benchmark tests-benchmark/replication; do
+            (cd "$m" && go mod verify)
+            (cd "$m" && go vet ./...)
+            (cd "$m" && go test -tags "" -race ./...)
+          done
 
   live-gate:
     name: Live acceptance gate
@@ -85,21 +86,12 @@ jobs:
       - name: Build package
         env:
           CGO_ENABLED: 1
-        run: go build -tags "sqlite_preupdate_hook sqlite_fts5" ./...
+        run: go build ./...
 
       - name: Run live release-gate scenarios
         env:
           CGO_ENABLED: 1
         run: bash tests-live/run.sh gate
-
-      - name: Run pure-Go live matrix
-        env:
-          CGO_ENABLED: 0
-          MURMUR_TAGS: modernc
-        run: |
-          bash tests-live/run.sh three-node-sync
-          bash tests-live/run.sh rolling-restart
-          bash tests-live/run.sh partition
 
       - name: Run race-instrumented live matrix
         env:
@@ -262,15 +254,17 @@ jobs:
         run: go mod verify
 
       - name: Go vet
-        run: go vet -tags "modernc" ./...
-
-      - name: Run tests (Windows pure Go modernc)
         env:
-          CGO_ENABLED: 0
-        run: go test -tags "modernc" -v ./...
+          CGO_ENABLED: 1
+        run: go vet ./...
+
+      - name: Run tests (Windows)
+        env:
+          CGO_ENABLED: 1
+        run: go test -v ./...
 
   cross-compile:
-    name: Cross-Compilation Matrix (arm64/windows/linux)
+    name: Build Linux amd64
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -281,30 +275,9 @@ jobs:
         with:
           go-version: '1.26.x'
 
-      - name: Build Linux amd64 (Default mattn SQLite CGO)
+      - name: Build Linux amd64
         env:
           GOOS: linux
           GOARCH: amd64
           CGO_ENABLED: 1
-        run: go build -tags "sqlite_preupdate_hook sqlite_fts5" ./...
-
-      - name: Build Linux amd64 (Pure Go modernc)
-        env:
-          GOOS: linux
-          GOARCH: amd64
-          CGO_ENABLED: 0
-        run: go build -tags "modernc" ./...
-
-      - name: Build Linux arm64 (Pure Go modernc)
-        env:
-          GOOS: linux
-          GOARCH: arm64
-          CGO_ENABLED: 0
-        run: go build -tags "modernc" ./...
-
-      - name: Build Windows amd64 (Pure Go modernc)
-        env:
-          GOOS: windows
-          GOARCH: amd64
-          CGO_ENABLED: 0
-        run: go build -tags "modernc" ./...
+        run: go build ./...

@@ -11,8 +11,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/cockroachdb/pebble/v2"
-
 	"github.com/marcgauthier/murmur/schema"
 )
 
@@ -77,22 +75,22 @@ func (s *Store) StoreSchemaRevision(m *schema.Manifest) error {
 	defer s.gate.RUnlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
 	id := schema.RevisionID(m)
-	if err := b.Set(schemaRevKey(id), raw, nil); err != nil {
+	if err := b.Set(schemaRevKey(id), raw); err != nil {
 		return err
 	}
-	if err := b.Set(SchemaKey(schemaCurrentKey), raw, nil); err != nil {
+	if err := b.Set(SchemaKey(schemaCurrentKey), raw); err != nil {
 		return err
 	}
-	if err := b.Set(SysKey(sysSchemaEpoch), encodeU64(m.Version), nil); err != nil {
+	if err := b.Set(SysKey(sysSchemaEpoch), encodeU64(m.Version)); err != nil {
 		return err
 	}
-	if err := b.Set(SysKey(sysSchemaHash), m.Hash[:], nil); err != nil {
+	if err := b.Set(SysKey(sysSchemaHash), m.Hash[:]); err != nil {
 		return err
 	}
-	if err := s.commitBatch(b, pebble.Sync); err != nil {
+	if err := s.commitBatch(b, true); err != nil {
 		return err
 	}
 	registry, err := m.Registry()
@@ -120,14 +118,14 @@ func (s *Store) StoreSchemaRevisions(revs []*schema.Manifest) error {
 	defer s.gate.RUnlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
 	for _, m := range revs {
-		if err := b.Set(schemaRevKey(schema.RevisionID(m)), schema.EncodeManifest(m), nil); err != nil {
+		if err := b.Set(schemaRevKey(schema.RevisionID(m)), schema.EncodeManifest(m)); err != nil {
 			return err
 		}
 	}
-	return s.commitBatch(b, pebble.Sync)
+	return s.commitBatch(b, true)
 }
 
 // LoadSchemaRevision returns one stored revision, or (nil, nil) when absent.
@@ -275,5 +273,5 @@ func (s *Store) StoreMergeResult(frontier [][32]byte, revID [32]byte) error {
 	defer s.gate.RUnlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return s.dbSet(schemaMergeKey(schema.FrontierKey(frontier)), revID[:], pebble.Sync)
+	return s.dbSet(schemaMergeKey(schema.FrontierKey(frontier)), revID[:], true)
 }

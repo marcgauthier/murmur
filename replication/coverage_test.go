@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/memberlist"
+	"github.com/marcgauthier/murmur/compression"
 
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crdt"
@@ -382,7 +383,7 @@ func testChunkPayload(t *testing.T) []byte {
 	})
 }
 
-// TestOnSnapshotChunkPaths covers decode failures, zstd failures, missing
+// TestOnSnapshotChunkPaths covers decode failures, compression failures, missing
 // manifests, and one applied chunk.
 func TestOnSnapshotChunkPaths(t *testing.T) {
 	mk := func(applier Applier) (*Manager, *peerState) {
@@ -397,8 +398,8 @@ func TestOnSnapshotChunkPaths(t *testing.T) {
 	}
 	m, p = mk(&fakeApplier{})
 	m.claimSnapshotSource(p)
-	if err := onSnapshotChunkFixture(m, p, nil, &Frame{Flags: FlagZstd, Payload: []byte("junk")}); err == nil {
-		t.Fatal("malformed zstd chunk accepted")
+	if err := onSnapshotChunkFixture(m, p, nil, &Frame{Flags: CompressedFlags(compression.IDDeflate), Payload: []byte("junk")}); err == nil {
+		t.Fatal("malformed compressed chunk accepted")
 	}
 	m, p = mk(&fakeApplier{})
 	m.claimSnapshotSource(p)

@@ -14,8 +14,10 @@ import (
 
 type InspectCommand struct{}
 
-func (c *InspectCommand) Name() string        { return "inspect" }
-func (c *InspectCommand) Description() string { return "Inspect offline database metadata, watermarks, and schema" }
+func (c *InspectCommand) Name() string { return "inspect" }
+func (c *InspectCommand) Description() string {
+	return "Inspect offline database metadata, watermarks, and schema"
+}
 func (c *InspectCommand) Usage() string {
 	return "murmur inspect <data-dir> [--json]"
 }
@@ -25,19 +27,19 @@ func init() {
 }
 
 type inspectionReport struct {
-	DataDir         string `json:"data_dir"`
-	NodeID          string `json:"node_id"`
-	DBID            string `json:"db_id"`
-	State           string `json:"state"`
-	StateGeneration uint64 `json:"state_generation"`
-	HLC             uint64 `json:"hlc_watermark"`
-	LocalSeq        uint64 `json:"local_sequence"`
-	SchemaEpoch     uint64 `json:"schema_epoch"`
-	SchemaHash      string `json:"schema_hash"`
-	KeyRegistryPath string `json:"key_registry_path,omitempty"`
-	PebbleFiles     int    `json:"pebble_files"`
-	PebbleDiskBytes int64  `json:"pebble_disk_bytes"`
-	TableCount      int    `json:"table_count"`
+	DataDir          string `json:"data_dir"`
+	NodeID           string `json:"node_id"`
+	DBID             string `json:"db_id"`
+	State            string `json:"state"`
+	StateGeneration  uint64 `json:"state_generation"`
+	HLC              uint64 `json:"hlc_watermark"`
+	LocalSeq         uint64 `json:"local_sequence"`
+	SchemaEpoch      uint64 `json:"schema_epoch"`
+	SchemaHash       string `json:"schema_hash"`
+	KeyRegistryPath  string `json:"key_registry_path,omitempty"`
+	StorageFiles     int    `json:"storage_files"`
+	StorageDiskBytes int64  `json:"storage_disk_bytes"`
+	TableCount       int    `json:"table_count"`
 }
 
 func (c *InspectCommand) Run(ctx context.Context, globalOpts GlobalOptions, args []string, stdout, stderr io.Writer) error {
@@ -67,9 +69,9 @@ func (c *InspectCommand) Run(ctx context.Context, globalOpts GlobalOptions, args
 	})
 
 	report := inspectionReport{
-		DataDir:         dataDir,
-		PebbleFiles:     fileCount,
-		PebbleDiskBytes: diskBytes,
+		DataDir:          dataDir,
+		StorageFiles:     fileCount,
+		StorageDiskBytes: diskBytes,
 	}
 
 	keysDir := filepath.Join(dataDir, "keys")
@@ -78,30 +80,39 @@ func (c *InspectCommand) Run(ctx context.Context, globalOpts GlobalOptions, args
 		report.KeyRegistryPath = keyRegistryFile
 	}
 
-	db, err := openLocalDB(ctx, dataDir, globalOpts, true)
-	if err != nil {
-		return fmt.Errorf("open database for inspection: %w", err)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	defer db.Close()
+	store, err := openOfflineStore(dataDir, globalOpts)
+	if err != nil {
+		return fmt.Errorf("open durable state for inspection: %w", err)
+	}
+	defer store.Close()
 
-	st := db.Status()
-	report.NodeID = st.NodeID.String()
-	report.DBID = st.DBID.String()
-	report.State = st.State.String()
-	report.StateGeneration = st.StateGeneration
-	report.HLC = st.HLC
-	report.LocalSeq = st.LocalSeq
-	report.SchemaEpoch = st.SchemaEpoch
-	report.SchemaHash = hex.EncodeToString(st.SchemaHash[:])
-	report.PebbleDiskBytes = int64(st.PebbleSizeBytes)
+	report.NodeID = store.NodeID().String()
+	report.DBID = store.DBID().String()
+	report.State = "durable-state-open"
+	report.StateGeneration, err = store.StateGeneration()
+	if err != nil {
+		return fmt.Errorf("read durable state generation: %w", err)
+	}
+	report.HLC = store.ClockMax()
+	report.LocalSeq, err = store.LocalSeq()
+	if err != nil {
+		return fmt.Errorf("read local sequence: %w", err)
+	}
 
-	// Count user tables
-	rows, err := db.QueryContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-	if err == nil {
-		if rows.Next() {
-			_ = rows.Scan(&report.TableCount)
-		}
-		rows.Close()
+	// Table definitions come from the durable schema manifest, not from a
+	// query-engine catalog. This keeps inspection independent of the current
+	// materializer implementation.
+	manifest, err := store.LoadSchemaManifest()
+	if err != nil {
+		return fmt.Errorf("read schema manifest for inspection: %w", err)
+	}
+	if manifest != nil {
+		report.SchemaEpoch = manifest.Version
+		report.SchemaHash = hex.EncodeToString(manifest.Hash[:])
+		report.TableCount = len(manifest.Tables)
 	}
 
 	if globalOpts.JSON {
@@ -121,7 +132,7 @@ func (c *InspectCommand) Run(ctx context.Context, globalOpts GlobalOptions, args
 		{"Schema Hash", report.SchemaHash},
 		{"Key Registry", report.KeyRegistryPath},
 		{"User Tables", fmt.Sprintf("%d", report.TableCount)},
-		{"Storage Disk Size", fmt.Sprintf("%d files (%d bytes / %.2f MB)", report.PebbleFiles, diskBytes, float64(diskBytes)/(1024*1024))},
+		{"Storage Disk Size", fmt.Sprintf("%d files (%d bytes / %.2f MB)", report.StorageFiles, diskBytes, float64(diskBytes)/(1024*1024))},
 	})
 
 	return nil

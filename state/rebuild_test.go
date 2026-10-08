@@ -54,7 +54,7 @@ func TestRebuildSnapshotProgressAndIsolation(t *testing.T) {
 func TestRebuildSnapshotCorruptCellNotProcessed(t *testing.T) {
 	s := openTestStore(t, ids.NewNodeID())
 	key := CellKey(1, ids.NewRowID(), 1)
-	if err := s.db.Set(key, []byte{0xff}, nil); err != nil {
+	if err := s.dbSet(key, []byte{0xff}, true); err != nil {
 		t.Fatal(err)
 	}
 	var processed uint64

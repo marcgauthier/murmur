@@ -2,12 +2,12 @@
 package openprogress_test
 
 import (
- "github.com/marcgauthier/murmur/internal/testdb"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/marcgauthier/murmur/internal/testdb"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,28 +17,36 @@ import (
 	"time"
 
 	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 const rowsPerTable = 6000
+
+type progressRecord struct {
+	ID      ids.RowID `rime:"primary"`
+	Message string
+	Ordinal int64
+}
 
 type fixture struct {
 	Node db.NodeID
 	DB   db.DBID
 }
 
-func config(dir string, f fixture) db.Config {
-	var tables []schema.TableSchema
-	var ddl []string
-	for _, name := range []string{"requests", "events"} {
-		tables = append(tables, schema.TableSchema{Name: name, Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob}, {Name: "message", Type: schema.ColText}, {Name: "ordinal", Type: schema.ColInteger},
-		}})
-		ddl = append(ddl, fmt.Sprintf("CREATE INDEX idx_%s_ordinal ON %s(ordinal)", name, name))
+func config(dir string, f fixture) (db.Config, error) {
+	var definitions []db.TableDefinition
+	for i, name := range []string{"requests", "events"} {
+		definition, err := db.Define[progressRecord](name, uint32(301+i), db.RecordOptions{
+			PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Message": 2, "Ordinal": 3},
+		})
+		if err != nil {
+			return db.Config{}, err
+		}
+		definitions = append(definitions, definition)
 	}
 	return testdb.Configure(db.Config{Path: filepath.Join(dir, "db"), NodeID: f.Node, DBID: f.DB,
-		Schema: db.SchemaConfig{Version: 1, Tables: tables, LocalDDL: ddl}, Pebble: db.DefaultPebbleConfig(),
-		Encryption: db.EncryptionConfig{Key: bytes.Repeat([]byte{0x63}, 32), KeyID: "open-progress-live"}})
+		Tables: definitions, Spool: db.DefaultSpoolConfig(),
+		Encryption: db.EncryptionConfig{Key: bytes.Repeat([]byte{0x63}, 32), KeyID: "open-progress-live"}}), nil
 }
 
 func TestEmbeddedOpenProgressLive(t *testing.T) {
@@ -58,7 +66,7 @@ func TestEmbeddedOpenProgressLive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, role := range []string{"populate", "reload", "cancel", "reload", "index-failure", "reload"} {
+	for _, role := range []string{"populate", "reload", "cancel", "reload", "open-failure", "reload"} {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		cmd := exec.CommandContext(ctx, binary, "-test.run=^TestOpenProgressChild$", "-test.v", "-test.timeout=2m")
 		cmd.Env = append(os.Environ(), "MURMUR_PROGRESS_CHILD="+role, "MURMUR_PROGRESS_DIR="+dir)
@@ -85,27 +93,32 @@ func TestOpenProgressChild(t *testing.T) {
 	if err := json.Unmarshal(raw, &f); err != nil {
 		t.Fatal(err)
 	}
-	cfg := config(dir, f)
+	cfg, err := config(dir, f)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if role == "populate" {
 		live, err := db.Open(context.Background(), cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer live.Close()
-		for _, table := range []string{"requests", "events"} {
+		for _, name := range []string{"requests", "events"} {
+			table, err := db.TableOf[progressRecord](live, name)
+			if err != nil {
+				t.Fatal(err)
+			}
 			for start := 0; start < rowsPerTable; start += 1000 {
-				tx, err := live.BeginTx(context.Background(), nil)
-				if err != nil {
-					t.Fatal(err)
-				}
-				for i := start; i < start+1000; i++ {
-					id := db.NewRowID()
-					if _, err := tx.ExecContext(context.Background(), "INSERT INTO "+table+"(id,message,ordinal) VALUES(?,?,?)", id[:], "realistic diagnostic "+fmt.Sprint(i)+" "+string(bytes.Repeat([]byte("trace "), 512)), i); err != nil {
-						tx.Rollback()
-						t.Fatal(err)
+				err := live.WriteTxContext(context.Background(), func(tx *db.Tx) error {
+					for i := start; i < start+1000; i++ {
+						row := &progressRecord{ID: db.NewRowID(), Message: "realistic diagnostic " + fmt.Sprint(i) + " " + string(bytes.Repeat([]byte("trace "), 512)), Ordinal: int64(i)}
+						if err := table.Insert(tx, row); err != nil {
+							return err
+						}
 					}
-				}
-				if err := tx.Commit(); err != nil {
+					return nil
+				})
+				if err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -127,8 +140,8 @@ func TestOpenProgressChild(t *testing.T) {
 		}
 		active.Add(-1)
 	}
-	if role == "index-failure" {
-		cfg.Schema.LocalDDL = append(cfg.Schema.LocalDDL, "CREATE INDEX impossible_index ON requests(abs(ordinal - 9223372036854775807 - 1))")
+	if role == "open-failure" {
+		cfg.Encryption.Key = []byte{1, 2, 3}
 	}
 	live, err := db.Open(ctx, cfg)
 	if role == "cancel" {
@@ -138,12 +151,12 @@ func TestOpenProgressChild(t *testing.T) {
 			}
 			t.Fatalf("cancel result=%v", err)
 		}
-	} else if role == "index-failure" {
+	} else if role == "open-failure" {
 		if err == nil || live != nil {
 			if live != nil {
 				live.Close()
 			}
-			t.Fatal("expected index build failure")
+			t.Fatal("expected open failure")
 		}
 	} else {
 		if err != nil {
@@ -154,59 +167,24 @@ func TestOpenProgressChild(t *testing.T) {
 		if p == nil || p.Phase != db.OpenReady || p.TotalItemsKnown || p.ProcessedItems != rowsPerTable*2*3 || p.RowsInserted != rowsPerTable*2 || p.RowsSkipped != 0 || p.PercentComplete != 0 {
 			t.Fatalf("terminal=%+v", p)
 		}
-		for _, table := range []string{"requests", "events"} {
-			rows, err := live.QueryContext(context.Background(), "SELECT count(*),sum(ordinal) FROM "+table)
+		for _, name := range []string{"requests", "events"} {
+			table, err := db.TableOf[progressRecord](live, name)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !rows.Next() {
-				rows.Close()
-				t.Fatal("missing count")
-			}
-			var n, sum int64
-			if err := rows.Scan(&n, &sum); err != nil {
-				rows.Close()
+			rows, err := table.Where().Find()
+			if err != nil {
 				t.Fatal(err)
 			}
-			rows.Close()
+			n := int64(len(rows))
+			var sum int64
+			for _, row := range rows {
+				sum += row.Ordinal
+			}
 			if n != rowsPerTable || sum != rowsPerTable*(rowsPerTable-1)/2 {
-				t.Fatalf("wrong contents %s", table)
+				t.Fatalf("wrong contents %s", name)
 			}
 		}
-		indexes, err := live.QueryContext(context.Background(), "SELECT count(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%_ordinal'")
-		if err != nil {
-			t.Fatal(err)
-		}
-		var n int
-		if !indexes.Next() {
-			indexes.Close()
-			t.Fatal("missing indexes")
-		}
-		if err := indexes.Scan(&n); err != nil {
-			indexes.Close()
-			t.Fatal(err)
-		}
-		indexes.Close()
-		if n != 2 {
-			t.Fatalf("indexes=%d", n)
-		}
-		main, err := live.QueryContext(context.Background(), "PRAGMA database_list")
-		if err != nil {
-			t.Fatal(err)
-		}
-		for main.Next() {
-			var seq int
-			var name, file string
-			if err := main.Scan(&seq, &name, &file); err != nil {
-				main.Close()
-				t.Fatal(err)
-			}
-			if name == "main" && file != "" {
-				main.Close()
-				t.Fatal("SQLite persisted to disk")
-			}
-		}
-		main.Close()
 	}
 	if overlap.Load() {
 		t.Fatal("overlapping callbacks")
@@ -242,25 +220,14 @@ func TestOpenProgressChild(t *testing.T) {
 	if role == "cancel" {
 		want = db.OpenCancelled
 	}
-	if role == "index-failure" {
+	if role == "open-failure" {
 		want = db.OpenFailed
-	}
-	if role == "index-failure" {
-		found := false
-		for _, phase := range phases {
-			if phase == db.OpenIndexing {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("index failure never reached indexing: %v, error=%v", phases, err)
-		}
 	}
 	if lastEvent.Phase != want {
 		t.Fatalf("terminal phase=%v", lastEvent.Phase)
 	}
 	if role == "reload" {
-		wanted := []db.OpenPhase{db.OpenOpening, db.OpenRebuilding, db.OpenIndexing, db.OpenFinalizing, db.OpenReady}
+		wanted := []db.OpenPhase{db.OpenOpening, db.OpenRebuilding, db.OpenFinalizing, db.OpenReady}
 		if len(phases) != len(wanted) {
 			t.Fatalf("phases=%v", phases)
 		}
@@ -364,7 +331,10 @@ func TestOpenProgressChildExtra(t *testing.T) {
 	if err := json.Unmarshal(raw, &f); err != nil {
 		t.Fatal(err)
 	}
-	cfg := config(dir, f)
+	cfg, err := config(dir, f)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// populate-extra: write data into both tables using same schema as main suite.
 	if role == "populate-extra" {
@@ -373,22 +343,22 @@ func TestOpenProgressChildExtra(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer live.Close()
-		for _, table := range []string{"requests", "events"} {
+		for _, name := range []string{"requests", "events"} {
+			table, err := db.TableOf[progressRecord](live, name)
+			if err != nil {
+				t.Fatal(err)
+			}
 			for start := 0; start < rowsPerTable; start += 1000 {
-				tx, err := live.BeginTx(context.Background(), nil)
-				if err != nil {
-					t.Fatal(err)
-				}
-				for i := start; i < start+1000; i++ {
-					id := db.NewRowID()
-					if _, err := tx.ExecContext(context.Background(),
-						"INSERT INTO "+table+"(id,message,ordinal) VALUES(?,?,?)",
-						id[:], "extra-live-"+fmt.Sprint(i)+"-"+string(bytes.Repeat([]byte("x"), 256)), i); err != nil {
-						tx.Rollback()
-						t.Fatal(err)
+				err := live.WriteTxContext(context.Background(), func(tx *db.Tx) error {
+					for i := start; i < start+1000; i++ {
+						row := &progressRecord{ID: db.NewRowID(), Message: "extra-live-" + fmt.Sprint(i) + "-" + string(bytes.Repeat([]byte("x"), 256)), Ordinal: int64(i)}
+						if err := table.Insert(tx, row); err != nil {
+							return err
+						}
 					}
-				}
-				if err := tx.Commit(); err != nil {
+					return nil
+				})
+				if err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -429,15 +399,15 @@ func TestOpenProgressChildExtra(t *testing.T) {
 		}
 		// Verify both tables are actually queryable with the correct row counts.
 		for _, name := range []string{"requests", "events"} {
-			rows, err := live.QueryContext(context.Background(), "SELECT count(*) FROM "+name)
+			table, err := db.TableOf[progressRecord](live, name)
 			if err != nil {
 				t.Fatalf("table-tracking: query %s: %v", name, err)
 			}
-			var n int64
-			if rows.Next() {
-				rows.Scan(&n)
+			rows, err := table.Where().Count()
+			if err != nil {
+				t.Fatalf("table-tracking: count %s: %v", name, err)
 			}
-			rows.Close()
+			n := int64(rows)
 			if n != rowsPerTable {
 				t.Fatalf("table-tracking: %s count=%d want %d", name, n, rowsPerTable)
 			}
@@ -481,7 +451,7 @@ func TestOpenProgressChildExtra(t *testing.T) {
 		n := rebuildCount
 		mu.Unlock()
 		// At minimum we must see the phase-entry event. With rowsPerTable=6000 and
-		// real Pebble I/O the rebuild takes well over 250 ms so the ticker fires.
+		// real Spool I/O the rebuild takes well over 250 ms so the ticker fires.
 		// Accept 1 as a lower bound only on an unexpectedly fast machine.
 		if n < 1 {
 			t.Fatalf("heartbeat: rebuilding events=%d, expected ≥1", n)
@@ -498,7 +468,10 @@ func TestOpenProgressChildExtra(t *testing.T) {
 			t.Fatal(err)
 		}
 		emptyF := fixture{db.NewNodeID(), db.NewDBID()}
-		emptyCfg := config(emptyDir, emptyF)
+		emptyCfg, err := config(emptyDir, emptyF)
+		if err != nil {
+			t.Fatal(err)
+		}
 		var events []db.OpenProgress
 		emptyCfg.OnOpenProgress = func(p db.OpenProgress) { events = append(events, p) }
 		live, err := db.Open(context.Background(), emptyCfg)
@@ -519,7 +492,7 @@ func TestOpenProgressChildExtra(t *testing.T) {
 				phases = append(phases, ev.Phase)
 			}
 		}
-		want := []db.OpenPhase{db.OpenOpening, db.OpenRebuilding, db.OpenIndexing, db.OpenFinalizing, db.OpenReady}
+		want := []db.OpenPhase{db.OpenOpening, db.OpenRebuilding, db.OpenFinalizing, db.OpenReady}
 		if len(phases) != len(want) {
 			t.Fatalf("empty-db phases=%v want=%v", phases, want)
 		}

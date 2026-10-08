@@ -49,11 +49,12 @@ func TestNearOOMSurvivesAndConverges(t *testing.T) {
 	conc := harness.EnvInt("MURMUR_RX_OOM_CONC", 4)
 
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "resource-oom",
-		NumNodes:    2,
-		AwaitUnlock: true,
-		Schema:      rxSchema(),
-		PebbleByNode: map[int]*harness.PebbleOptions{
+		Name:            "resource-oom",
+		NumNodes:        2,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
+		SpoolByNode: map[int]*harness.SpoolOptions{
 			// 16x less cache than default; the victim must serve
 			// churn far larger than its hot set.
 			1: {CacheBytes: 16 << 20, MemTableBytes: 1 << 20},
@@ -70,12 +71,11 @@ func TestNearOOMSurvivesAndConverges(t *testing.T) {
 	val := strings.Repeat("m", 2<<10)
 	for i := 0; i < rows; i++ {
 		target := i % 2
-		if err := cluster.ExecSQL(target, "INSERT INTO rx_rows (id, name) VALUES (?, ?)",
-			fmt.Sprintf("%032x", i+1), val); err != nil {
+		if err := cluster.TypedContentionInsert(target, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", i+1), Name: val}); err != nil {
 			t.Fatalf("churn insert %d on node %d: %v", i, target+1, err)
 		}
 		if (i+1)%500 == 0 {
-			if _, err := cluster.QueryRowCount(1, tableName); err != nil {
+			if _, err := rxCount(cluster, 1); err != nil {
 				t.Fatalf("victim unresponsive at churn row %d: %v", i+1, err)
 			}
 			t.Logf("churn %d/%d rows, victim peak RSS %d MiB", i+1, rows, peakRSS()/1048576)
@@ -93,7 +93,7 @@ func TestNearOOMSurvivesAndConverges(t *testing.T) {
 			defer wg.Done()
 			for b := 0; b < burst; b++ {
 				id := fmt.Sprintf("%032x", (1<<32)+(w<<20)+b)
-				if err := cluster.ExecSQL(1, "INSERT INTO rx_rows (id, name) VALUES (?, ?)", id, big); err != nil {
+				if err := cluster.TypedContentionInsert(1, harness.TypedContentionRow{ID: id, Name: big}); err != nil {
 					errCh <- fmt.Errorf("writer %d burst %d: %w", w, b, err)
 					return
 				}
@@ -137,8 +137,7 @@ func TestNearOOMSurvivesAndConverges(t *testing.T) {
 		if !procAlive(victimPID) {
 			break
 		}
-		if err := cluster.ExecSQL(1, "INSERT INTO rx_rows (id, name) VALUES (?, ?)",
-			fmt.Sprintf("%032x", (2<<32)+i), edge); err != nil {
+		if err := cluster.TypedContentionInsert(1, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", (2<<32)+i), Name: edge}); err != nil {
 			// Errors are expected at the edge (kill mid-flight).
 			time.Sleep(100 * time.Millisecond)
 			continue
@@ -248,8 +247,8 @@ type oomSegment struct {
 }
 
 // oomSegments partitions the OOM dataset (churn + per-writer bursts +
-// leg-B edge rows) so no single digest query exceeds ~100MB: a whole
-// 500MB+ SELECT * cannot clear the 15s API client timeout, while each
+// leg-B edge rows) so no single digest pass exceeds ~100MB: a whole
+// 500MB+ table read cannot clear the 15s API client timeout, while each
 // segment reads in seconds. Exactness is unchanged: every row sits in
 // exactly one segment and all segments must match on both nodes.
 func oomSegments(rows, burst, conc, more int) []oomSegment {
@@ -306,20 +305,40 @@ func oomWaitDigests(t *testing.T, cluster *harness.Cluster, segs []oomSegment, t
 	return ""
 }
 
-// oomSegmentDigest hashes one id range on one node (same %v: cell
-// encoding as the whole-table digest).
+// oomSegmentDigest hashes one id range on one node via bounded-concurrency
+// typed point reads: every row's full content feeds the digest, but no
+// single response approaches the 15s client budget. A missing row (not
+// yet replicated) fails the segment so the poller retries.
 func oomSegmentDigest(cluster *harness.Cluster, idx int, s oomSegment) (string, error) {
-	res, err := cluster.QuerySQL(idx, "SELECT * FROM rx_rows WHERE id >= ? AND id < ? ORDER BY id",
-		fmt.Sprintf("%032x", s.lo), fmt.Sprintf("%032x", s.hi))
-	if err != nil {
-		return "", err
+	n := s.hi - s.lo
+	rows := make([]harness.TypedContentionRow, n)
+	errCh := make(chan error, n)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 32)
+	for id := s.lo; id < s.hi; id++ {
+		wg.Add(1)
+		go func(id uint64) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			row, err := cluster.TypedContentionRead(idx, fmt.Sprintf("%032x", id))
+			if err != nil {
+				errCh <- err
+				return
+			}
+			rows[id-s.lo] = row
+		}(id)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			return "", err
+		}
 	}
 	h := sha256.New()
-	for _, row := range res.Rows {
-		for _, cell := range row {
-			h.Write([]byte(fmt.Sprintf("%v:", cell)))
-		}
-		h.Write([]byte("\n"))
+	for _, row := range rows {
+		fmt.Fprintf(h, "%s:%s:%s:%d\n", row.ID, row.Name, row.Phone, row.Score)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }

@@ -9,32 +9,26 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func TestMultiProcessDisjointAndSharedCellContention(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "crdt-contention",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{Name: "contacts", Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-			{Name: "phone", Type: schema.ColText, Nullable: true},
-			{Name: "score", Type: schema.ColInteger, Nullable: true},
-		}}}},
+		Name:            "crdt-contention",
+		NumNodes:        3,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 	for _, node := range cluster.Nodes {
 		t.Logf("%s pid=%d dir=%s repl=%s", node.Label, node.Process.Process.Pid, node.Dir, node.ReplAddr)
 	}
 	waitForPeers(t, cluster, 2, 20*time.Second)
 
-	rowID := fmt.Sprintf("%032x", 31_415_926)
-	if err := cluster.ExecSQL(0,
-		"INSERT INTO contacts (id, name, phone, score) VALUES (?, ?, ?, ?)",
-		rowID, "baseline", "baseline", 0); err != nil {
+	rowID := "03141592-6000-4000-8000-000000000000"
+	if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{
+		ID: rowID, Name: "baseline", Phone: "baseline", Score: 0,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	waitForState(t, cluster, rowID, "baseline", "baseline", "0", 20*time.Second)
@@ -43,12 +37,12 @@ func TestMultiProcessDisjointAndSharedCellContention(t *testing.T) {
 	// order at other processes.
 	disjoint := []struct {
 		node  int
-		query string
+		field string
 		value any
 	}{
-		{0, "UPDATE contacts SET name = ? WHERE id = ?", "node1-name"},
-		{1, "UPDATE contacts SET phone = ? WHERE id = ?", "node2-phone"},
-		{2, "UPDATE contacts SET score = ? WHERE id = ?", 42},
+		{0, "name", "node1-name"},
+		{1, "phone", "node2-phone"},
+		{2, "score", 42},
 	}
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(disjoint))
@@ -57,7 +51,7 @@ func TestMultiProcessDisjointAndSharedCellContention(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errCh <- cluster.ExecSQL(edit.node, edit.query, edit.value, rowID)
+			errCh <- cluster.TypedContentionUpdate(edit.node, rowID, edit.field, fmt.Sprint(edit.value))
 		}()
 	}
 	wg.Wait()
@@ -82,7 +76,7 @@ func TestMultiProcessDisjointAndSharedCellContention(t *testing.T) {
 			defer wg.Done()
 			for seq := 0; seq < updatesPerNode; seq++ {
 				value := fmt.Sprintf("node%d-cell-%03d", node+1, seq)
-				errCh <- cluster.ExecSQL(node, "UPDATE contacts SET name = ? WHERE id = ?", value, rowID)
+				errCh <- cluster.TypedContentionUpdate(node, rowID, "name", value)
 			}
 		}()
 	}
@@ -101,14 +95,14 @@ func TestMultiProcessDisjointAndSharedCellContention(t *testing.T) {
 	if !strings.HasPrefix(winner, "node1-cell-") && !strings.HasPrefix(winner, "node2-cell-") && !strings.HasPrefix(winner, "node3-cell-") {
 		t.Fatalf("same-cell winner %q did not come from the concurrent write set", winner)
 	}
-	if got, err := cluster.ComputeTableDigest(0, "contacts", "id"); err != nil {
+	first, err := cluster.TypedContentionRead(0, rowID)
+	if err != nil {
 		t.Fatal(err)
-	} else {
-		for i := 1; i < len(cluster.Nodes); i++ {
-			other, err := cluster.ComputeTableDigest(i, "contacts", "id")
-			if err != nil || other != got {
-				t.Fatalf("logical state digest differs: node1=%s node%d=%s err=%v", got, i+1, other, err)
-			}
+	}
+	for i := 1; i < len(cluster.Nodes); i++ {
+		other, err := cluster.TypedContentionRead(i, rowID)
+		if err != nil || other != first {
+			t.Fatalf("logical typed row differs: node1=%+v node%d=%+v err=%v", first, i+1, other, err)
 		}
 	}
 	t.Logf("three process cell conflict converged to %q after %d updates per node", winner, updatesPerNode)
@@ -158,10 +152,9 @@ func waitForState(t *testing.T, cluster *harness.Cluster, id, wantName, wantPhon
 	for time.Now().Before(deadline) {
 		ok := true
 		for i := range cluster.Nodes {
-			res, err := cluster.QuerySQL(i, "SELECT name, phone, score FROM contacts WHERE id = ?", id)
-			last[i] = fmt.Sprintf("err=%v rows=%v", err, res)
-			if err != nil || len(res.Rows) != 1 || len(res.Rows[0]) < 3 ||
-				fmt.Sprint(res.Rows[0][0]) != wantName || fmt.Sprint(res.Rows[0][1]) != wantPhone || fmt.Sprint(res.Rows[0][2]) != wantScore {
+			row, err := cluster.TypedContentionRead(i, id)
+			last[i] = fmt.Sprintf("row=%+v err=%v", row, err)
+			if err != nil || row.Name != wantName || row.Phone != wantPhone || fmt.Sprint(row.Score) != wantScore {
 				ok = false
 				break
 			}
@@ -182,15 +175,15 @@ func waitForCellConvergence(t *testing.T, cluster *harness.Cluster, id, wantPhon
 		var winner string
 		converged := true
 		for i := range cluster.Nodes {
-			res, err := cluster.QuerySQL(i, "SELECT name, phone, score FROM contacts WHERE id = ?", id)
-			if err != nil || len(res.Rows) != 1 || len(res.Rows[0]) < 3 {
-				last[i] = fmt.Sprintf("err=%v rows=%v", err, res)
+			row, err := cluster.TypedContentionRead(i, id)
+			if err != nil {
+				last[i] = fmt.Sprintf("err=%v row=%+v", err, row)
 				converged = false
 				continue
 			}
-			name, phone, score := fmt.Sprint(res.Rows[0][0]), fmt.Sprint(res.Rows[0][1]), fmt.Sprint(res.Rows[0][2])
-			last[i] = fmt.Sprintf("name=%q phone=%q score=%q", name, phone, score)
-			if phone != wantPhone || score != wantScore {
+			name := row.Name
+			last[i] = fmt.Sprintf("name=%q phone=%q score=%d", row.Name, row.Phone, row.Score)
+			if row.Phone != wantPhone || fmt.Sprint(row.Score) != wantScore {
 				converged = false
 			}
 			if i == 0 {

@@ -1,11 +1,15 @@
 package schema
 
 import (
+	"bytes"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/internal/recordcodec"
+	"github.com/marcgauthier/murmur/rime"
 )
 
 func manifestTestTables() []TableSchema {
@@ -32,6 +36,7 @@ func registryTables(reg *Registry) []TableSchema {
 	for i, p := range reg.Tables {
 		out[i] = *p
 		out[i].Columns = append([]ColumnSchema(nil), p.Columns...)
+		out[i].RecordDescriptor = append([]byte(nil), p.RecordDescriptor...)
 	}
 	return out
 }
@@ -82,6 +87,126 @@ func TestManifestRoundTrip(t *testing.T) {
 	}
 	if _, err := DecodeManifest(append(enc, 0)); err == nil {
 		t.Fatal("manifest with trailing bytes accepted")
+	}
+}
+
+func TestRichRecordDescriptorManifestRoundTrip(t *testing.T) {
+	type row struct {
+		ID   [16]byte
+		Name string
+	}
+	type changedRow struct {
+		ID   [16]byte
+		Name int
+	}
+	makeDescriptor := func(rt reflect.Type) []byte {
+		t.Helper()
+		compiled, e := recordcodec.Compile(rt, recordcodec.CompileOptions{TableID: 4, PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Name": 2}})
+		if e != nil {
+			t.Fatal(e)
+		}
+		raw, e := recordcodec.MarshalDescriptor(compiled)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return raw
+	}
+	tables := manifestTestTables()
+	tables[0].ID, tables[0].PK = 4, 1
+	tables[0].Columns[0].ID, tables[0].Columns[1].ID = 1, 2
+	tables[0].RecordDescriptor = makeDescriptor(reflect.TypeFor[row]())
+	reg, err := BuildRegistry(1, tables)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(reg.Table("contacts").RecordDescriptor, tables[0].RecordDescriptor) {
+		t.Fatal("registry dropped the rich record descriptor")
+	}
+	m, err := NewGenesis(tables, 1, ids.NodeID{}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := EncodeManifest(m)
+	if string(raw[:4]) != "SMF3" {
+		t.Fatalf("rich schema manifest marker %q", raw[:4])
+	}
+	back, err := DecodeManifest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(back.Tables[0].RecordDescriptor, tables[0].RecordDescriptor) || back.Hash != m.Hash {
+		t.Fatal("rich descriptor/hash did not round trip")
+	}
+	changed := cloneTables(tables)
+	changed[0].RecordDescriptor = makeDescriptor(reflect.TypeFor[changedRow]())
+	if _, err = NewAuthoredRevision(m, changed, ids.NodeID{}, 2); err == nil {
+		t.Fatal("incompatible descriptor change accepted")
+	}
+}
+
+func TestRichManifestAdditiveBranchesMerge(t *testing.T) {
+	type base struct {
+		ID   [16]byte
+		Name string
+	}
+	type ageRow struct {
+		ID   [16]byte
+		Name string
+		Age  rime.Optional[int]
+	}
+	type cityRow struct {
+		ID   [16]byte
+		Name string
+		City rime.Optional[string]
+	}
+	compile := func(rt reflect.Type, fields map[string]uint32) []byte {
+		t.Helper()
+		s, e := recordcodec.Compile(rt, recordcodec.CompileOptions{TableID: 44, PrimaryField: "ID", FieldIDs: fields})
+		if e != nil {
+			t.Fatal(e)
+		}
+		b, e := recordcodec.MarshalDescriptor(s)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return b
+	}
+	baseDesc := compile(reflect.TypeFor[base](), map[string]uint32{"ID": 1, "Name": 2})
+	ageDesc := compile(reflect.TypeFor[ageRow](), map[string]uint32{"ID": 1, "Name": 2, "Age": 10})
+	cityDesc := compile(reflect.TypeFor[cityRow](), map[string]uint32{"ID": 1, "Name": 2, "City": 11})
+	if !recordcodec.DescriptorSuperset(baseDesc, ageDesc) {
+		t.Fatal("base is not a descriptor superset of age extension")
+	}
+	if !recordcodec.DescriptorSuperset(baseDesc, cityDesc) {
+		t.Fatal("base is not a descriptor superset of city extension")
+	}
+	tables := manifestTestTables()
+	tables[0].ID, tables[0].PK = 8, 1
+	tables[0].Columns[0].ID, tables[0].Columns[1].ID = 1, 2
+	tables[0].RecordDescriptor = baseDesc
+	gen, err := NewGenesis(tables, 1, ids.NodeID{}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ageTables := cloneTables(gen.Tables)
+	ageTables[0].RecordDescriptor = ageDesc
+	cityTables := cloneTables(gen.Tables)
+	cityTables[0].RecordDescriptor = cityDesc
+	a, err := NewAuthoredRevision(gen, ageTables, ids.NodeID{}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewAuthoredRevision(gen, cityTables, ids.NodeID{}, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revs := map[[32]byte]*Manifest{RevisionID(gen): gen, RevisionID(a): a, RevisionID(b): b}
+	merged, err := DeriveMerge(revs, [][32]byte{RevisionID(a), RevisionID(b)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recordcodec.DescriptorSuperset(ageDesc, merged.Tables[0].RecordDescriptor) || !recordcodec.DescriptorSuperset(cityDesc, merged.Tables[0].RecordDescriptor) {
+		t.Fatal("manifest merge dropped concurrent rich fields")
 	}
 }
 
@@ -332,35 +457,6 @@ func TestDeriveMergeDeterministic(t *testing.T) {
 	}
 	if ok, err := AncestorOf(revs, RevisionID(revA), RevisionID(revB)); err != nil || ok {
 		t.Fatal("concurrent branches must not be ancestors")
-	}
-}
-
-func TestMigrationDDL(t *testing.T) {
-	old := registryTables(mustRegistry(t, 1, manifestTestTables()))
-	next := cloneTables(old)
-	next[0].Columns = append(next[0].Columns, ColumnSchema{Name: "phone", Type: ColText, Nullable: true, ID: 777})
-	next = append(next, TableSchema{
-		Name: "orders",
-		ID:   888,
-		PK:   889,
-		Columns: []ColumnSchema{
-			{Name: "id", Type: ColBlob, ID: 889},
-			{Name: "total", Type: ColInteger, ID: 890, Nullable: true},
-		},
-	})
-	ddl, err := MigrationDDL(old, next)
-	if err != nil {
-		t.Fatal(err)
-	}
-	joined := strings.Join(ddl, "\n")
-	if !strings.Contains(joined, "ALTER TABLE \"contacts\" ADD COLUMN \"phone\" TEXT") {
-		t.Fatalf("missing add-column DDL: %v", ddl)
-	}
-	if !strings.Contains(joined, "CREATE TABLE IF NOT EXISTS \"orders\"") {
-		t.Fatalf("missing create-table DDL: %v", ddl)
-	}
-	if _, err := MigrationDDL(next, old); err == nil {
-		t.Fatal("destructive DDL accepted")
 	}
 }
 

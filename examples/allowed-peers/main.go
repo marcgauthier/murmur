@@ -4,7 +4,7 @@
 //
 // Run it:
 //
-//	go run -tags "sqlite_preupdate_hook sqlite_fts5" ./examples/allowed-peers
+//	go run ./examples/allowed-peers
 package main
 
 import (
@@ -17,9 +17,14 @@ import (
 	"time"
 
 	"github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/transport"
 )
+
+type note struct {
+	ID   ids.RowID `rime:"primary"`
+	Body string
+}
 
 func freePort() int {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -30,18 +35,18 @@ func freePort() int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-func count(ctx context.Context, db *murmur.DB) int {
-	var n int
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM notes`).Scan(&n); err != nil {
+func count(table *murmur.RecordTable[note]) int {
+	n, err := table.Where().Count()
+	if err != nil {
 		log.Fatal(err)
 	}
 	return n
 }
 
-func waitCount(ctx context.Context, db *murmur.DB, want int, timeout time.Duration) {
+func waitCount(table *murmur.RecordTable[note], want int, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if count(ctx, db) == want {
+		if count(table) == want {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -64,9 +69,14 @@ func main() {
 	dbid := murmur.NewDBID()
 
 	const nodes = 3
+	definition, err := murmur.Define[note]("notes", 9, murmur.RecordOptions{PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Body": 2}})
+	if err != nil {
+		log.Fatal(err)
+	}
 	ids := make([]murmur.NodeID, nodes)
 	addrs := make([]string, nodes)
 	dbs := make([]*murmur.DB, nodes)
+	tables := make([]*murmur.RecordTable[note], nodes)
 	for i := range ids {
 		ids[i] = murmur.NewNodeID()
 		addrs[i] = fmt.Sprintf("127.0.0.1:%d", freePort())
@@ -96,17 +106,9 @@ func main() {
 			Path:   dir,
 			NodeID: ids[i],
 			DBID:   dbid,
-			Schema: murmur.SchemaConfig{
-				Version: 1,
-				Tables: []schema.TableSchema{{
-					Name: "notes",
-					Columns: []schema.ColumnSchema{
-						{Name: "id", Type: schema.ColBlob},
-						{Name: "body", Type: schema.ColText, Nullable: true},
-					},
-				}},
-			},
-			Pebble: murmur.DefaultPebbleConfig(),
+			Schema: murmur.SchemaConfig{Version: 1},
+			Tables: []murmur.TableDefinition{definition},
+			Spool:  murmur.DefaultSpoolConfig(),
 			Encryption: murmur.EncryptionConfig{
 				Key:   []byte("0123456789abcdef0123456789abcdef"),
 				KeyID: "allowlist-key",
@@ -124,32 +126,37 @@ func main() {
 			log.Fatal(err)
 		}
 		defer dbs[i].Close()
-	}
-
-	for r := 0; r < 2; r++ {
-		id := murmur.NewRowID()
-		if _, err := dbs[0].ExecContext(ctx,
-			`INSERT INTO notes (id, body) VALUES (?, ?)`, id[:], fmt.Sprintf("mesh-%d", r)); err != nil {
+		tables[i], err = murmur.TableOf[note](dbs[i], "notes")
+		if err != nil {
 			log.Fatal(err)
 		}
 	}
-	waitCount(ctx, dbs[1], 2, 30*time.Second)
+
+	for r := 0; r < 2; r++ {
+		if err := dbs[0].WriteTxContext(ctx, func(tx *murmur.Tx) error {
+			return tables[0].Insert(tx, &note{ID: murmur.NewRowID(), Body: fmt.Sprintf("mesh-%d", r)})
+		}); err != nil {
+			log.Fatal(err)
+		}
+	}
+	waitCount(tables[1], 2, 30*time.Second)
 
 	// Negative checks need a settle margin: isolation means node 3
 	// holds nothing after the mesh has long converged.
 	time.Sleep(3 * time.Second)
-	if got := count(ctx, dbs[2]); got != 0 {
+	if got := count(tables[2]); got != 0 {
 		log.Fatalf("node 3 received %d mesh rows despite the allow-list", got)
 	}
 	fmt.Println("mesh converged on nodes 1-2; node 3 received nothing")
 
 	id := murmur.NewRowID()
-	if _, err := dbs[2].ExecContext(ctx,
-		`INSERT INTO notes (id, body) VALUES (?, ?)`, id[:], "stranded"); err != nil {
+	if err := dbs[2].WriteTxContext(ctx, func(tx *murmur.Tx) error {
+		return tables[2].Insert(tx, &note{ID: id, Body: "stranded"})
+	}); err != nil {
 		log.Fatal(err)
 	}
 	time.Sleep(3 * time.Second)
-	if got := count(ctx, dbs[0]); got != 2 {
+	if got := count(tables[0]); got != 2 {
 		log.Fatalf("node 1 holds %d rows, want 2 (node 3 leaked in)", got)
 	}
 	fmt.Println("node 3's write stayed stranded; allow-list holds both directions")

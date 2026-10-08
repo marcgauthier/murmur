@@ -8,10 +8,11 @@
 package dosclient_test
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,18 +30,9 @@ import (
 	"time"
 
 	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 	"github.com/marcgauthier/murmur/transport"
 )
-
-var dosSchema = &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-	Name: "dos_rows",
-	Columns: []schema.ColumnSchema{
-		{Name: "id", Type: schema.ColBlob},
-		{Name: "name", Type: schema.ColText, Nullable: true},
-	},
-}}}
 
 func envSeconds(name string, def int) time.Duration {
 	if v := harness.GetEnv(name); v != "" {
@@ -69,20 +62,21 @@ func TestDoSClientFlood(t *testing.T) {
 	nQUICHalf := envInt("MURMUR_DOS_CLIENT_QUIC_HALFOPEN", 24)
 
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "dos-client",
-		NumNodes:    2,
-		AwaitUnlock: true,
-		Schema:      dosSchema,
+		Name:            "dos-client",
+		NumNodes:        2,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 	victim, peer := 0, 1
 	api, repl := cluster.Nodes[victim].APIAddr, cluster.Nodes[victim].ReplAddr
 
 	// --- Positive control (pre-attack): both directions converge.
-	if err := cluster.ExecSQL(peer, "INSERT INTO dos_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 1), "honest-1"); err != nil {
+	if err := cluster.TypedContentionInsert(peer, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 1), Name: "honest-1"}); err != nil {
 		t.Fatalf("pre-attack insert: %v", err)
 	}
 	waitConverged(t, cluster, 1, 30*time.Second)
-	if err := cluster.ExecSQL(victim, "INSERT INTO dos_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 2), "honest-2"); err != nil {
+	if err := cluster.TypedContentionInsert(victim, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 2), Name: "honest-2"}); err != nil {
 		t.Fatalf("pre-attack insert on victim: %v", err)
 	}
 	waitConverged(t, cluster, 2, 30*time.Second)
@@ -120,7 +114,7 @@ func TestDoSClientFlood(t *testing.T) {
 		}()
 	}
 	for i := 0; i < 5; i++ {
-		if err := cluster.ExecSQL(peer, "INSERT INTO dos_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 100+i), "garbage-hb"); err != nil {
+		if err := cluster.TypedContentionInsert(peer, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 100+i), Name: "garbage-hb"}); err != nil {
 			close(garbageStop)
 			garbageWG.Wait()
 			t.Fatalf("heartbeat write during garbage: %v", err)
@@ -202,15 +196,15 @@ func TestDoSClientFlood(t *testing.T) {
 			atk.stop()
 			t.Fatalf("healthz on flooded victim took %v, want < 5s", dt)
 		}
-		if _, err := cluster.QueryRowCount(victim, "dos_rows"); err != nil {
+		if _, err := cluster.TypedContentionRows(victim); err != nil {
 			atk.stop()
 			t.Fatalf("legit query on flooded victim: %v", err)
 		}
 		time.Sleep(2 * time.Second)
 	}
-	// Legit exec directly on the flooded victim succeeds fast.
+	// Legit write directly on the flooded victim succeeds fast.
 	start := time.Now()
-	if err := cluster.ExecSQL(victim, "INSERT INTO dos_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 200), "during-flood-victim"); err != nil {
+	if err := cluster.TypedContentionInsert(victim, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 200), Name: "during-flood-victim"}); err != nil {
 		atk.stop()
 		t.Fatalf("exec on flooded victim: %v", err)
 	}
@@ -224,7 +218,7 @@ func TestDoSClientFlood(t *testing.T) {
 		t.Fatalf("sessions grew %.0f -> %.0f during flood (attacker state attaching?)", baseSessions, got)
 	}
 	// The legit peer's write converges on the victim within the latency bound.
-	if err := cluster.ExecSQL(peer, "INSERT INTO dos_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 201), "during-flood-peer"); err != nil {
+	if err := cluster.TypedContentionInsert(peer, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 201), Name: "during-flood-peer"}); err != nil {
 		atk.stop()
 		t.Fatalf("peer write during flood: %v", err)
 	}
@@ -245,7 +239,7 @@ func TestDoSClientFlood(t *testing.T) {
 	waitConnectedPeers(t, cluster, victim, 1, 30*time.Second)
 
 	// --- Positive control (post-attack): fast convergence, equal digests.
-	if err := cluster.ExecSQL(peer, "INSERT INTO dos_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 202), "post-attack"); err != nil {
+	if err := cluster.TypedContentionInsert(peer, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 202), Name: "post-attack"}); err != nil {
 		t.Fatalf("post-attack insert: %v", err)
 	}
 	start = time.Now()
@@ -519,16 +513,17 @@ func waitConvergedDeadline(t *testing.T, c *harness.Cluster, want int, deadline 
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "dos_rows")
-			if err != nil || n != want {
+			rows, err := c.TypedContentionRows(i)
+			if err != nil || len(rows) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, "dos_rows", "id")
-			if err != nil {
-				ok = false
-				break
+			sort.Slice(rows, func(a, b int) bool { return rows[a].ID < rows[b].ID })
+			h := sha256.New()
+			for _, row := range rows {
+				fmt.Fprintf(h, "%s:%s:%s:%d\n", row.ID, row.Name, row.Phone, row.Score)
 			}
+			d := hex.EncodeToString(h.Sum(nil))
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -541,7 +536,7 @@ func waitConvergedDeadline(t *testing.T, c *harness.Cluster, want int, deadline 
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatalf("%s: nodes did not converge on %d dos_rows rows with equal digests in time", what, want)
+	t.Fatalf("%s: nodes did not converge on %d contention rows with equal digests in time", what, want)
 }
 
 func replSessions(t *testing.T, apiAddr string) float64 {
@@ -555,15 +550,8 @@ func replSessions(t *testing.T, apiAddr string) float64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range bytes.Split(raw, []byte("\n")) {
-		if bytes.HasPrefix(line, []byte("spedsql_repl_sessions_opened_total")) {
-			fields := bytes.Fields(line)
-			v, err := strconv.ParseFloat(string(fields[len(fields)-1]), 64)
-			if err != nil {
-				t.Fatalf("parse sessions: %v", err)
-			}
-			return v
-		}
+	if value, ok := harness.MetricValueFrom(string(raw), "spedsql_repl_sessions_opened_total"); ok {
+		return value
 	}
 	t.Fatal("sessions counter missing from /metrics")
 	return 0

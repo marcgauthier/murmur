@@ -22,27 +22,27 @@ func TestStalledCompactionStaysCorrect(t *testing.T) {
 	rows := harness.EnvInt("MURMUR_RX_COMPACT_ROWS", 3000)
 
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "resource-compact",
-		NumNodes:    2,
-		AwaitUnlock: true,
-		Schema:      rxSchema(),
-		PebbleByNode: map[int]*harness.PebbleOptions{
+		Name:            "resource-compact",
+		NumNodes:        2,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
+		SpoolByNode: map[int]*harness.SpoolOptions{
 			1: {MemTableBytes: 1 << 20, DisableAutomaticCompactions: true},
 		},
 	})
-	victimSST := func() int { return countSSTs(t, cluster.Nodes[1].PebbleDir) }
-	controlSST := func() int { return countSSTs(t, cluster.Nodes[0].PebbleDir) }
+	victimSST := func() int { return countSSTs(t, cluster.Nodes[1].Dir) }
+	controlSST := func() int { return countSSTs(t, cluster.Nodes[0].Dir) }
 
 	// Churn through the victim so its L0 debt is its own writes (plus
 	// what replicates back); probe responsiveness along the way.
 	val := strings.Repeat("c", 1<<10)
 	for i := 0; i < rows; i++ {
-		if err := cluster.ExecSQL(1, "INSERT INTO rx_rows (id, name) VALUES (?, ?)",
-			fmt.Sprintf("%032x", i+1), val); err != nil {
+		if err := cluster.TypedContentionInsert(1, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", i+1), Name: val}); err != nil {
 			t.Fatalf("churn insert %d on victim: %v", i, err)
 		}
 		if (i+1)%500 == 0 {
-			if _, err := cluster.QueryRowCount(1, tableName); err != nil {
+			if _, err := rxCount(cluster, 1); err != nil {
 				t.Fatalf("victim unresponsive at churn row %d: %v", i+1, err)
 			}
 			t.Logf("churn %d/%d rows; sst victim=%d control=%d",
@@ -70,7 +70,7 @@ func TestStalledCompactionStaysCorrect(t *testing.T) {
 	d := waitDigests(t, cluster, []int{0, 1}, 3*time.Minute)
 	t.Logf("converged under stall: %d rows, digest %s", rows, d)
 
-	// Re-enable compactions (drop the pebble override from the victim
+	// Re-enable compactions (drop the storage override from the victim
 	// config) and restart on the same data dir: debt must drain. The
 	// pre-restart count is the baseline: sampling after the restart would
 	// race the drain itself.
@@ -102,7 +102,7 @@ func TestStalledCompactionStaysCorrect(t *testing.T) {
 	t.Logf("PASS: stall survived, debt drained, digest stable %s", d2)
 }
 
-// enableCompactions removes the pebble override section from a node config
+// enableCompactions removes the storage override section from a node config
 // file so the next start uses production compaction behavior.
 func enableCompactions(t *testing.T, configFile string) {
 	t.Helper()
@@ -114,7 +114,7 @@ func enableCompactions(t *testing.T, configFile string) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		t.Fatalf("parse config: %v", err)
 	}
-	delete(cfg, "pebble")
+	delete(cfg, "spool")
 	raw, err = json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		t.Fatalf("encode config: %v", err)

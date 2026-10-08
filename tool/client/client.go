@@ -1,7 +1,6 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -12,6 +11,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/marcgauthier/murmur/schema"
 )
 
 // Client interacts with a running Murmur node's HTTP / mTLS API.
@@ -128,70 +129,50 @@ func (c *Client) AdminStatus(ctx context.Context) (map[string]any, error) {
 	return result, nil
 }
 
-// QueryResult represents columns and row data returned by a query.
-type QueryResult struct {
-	Columns []string   `json:"columns"`
-	Rows    [][]string `json:"rows"`
+// TriggerGC asks the node to collect replication history permitted by its
+// persisted peer acknowledgements and retention settings.
+func (c *Client) TriggerGC(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/admin/gc", nil)
+	if err != nil {
+		return err
+	}
+	// Collection can drain a large retained log in multiple bounded passes;
+	// retain caller cancellation while allowing longer maintenance than the
+	// short default timeout used by diagnostic reads.
+	gcClient := *c.httpClient
+	gcClient.Timeout = 5 * time.Minute
+	resp, err := gcClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("garbage-collection request failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
-// Query executes a read-only SQL query on the remote node.
-func (c *Client) Query(ctx context.Context, sqlQuery string) (*QueryResult, error) {
-	payload, _ := json.Marshal(map[string]string{"query": sqlQuery})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/query", bytes.NewReader(payload))
+// SchemaTables retrieves the durable schema manifest from a running node.
+func (c *Client) SchemaTables(ctx context.Context) ([]schema.TableSchema, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/schema", nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("query failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("schema request failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-
-	var result QueryResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode query response: %w", err)
+	var tables []schema.TableSchema
+	if err := json.NewDecoder(resp.Body).Decode(&tables); err != nil {
+		return nil, fmt.Errorf("decode schema response: %w", err)
 	}
-	return &result, nil
-}
-
-// ExecResult represents rows affected or mutation feedback.
-type ExecResult struct {
-	RowsAffected int64 `json:"rows_affected"`
-	LastInsertID int64 `json:"last_insert_id"`
-}
-
-// Exec executes a mutation or DDL query on the remote node.
-func (c *Client) Exec(ctx context.Context, sqlStmt string) (*ExecResult, error) {
-	payload, _ := json.Marshal(map[string]string{"query": sqlStmt})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/exec", bytes.NewReader(payload))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("exec failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var result ExecResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode exec response: %w", err)
-	}
-	return &result, nil
+	return tables, nil
 }
 
 // DebugPeers queries debug peers list.

@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/marcgauthier/murmur/internal/recordcodec"
 )
 
 // ErrUnsupportedSchema is returned for schemas that violate the v1
@@ -75,6 +77,9 @@ type TableSchema struct {
 	Name    string
 	PK      uint32 // column ID of the primary key
 	Columns []ColumnSchema
+	// RecordDescriptor is a canonical rich Go record descriptor. Empty keeps
+	// the historic scalar-table identity and wire format.
+	RecordDescriptor []byte
 }
 
 // ColumnByID returns the column or nil.
@@ -119,6 +124,11 @@ func BuildRegistry(epoch uint64, tables []TableSchema) (*Registry, error) {
 		}
 		if len(t.Columns) == 0 {
 			return nil, fmt.Errorf("schema: table %q has no columns: %w", t.Name, ErrUnsupportedSchema)
+		}
+		if len(t.RecordDescriptor) != 0 {
+			if err := recordcodec.ValidateDescriptor(t.RecordDescriptor); err != nil {
+				return nil, fmt.Errorf("schema: table %q has invalid rich record descriptor: %w", t.Name, err)
+			}
 		}
 		if t.ID == 0 {
 			t.ID = deriveID("table:" + lower)
@@ -199,10 +209,11 @@ func BuildRegistry(epoch uint64, tables []TableSchema) (*Registry, error) {
 			return nil, fmt.Errorf("schema: primary key cannot use %s: %w", pk.MergePolicy, ErrUnsupportedSchema)
 		}
 		tp := &TableSchema{
-			ID:      t.ID,
-			Name:    t.Name,
-			PK:      t.PK,
-			Columns: append([]ColumnSchema(nil), t.Columns...),
+			ID:               t.ID,
+			Name:             t.Name,
+			PK:               t.PK,
+			Columns:          append([]ColumnSchema(nil), t.Columns...),
+			RecordDescriptor: append([]byte(nil), t.RecordDescriptor...),
 		}
 		r.Tables = append(r.Tables, tp)
 		r.byName[lower] = tp
@@ -247,6 +258,12 @@ func (r *Registry) canonicalHash() [32]byte {
 				h.Write([]byte{0})
 			}
 		}
+		if len(t.RecordDescriptor) != 0 {
+			h.Write([]byte("murmur/schema/rime-record/v1"))
+			binary.BigEndian.PutUint32(id[:], uint32(len(t.RecordDescriptor)))
+			h.Write(id[:])
+			h.Write(t.RecordDescriptor)
+		}
 	}
 	var out [32]byte
 	// Preserve the identity of historical all-LWW schemas exactly.
@@ -287,28 +304,4 @@ func deriveID(s string) uint32 {
 		id ^= 0x9e3779b9
 	}
 	return id
-}
-
-// CreateTableDDL renders the replicated table DDL for the query engine.
-func (t *TableSchema) CreateTableDDL() string {
-	var sb strings.Builder
-	sb.WriteString("CREATE TABLE IF NOT EXISTS \"")
-	sb.WriteString(t.Name)
-	sb.WriteString("\" (")
-	for i, c := range t.Columns {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteString("\"")
-		sb.WriteString(c.Name)
-		sb.WriteString("\" ")
-		sb.WriteString(c.Type.String())
-		if c.ID == t.PK {
-			sb.WriteString(" PRIMARY KEY NOT NULL")
-		} else if !c.Nullable {
-			sb.WriteString(" NOT NULL")
-		}
-	}
-	sb.WriteString(")")
-	return sb.String()
 }

@@ -1,6 +1,7 @@
 # Stale-node snapshot resync (multi-process)
 
-Run with `go test -count=1 ./tests-live/snapshot-resync`. Three Murmur-SQL
+Run with `CGO_ENABLED=0 bash tests-live/run.sh snapshot-resync`. The suite uses
+managed typed records without SQLite or CGO. Three Murmur-SQL
 daemon processes mesh with aggressive log retention (1s log retention, 20s
 offline pin, 10 retained batches). Node3 writes acknowledged rows and the
 mesh converges; node3 stops; the survivors write 60 rows; the test waits
@@ -21,3 +22,7 @@ progress/deferral series (`spedsql_repl_snapshots_busy_deferred_total`,
 `spedsql_peer_awaiting_snapshot`,
 `spedsql_peer_snapshot_chunks_received/total`) must be present in
 `/metrics`.
+
+A multi-source case gives the stale node three snapshot sources concurrently,
+with 6,000 survivor records inserted in typed batches. It requires at least one
+suppressed rival-source frame in addition to completed snapshot convergence.

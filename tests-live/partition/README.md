@@ -1,6 +1,7 @@
 # Partition and healing smoke test
 
-Run with `go test -count=1 ./tests-live/partition`. Four encrypted QUIC nodes
+Run with `CGO_ENABLED=0 bash tests-live/run.sh partition`. The test uses
+managed typed records without SQLite or CGO. Four encrypted QUIC nodes
 form a mesh, split into two isolated pairs, and write independently. The test
 checks each side remains isolated, restores cross-partition peers, verifies
 equal ordered state digests, then confirms a post-heal write replicates.

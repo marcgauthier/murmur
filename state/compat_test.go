@@ -2,13 +2,14 @@ package state
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/pebble/v2"
-
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/spool"
 )
 
 // TestFormatMarkersWrittenFresh proves new stores record the format and
@@ -43,7 +44,7 @@ func TestMinReaderWriterGateOpen(t *testing.T) {
 	}
 
 	if err := tamper(t, func(s *Store) {
-		if err := s.db.Set(SysKey(sysMinReader), encodeU64(999), pebble.Sync); err != nil {
+		if err := s.dbSet(SysKey(sysMinReader), encodeU64(999), true); err != nil {
 			t.Fatal(err)
 		}
 	}); err == nil || !strings.Contains(err.Error(), "minimum reader") {
@@ -51,7 +52,7 @@ func TestMinReaderWriterGateOpen(t *testing.T) {
 	}
 
 	if err := tamper(t, func(s *Store) {
-		if err := s.db.Set(SysKey(sysMinWriter), encodeU64(999), pebble.Sync); err != nil {
+		if err := s.dbSet(SysKey(sysMinWriter), encodeU64(999), true); err != nil {
 			t.Fatal(err)
 		}
 	}); err == nil || !strings.Contains(err.Error(), "minimum writer") {
@@ -66,10 +67,10 @@ func TestMinReaderWriterGateOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.db.Delete(SysKey(sysMinReader), pebble.Sync); err != nil {
+	if err := deleteSync(s, SysKey(sysMinReader)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.db.Delete(SysKey(sysMinWriter), pebble.Sync); err != nil {
+	if err := deleteSync(s, SysKey(sysMinWriter)); err != nil {
 		t.Fatal(err)
 	}
 	_ = s.Close()
@@ -109,13 +110,39 @@ func TestFreshStoreExceedsPreviousRelease(t *testing.T) {
 	}
 }
 
+func TestFormatFiveStoreFailsClosedWithoutRewrite(t *testing.T) {
+	dir := t.TempDir()
+	node := ids.NewNodeID()
+	s, err := openSignedFixture(dir, node, ids.DBID{}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{sysFormat, sysMinReader, sysMinWriter} {
+		if err := s.dbSet(SysKey(marker), encodeU64(5), true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openSignedFixture(dir, node, ids.DBID{}, Options{}); err == nil || !strings.Contains(err.Error(), "removed SQL runtime") {
+		t.Fatalf("format-5 open error = %v", err)
+	}
+}
+
 // TestPreviousReleaseV2StoreRequiresBaselineMigration proves backward compatibility: a store
 // carrying previous-release v2 markers opens read-write on this binary
 // with its markers left at v2 (no eager upgrade).
 func TestPreviousReleaseV2StoreRequiresBaselineMigration(t *testing.T) {
 	dir := t.TempDir()
 	node := ids.NewNodeID()
-	pdb, err := pebble.Open(dir, &pebble.Options{})
+	// Build the legacy-marker store with raw Spool, as the previous
+	// release would have persisted it (markers, node identity, and the
+	// stored cluster identity the migration path expects).
+	spopt := spool.DefaultOptions(dir)
+	spopt.MasterKey = append([]byte(nil), testMasterKey...)
+	spopt.ContextID = append([]byte(nil), fixtureDBID[:]...)
+	sp, err := spool.Open(spopt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,14 +154,20 @@ func TestPreviousReleaseV2StoreRequiresBaselineMigration(t *testing.T) {
 		{sysMinReader, prevReleaseFormat},
 		{sysMinWriter, prevReleaseFormat},
 	} {
-		if err := pdb.Set(SysKey(mk.name), encodeU64(mk.val), pebble.Sync); err != nil {
+		if err := sp.Put(SysKey(mk.name), encodeU64(mk.val)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := pdb.Set(SysKey(sysLocalNode), node[:], pebble.Sync); err != nil {
+	if err := sp.Put(SysKey(sysLocalNode), node[:]); err != nil {
 		t.Fatal(err)
 	}
-	if err := pdb.Close(); err != nil {
+	if err := sp.Put(SysKey(sysDBID), fixtureDBID[:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := openSignedFixture(dir, node, ids.DBID{}, Options{}); err == nil || !strings.Contains(err.Error(), "MigrateOriginBaseline") {
@@ -162,4 +195,31 @@ func TestPreviousReleaseV2StoreRequiresBaselineMigration(t *testing.T) {
 	if err != nil || !ok || st.Value.S != "v2-write" {
 		t.Fatalf("v2 store readback: %v %v", st, err)
 	}
+}
+
+// TestOpenRejectsLegacyPebbleDir proves a directory holding a legacy
+// Pebble database fails open without modification, while a bare LOCK
+// file (which Spool also uses) is not treated as Pebble evidence.
+func TestOpenRejectsLegacyPebbleDir(t *testing.T) {
+	node := ids.NewNodeID()
+	for _, name := range []string{"CURRENT", "OPTIONS", "MANIFEST-000001", "OPTIONS-000003", "000005.sst", "000008.log"} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := openSignedFixture(dir, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
+		if err == nil || !strings.Contains(err.Error(), "legacy Pebble") {
+			t.Fatalf("%s: err = %v, want legacy Pebble rejection", name, err)
+		}
+	}
+	// A lone LOCK file opens normally.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "LOCK"), []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := openSignedFixture(dir, node, ids.DBID{}, Options{Limits: codec.DefaultLimits()})
+	if err != nil {
+		t.Fatalf("LOCK-only dir: %v", err)
+	}
+	_ = s.Close()
 }

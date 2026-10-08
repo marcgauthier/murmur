@@ -435,6 +435,66 @@ func (db *DB) shadowReader() *shadowResolvingReader {
 	return &shadowResolvingReader{db: db, cols: make(map[uint32]map[uint32]bool)}
 }
 
+// BridgeStoredRowExists reports whether the authoritative state materializes a
+// live row, without consulting either query engine. Bridge import uses this
+// before acquiring its write coordinator, so the check cannot deadlock on a
+// query-engine reader held behind that coordinator.
+func (db *DB) BridgeStoredRowExists(table string, key ids.RowID) (bool, error) {
+	if db == nil {
+		return false, ErrClosed
+	}
+	if err := db.requireRead(); err != nil {
+		return false, err
+	}
+	definition := db.reg.Table(table)
+	if definition == nil {
+		return false, fmt.Errorf("murmur: bridge row table %q is not registered: %w", table, ErrUnsupportedSchema)
+	}
+	rows, err := db.store.GetRows([]state.RowRef{{Table: definition.ID, ID: key}})
+	if err != nil {
+		return false, err
+	}
+	if len(rows) != 1 || len(rows[0].Cells) == 0 {
+		return false, nil
+	}
+	row, err := db.resolveTypedBridgeRow(rows[0])
+	if err != nil {
+		return false, err
+	}
+	if _, ok := row.Cells[definition.PK]; !ok {
+		return false, nil
+	}
+	return !row.Tomb.Present || crdt.CompareVersion(row.Newest, row.Tomb.Version) > 0, nil
+}
+
+func (db *DB) resolveTypedBridgeRow(row *state.Row) (*state.Row, error) {
+	if row == nil {
+		return nil, fmt.Errorf("murmur: nil typed bridge row")
+	}
+	cols := db.bridgeColumnsFor(row.Table)
+	if cols == nil {
+		return row, nil
+	}
+	effective, err := resolveBridgeRow(row.Cells, cols, db.bridgeShadowLimits())
+	if err != nil {
+		return nil, err
+	}
+	shadowed, err := bridgeRowShadowed(row.Cells, cols, db.bridgeShadowLimits())
+	if err != nil {
+		return nil, err
+	}
+	resolved := &state.Row{Table: row.Table, ID: row.ID, Cells: effective, Tomb: row.Tomb}
+	if shadowed {
+		resolved.Tomb = crdt.TombstoneState{}
+	}
+	for _, cell := range effective {
+		if crdt.CompareVersion(cell.Version, resolved.Newest) > 0 {
+			resolved.Newest = cell.Version
+		}
+	}
+	return resolved, nil
+}
+
 func (r *shadowResolvingReader) columns(table uint32) map[uint32]bool {
 	if cols, ok := r.cols[table]; ok {
 		return cols
@@ -444,7 +504,7 @@ func (r *shadowResolvingReader) columns(table uint32) map[uint32]bool {
 	return cols
 }
 
-// GetRow implements sqlengine.StateReader.
+// GetRow implements state.Reader.
 func (r *shadowResolvingReader) GetRow(table uint32, row ids.RowID) (map[uint32]codec.CellState, error) {
 	raw, err := r.db.store.GetRow(table, row)
 	if err != nil {
@@ -457,7 +517,7 @@ func (r *shadowResolvingReader) GetRow(table uint32, row ids.RowID) (map[uint32]
 	return resolveBridgeRow(raw, cols, r.db.bridgeShadowLimits())
 }
 
-// GetTombstone implements sqlengine.StateReader.
+// GetTombstone implements state.Reader.
 func (r *shadowResolvingReader) GetTombstone(table uint32, row ids.RowID) (crdt.Version, bool, error) {
 	tomb, present, err := r.db.store.GetTombstone(table, row)
 	if err != nil || !present {
@@ -481,7 +541,7 @@ func (r *shadowResolvingReader) GetTombstone(table uint32, row ids.RowID) (crdt.
 	return tomb, true, nil
 }
 
-// IterateTable implements sqlengine.StateReader.
+// IterateTable implements state.Reader.
 func (r *shadowResolvingReader) IterateTable(tableID uint32, fn func(*state.Row) error) error {
 	cols := r.columns(tableID)
 	if cols == nil {

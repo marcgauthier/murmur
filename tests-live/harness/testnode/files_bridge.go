@@ -20,7 +20,6 @@ import (
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/bridge"
 	"github.com/marcgauthier/murmur/ids"
-	"github.com/marcgauthier/murmur/schema"
 )
 
 // FilesConfigFile mirrors db.FilesConfig in node JSON configuration.
@@ -426,6 +425,25 @@ func (d *NodeDaemon) handleBridgeExport(w http.ResponseWriter, r *http.Request) 
 	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	d.mu.Lock()
+	database := d.database
+	d.mu.Unlock()
+	if database == nil {
+		http.Error(w, "node is locked", http.StatusServiceUnavailable)
+		return
+	}
+	// BridgeSchema is a snapshot. Rebind the capturer so additive typed
+	// schema migrations become visible to subsequent exports.
+	resolver, err := database.BridgeSchema()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("bridge schema: %v", err), http.StatusInternalServerError)
+		return
+	}
+	rt.capturer, err = bridge.NewCapturer(database.BridgeLogSource(), resolver, rt.outbox, 64, 4<<20)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("new capturer: %v", err), http.StatusInternalServerError)
+		return
+	}
 	var opts struct {
 		CaptureOnly bool `json:"capture_only"`
 	}
@@ -639,30 +657,6 @@ func (d *NodeDaemon) handleBridgeRelease(w http.ResponseWriter, r *http.Request)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"released": true})
-}
-
-func (d *NodeDaemon) handleAdminMigrate(w http.ResponseWriter, r *http.Request) {
-	database := d.databaseOrLocked(w)
-	if database == nil {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var req struct {
-		Tables []schema.TableSchema `json:"tables"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf("bad json: %v", err), http.StatusBadRequest)
-		return
-	}
-	if err := database.Migrate(r.Context(), req.Tables); err != nil {
-		http.Error(w, fmt.Sprintf("migrate error: %v", err), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"migrated": true})
 }
 
 func (d *NodeDaemon) handleAdminRotateKey(w http.ResponseWriter, r *http.Request) {

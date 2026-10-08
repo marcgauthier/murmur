@@ -17,17 +17,29 @@ func BenchmarkSnapshotSeed(b *testing.B) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(b, nodeA, nodeC)
 
-	dbA, err := openSignedFixture(ctx, replConfig(b.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	cfgA := replConfig(b.TempDir(), nodeA, dbid, creds[nodeA], nil)
+	cfgA.Schema.Tables = nil
+	definition, err := Define[facadeRecord]("records", 71, RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2},
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	cfgA.Tables = []TableDefinition{definition}
+	dbA, err := openSignedFixture(ctx, cfgA)
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer dbA.Close()
+	tableA, err := TableOf[facadeRecord](dbA, "records")
+	if err != nil {
+		b.Fatal(err)
+	}
 	addrA := waitForAddr(b, dbA, 5*time.Second)
 
 	for i := 0; i < n; i++ {
-		id := NewRowID()
-		if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
-			id[:], fmt.Sprintf("seed%04d", i), fmt.Sprintf("p%04d", i)); err != nil {
+		if err := insertRecord(ctx, dbA, tableA, &facadeRecord{ID: NewRowID(), Name: fmt.Sprintf("seed%04d", i)}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -36,6 +48,8 @@ func BenchmarkSnapshotSeed(b *testing.B) {
 	}
 	cfgC := replConfig(b.TempDir(), nodeC, dbid, creds[nodeC],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
+	cfgC.Schema.Tables = nil
+	cfgC.Tables = []TableDefinition{definition}
 	b.ResetTimer()
 	start := time.Now()
 	dbC, err := openSignedFixture(ctx, cfgC)
@@ -43,7 +57,21 @@ func BenchmarkSnapshotSeed(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer dbC.Close()
-	waitForRows(b, dbC, n, 120*time.Second)
+	tableC, err := TableOf[facadeRecord](dbC, "records")
+	if err != nil {
+		b.Fatal(err)
+	}
+	deadline := time.Now().Add(120 * time.Second)
+	for {
+		count, err := tableC.Where().Count()
+		if err == nil && count == n {
+			break
+		}
+		if time.Now().After(deadline) {
+			b.Fatalf("timed out waiting for %d rows", n)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	elapsed := time.Since(start)
 	snapBytes := dbC.Status().Replication.SnapshotBytesReceived
 	b.ReportMetric(float64(n)/elapsed.Seconds(), "rows/sec")

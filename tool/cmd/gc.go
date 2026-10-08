@@ -44,9 +44,7 @@ func (c *GCCommand) Run(ctx context.Context, globalOpts GlobalOptions, args []st
 	}
 
 	if trigger {
-		// Attempt to run PRAGMA optimize or trigger maintenance
-		_, err := client.Exec(ctx, "PRAGMA optimize;")
-		if err != nil {
+		if err := client.TriggerGC(ctx); err != nil {
 			return fmt.Errorf("trigger GC/maintenance failed: %w", err)
 		}
 		if globalOpts.JSON {

@@ -16,19 +16,18 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func TestPauseResumeLosesNoWrites(t *testing.T) {
+	if !supportsPauseResume() {
+		t.Skip("process pause/resume via SIGSTOP/SIGCONT is not supported on Windows")
+	}
 	stopSeconds := envSeconds("MURMUR_PAUSE_RESUME_STOP_SECONDS", 20)
 	if stopSeconds < 15 {
 		t.Logf("stop window %ds below the 15s floor; using 15s", stopSeconds)
@@ -39,21 +38,14 @@ func TestPauseResumeLosesNoWrites(t *testing.T) {
 		NumNodes:       3,
 		AwaitUnlock:    true,
 		BootstrapSeeds: []int{0},
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "pr_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		TypedRecords:   true,
 	})
 
 	// Positive control baseline: full mesh (sessions + SWIM) converges.
 	waitConnectedPeers(t, cluster, 2, 60*time.Second)
 	waitMembership(t, cluster, 3, 60*time.Second)
 	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("%032x", i)
-		if err := cluster.ExecSQL(0, "INSERT INTO pr_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("base-%d", i)); err != nil {
+		if err := cluster.TypedInsert(0, fmt.Sprintf("base-%d", i)); err != nil {
 			t.Fatalf("baseline write: %v", err)
 		}
 	}
@@ -90,10 +82,9 @@ func TestPauseResumeLosesNoWrites(t *testing.T) {
 					if paused[node].Load() {
 						continue
 					}
-					id := fmt.Sprintf("ff%02x%028x", node, seq)
 					seq++
 					value := fmt.Sprintf("flow-n%d-%08d", node+1, seq)
-					if err := cluster.ExecSQL(node, "INSERT INTO pr_rows (id, name) VALUES (?, ?)", id, value); err == nil {
+					if err := cluster.TypedInsert(node, value); err == nil {
 						ackMu.Lock()
 						acknowledged[value] = struct{}{}
 						ackMu.Unlock()
@@ -115,7 +106,7 @@ func TestPauseResumeLosesNoWrites(t *testing.T) {
 	ackedAtStop := len(acknowledged)
 	ackMu.Unlock()
 	t.Logf("SIGSTOP node2 with %d rows acknowledged so far", ackedAtStop)
-	if err := proc.Signal(syscall.SIGSTOP); err != nil {
+	if err := pauseProcess(proc); err != nil {
 		t.Fatalf("SIGSTOP node2: %v", err)
 	}
 
@@ -159,7 +150,7 @@ func TestPauseResumeLosesNoWrites(t *testing.T) {
 	}
 
 	// Resume and prove streams come back.
-	if err := proc.Signal(syscall.SIGCONT); err != nil {
+	if err := resumeProcess(proc); err != nil {
 		t.Fatalf("SIGCONT node2: %v", err)
 	}
 	resumeStart := time.Now()
@@ -173,9 +164,9 @@ func TestPauseResumeLosesNoWrites(t *testing.T) {
 	total := len(acknowledged)
 	ackMu.Unlock()
 	// 180s bound: post-resume range-repair of ~2k rows normally lands in
-	// ~10s, but one modernc-backend run needed past 120s (observed once
-	// in 7 runs; pure-Go SQLite + cold page cache). The bound stays
-	// finite and the no-loss assertions below are unchanged.
+	// ~10s, but one run needed past 120s (observed once in 7 runs;
+	// cold page cache). The bound stays finite and the no-loss
+	// assertions below are unchanged.
 	waitConverged(t, cluster, total, 180*time.Second)
 	assertAcknowledgedPresent(t, cluster, acknowledged)
 
@@ -202,8 +193,7 @@ func TestPauseResumeLosesNoWrites(t *testing.T) {
 	}
 
 	// Post-resume honest write still replicates everywhere.
-	postID := fmt.Sprintf("%032x", 999_999)
-	if err := cluster.ExecSQL(1, "INSERT INTO pr_rows (id, name) VALUES (?, ?)", postID, "post-resume"); err != nil {
+	if err := cluster.TypedInsert(1, "post-resume"); err != nil {
 		t.Fatalf("post-resume write: %v", err)
 	}
 	ackMu.Lock()
@@ -351,21 +341,16 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
-		var first string
+		var first []string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "pr_rows")
-			if err != nil || n != want {
-				ok = false
-				break
-			}
-			d, err := c.ComputeTableDigest(i, "pr_rows", "id")
-			if err != nil {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
 			if i == 0 {
-				first = d
-			} else if d != first {
+				first = names
+			} else if !sameNames(names, first) {
 				ok = false
 				break
 			}
@@ -376,24 +361,22 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 		time.Sleep(200 * time.Millisecond)
 	}
 	for i := range c.Nodes {
-		n, _ := c.QueryRowCount(i, "pr_rows")
-		t.Logf("node %d at timeout: count=%d", i, n)
+		names, _ := c.TypedNames(i)
+		t.Logf("node %d at timeout: count=%d", i, len(names))
 	}
-	t.Fatalf("nodes did not converge on %d pr_rows rows with equal digests within %v", want, timeout)
+	t.Fatalf("nodes did not converge on %d typed records with equal contents within %v", want, timeout)
 }
 
 func assertAcknowledgedPresent(t *testing.T, c *harness.Cluster, acknowledged map[string]struct{}) {
 	t.Helper()
 	for _, node := range c.Nodes {
-		res, err := c.QuerySQL(node.Index, "SELECT name FROM pr_rows")
+		names, err := c.TypedNames(node.Index)
 		if err != nil {
-			t.Fatalf("%s recovery query: %v", node.Label, err)
+			t.Fatalf("%s typed recovery read: %v", node.Label, err)
 		}
-		present := make(map[string]struct{}, len(res.Rows))
-		for _, row := range res.Rows {
-			if len(row) > 0 {
-				present[fmt.Sprint(row[0])] = struct{}{}
-			}
+		present := make(map[string]struct{}, len(names))
+		for _, name := range names {
+			present[name] = struct{}{}
 		}
 		for value := range acknowledged {
 			if _, ok := present[value]; !ok {
@@ -401,6 +384,18 @@ func assertAcknowledgedPresent(t *testing.T, c *harness.Cluster, acknowledged ma
 			}
 		}
 	}
+}
+
+func sameNames(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func metricValue(t *testing.T, apiAddr, name string) float64 {
@@ -414,22 +409,8 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line == "" || line[0] == '#' {
-			continue
-		}
-		if !strings.HasPrefix(line, name) {
-			continue
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(line, name))
-		if i := strings.LastIndex(rest, " "); i >= 0 {
-			rest = rest[i+1:]
-		}
-		v, err := strconv.ParseFloat(rest, 64)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		return v
+	if value, ok := harness.MetricValueFrom(string(raw), name); ok {
+		return value
 	}
 	t.Fatalf("counter %s not present in /metrics", name)
 	return 0

@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"fmt"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/marcgauthier/murmur/codec"
 )
 
@@ -18,7 +17,7 @@ func (s *Store) VerifyOriginChunk(chunk *codec.TransactionChunk) error {
 	return s.openOpt.OriginSigning.VerifyChunk(chunk, s.dbID)
 }
 
-func (s *Store) pinOriginKey(b *pebble.Batch, adopting bool) error {
+func (s *Store) pinOriginKey(b *batch, adopting bool) error {
 	pub, _ := s.openOpt.OriginSigning.TrustedKeys.Lookup(s.nodeID)
 	fingerprint := sha256.Sum256(pub)
 	old, err := s.getDirect(SysKey("origin_signing_key"))
@@ -28,7 +27,7 @@ func (s *Store) pinOriginKey(b *pebble.Batch, adopting bool) error {
 	if err != nil && !isNotFound(err) {
 		return err
 	}
-	return b.Set(SysKey("origin_signing_key"), fingerprint[:], nil)
+	return b.Set(SysKey("origin_signing_key"), fingerprint[:])
 }
 
 // finishOriginBaseline establishes explicitly trusted pre-signature state.
@@ -36,27 +35,29 @@ func (s *Store) pinOriginKey(b *pebble.Batch, adopting bool) error {
 func (s *Store) finishOriginBaseline() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	b := s.db.NewBatch()
-	defer b.Close()
 	for _, prefix := range []byte{prefixLog, prefixTxnStage, prefixSnapshot, prefixPeerAck} {
-		if err := b.DeleteRange([]byte{prefix}, []byte{prefix + 1}, nil); err != nil {
+		if err := s.deletePrefixRange([]byte{prefix}); err != nil {
 			return err
 		}
 	}
+	b := s.mem.newBatch()
+	defer b.Close()
 	for _, name := range []string{sysFormat, sysMinReader, sysMinWriter} {
-		if err := b.Set(SysKey(name), encodeU64(FormatVersion), nil); err != nil {
+		if err := b.Set(SysKey(name), encodeU64(FormatVersion)); err != nil {
 			return err
 		}
 	}
-	if err := b.Set(SysKey("origin_trusted_baseline"), encodeU64(s.clock.Max()), nil); err != nil {
+	if err := b.Set(SysKey("origin_trusted_baseline"), encodeU64(s.clock.Max())); err != nil {
 		return err
 	}
 	if err := s.pinOriginKey(b, false); err != nil {
 		return err
 	}
-	if err := s.commitBatch(b, pebble.Sync); err != nil {
+	if err := s.commitBatch(b, true); err != nil {
 		return err
 	}
+	s.stagedTransactionBytes = 0
+	s.stagedTransactionCount = 0
 	s.migratingOrigin = false
 	return nil
 }

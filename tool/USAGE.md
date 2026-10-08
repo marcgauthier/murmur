@@ -1,6 +1,6 @@
-# Murmur SQL CLI Operational Tool (`murmur`)
+# Murmur Operational CLI (`murmur`)
 
-The `murmur` CLI is a standalone, CGO-free diagnostic, operational, and management utility for Murmur SQL databases. It combines local database management, interactive shell access, storage inspection, data repair, cryptographic key inspection, backup/restore lifecycle workflows, and remote cluster diagnostics over mTLS.
+The `murmur` CLI provides database initialization, durable-state inspection and verification, key diagnostics, backup and restore, and remote cluster operations. SQL shell, query, import, and export commands have been removed; applications define schemas and access records through the managed Go API.
 
 ---
 
@@ -8,21 +8,16 @@ The `murmur` CLI is a standalone, CGO-free diagnostic, operational, and manageme
 
 1. [Installation and Build](#1-installation-and-build)
 2. [Global Flags & Authentication](#2-global-flags--authentication)
-3. [Database Lifecycle & Querying](#3-database-lifecycle--querying)
+3. [Database Initialization](#3-database-initialization)
    - [`init` - Initialize a Database](#init---initialize-a-database)
-   - [`shell` - Interactive REPL & Dot-Commands](#shell---interactive-repl--dot-commands)
-   - [`query` - Execute SQL Statements & Scripts](#query---execute-sql-statements--scripts)
-   - [`import` - Bulk Import CSV / JSON](#import---bulk-import-csv--json)
-   - [`export` - Export Tables / Views](#export---export-tables--views)
-   - [`dump` - Full SQL Schema and Data Dumper](#dump---full-sql-schema-and-data-dumper)
 4. [Storage, Integrity & Diagnostics](#4-storage-integrity--diagnostics)
    - [`inspect` - Low-Level Storage Inspector](#inspect---low-level-storage-inspector)
-   - [`verify` - Storage & Materialization Integrity Check](#verify---storage--materialization-integrity-check)
-   - [`repair` - Materializer Rebuild & State Repair](#repair---materializer-rebuild--state-repair)
+   - [`verify` - Durable Storage & Schema Manifest Check](#verify---durable-storage--schema-manifest-check)
+   - [`repair` - Durable State & Restore Intent](#repair---durable-state--restore-intent)
    - [`schema` - Schema Manifest & Table Metadata](#schema---schema-manifest--table-metadata)
    - [`keys` - Key Registry & Cryptographic State](#keys---key-registry--cryptographic-state)
    - [`doctor` - Automated System Health Check](#doctor---automated-system-health-check)
-   - [`bench` - Microbenchmarks (I/O, Ciphers, Transactions)](#bench---microbenchmarks-io-ciphers-transactions)
+   - [`bench` - Typed Storage and Cipher Microbenchmarks](#bench---typed-storage-and-cipher-microbenchmarks)
 5. [Cluster & Replication Operations](#5-cluster--replication-operations)
    - [`status` - Node Liveness & Runtime Status](#status---node-liveness--runtime-status)
    - [`cluster` - Cluster Membership & Topology](#cluster---cluster-membership--topology)
@@ -39,13 +34,13 @@ The `murmur` CLI is a standalone, CGO-free diagnostic, operational, and manageme
 
 ## 1. Installation and Build
 
-The `murmur` CLI is written in pure Go and can be built without a C compiler (`CGO_ENABLED=0`), enabling cross-compilation for Linux, macOS, and Windows.
+The CLI commands use direct Spool access and the managed Go database API. The production module and its normal test suite build with CGO disabled and do not require SQLite build tags.
 
 ### Build from Source
 
 ```bash
-# Pure-Go build using modernc.org/sqlite
-CGO_ENABLED=0 go build -tags modernc -o bin/murmur ./tool
+# Build the operational CLI
+CGO_ENABLED=0 go build -o bin/murmur ./tool
 
 # Verify build
 ./bin/murmur --help
@@ -71,11 +66,11 @@ Global options can be provided to any subcommand:
 
 ---
 
-## 3. Database Lifecycle & Querying
+## 3. Database Initialization
 
 ### `init` - Initialize a Database
 
-Creates a new Murmur database directory with storage manifests, cryptographic key registry, and a unique node ID.
+Creates an encrypted Spool database directory and unique node identity. The database has no bound application schema until the application first opens it with its Go table definitions. SQL seed files are not supported.
 
 ```bash
 # Initialize with default settings
@@ -88,129 +83,13 @@ murmur init /var/lib/murmur/data --passphrase="super-secret-passphrase"
 murmur init /var/lib/murmur/data --key-hex="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 ```
 
-### `shell` - Interactive REPL & Dot-Commands
 
-Starts an interactive SQL REPL session. The interactive shell supports syntax highlighting, line editing, multiline SQL queries, and a suite of dot-commands.
-
-```bash
-# Launch interactive shell
-murmur shell /var/lib/murmur/data
-
-# Shorthand invocation
-murmur /var/lib/murmur/data
-```
-
-#### Supported Dot-Commands in Shell
-
-| Command | Arguments | Description |
-|---|---|---|
-| `.help` | | Show help and list available dot commands |
-| `.tables` | `[pattern]` | List tables in database |
-| `.schema` | `[table]` | Show `CREATE` statements for tables |
-| `.mode` | `table\|csv\|json` | Switch output rendering format |
-| `.headers` | `on\|off` | Toggle column headers in query output |
-| `.timer` | `on\|off` | Toggle execution timer display |
-| `.read` | `<file.sql>` | Execute SQL statements from an external file |
-| `.dump` | `[table]` | Render SQL script to reconstruct schema and data |
-| `.status` | | Display node ID, schema version, and directory stats |
-| `.quit` / `.exit` | | Exit the interactive shell |
-
-#### Interactive Session Example
-
-```sql
-murmur> CREATE TABLE users (id BLOB PRIMARY KEY, username TEXT, email TEXT, score INTEGER);
-Migration applied: schema updated to version 2 (1 total tables).
-
-murmur> INSERT INTO users (id, username, email, score) VALUES (x'a0000000000000000000000000000001', 'alice', 'alice@example.com', 95);
-murmur> INSERT INTO users (id, username, email, score) VALUES (x'b0000000000000000000000000000002', 'bob', 'bob@example.com', 80);
-
-murmur> .mode table
-Output mode set to table.
-
-murmur> SELECT username, email, score FROM users ORDER BY score DESC;
-+----------+-------------------+-------+
-| USERNAME | EMAIL             | SCORE |
-+----------+-------------------+-------+
-| alice    | alice@example.com | 95    |
-| bob      | bob@example.com   | 80    |
-+----------+-------------------+-------+
-
-murmur> .status
-=== Murmur Database Status ===
-Target:          /var/lib/murmur/data
-Node ID:         node_01h7abc...
-Schema Version:  2
-Tables:          users
-
-murmur> .quit
-```
-
-### `query` - Execute SQL Statements & Scripts
-
-Run non-interactive queries, DDL migrations, or execute scripts from standard input or files against local databases or remote nodes.
-
-```bash
-# Execute query locally
-murmur query /var/lib/murmur/data "SELECT username, score FROM users WHERE score >= 80"
-
-# Output query results in JSON
-murmur query /var/lib/murmur/data --json "SELECT * FROM users"
-
-# Execute a SQL migration script
-murmur query /var/lib/murmur/data --file=migrations/v1.sql
-
-# Pipe SQL from stdin
-cat migrations/seed.sql | murmur query /var/lib/murmur/data
-
-# Execute query against a remote node over mTLS
-murmur query https://node1.internal:8443 \
-  --cert=client.crt --key=client.key --ca=ca.crt \
-  "SELECT count(*) FROM users"
-```
-
-### `import` - Bulk Import CSV / JSON
-
-Import structured data into a table. Automatically transforms 16-byte UUID hex strings into primary key BLOBs.
-
-```bash
-# Import CSV data
-murmur import /var/lib/murmur/data users data/users.csv --format=csv
-
-# Import JSON lines (JSONL) data
-murmur import /var/lib/murmur/data events data/events.json --format=json
-```
-
-### `export` - Export Tables / Views
-
-Export table data into CSV or JSON formats.
-
-```bash
-# Export table to CSV
-murmur export /var/lib/murmur/data users --format=csv --output=backup_users.csv
-
-# Export table to JSON array
-murmur export /var/lib/murmur/data users --format=json --output=backup_users.json
-```
-
-### `dump` - Full SQL Schema and Data Dumper
-
-Generates standard SQL `CREATE TABLE` and `INSERT` statements to recreate the database.
-
-```bash
-# Dump entire database to file
-murmur dump /var/lib/murmur/data > backup.sql
-
-# Dump only a single table
-murmur dump /var/lib/murmur/data users > users.sql
-```
-
----
-
+Applications bind their Go record types and schema through `Config.Tables` and use Murmur's managed typed API. The CLI does not parse SQL or dynamically construct application tables. See the [RIME migration schema guide](../architecture/rime-migration-schema.md) for supported record and query features.
 ## 4. Storage, Integrity & Diagnostics
 
 ### `inspect` - Low-Level Storage Inspector
 
-Inspects storage files, WAL/Pebble directory structures, manifest versions, and on-disk payload sizes without acquiring SQLite locks.
+Inspects storage files, segment files, manifest versions, and on-disk payload sizes by opening encrypted Spool state directly. It does not construct the RIME query materializer. The reported table count comes from the durable schema manifest.
 
 ```bash
 # Inspect local database directory
@@ -220,33 +99,33 @@ murmur inspect /var/lib/murmur/data
 murmur inspect /var/lib/murmur/data --json
 ```
 
-### `verify` - Storage & Materialization Integrity Check
+### `verify` - Durable Storage & Schema Manifest Check
 
-Performs low-level cryptographic checksum checks, Pebble LSM-tree integrity scans, and executes SQLite `PRAGMA integrity_check` on the materialized view.
+Opens encrypted Spool directly and verifies durable records without constructing the RIME query materializer. Before the application binds its Go schema, the result remains valid and includes a warning that no schema is bound. The result sets `materializer_checked` to `false`: reconstructing a RIME materializer requires the application's Go table definitions, which are not available to the CLI. `--deep` (or legacy `--full`) is reported in the result; opening always performs the full durable replay.
 
 ```bash
-# Quick integrity verification
-murmur verify /var/lib/murmur/data --quick
+# Verify durable state and schema manifest
+murmur verify /var/lib/murmur/data
 
-# Full forensic integrity check
-murmur verify /var/lib/murmur/data --full
+# Request detailed verification metadata
+murmur verify /var/lib/murmur/data --deep
 ```
 
-### `repair` - Materializer Rebuild & State Repair
+### `repair` - Durable State & Restore Intent
 
-Rebuilds corrupt or missing SQLite materialization databases (`materialized.db`) from scratch by replaying change records from the underlying Pebble / KV storage engine.
+Replays and checks authoritative encrypted Spool directly, or clears a pending restore intent when explicitly requested. RIME materialization is rebuilt when the application opens with its Go table definitions; the CLI cannot rebuild it without those definitions. `--dry-run` does not open storage or change files.
 
 ```bash
-# Check if rebuild is necessary
+# Check durable state
 murmur repair /var/lib/murmur/data
 
-# Force rebuild of materialized SQLite database
-murmur repair /var/lib/murmur/data --force
+# Clear a restore intent after confirming recovery state
+murmur repair /var/lib/murmur/data --clear-intent
 ```
 
 ### `schema` - Schema Manifest & Table Metadata
 
-Displays registered table definitions, column types, nullability, primary key constraints, and schema epoch version.
+Displays registered table definitions from the durable schema manifest, including stable table/column IDs, types, nullability, and primary-key identity. Local mode opens encrypted Spool directly and does not construct a query materializer. Remote mode uses `GET /v1/schema`.
 
 ```bash
 # Show schema overview
@@ -258,7 +137,7 @@ murmur schema /var/lib/murmur/data --markdown
 
 ### `keys` - Key Registry & Cryptographic State
 
-Inspects the on-disk `KEYREGISTRY` file, displays active and expired cryptographic keys, key generations, cipher algorithms, and pinned backup checkpoints.
+Inspects the on-disk key registry and opens encrypted Spool directly to display active and retired data keys, key generations, and wrapping-key identity. It does not construct the RIME query materializer.
 
 ```bash
 # Inspect key registry
@@ -270,7 +149,7 @@ murmur keys /var/lib/murmur/data --passphrase="super-secret-passphrase"
 
 ### `doctor` - Automated System Health Check
 
-Runs comprehensive diagnostics on directory permissions, key registry validity, database locking, storage engine health, schema status, and SQLite materializer integrity.
+Local mode opens encrypted Spool directly, replays durable state, and verifies the schema manifest without constructing the RIME query materializer. It reports the materializer as unchecked because application Go table definitions are unavailable to the CLI. Remote mode checks TLS configuration and the live node status endpoint.
 
 ```bash
 # Run doctor check
@@ -280,16 +159,16 @@ murmur doctor /var/lib/murmur/data
 murmur doctor /var/lib/murmur/data --json
 ```
 
-### `bench` - Microbenchmarks (I/O, Ciphers, Transactions)
+### `bench` - Typed Storage and Cipher Microbenchmarks
 
-Evaluates system storage I/O throughput, cryptographic ciphers (AES-256-GCM, ChaCha20-Poly1305, SHA-256), and SQLite transaction execution rates.
+Measures durable typed-record batch writes and point reads through Murmur's managed RIME API, plus AES-256-GCM, ChaCha20-Poly1305, and SHA-256 throughput. The record measurements include Spool durability and are not an isolated RIME engine benchmark.
 
 ```bash
 # Run default benchmark suite
 murmur bench
 
-# Run benchmark with 50,000 operations
-murmur bench --operations=50000 --markdown
+# Run benchmark for a shorter interval
+murmur bench --duration=500ms --json
 ```
 
 ---
@@ -330,14 +209,14 @@ murmur lag https://node1.cluster.internal:8443 \
 
 ### `gc` - Garbage Collection Inspection & Trigger
 
-Inspects tombstone counts, dead tuple generations, and optionally triggers a garbage collection compaction sweep.
+Inspects replication GC watermarks and retention state. `--trigger` calls the node's `POST /v1/admin/gc` endpoint, which runs Murmur's collector for eligible replication-log and transaction-receipt history using persisted peer acknowledgements and configured retention limits.
 
 ```bash
-# Inspect GC tombstone status
+# Inspect GC watermarks and retention state
 murmur gc https://node1.cluster.internal:8443 \
   --cert=client.crt --key=client.key --ca=ca.crt
 
-# Trigger online GC sweep
+# Trigger online replication-history collection
 murmur gc https://node1.cluster.internal:8443 \
   --cert=client.crt --key=client.key --ca=ca.crt --trigger
 ```
@@ -350,7 +229,7 @@ Murmur provides point-in-point, encrypted hot snapshots that can be safely verif
 
 ### `backup create` - Consistent Hot Snapshot
 
-Creates an encrypted, gzip-compressed tar archive containing database state, key registry metadata, and manifests.
+Creates an encrypted, gzip-compressed archive from an authoritative Spool checkpoint and its embedded manifests. Local backup creation does not construct the RIME query materializer and does not include a `schema.json` sidecar.
 
 ```bash
 # Create backup archive
@@ -408,7 +287,7 @@ All operational commands support the `--json` flag, making the CLI ideal for aut
 set -e
 
 # Run doctor and verify overall status
-STATUS=$(murmur doctor /var/lib/murmur/data --json | jq -r '.status')
+STATUS=$(murmur doctor /var/lib/murmur/data --json | jq -r '.overall')
 
 if [ "$STATUS" != "HEALTHY" ]; then
   echo "Node health check failed: status=$STATUS"

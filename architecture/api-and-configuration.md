@@ -14,9 +14,14 @@ Public Go API, configuration example, and internal interfaces.
 
 ## 5. Public Package API
 
-`Config.OriginSigning` is mandatory, including offline writers. It supplies a separate Ed25519 private key and explicit origin key registry. `Replication.TrustedSnapshotSources` controls merged-state recovery; `MigrateOriginBaseline` provides strict offline cutover and `ScanReplicationLog` returns complete signed transactions. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
+`Config.OriginSigning` is mandatory, including offline writers. It supplies a separate Ed25519 private key and explicit origin key registry. `Replication.TrustedSnapshotSources` controls merged-state recovery and `ScanReplicationLog` returns complete signed transactions. Legacy SQL stores must be exported with the previous release and reopened from a fresh directory. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
 
 Keep the public API small.
+
+`SchemaConfig` accepts the replicated version, table descriptors and
+remote-adoption policy. It no longer accepts raw SQL schema or local-object
+DDL; define native tables and indexes through `Config.Tables` and typed RIME
+options.
 
 Initial concept:
 
@@ -25,12 +30,10 @@ type Config struct {
     Path        string
     NodeID      NodeID
     DBID        DBID
-    QueryStore  QueryStoreConfig
     Encryption EncryptionConfig
     Replication ReplicationConfig
-    Cache       CacheConfig
     Schema      SchemaConfig
-    Pebble      PebbleConfig
+    Spool       SpoolConfig
     Durability  DurabilityConfig
     Backup      BackupScheduleConfig
     Files       FilesConfig
@@ -48,37 +51,6 @@ func Open(ctx context.Context, cfg Config) (*DB, error)
 type DB struct {
     // unexported internals
 }
-
-func (db *DB) ExecContext(
-    ctx context.Context,
-    query string,
-    args ...any,
-) (Result, error)
-
-func (db *DB) QueryContext(
-    ctx context.Context,
-    query string,
-    args ...any,
-) (*Rows, error)
-
-func (db *DB) QueryRowContext(
-    ctx context.Context,
-    query string,
-    args ...any,
-) *Row
-
-func (db *DB) BeginTx(
-    ctx context.Context,
-    opts *TxOptions,
-) (*Tx, error)
-
-func (db *DB) PrepareContext(
-    ctx context.Context,
-    query string,
-) (*Stmt, error)
-
-func (db *DB) Subscribe(ctx context.Context, query string, args ...any) (*Subscription, error)
-func (db *DB) SubscribeWithOptions(ctx context.Context, query string, opts SubscriptionOptions, args ...any) (*Subscription, error)
 
 func (db *DB) AddPeer(ctx context.Context, peer Peer) error
 func (db *DB) RemovePeer(ctx context.Context, nodeID NodeID) error
@@ -98,27 +70,21 @@ func (db *DB) Status() Status
 func (db *DB) Metrics() MetricsSnapshot
 func (db *DB) DurabilityMode() DurabilityMode
 func (db *DB) Sync(ctx context.Context) error
+func (db *DB) GC(ctx context.Context) error
 func (db *DB) Close() error
 ```
 
 `Peers` and `AddPeer` supply bootstrap candidates, not permanent replication links. Discovery and the bounded scheduler select actual connections. `RemovePeer` explicitly retires and persistently excludes a NodeID locally, including from subsequent discovery; `AddPeer` clears that exclusion. This is local administrative policy, not a cluster-wide revocation. `ForceSync` schedules immediate synchronization subject to the same session and connection limits as background work. See [Sections 26](membership-and-transport.md#26-replication-transport)–[28](replication-and-dissemination.md#28-quic-connection-model) for membership configuration and connection budgets.
 
-A `database/sql/driver.Driver` is implemented (`driver.go`, registered as
-`murmur`, with legacy alias `replicateddb`) so applications can do:
+`GC` runs an operator-triggered log and receipt collection pass. It obeys
+persisted peer acknowledgements and configured retention limits, so it never
+collects history still required by an admitted peer. Use a context deadline
+when collecting a large backlog.
 
-```go
-murmur.RegisterDriverDB("primary", db)
-sqldb, err := sql.Open("murmur", "primary")
-// or: sqldb, err := sql.Open("replicateddb", "primary")
-// or: sqldb := sql.OpenDB(murmur.NewConnector(db))
-```
-
-Exec runs through implicit transactions, Query through reads, and Begin maps
-to `DB.BeginTx`; write statements issued as Query outside an explicit
-transaction are rejected so change capture cannot be bypassed. Closing sql
-handles never closes the underlying `*DB`. The explicit `DB`/`Tx` API remains
-the primary interface: transaction interception and connection-specific hooks
-are easier to prove there first.
+The `database/sql/driver` wrapper, SQL statement/query/transaction methods,
+SQL subscription worker, SQLite materializer, and SQLite package have been
+removed. Reusable parameterized queries use the typed `RecordQuery.Compile`
+API. `RecordTable.Subscribe` is the managed subscription surface.
 
 `Config.OnOpenProgress func(OpenProgress)` optionally reports startup while
 `Open` is blocked. `OpenProgress` contains `Phase`, `StartedAt`, `Elapsed`,
@@ -129,21 +95,139 @@ are easier to prove there first.
 `OpenReady`, `OpenFailed`, and `OpenCancelled`. Only `OpenReady` signals success.
 `Status.OpenProgress *OpenProgress` returns a copy of the retained startup
 snapshot, or nil when reporting was disabled. Callbacks are excluded from JSON
-configuration serialization. See [startup progress](runtime-and-diagnostics.md#startup-progress)
+configuration serialization. See [startup progress](runtime-and-diagnostics.md#startup-progress-reporting)
 for processed-cell, timing, callback, and cancellation semantics. Totals and
 estimates remain unknown; their numeric fields stay zero. `OpenCounting` remains
 defined for compatibility but is never emitted. No counting scan is performed.
 
-`Open` requires both `cfg.Schema` and `cfg.Pebble`. The schema must include its version and complete table and column declarations; do not infer it from existing data. Validate it against [Section 6](schema.md#6-schema-rules-for-version-1) and persisted schema metadata before creating tables, rebuilding data, or starting replication. Errors must identify the offending table, column, or index.
+`Open` requires `cfg.Spool` and managed definitions in `Config.Tables`. Only
+replicated definitions enter the cluster manifest, so a local-only database
+may have an empty replicated table set. `Schema.Tables` is manifest metadata
+produced from managed definitions; it is not an alternate SQL configuration.
+Do not infer replicated table or column declarations from existing data.
+Validate definitions against [Section 6](schema.md#6-schema-rules-for-version-1)
+and persisted metadata before rebuilding data or starting replication. Errors
+must identify the offending table, field, or index.
 
-`PebbleConfig` is required; use `DefaultPebbleConfig()` for standard settings. `Config.Path` is the database directory. Expose cache size, memtable size/count, maximum open files, compaction concurrency, and compression; keep storage caches out of `CacheConfig`. Validate settings before opening Pebble. Encryption keys come from `Encryption.Key` or `Encryption.Provider`; never weaken the replication acknowledgement or durability contract through storage options.
+### Native typed record API status
+
+`RecordOptions.Scope` defaults to `TableScopeReplicated`. Set it to
+`TableScopeNodeLocal` for a persistent typed table whose cells stay in the
+node-local Spool namespace and are absent from replication logs and snapshots.
+Set it to `TableScopeEphemeral` for an in-memory typed table that resets on
+reopen. Both local scopes currently support LWW fields only. Persistent
+node-local writes can share one atomic Spool commit with replicated typed
+writes; ephemeral writes cannot share a transaction with durable tables.
+Node-local tables are not eligible for typed bridge import or export.
+
+
+The managed record facade is the only supported database API. `Open` requires
+at least one compiled `Config.Tables` definition and rejects SQL-only
+`Schema.Tables` configurations before opening Spool:
+
+```go
+type Contact struct {
+    ID   ids.RowID `rime:"primary"`
+    Name string
+}
+
+definition, err := murmur.Define[Contact]("contacts", 17, murmur.RecordOptions{
+    PrimaryField: "ID",
+    FieldIDs: map[string]uint32{"ID": 1, "Name": 2},
+})
+if err != nil { return err }
+
+refuseSchemaDrift := false
+db, err := murmur.Open(ctx, murmur.Config{
+    // Path, NodeID, encryption, Spool and origin signing are required.
+    Schema: murmur.SchemaConfig{Version: 1, AcceptRemoteSchema: &refuseSchemaDrift},
+    Tables: []murmur.TableDefinition{definition},
+})
+```
+
+`Define[T]` requires a stable nonzero table ID, a 16-byte primary field marked
+`rime:"primary"`, and explicit stable IDs for all exported persisted fields.
+`TableOf[T]` returns a typed handle; `Get` returns a mutable deep clone, while
+`Insert`, `Save`, `Update`, `Delete`, and their batch forms stage through
+`DB.WriteTxContext` and `Tx`. `WriteTxContext` runs its callback before
+writer admission, so independent callbacks can stage concurrently. Commits are
+still serialized; stale transactions may return `rime.ErrConflict`, while
+disjoint writes can proceed. The database tracks these in-flight callbacks so
+`Close` drains them before closing RIME or Spool. `Where` and `WhereTx` return
+a read-only query wrapper with predicates, ordering, pagination, `Find`, `First`, `Count`,
+`Exists`, `Each`, read-only `Aggregate`/`AggregateContext`, and typed `GroupBy`
+with grouped aggregate methods; returned records are independent deep copies.
+`InnerJoinReadTx` and `LeftJoinReadTx` join typed tables on one pinned read
+snapshot using `FieldOf` key handles, and return detached record pairs.
+`RecordTable.Compile` creates a reusable parameterized read query; `CompileTx`
+and `CompileReadTx` bind it to a managed write overlay or pinned read snapshot.
+Compiled `Find` returns detached rows and `Count` retains RIME's parameter
+count/type validation. `RecordTable.Subscribe` pins a RIME read snapshot while
+capturing its observer cursor, then evaluates without holding the writer lock.
+Events include the full current `Rows` snapshot and, for updates, deterministic
+primary-key `Changes` (`RecordAdded`, `RecordUpdated`, or `RecordRemoved`).
+Equality uses built-in canonical field semantics and registered custom codec
+equality hooks. Keep `RecordSubscription.ResumeCursor()` and provide that
+`RecordSubscriptionCursor` through `RecordSubscriptionOptions.ResumeFrom` to
+resume after the retained sequence during the same database open. Tokens bind
+the database ID, observer epoch, and RIME materializer generation, so tokens
+from another database, another open, or a rebuild fail with
+`ErrSubscriptionExpired`. The cursor is an in-memory observer position, not a
+durable replication or application checkpoint; synchronous durability does not
+make it survive reopening. A full bounded buffer or a rebuild emits
+`EventReset` with `ErrSubscriptionReset`.
+Use `StringFieldOf[T]` for RIME's indexed prefix, suffix, substring, and LIKE
+predicates; these operations do not provide tokenized full-text search or
+ranking.
+If storage failure makes a typed commit outcome uncertain,
+`WriteTxContext` returns `*CommitOutcomeUncertainError` with its `TxID`.
+Reopen the database and call `HasTransactionReceipt(TxID)` to determine whether
+that transaction committed.
+
+Host-managed lifecycles can use `DB.BeginTx(ctx)`, then stage operations
+through the returned `*Tx` and call `Commit`, `CommitContext`, or
+`Rollback`. Commit follows the same writer scheduler and Spool-before-RIME
+publication path as `WriteTxContext`. A transaction opened before a typed
+schema/materializer generation change is rejected at commit. The former SQL
+transaction methods are gone from Murmur's public API. The `RecordTx` name remains
+a temporary compatibility alias for `Tx`; new code should use `Tx` in callback
+signatures and typed declarations. Production has no SQLite materializer or
+SQL application interface.
+Use `rime.Count[T]()` for row counts and
+`murmur.NumericFieldOf[T, V](table, "Field")` with RIME's `SumOf`/`AvgOf` to
+build numeric aggregates. The current
+durable facade accepts LWW fields, numeric MIN/MAX fields, top-level int64
+PN_COUNTER fields, and top-level `[]string` OR_SET fields. Extrema, counters,
+and sets change through `RecordMin`, `RecordMax`, `RecordCounterAdd`,
+`RecordSetAdd`, and `RecordSetRemove`; existing extrema fields cannot be
+replaced directly. A new record's initial numeric value seeds its MIN/MAX field.
+The removed SQL methods cannot bypass Spool. Opened databases rebuild directly
+into RIME. A typed configuration whose
+descriptor is an additive subset of the stored schema can reopen as an older
+writer; unknown top-level and supported nested fields remain durable through
+its writes. Custom field types can register stable codec IDs and versions with
+encode, decode, clone, and equality hooks in `RecordOptions.Codecs`. Typed
+`DB.ReadTxContext` pins a local MVCC snapshot for `GetRead` and `WhereReadTx`;
+`RecordReadTx.Snapshot` returns its local commit ID and `DB.ReadAt` can reopen a
+retained snapshot. Close read transactions promptly so old versions can be
+reclaimed. Snapshot IDs are local to one materializer generation, not
+cluster-wide timestamps. `MigrateRecords(ctx, completeDefinitions)` publishes
+an additive typed schema revision, rebuilds the private RIME materializer from
+Spool, and makes new typed handles available. Existing table and field IDs,
+types, and merge policies must remain unchanged; drops and incompatible edits
+fail before the manifest changes. Peers with compatible older typed bindings
+can adopt the new manifest and retain fields they do not know. Operational
+feature ports remain incomplete. See [the migration plan](../MIGRATION_PLAN.md)
+for the cutover gates.
+
+`SpoolConfig` is required; use `DefaultSpoolConfig()` for standard settings. `Config.Path` is the database directory. Expose block/segment sizing, worker concurrency, pending-memory bounds, compaction, and compression. Validate settings before opening Spool. Encryption keys come from `Encryption.Key` or `Encryption.Provider`; never weaken the replication acknowledgement or durability contract through storage options.
 
 `DurabilityConfig{Mode: DurabilityAsync, SyncInterval: time.Second}` enables
-opt-in scheduled Pebble syncs for applications accepting approximately one
+opt-in scheduled Spool syncs for applications accepting approximately one
 second of unsynced acknowledged writes. `SyncInterval` must be non-negative
 and is valid only with `DurabilityAsync`; zero keeps manual `DB.Sync` behavior.
 `Metrics().PeriodicSyncs` and `PeriodicSyncFailures` report scheduled sync
-results. See [Section 17](transactions.md#17-alternative-write-optimization)
+results. See [Section 17](transactions.md#17-durability-modes)
 for the durability contract.
 
 `DurabilityConfig.MaxUnsyncedBytes` adds a size trigger beside the time
@@ -153,49 +237,39 @@ disables it. When both triggers are set, whichever is reached first fires,
 bounding the loss window under bursty load. With both zero, asynchronous
 commits sync only on explicit `DB.Sync` and graceful close.
 
-`DurabilityConfig.GroupCommit` configures synchronous group commit, enabled by
-default in `DurabilitySynchronous` mode and ignored in `DurabilityAsync` mode.
+`DurabilityConfig.GroupCommit` configures synchronous group commit for managed
+typed writes. It is enabled by default in `DurabilitySynchronous` mode and
+ignored in `DurabilityAsync` mode.
 `MaxDelay` (default one millisecond; negative disables grouping) bounds the
 leader's wait for concurrent transactions, `MaxTransactions` (default 64,
 maximum 512) caps transactions per group, and `MaxBytes` (default 4 MiB,
 maximum 64 MiB) caps the group's total encoded size. Grouped transactions
-share one synced Pebble batch and are each acknowledged after that shared
+share one synced Spool commit and are each acknowledged after that shared
 fsync, so the synchronous durability contract is unchanged. See
-[Section 16](transactions.md#16-local-sql-commit-ordering) for the commit
+[Section 16](transactions.md#16-durable-first-typed-commit-ordering) for the commit
 path and failure semantics.
 
 ```go
-type PebbleConfig struct {
-    CacheBytes              int64
-    MemTableBytes           uint64
-    MemTableCount           int
-    MaxOpenFiles            int
-    MaxConcurrentCompactions int
-    DisableAutomaticCompactions bool // default false; stalled-compaction simulation
-    Compression             CompressionConfig
+type SpoolConfig struct {
+    WriteBufferSize   int
+    SegmentSize       int64
+    BlockSize         int
+    Workers           int
+    PendingMemoryCap  int64
+    CompactionRatio   float64
+    DisableCompaction bool
+    Compression       spool.Compression
+    Faults            *spool.FaultHooks
 }
-
-type CompressionConfig struct {
-    Algorithm CompressionAlgorithm // default zstd (empty resolves to it)
-    ZstdLevel int                  // default 3; supported levels are 3, 9, and 12
-}
-
-type CompressionAlgorithm string
-
-const (
-    CompressionZstd   CompressionAlgorithm = "zstd"
-    CompressionSnappy CompressionAlgorithm = "snappy"
-    CompressionNone   CompressionAlgorithm = "none"
-)
 ```
 
-The default constructor sets a 256 MiB block cache, 4 MiB memtable, two memtables, 1,000 open files, one concurrent compaction, and `CompressionZstd` at level 3. Explicit `CompressionNone` disables compression; zero compression configuration resolves to enabled Zstd level 3. A missing/invalid storage budget is an error rather than silently allocating an unbounded cache.
+The default constructor sets 4 MiB write buffers, 64 MiB segments, 64 KiB blocks, background workers, 64 MiB pending-memory bounds, 0.5 compaction ratio, and `spool.CompressionDeflate`. Explicit `CompressionNone` disables compression. A missing/invalid storage budget is an error rather than silently allocating an unbounded cache.
 
-Target `github.com/cockroachdb/pebble/v2` v2.1.6 and its versioned APIs. This is a new-database architecture change: detect and reject existing Badger directories with `ErrUnsupportedStorageFormat` before creating or modifying storage files. No importer, automatic conversion, or Badger runtime fallback is planned. The current Go implementation uses Pebble; the roadmap describes target capabilities and is not a record of completed phases. See the [implementation inventory](capability-gaps.md).
+Spool serves as the sole persistence backend under `Config.Path/data`. Detect and reject existing legacy Pebble or unsupported storage directories with `ErrUnsupportedStorageFormat` before creating or modifying storage files. No importer, automatic conversion, or Pebble runtime fallback is supported.
 
-`Open` also requires `cfg.Encryption`: a write algorithm (default AES-256-GCM), application wrapping key (directly or via a provider), and positive internal data-key rotation duration. Validate wrapping-material key length against its own algorithm and validate the selected write algorithm before opening Pebble; see [Sections 39](encryption.md#39-encrypted-pebble-vfs)–[43](encryption.md#43-application-key-rotation-and-file-rewriting) for rotation semantics.
+`Open` also requires `cfg.Encryption`: AES-256-GCM storage encryption with a 32-byte application wrapping key (directly or via a provider), and positive internal data-key rotation duration. Validate wrapping-material key length and algorithm before opening Spool; see [Sections 39](encryption.md#39-at-rest-encryption-via-spool-aes-256-gcm)–[43](encryption.md#43-application-key-rotation-and-compaction-rewriting) for rotation semantics.
 
-Key-provider interfaces are application-facing because callers implement them; storage and transport interfaces remain internal. Rotation methods operate on the encryption manager described in [Sections 39](encryption.md#39-encrypted-pebble-vfs)–[43](encryption.md#43-application-key-rotation-and-file-rewriting). `RotateStorageKey` rewraps the key registry; cipher changes and existing-file rewrites are separate operations.
+Key-provider interfaces are application-facing because callers implement them; storage and transport interfaces remain internal. Rotation methods operate on the Spool storage layer described in [Sections 39](encryption.md#39-at-rest-encryption-via-spool-aes-256-gcm)–[43](encryption.md#43-application-key-rotation-and-compaction-rewriting). `RotateStorageKey` rewraps the keyring; data key rotation and compaction rewriting are separate operations.
 
 ### 5.1 Do not expose unrestricted raw write access
 
@@ -217,7 +291,7 @@ If a raw SQL handle is exposed, make it read-only or clearly unsafe/debug-only.
 
 Target developer experience:
 
-`Schema`, `Pebble`, and `Encryption` are mandatory. `Open` validates them before materialization or replication starts. `storageKey` below is an application-supplied 32-byte secret.
+`Schema`, `Spool`, and `Encryption` are mandatory. `Open` validates them before materialization or replication starts. `storageKey` below is an application-supplied 32-byte secret.
 
 ```go
 db, err := murmur.Open(ctx, murmur.Config{
@@ -225,12 +299,7 @@ db, err := murmur.Open(ctx, murmur.Config{
     NodeID: murmur.MustNodeID("..."),
     DBID:   clusterDBID, // shared configured/persisted ID for joining this cluster
 
-    Pebble: murmur.DefaultPebbleConfig(), // includes Zstd level 3
-
-    QueryStore: murmur.QueryStoreConfig{
-        RemoteApplyInterval: 1 * time.Second,
-        RemoteApplyMaxTransactions: 1000,
-    },
+    Spool: murmur.DefaultSpoolConfig(),
 
     Schema: murmur.SchemaConfig{
         Version: 7,
@@ -246,10 +315,6 @@ db, err := murmur.Open(ctx, murmur.Config{
         Key:             storageKey,
         KeyID:           "storage-key-v1",
         DataKeyRotation: 24 * time.Hour,
-    },
-
-    Cache: murmur.CacheConfig{
-        StatementCacheEntries: 256,
     },
 
     Replication: murmur.ReplicationConfig{
@@ -299,7 +364,7 @@ No external database service is required.
 type QueryEngine interface {
     Begin(ctx context.Context) (QueryTx, error)
     Query(ctx context.Context, q string, args ...any) (Rows, error)
-    Rebuild(ctx context.Context, src StateReader) error
+    Rebuild(ctx context.Context, src state.Reader) error
     Apply(ctx context.Context, changes []WinningChange) error
     Generation() uint64
     Close() error
@@ -326,15 +391,11 @@ type StateStore interface {
 
 `DB.ApplyRemoteGroup` is the replication manager's optional grouped-applier
 entry point. It takes ordered, contiguous transactions and commits their
-independent receipts and sequence positions atomically; acknowledgements may
-advance after durable Pebble receipt, before SQLite query visibility. The query
-store batches affected rows until `QueryStore.RemoteApplyInterval` (default 1s)
-or `QueryStore.RemoteApplyMaxTransactions` (default 1,000) is reached. Zero
-selects the default for each; negative values are invalid. A local SQL write
-flushes pending remote rows first.
+independent receipts and sequence positions atomically. It publishes winning
+records through RIME before acknowledging the apply.
 
-The query view is always in-memory; see [query store](sqlite-backends.md#query-store-and-security).
-Pebble data and replication formats are unchanged.
+The query view is RIME. SQL-only configurations and statements are not part of
+the public API.
 
 ### Transport
 

@@ -135,8 +135,8 @@ func TestProviderAlgorithmLengths(t *testing.T) {
 		t.Fatal("expected length mismatch for AES-128-GCM")
 	}
 	t.Setenv("MURMUR_TEST_KEY16", "00112233445566778899aabbccddeeff")
-	m16, err := (&EnvProvider{Var: "MURMUR_TEST_KEY16", Algorithm: AlgorithmAEGIS128L}).Current(context.Background())
-	if err != nil || len(m16.Key) != 16 || m16.Algorithm != AlgorithmAEGIS128L.String() {
+	m16, err := (&EnvProvider{Var: "MURMUR_TEST_KEY16", Algorithm: AlgorithmAES128GCM}).Current(context.Background())
+	if err != nil || len(m16.Key) != 16 || m16.Algorithm != AlgorithmAES128GCM.String() {
 		t.Fatalf("env16: %v", err)
 	}
 	if _, err := decodeKeyMaterial([]byte("001122"), AlgorithmAES256GCM); err == nil {

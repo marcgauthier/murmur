@@ -11,50 +11,44 @@ package hostilepeer_test
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/marcgauthier/murmur/compression"
 
-	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/replication"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func TestHostilePeerAttacksRejected(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "hostile-peer",
-		NumNodes:    2,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "hostile_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:         "hostile-peer",
+		NumNodes:     2,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 	target := 0 // attacker aims at node1; node2 is the honest witness
 
 	// Positive control (pre-attack): honest writes replicate both ways.
-	if err := cluster.ExecSQL(0, "INSERT INTO hostile_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 1), "honest-1"); err != nil {
+	if err := cluster.TypedInsert(0, "honest-1"); err != nil {
 		t.Fatalf("baseline insert node1: %v", err)
 	}
-	waitConverged(t, cluster, "hostile_rows", 1, 30*time.Second)
-	if err := cluster.ExecSQL(1, "INSERT INTO hostile_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 2), "honest-2"); err != nil {
+	waitConverged(t, cluster, 1, 30*time.Second)
+	if err := cluster.TypedInsert(1, "honest-2"); err != nil {
 		t.Fatalf("baseline insert node2: %v", err)
 	}
-	waitConverged(t, cluster, "hostile_rows", 2, 30*time.Second)
-	preAttack := nodeDigest(t, cluster, target, "hostile_rows")
+	waitConverged(t, cluster, 2, 30*time.Second)
+	preAttack := nodeDigest(t, cluster, target)
 
 	baseOriginUnknown := metricValue(t, cluster.Nodes[target].APIAddr, "spedsql_repl_origin_unknown_total")
 	baseInvalid := metricValue(t, cluster.Nodes[target].APIAddr, "spedsql_repl_batches_invalid_total")
@@ -117,7 +111,7 @@ func TestHostilePeerAttacksRejected(t *testing.T) {
 	replayHello := replication.EncodeHello(nil, &replication.Hello{
 		ProtocolVersion: replication.ProtocolVersion, MinProtocolVersion: replication.MinProtocolVersion,
 		NodeID: atk.id, DBID: atk.dbid, SchemaEpoch: 9999, SchemaHash: randomHash(),
-		Capabilities: replication.CapMergePolicies | replication.CapZstd | replication.CapOriginSignatures, MaxTransactionBytes: 64 << 20,
+		Capabilities: replication.CapMergePolicies | replication.CapCompression | replication.CapOriginSignatures, MaxTransactionBytes: 64 << 20,
 	})
 	watched.send(t, replication.MsgHello, 0, replayHello)
 	errFrames := watched.collectUntil(10*time.Second, func(fr *replication.Frame) bool {
@@ -151,8 +145,9 @@ func TestHostilePeerAttacksRejected(t *testing.T) {
 	if got := metricValue(t, cluster.Nodes[target].APIAddr, "spedsql_repl_batches_received_total"); got != baseReceived {
 		t.Fatalf("batches_received moved %v -> %v during attacks (an attack batch applied)", baseReceived, got)
 	}
-	assertDigestUnchanged(t, cluster, target, "hostile_rows", preAttack, "after forged-batch attacks")
-	if n, err := cluster.QueryRowCount(target, "hostile_rows"); err != nil || n != 2 {
+	assertDigestUnchanged(t, cluster, target, preAttack, "after forged-batch attacks")
+	if rows, err := cluster.TypedNames(target); err != nil || len(rows) != 2 {
+		n := len(rows)
 		t.Fatalf("node1 row count = %d, err = %v after attacks, want 2", n, err)
 	}
 
@@ -189,34 +184,27 @@ func TestHostilePeerAttacksRejected(t *testing.T) {
 	}
 	probe.close()
 
-	// --- P4: compressed snapshot bomb. A tiny zstd frame expanding to
+	// --- P4: compressed snapshot bomb. A tiny deflate frame expanding to
 	// megabytes of undecodable chunk bytes; the stream must die, not the node.
 	bomb := atk.dialMismatch(t, nodeAddr, nodeID)
 	handshakes++
 	bombRaw := bytes.Repeat([]byte{0xFF}, 4<<20)
-	enc, err := zstd.NewWriter(nil)
+	compressed, err := compression.Deflate.Compress(nil, bombRaw)
 	if err != nil {
-		t.Fatalf("zstd writer: %v", err)
+		t.Fatalf("deflate compress: %v", err)
 	}
-	compressed := enc.EncodeAll(bombRaw, nil)
-	_ = enc.Close()
 	if len(compressed) >= len(bombRaw)/4 {
 		t.Fatalf("bomb does not compress: %d -> %d", len(bombRaw), len(compressed))
 	}
 	// Non-vacuous guard: the bomb decompresses locally, so rejection is by
 	// product bounds/validation, not a corrupt test payload.
-	dec, err := zstd.NewReader(bytes.NewReader(compressed))
-	if err != nil {
-		t.Fatalf("bomb does not decompress locally: %v", err)
-	}
-	if _, err := io.ReadAll(io.LimitReader(dec, 8<<20)); err != nil {
+	if _, err := compression.Deflate.Decompress(nil, compressed, 8<<20); err != nil {
 		t.Fatalf("bomb unreadable locally: %v", err)
 	}
-	dec.Close()
 	bomb.collectUntil(5*time.Second, func(fr *replication.Frame) bool {
 		return fr.Type == replication.MsgSchemaRequest
 	})
-	bomb.send(t, replication.MsgSnapshotChunk, replication.FlagZstd, compressed)
+	bomb.send(t, replication.MsgSnapshotChunk, replication.CompressedFlags(compression.IDDeflate), compressed)
 	assertStreamDead(t, bomb, "snapshot bomb")
 	bomb.close()
 	probe2 := atk.dialMismatch(t, nodeAddr, nodeID)
@@ -257,7 +245,7 @@ func TestHostilePeerAttacksRejected(t *testing.T) {
 	tip := manifest.Revisions[0]
 	var tableID, idCol, nameCol uint32
 	for _, tb := range tip.Tables {
-		if strings.EqualFold(tb.Name, "hostile_rows") {
+		if strings.EqualFold(tb.Name, "live_typed_records") {
 			tableID = tb.ID
 			for _, c := range tb.Columns {
 				switch strings.ToLower(c.Name) {
@@ -271,7 +259,7 @@ func TestHostilePeerAttacksRejected(t *testing.T) {
 	}
 	if tableID == 0 || idCol == 0 || nameCol == 0 {
 		hlcSess.close()
-		t.Fatalf("hostile_rows ids not resolved (table=%d id=%d name=%d)", tableID, idCol, nameCol)
+		t.Fatalf("live typed record ids not resolved (table=%d id=%d name=%d)", tableID, idCol, nameCol)
 	}
 	farFuture := (uint64(time.Now().UnixMilli()) + 10*365*24*3600*1000) << 16
 	rowID := ids.NewRowID()
@@ -301,21 +289,21 @@ func TestHostilePeerAttacksRejected(t *testing.T) {
 	}
 	hlcSess.close()
 	// The unprovisioned origin is rejected before HLC observation; the honest pair stays unchanged.
-	waitConverged(t, cluster, "hostile_rows", 2, 30*time.Second)
+	waitConverged(t, cluster, 2, 30*time.Second)
 
 	// --- Positive control (post-attack): the pair stays responsive and
 	// converged; schema identity untouched by the attacks.
 	if got := metricValue(t, cluster.Nodes[target].APIAddr, "spedsql_schema_epoch"); got != schemaEpoch {
 		t.Fatalf("schema epoch moved %v -> %v during attacks", schemaEpoch, got)
 	}
-	if err := cluster.ExecSQL(1, "INSERT INTO hostile_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 4), "post-attack-1"); err != nil {
+	if err := cluster.TypedInsert(1, "post-attack-1"); err != nil {
 		t.Fatalf("post-attack insert node2: %v", err)
 	}
-	waitConverged(t, cluster, "hostile_rows", 3, 30*time.Second)
-	if err := cluster.ExecSQL(0, "INSERT INTO hostile_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 5), "post-attack-2"); err != nil {
+	waitConverged(t, cluster, 3, 30*time.Second)
+	if err := cluster.TypedInsert(0, "post-attack-2"); err != nil {
 		t.Fatalf("post-attack insert node1: %v", err)
 	}
-	waitConverged(t, cluster, "hostile_rows", 4, 30*time.Second)
+	waitConverged(t, cluster, 4, 30*time.Second)
 }
 
 func mkBatch(origin ids.NodeID, seq, hlc uint64, proto uint16, epoch uint64) *codec.MutationBatch {
@@ -392,39 +380,35 @@ func frameSummary(frames []*replication.Frame) string {
 	return strings.Join(parts, ",")
 }
 
-func nodeDigest(t *testing.T, cluster *harness.Cluster, idx int, table string) string {
+func nodeDigest(t *testing.T, cluster *harness.Cluster, idx int) string {
 	t.Helper()
-	d, err := cluster.ComputeTableDigest(idx, table, "id")
+	d, err := typedDigest(cluster, idx)
 	if err != nil {
 		t.Fatalf("node %d digest: %v", idx, err)
 	}
 	return d
 }
 
-func assertDigestUnchanged(t *testing.T, cluster *harness.Cluster, idx int, table, want, ctx string) {
+func assertDigestUnchanged(t *testing.T, cluster *harness.Cluster, idx int, want, ctx string) {
 	t.Helper()
-	if got := nodeDigest(t, cluster, idx, table); got != want {
-		t.Fatalf("node %d %s digest changed %s: %s -> %s", idx, table, ctx, want, got)
+	if got := nodeDigest(t, cluster, idx); got != want {
+		t.Fatalf("node %d typed record digest changed %s: %s -> %s", idx, ctx, want, got)
 	}
 }
 
-func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, timeout time.Duration) {
+func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, table)
-			if err != nil || n != want {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, table, "id")
-			if err != nil {
-				ok = false
-				break
-			}
+			d := digestNames(names)
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -438,11 +422,24 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 		time.Sleep(200 * time.Millisecond)
 	}
 	for i := range c.Nodes {
-		n, nerr := c.QueryRowCount(i, table)
-		d, derr := c.ComputeTableDigest(i, table, "id")
-		t.Logf("node %d at timeout: count=%d countErr=%v digest=%s digestErr=%v", i, n, nerr, d, derr)
+		names, err := c.TypedNames(i)
+		t.Logf("node %d at timeout: count=%d readErr=%v digest=%s", i, len(names), err, digestNames(names))
 	}
-	t.Fatalf("nodes did not converge on %d %s rows with equal digests within %v", want, table, timeout)
+	t.Fatalf("nodes did not converge on %d typed records with equal digests within %v", want, timeout)
+}
+
+func typedDigest(c *harness.Cluster, idx int) (string, error) {
+	names, err := c.TypedNames(idx)
+	if err != nil {
+		return "", err
+	}
+	return digestNames(names), nil
+}
+
+func digestNames(names []string) string {
+	sort.Strings(names)
+	h := sha256.Sum256([]byte(strings.Join(names, "\n")))
+	return hex.EncodeToString(h[:])
 }
 
 func metricValue(t *testing.T, apiAddr, name string) float64 {
@@ -456,22 +453,8 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line == "" || line[0] == '#' {
-			continue
-		}
-		if !strings.HasPrefix(line, name) {
-			continue
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(line, name))
-		if i := strings.LastIndex(rest, " "); i >= 0 {
-			rest = rest[i+1:]
-		}
-		v, err := strconv.ParseFloat(rest, 64)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		return v
+	if value, ok := harness.MetricValueFrom(string(raw), name); ok {
+		return value
 	}
 	t.Fatalf("counter %s not present in /metrics", name)
 	return 0

@@ -21,11 +21,11 @@ func openUnsyncedTestStore(t *testing.T, node ids.NodeID, async bool) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(t.TempDir(), node, ids.DBID{}, Options{
+	s, err := Open(t.TempDir(), node, ids.DBID{}, withTestKey(Options{
 		Limits:          codec.DefaultLimits(),
 		OriginSigning:   origin.Config{PrivateKey: priv, TrustedKeys: reg},
 		AsyncDurability: async,
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}

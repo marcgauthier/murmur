@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -19,19 +20,20 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/pprof"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/crypto"
+	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/metrics"
 	"github.com/marcgauthier/murmur/origin"
 	"github.com/marcgauthier/murmur/schema"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/marcgauthier/murmur/spool"
 )
 
 // NodeConfigFile represents the JSON configuration file for a node instance.
@@ -53,16 +55,19 @@ type NodeConfigFile struct {
 	AwaitUnlock            bool                   `json:"await_unlock"`
 	KeyHex                 string                 `json:"key_hex,omitempty"`
 	KeyID                  string                 `json:"key_id,omitempty"`
-	SchemaPath             string                 `json:"schema_path,omitempty"`
 	TLSCACertFile          string                 `json:"tls_ca_cert_file,omitempty"`
 	TLSNodeCertFile        string                 `json:"tls_node_cert_file,omitempty"`
 	TLSNodeKeyFile         string                 `json:"tls_node_key_file,omitempty"`
 	Schema                 *db.SchemaConfig       `json:"schema,omitempty"`
+	TypedRecords           bool                   `json:"typed_records,omitempty"`
+	TypedSchemaVersion     int                    `json:"typed_schema_version,omitempty"`
+	TypedSchemaCrashPhase  string                 `json:"typed_schema_crash_phase,omitempty"`
+	TypedContention        bool                   `json:"typed_contention,omitempty"`
 	Files                  *FilesConfigFile       `json:"files,omitempty"`
 	Bridge                 *BridgeConfigFile      `json:"bridge,omitempty"`
 	Replication            *ReplicationConfigFile `json:"replication,omitempty"`
 	Limits                 *LimitsConfigFile      `json:"limits,omitempty"`
-	Pebble                 *PebbleConfigFile      `json:"pebble,omitempty"`
+	Spool                  *SpoolConfigFile       `json:"spool,omitempty"`
 }
 
 // ReplicationConfigFile carries optional retention overrides. Zero values
@@ -88,16 +93,12 @@ type LimitsConfigFile struct {
 	MaxBatchMutations   int   `json:"max_batch_mutations,omitempty"`
 }
 
-// PebbleConfigFile carries optional Pebble storage overrides. Zero values
-// select production defaults; positive values override them (used by live
-// scenarios that must shrink the cache/memtables or stall compactions).
-type PebbleConfigFile struct {
-	CacheBytes                  int64  `json:"cache_bytes,omitempty"`
-	MemTableBytes               uint64 `json:"memtable_bytes,omitempty"`
-	MemTableCount               int    `json:"memtable_count,omitempty"`
-	MaxOpenFiles                int    `json:"max_open_files,omitempty"`
-	MaxConcurrentCompactions    int    `json:"max_concurrent_compactions,omitempty"`
-	DisableAutomaticCompactions bool   `json:"disable_automatic_compactions,omitempty"`
+// SpoolConfigFile carries optional Spool storage overrides.
+type SpoolConfigFile struct {
+	TargetBlockBytes int   `json:"target_block_bytes,omitempty"`
+	MaxBlockBytes    int   `json:"max_block_bytes,omitempty"`
+	MaxPendingBytes  int64 `json:"max_pending_bytes,omitempty"`
+	CacheBytes       int64 `json:"cache_bytes,omitempty"`
 }
 
 type PeerConfig struct {
@@ -119,10 +120,6 @@ func main() {
 		runAgent(os.Args[2:])
 	case "unlock":
 		runUnlock(os.Args[2:])
-	case "exec":
-		runExec(os.Args[2:])
-	case "query":
-		runQuery(os.Args[2:])
 	case "status":
 		runStatus(os.Args[2:])
 	default:
@@ -142,8 +139,6 @@ func printUsage() {
 Commands:
   agent   Run a Murmur-SQL node agent daemon
   unlock  Send encryption key to unlock an await-unlock node
-  exec    Execute a SQL DDL/DML statement against an HTTP service API
-  query   Run a SQL query against an HTTP service API
   status  Check node status via HTTP service API
 `)
 }
@@ -152,14 +147,13 @@ func runAgent(args []string) {
 	fs := flag.NewFlagSet("agent", flag.ExitOnError)
 	configPath := fs.String("config", "", "Path to JSON configuration file")
 	nodeIDStr := fs.String("node-id", "", "Node UUID")
-	dataDir := fs.String("data-dir", "", "Data directory for Pebble store and logs")
+	dataDir := fs.String("data-dir", "", "Data directory for Spool store and logs")
 	listenAddr := fs.String("listen-addr", "127.0.0.1:7443", "Replication listen address")
 	apiAddr := fs.String("api-addr", "127.0.0.1:8080", "HTTPS API listen address")
-	metricsAddr := fs.String("metrics-addr", "", "Prometheus metrics listen address (optional, defaults to api-addr)")
+	metricsAddr := fs.String("metrics-addr", "", "JSON metrics listen address (optional, defaults to api-addr)")
 	awaitUnlock := fs.Bool("await-unlock", false, "Wait for key via Remote Unlock HTTPS API")
 	keyHex := fs.String("key-hex", "", "Hex-encoded 32-byte encryption key")
 	keyID := fs.String("key-id", "default-key", "Encryption Key ID")
-	schemaPath := fs.String("schema-path", "", "Directory containing *.sql schema files")
 	logFile := fs.String("log-file", "", "Log output file (optional)")
 	_ = fs.Parse(args)
 
@@ -172,7 +166,6 @@ func runAgent(args []string) {
 		AwaitUnlock: *awaitUnlock,
 		KeyHex:      *keyHex,
 		KeyID:       *keyID,
-		SchemaPath:  *schemaPath,
 	}
 
 	if *configPath != "" {
@@ -213,7 +206,7 @@ func runAgent(args []string) {
 	if cfg.DataDir == "" {
 		cfg.DataDir = "./node-data"
 	}
-	_ = os.MkdirAll(filepath.Join(cfg.DataDir, "pebble"), 0755)
+	_ = os.MkdirAll(filepath.Join(cfg.DataDir, "data"), 0755)
 
 	var nodeID db.NodeID
 	if cfg.NodeID != "" {
@@ -265,8 +258,59 @@ type NodeDaemon struct {
 	mu              sync.Mutex
 	database        *db.DB
 	httpServer      *http.Server
-	promReg         *prometheus.Registry
 	bridge          *bridgeRuntime
+}
+
+type liveTypedRecord struct {
+	ID    ids.RowID `rime:"primary" json:"id"`
+	Name  string    `json:"name"`
+	Count int64     `json:"count"`
+	Tags  []string  `json:"tags"`
+	Peak  int64     `json:"peak"`
+	Floor float64   `json:"floor"`
+}
+
+type liveContentionRecord struct {
+	ID    ids.RowID `rime:"primary" json:"id"`
+	Name  string    `json:"name"`
+	Phone string    `json:"phone"`
+	Score int64     `json:"score"`
+}
+
+type liveTypedLocalRecord struct {
+	ID   ids.RowID `rime:"primary" json:"id"`
+	Name string    `json:"name"`
+}
+
+type liveTypedRecordV2 struct {
+	ID    ids.RowID `rime:"primary" json:"id"`
+	Name  string    `json:"name"`
+	Count int64     `json:"count"`
+	Tags  []string  `json:"tags"`
+	Peak  int64     `json:"peak"`
+	Floor float64   `json:"floor"`
+	Note  string    `json:"note"`
+}
+
+type liveTypedRecordRegion struct {
+	ID     ids.RowID `rime:"primary" json:"id"`
+	Name   string    `json:"name"`
+	Count  int64     `json:"count"`
+	Tags   []string  `json:"tags"`
+	Peak   int64     `json:"peak"`
+	Floor  float64   `json:"floor"`
+	Region string    `json:"region"`
+}
+
+type liveTypedRecordV4 struct {
+	ID     ids.RowID `rime:"primary" json:"id"`
+	Name   string    `json:"name"`
+	Count  int64     `json:"count"`
+	Tags   []string  `json:"tags"`
+	Peak   int64     `json:"peak"`
+	Floor  float64   `json:"floor"`
+	Note   string    `json:"note"`
+	Region string    `json:"region"`
 }
 
 func (d *NodeDaemon) apiTLSConfig() (*tls.Config, error) {
@@ -338,28 +382,64 @@ func requireAPIClientCert(next http.Handler) http.Handler {
 }
 
 func (d *NodeDaemon) Start() error {
-	d.promReg = prometheus.NewRegistry()
-
 	mux := http.NewServeMux()
 
 	// Metrics endpoint
-	mux.Handle("/metrics", promhttp.HandlerFor(d.promReg, promhttp.HandlerOpts{}))
+	mux.Handle("/metrics", metrics.Handler(func() db.Status {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.database == nil {
+			return db.Status{}
+		}
+		return d.database.Status()
+	}))
 
 	// The daemon API is protected by the verified client certificate on this
 	// listener. /healthz is the sole HTTPS route that permits no client cert.
 	mux.HandleFunc("/v1/admin/unlock", d.handleAdminUnlock)
 	mux.HandleFunc("/v1/admin/status", d.handleAdminStatus)
+	mux.HandleFunc("/v1/admin/gc", d.handleAdminGC)
 	mux.HandleFunc("/v1/admin/lock", d.handleAdminLock)
 	mux.HandleFunc("/v1/admin/add_peer", d.handleAdminAddPeer)
 	mux.HandleFunc("/v1/admin/authorize_origin", d.handleAuthorizeOrigin)
 	mux.HandleFunc("/v1/admin/remove_peer", d.handleAdminRemovePeer)
 
 	mux.HandleFunc("/v1/status", d.handleServiceStatus)
+	mux.HandleFunc("/v1/schema", d.handleServiceSchema)
 	mux.HandleFunc("/v1/query", d.handleServiceQuery)
 	mux.HandleFunc("/v1/exec", d.handleServiceExec)
-	mux.HandleFunc("/v1/crdt", d.handleMerge)
-	mux.HandleFunc("/v1/crdt/state", d.handleMergeState)
-	mux.HandleFunc("/v1/subscribe", d.handleServiceSubscribe)
+	mux.HandleFunc("/v1/typed/insert", d.handleTypedInsert)
+	mux.HandleFunc("/v1/typed/contention/insert", d.handleTypedContentionInsert)
+	mux.HandleFunc("/v1/typed/contention/insert-many", d.handleTypedContentionInsertMany)
+	mux.HandleFunc("/v1/typed/contention/update", d.handleTypedContentionUpdate)
+	mux.HandleFunc("/v1/typed/contention/read", d.handleTypedContentionRead)
+	mux.HandleFunc("/v1/typed/contention/delete", d.handleTypedContentionDelete)
+	mux.HandleFunc("/v1/typed/contention/all", d.handleTypedContentionAll)
+	mux.HandleFunc("/v1/typed/contention/prefix-count", d.handleTypedContentionPrefixCount)
+	mux.HandleFunc("/v1/typed/contention/digest", d.handleTypedContentionDigest)
+	mux.HandleFunc("/v1/typed/local-insert", d.handleTypedLocalInsert)
+	mux.HandleFunc("/v1/typed/local-count", d.handleTypedLocalCount)
+	mux.HandleFunc("/v1/typed/explicit-tx", d.handleTypedExplicitTx)
+	mux.HandleFunc("/v1/typed/migrate-v2", d.handleTypedMigrateV2)
+	mux.HandleFunc("/v1/typed/migrate-region", d.handleTypedMigrateRegion)
+	mux.HandleFunc("/v1/typed/migrate-v4", d.handleTypedMigrateV4)
+	mux.HandleFunc("/v1/typed/set-note", d.handleTypedSetNote)
+	mux.HandleFunc("/v1/typed/set-region", d.handleTypedSetRegion)
+	mux.HandleFunc("/v1/typed/branch-values", d.handleTypedBranchValues)
+	mux.HandleFunc("/v1/typed/rename", d.handleTypedRename)
+	mux.HandleFunc("/v1/typed/note", d.handleTypedNote)
+	mux.HandleFunc("/v1/typed/schema-epoch", d.handleTypedSchemaEpoch)
+	mux.HandleFunc("/v1/typed/count", d.handleTypedCount)
+	mux.HandleFunc("/v1/typed/enabled-names", d.handleTypedEnabledNames)
+	mux.HandleFunc("/v1/typed/names", d.handleTypedNames)
+	mux.HandleFunc("/v1/typed/counter-add", d.handleTypedCounterAdd)
+	mux.HandleFunc("/v1/typed/counter-value", d.handleTypedCounterValue)
+	mux.HandleFunc("/v1/typed/set-add", d.handleTypedSetAdd)
+	mux.HandleFunc("/v1/typed/set-remove", d.handleTypedSetRemove)
+	mux.HandleFunc("/v1/typed/set-values", d.handleTypedSetValues)
+	mux.HandleFunc("/v1/typed/extrema-update", d.handleTypedExtremaUpdate)
+	mux.HandleFunc("/v1/typed/extrema-values", d.handleTypedExtremaValues)
+	mux.HandleFunc("/v1/typed/watch", d.handleTypedWatch)
 
 	mux.HandleFunc("/v1/files/upload", d.handleFilesUpload)
 	mux.HandleFunc("/v1/files/download", d.handleFilesDownload)
@@ -373,7 +453,6 @@ func (d *NodeDaemon) Start() error {
 	mux.HandleFunc("/v1/admin/bridge/status", d.handleBridgeStatus)
 	mux.HandleFunc("/v1/admin/bridge/provenance", d.handleBridgeProvenance)
 	mux.HandleFunc("/v1/admin/bridge/release", d.handleBridgeRelease)
-	mux.HandleFunc("/v1/admin/migrate", d.handleAdminMigrate)
 	mux.HandleFunc("/v1/admin/rotate-key", d.handleAdminRotateKey)
 	mux.HandleFunc("/v1/admin/encryption-status", d.handleAdminEncryptionStatus)
 	mux.HandleFunc("/v1/debug/peers", d.handleDebugPeers)
@@ -438,14 +517,14 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 		return d.database, nil
 	}
 
-	pebbleDir := filepath.Join(d.cfg.DataDir, "pebble")
-	_ = os.MkdirAll(pebbleDir, 0755)
+	dataDir := d.cfg.DataDir
+	_ = os.MkdirAll(filepath.Join(dataDir, "data"), 0755)
 
 	dbCfg := db.Config{
-		Path:   pebbleDir,
+		Path:   dataDir,
 		NodeID: d.nodeID,
 		DBID:   d.dbID,
-		Pebble: db.DefaultPebbleConfig(),
+		Spool:  db.DefaultSpoolConfig(),
 		Encryption: db.EncryptionConfig{
 			Key:   append([]byte(nil), key...),
 			KeyID: keyID,
@@ -520,8 +599,43 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 		}
 	}
 
-	// Configure schema
-	if d.cfg.Schema != nil && len(d.cfg.Schema.Tables) > 0 {
+	// Configure native record schemas in this test-only typed mode.
+	if d.cfg.TypedRecords {
+		var definition db.TableDefinition
+		var err error
+		if d.cfg.TypedSchemaVersion >= 2 {
+			definition, err = db.Define[liveTypedRecordV2]("live_typed_records", 901, db.RecordOptions{
+				PrimaryField:  "ID",
+				FieldIDs:      map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6, "Note": 7},
+				MergePolicies: map[string]db.RecordMergePolicy{"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin},
+			})
+		} else {
+			definition, err = db.Define[liveTypedRecord]("live_typed_records", 901, db.RecordOptions{
+				PrimaryField:  "ID",
+				FieldIDs:      map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
+				MergePolicies: map[string]db.RecordMergePolicy{"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin},
+			})
+		}
+		if err != nil {
+			return nil, fmt.Errorf("define live typed record schema: %w", err)
+		}
+		localDefinition, err := liveTypedLocalDefinition()
+		if err != nil {
+			return nil, fmt.Errorf("define live node-local record schema: %w", err)
+		}
+		dbCfg.Schema = db.SchemaConfig{Version: 1}
+		dbCfg.Tables = []db.TableDefinition{definition, localDefinition}
+		if d.cfg.TypedContention {
+			contentionDefinition, err := db.Define[liveContentionRecord]("live_typed_contention", 903, db.RecordOptions{
+				PrimaryField: "ID",
+				FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Phone": 3, "Score": 4},
+			})
+			if err != nil {
+				return nil, fmt.Errorf("define live typed contention schema: %w", err)
+			}
+			dbCfg.Tables = append(dbCfg.Tables, contentionDefinition)
+		}
+	} else if d.cfg.Schema != nil && len(d.cfg.Schema.Tables) > 0 {
 		dbCfg.Schema = *d.cfg.Schema
 	} else {
 		dbCfg.Schema = db.SchemaConfig{
@@ -612,24 +726,15 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 			dbCfg.MaxBatchMutations = lc.MaxBatchMutations
 		}
 	}
-	if pc := d.cfg.Pebble; pc != nil {
-		if pc.CacheBytes > 0 {
-			dbCfg.Pebble.CacheBytes = pc.CacheBytes
+	if sc := d.cfg.Spool; sc != nil {
+		if sc.TargetBlockBytes > 0 {
+			dbCfg.Spool.TargetBlockBytes = sc.TargetBlockBytes
 		}
-		if pc.MemTableBytes > 0 {
-			dbCfg.Pebble.MemTableBytes = pc.MemTableBytes
+		if sc.MaxBlockBytes > 0 {
+			dbCfg.Spool.MaxBlockBytes = sc.MaxBlockBytes
 		}
-		if pc.MemTableCount > 0 {
-			dbCfg.Pebble.MemTableCount = pc.MemTableCount
-		}
-		if pc.MaxOpenFiles > 0 {
-			dbCfg.Pebble.MaxOpenFiles = pc.MaxOpenFiles
-		}
-		if pc.MaxConcurrentCompactions > 0 {
-			dbCfg.Pebble.MaxConcurrentCompactions = pc.MaxConcurrentCompactions
-		}
-		if pc.DisableAutomaticCompactions {
-			dbCfg.Pebble.DisableAutomaticCompactions = true
+		if sc.MaxPendingBytes > 0 {
+			dbCfg.Spool.MaxPendingBytes = sc.MaxPendingBytes
 		}
 	}
 
@@ -681,24 +786,6 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 		return nil, fmt.Errorf("db.Open: %w", err)
 	}
 
-	// Apply schema directory SQL files if present
-	if d.cfg.SchemaPath != "" {
-		if files, err := filepath.Glob(filepath.Join(d.cfg.SchemaPath, "*.sql")); err == nil {
-			for _, file := range files {
-				content, err := os.ReadFile(file)
-				if err == nil {
-					stmts := strings.Split(string(content), ";")
-					for _, stmt := range stmts {
-						stmt = strings.TrimSpace(stmt)
-						if stmt != "" {
-							_, _ = instance.ExecContext(ctx, stmt)
-						}
-					}
-				}
-			}
-		}
-	}
-
 	// Add configured peers, honoring persisted exclusions: an explicit
 	// RemovePeer survives restarts by design, and only an explicit
 	// AddPeer (which clears the exclusion) may re-admit the peer.
@@ -713,10 +800,6 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 		_ = instance.AddPeer(ctx, db.Peer{NodeID: peerNodeID, Addrs: p.Addrs})
 	}
 
-	// Register Prometheus metrics collector
-	collector := metrics.NewCollector(instance.Status)
-	_ = d.promReg.Register(collector)
-
 	d.database = instance
 
 	if err := d.initBridge(instance); err != nil {
@@ -727,6 +810,14 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 
 	log.Printf("[MURMUR] Database unlocked and online. NodeID: %s", instance.NodeID())
 	return instance, nil
+}
+
+func liveTypedLocalDefinition() (db.TableDefinition, error) {
+	return db.Define[liveTypedLocalRecord]("live_node_local_records", 902, db.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2},
+		Scope:        db.TableScopeNodeLocal,
+	})
 }
 
 // HTTP Handler delegations
@@ -776,8 +867,7 @@ func (d *NodeDaemon) handleAdminUnlock(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if isUnlockAuthFailure(err) {
 			// Credential failures stay generic: the wrong-key and
-			// unknown-key-id errors differ ("registry seal" vs
-			// "storage key unavailable"), which would make this
+			// wrapping-ID errors can differ, which would make this
 			// endpoint a key/key-ID oracle. The detail is logged
 			// server-side for operators instead.
 			log.Printf("unlock failed for node %s: %v", d.nodeID, err)
@@ -794,17 +884,16 @@ func (d *NodeDaemon) handleAdminUnlock(w http.ResponseWriter, r *http.Request) {
 }
 
 // isUnlockAuthFailure reports whether an openDatabase error is a credential
-// failure (wrong key material or unknown key ID) as opposed to a state
+// failure (wrong key material or wrapping-key ID) as opposed to a state
 // problem (schema mismatch, corruption). Only credential failures are
 // normalized to a generic response; state problems keep their detail so
 // callers can classify them.
 func isUnlockAuthFailure(err error) bool {
-	if errors.Is(err, crypto.ErrAuth) {
+	if errors.Is(err, crypto.ErrAuth) || errors.Is(err, spool.ErrWrongKey) {
 		return true
 	}
 	// The registry reports an unresolvable recorded key ID as
-	// "storage key %q unavailable" (see crypto.Registry); match the
-	// same marker the product itself uses.
+	// "storage key %q unavailable" (see crypto.Registry).
 	return strings.Contains(err.Error(), "unavailable")
 }
 
@@ -819,6 +908,26 @@ func (d *NodeDaemon) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (d *NodeDaemon) handleAdminGC(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	d.mu.Lock()
+	database := d.database
+	d.mu.Unlock()
+	if database == nil {
+		http.Error(w, "node is locked", http.StatusServiceUnavailable)
+		return
+	}
+	if err := database.GC(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"triggered": true})
+}
+
 func (d *NodeDaemon) handleAdminLock(w http.ResponseWriter, r *http.Request) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -828,7 +937,8 @@ func (d *NodeDaemon) handleAdminLock(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = d.database.Close()
 	d.database = nil
-	w.WriteHeader(http.StatusNoContent)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"updated": true})
 }
 
 func (d *NodeDaemon) handleAdminAddPeer(w http.ResponseWriter, r *http.Request) {
@@ -911,6 +1021,24 @@ func (d *NodeDaemon) handleServiceStatus(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+func (d *NodeDaemon) handleServiceSchema(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	tables, err := database.SchemaTables()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(tables)
+}
+
 func (d *NodeDaemon) handleDebugPeers(w http.ResponseWriter, r *http.Request) {
 	d.mu.Lock()
 	database := d.database
@@ -932,54 +1060,18 @@ func (d *NodeDaemon) handleDebugStacks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *NodeDaemon) handleServiceQuery(w http.ResponseWriter, r *http.Request) {
-	d.mu.Lock()
-	database := d.database
-	d.mu.Unlock()
-	if database == nil {
-		http.Error(w, "node is locked", http.StatusServiceUnavailable)
-		return
-	}
-	var req struct {
-		Query string `json:"query"`
-		Args  []any  `json:"args"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf("bad json: %v", err), http.StatusBadRequest)
-		return
-	}
-	normArgs := normalizeArgs(req.Args)
-	rows, err := database.QueryContext(r.Context(), req.Query, normArgs...)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("query error: %v", err), http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	cols := rows.Columns()
-	var result [][]any
-	for rows.Next() {
-		dest := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range dest {
-			ptrs[i] = &dest[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			http.Error(w, fmt.Sprintf("scan error: %v", err), http.StatusInternalServerError)
-			return
-		}
-		result = append(result, dest)
-	}
-	if result == nil {
-		result = [][]any{}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"columns": cols,
-		"rows":    result,
-	})
+	http.Error(w, "SQL query API was removed; use typed RIME records", http.StatusGone)
 }
 
 func (d *NodeDaemon) handleServiceExec(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, "SQL exec API was removed; use typed RIME records", http.StatusGone)
+}
+
+func (d *NodeDaemon) handleTypedInsert(w http.ResponseWriter, r *http.Request) {
+	if !d.cfg.TypedRecords {
+		http.Error(w, "typed test API is disabled", http.StatusNotFound)
+		return
+	}
 	d.mu.Lock()
 	database := d.database
 	d.mu.Unlock()
@@ -988,46 +1080,712 @@ func (d *NodeDaemon) handleServiceExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Query string `json:"query"`
-		Args  []any  `json:"args"`
+		ID    string `json:"id"`
+		Name  string `json:"name"`
+		Count int64  `json:"count"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	rowID := ids.NewRowID()
+	if req.ID != "" {
+		parsed, err := uuid.Parse(req.ID)
+		if err != nil {
+			http.Error(w, "id must be a UUID", http.StatusBadRequest)
+			return
+		}
+		rowID = ids.RowID(parsed)
+	}
+	var writeErr error
+	if table, err := db.TableOf[liveTypedRecord](database, "live_typed_records"); err == nil {
+		row := &liveTypedRecord{ID: rowID, Name: req.Name}
+		writeErr = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+			if err := table.Insert(tx, row); err != nil {
+				return err
+			}
+			if req.Count != 0 {
+				return db.RecordCounterAdd(tx, table, row.ID, "Count", req.Count)
+			}
+			return nil
+		})
+	} else if table, bindErr := db.TableOf[liveTypedRecordV2](database, "live_typed_records"); bindErr == nil {
+		row := &liveTypedRecordV2{ID: rowID, Name: req.Name}
+		writeErr = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+			if err := table.Insert(tx, row); err != nil {
+				return err
+			}
+			if req.Count != 0 {
+				return db.RecordCounterAdd(tx, table, row.ID, "Count", req.Count)
+			}
+			return nil
+		})
+	} else {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if writeErr != nil {
+		http.Error(w, writeErr.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"id": rowID.String()})
+}
+
+func (d *NodeDaemon) handleTypedContentionInsert(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	var req struct {
+		ID    string `json:"id"`
+		Name  string `json:"name"`
+		Phone string `json:"phone"`
+		Score int64  `json:"score"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+	parsed, err := uuid.Parse(req.ID)
+	if err != nil {
+		http.Error(w, "id must be a UUID", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	row := &liveContentionRecord{ID: ids.RowID(parsed), Name: req.Name, Phone: req.Phone, Score: req.Score}
+	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error { return table.Insert(tx, row) }); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (d *NodeDaemon) handleTypedContentionInsertMany(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	var req struct {
+		Rows []struct {
+			ID    string `json:"id"`
+			Name  string `json:"name"`
+			Phone string `json:"phone"`
+			Score int64  `json:"score"`
+		} `json:"rows"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Rows) == 0 {
+		http.Error(w, "rows are required", http.StatusBadRequest)
+		return
+	}
+	values := make([]*liveContentionRecord, 0, len(req.Rows))
+	for _, item := range req.Rows {
+		parsed, err := uuid.Parse(item.ID)
+		if err != nil {
+			http.Error(w, "each row id must be a UUID", http.StatusBadRequest)
+			return
+		}
+		values = append(values, &liveContentionRecord{ID: ids.RowID(parsed), Name: item.Name, Phone: item.Phone, Score: item.Score})
+	}
+	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error { return table.InsertMany(tx, values) }); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (d *NodeDaemon) handleTypedContentionUpdate(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	var req struct {
+		ID    string `json:"id"`
+		Field string `json:"field"`
+		Value string `json:"value"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" || req.Field == "" {
+		http.Error(w, "id, field, and value are required", http.StatusBadRequest)
+		return
+	}
+	parsed, err := uuid.Parse(req.ID)
+	if err != nil {
+		http.Error(w, "id must be a UUID", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	err = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+		return table.Update(tx, ids.RowID(parsed), func(row *liveContentionRecord) error {
+			switch req.Field {
+			case "name":
+				row.Name = req.Value
+			case "phone":
+				row.Phone = req.Value
+			case "score":
+				var score int64
+				if _, scanErr := fmt.Sscan(req.Value, &score); scanErr != nil {
+					return scanErr
+				}
+				row.Score = score
+			default:
+				return fmt.Errorf("unsupported contention field %q", req.Field)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (d *NodeDaemon) handleTypedContentionRead(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+	parsed, err := uuid.Parse(req.ID)
+	if err != nil {
+		http.Error(w, "id must be a UUID", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	row, err := table.Get(ids.RowID(parsed))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		ID    string `json:"id"`
+		Name  string `json:"name"`
+		Phone string `json:"phone"`
+		Score int64  `json:"score"`
+	}{ID: row.ID.String(), Name: row.Name, Phone: row.Phone, Score: row.Score})
+}
+
+func (d *NodeDaemon) handleTypedContentionDelete(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+	parsed, err := uuid.Parse(req.ID)
+	if err != nil {
+		http.Error(w, "id must be a UUID", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+		return table.Delete(tx, ids.RowID(parsed))
+	}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (d *NodeDaemon) handleTypedContentionAll(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	rows, err := table.Where().Find()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	values := make([]struct {
+		ID    string `json:"id"`
+		Name  string `json:"name"`
+		Phone string `json:"phone"`
+		Score int64  `json:"score"`
+	}, len(rows))
+	for i, row := range rows {
+		values[i].ID, values[i].Name, values[i].Phone, values[i].Score = row.ID.String(), row.Name, row.Phone, row.Score
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(values)
+}
+
+func (d *NodeDaemon) handleTypedContentionPrefixCount(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	var req struct {
+		Prefix string `json:"prefix"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf("bad json: %v", err), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	normArgs := normalizeArgs(req.Args)
-	res, err := database.ExecContext(r.Context(), req.Query, normArgs...)
+	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
 	if err != nil {
-		http.Error(w, fmt.Sprintf("exec error: %v", err), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	rowsAffected, _ := res.RowsAffected()
+	count, err := table.Where(db.StringFieldOf[liveContentionRecord](table, "Name").StartsWith(req.Prefix)).Count()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"rows_affected": rowsAffected,
-	})
+	_ = json.NewEncoder(w).Encode(map[string]int{"count": count})
 }
 
-func normalizeArgs(args []any) []any {
-	out := make([]any, len(args))
-	for i, a := range args {
-		switch v := a.(type) {
-		case string:
-			if len(v) == 32 {
-				if b, err := hex.DecodeString(v); err == nil && len(b) == 16 {
-					out[i] = b
-					continue
-				}
-			}
-			out[i] = v
-		default:
-			out[i] = v
+func (d *NodeDaemon) handleTypedContentionDigest(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	rows, err := table.Where().Find()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID.String() < rows[j].ID.String() })
+	h := sha256.New()
+	for _, row := range rows {
+		_, _ = fmt.Fprintf(h, "%s\\x00%s\\x00%s\\x00%d\\n", row.ID.String(), row.Name, row.Phone, row.Score)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"count": len(rows), "digest": hex.EncodeToString(h.Sum(nil))})
+}
+
+func (d *NodeDaemon) handleTypedLocalInsert(w http.ResponseWriter, r *http.Request) {
+	if !d.cfg.TypedRecords {
+		http.Error(w, "typed test API is disabled", http.StatusNotFound)
+		return
+	}
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveTypedLocalRecord](database, "live_node_local_records")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	row := &liveTypedLocalRecord{ID: ids.NewRowID(), Name: req.Name}
+	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error { return table.Insert(tx, row) }); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"id": row.ID.String()})
+}
+
+func (d *NodeDaemon) handleTypedLocalCount(w http.ResponseWriter, r *http.Request) {
+	if !d.cfg.TypedRecords {
+		http.Error(w, "typed test API is disabled", http.StatusNotFound)
+		return
+	}
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveTypedLocalRecord](database, "live_node_local_records")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	count, err := table.Where(db.FieldOf[liveTypedLocalRecord, string](table, "Name").Eq(req.Name)).Count()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]int{"count": count})
+}
+
+func (d *NodeDaemon) handleTypedExplicitTx(w http.ResponseWriter, r *http.Request) {
+	if !d.cfg.TypedRecords {
+		http.Error(w, "typed test API is disabled", http.StatusNotFound)
+		return
+	}
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	committed := &liveTypedRecord{ID: ids.NewRowID(), Name: req.Name}
+	tx, err := database.BeginTx(r.Context())
+	if err == nil {
+		err = table.Insert(tx, committed)
+	}
+	if err == nil {
+		err = tx.Commit()
+	} else if tx != nil {
+		_ = tx.Rollback()
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	rolledBack := &liveTypedRecord{ID: ids.NewRowID(), Name: req.Name + "-rolled-back"}
+	tx, err = database.BeginTx(r.Context())
+	if err == nil {
+		err = table.Insert(tx, rolledBack)
+	}
+	if err == nil {
+		err = tx.Rollback()
+	} else if tx != nil {
+		_ = tx.Rollback()
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"committed": committed.ID.String(), "rolled_back": rolledBack.ID.String()})
+}
+
+func (d *NodeDaemon) handleTypedMigrateV2(w http.ResponseWriter, r *http.Request) {
+	if !d.cfg.TypedRecords {
+		http.Error(w, "typed test API is disabled", http.StatusNotFound)
+		return
+	}
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	definition, err := db.Define[liveTypedRecordV2]("live_typed_records", 901, db.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs: map[string]uint32{
+			"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6, "Note": 7,
+		},
+		MergePolicies: map[string]db.RecordMergePolicy{
+			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
+			"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+		},
+	})
+	if err == nil {
+		var local db.TableDefinition
+		local, err = liveTypedLocalDefinition()
+		if err == nil {
+			err = installSchemaCrashForTest(database, d.cfg.TypedSchemaCrashPhase)
+		}
+		if err == nil {
+			err = database.MigrateRecords(r.Context(), []db.TableDefinition{definition, local})
 		}
 	}
-	return out
+	if err != nil {
+		http.Error(w, fmt.Sprintf("typed migration failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"migrated": true, "epoch": database.Status().SchemaEpoch})
 }
 
-func (d *NodeDaemon) handleServiceSubscribe(w http.ResponseWriter, r *http.Request) {
+func (d *NodeDaemon) handleTypedMigrateRegion(w http.ResponseWriter, r *http.Request) {
+	if !d.cfg.TypedRecords {
+		http.Error(w, "typed test API is disabled", http.StatusNotFound)
+		return
+	}
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	definition, err := db.Define[liveTypedRecordRegion]("live_typed_records", 901, db.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs: map[string]uint32{
+			"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6, "Region": 8,
+		},
+		MergePolicies: map[string]db.RecordMergePolicy{
+			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
+			"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+		},
+	})
+	if err == nil {
+		var local db.TableDefinition
+		local, err = liveTypedLocalDefinition()
+		if err == nil {
+			err = database.MigrateRecords(r.Context(), []db.TableDefinition{definition, local})
+		}
+	}
+	if err != nil {
+		http.Error(w, fmt.Sprintf("typed region migration failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"migrated": true, "epoch": database.Status().SchemaEpoch})
+}
+
+func (d *NodeDaemon) handleTypedMigrateV4(w http.ResponseWriter, r *http.Request) {
+	if !d.cfg.TypedRecords {
+		http.Error(w, "typed test API is disabled", http.StatusNotFound)
+		return
+	}
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	definition, err := db.Define[liveTypedRecordV4]("live_typed_records", 901, db.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs: map[string]uint32{
+			"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6, "Note": 7, "Region": 8,
+		},
+		MergePolicies: map[string]db.RecordMergePolicy{
+			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
+			"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+		},
+	})
+	if err == nil {
+		var local db.TableDefinition
+		local, err = liveTypedLocalDefinition()
+		if err == nil {
+			err = database.MigrateRecords(r.Context(), []db.TableDefinition{definition, local})
+		}
+	}
+	if err != nil {
+		http.Error(w, fmt.Sprintf("typed v4 rebind failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"migrated": true, "epoch": database.Status().SchemaEpoch})
+}
+
+func (d *NodeDaemon) handleTypedSetNote(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+		Note string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name and note are required", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveTypedRecordV2](database, "live_typed_records")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	row, err := table.Where(db.FieldOf[liveTypedRecordV2, string](table, "Name").Eq(req.Name)).First()
+	if err == nil {
+		err = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+			return table.Update(tx, row.ID, func(value *liveTypedRecordV2) error {
+				value.Note = req.Note
+				return nil
+			})
+		})
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"updated": true})
+}
+
+func (d *NodeDaemon) handleTypedSetRegion(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	var req struct {
+		Name   string `json:"name"`
+		Region string `json:"region"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name and region are required", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveTypedRecordRegion](database, "live_typed_records")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	row, err := table.Where(db.FieldOf[liveTypedRecordRegion, string](table, "Name").Eq(req.Name)).First()
+	if err == nil {
+		err = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+			return table.Update(tx, row.ID, func(value *liveTypedRecordRegion) error {
+				value.Region = req.Region
+				return nil
+			})
+		})
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (d *NodeDaemon) handleTypedBranchValues(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveTypedRecordV4](database, "live_typed_records")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	row, err := table.Where(db.FieldOf[liveTypedRecordV4, string](table, "Name").Eq(req.Name)).First()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"note": row.Note, "region": row.Region})
+}
+
+func (d *NodeDaemon) handleTypedRename(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	var req struct {
+		Name    string `json:"name"`
+		NewName string `json:"new_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" || req.NewName == "" {
+		http.Error(w, "name and new_name are required", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	row, err := table.Where(db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name)).First()
+	if err == nil {
+		err = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+			return table.Update(tx, row.ID, func(value *liveTypedRecord) error {
+				value.Name = req.NewName
+				return nil
+			})
+		})
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"updated": true})
+}
+
+func (d *NodeDaemon) handleTypedNote(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveTypedRecordV2](database, "live_typed_records")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	row, err := table.Where(db.FieldOf[liveTypedRecordV2, string](table, "Name").Eq(req.Name)).First()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"note": row.Note})
+}
+
+func (d *NodeDaemon) handleTypedSchemaEpoch(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]uint64{"epoch": database.Status().SchemaEpoch})
+}
+
+func (d *NodeDaemon) handleTypedCount(w http.ResponseWriter, r *http.Request) {
+	if !d.cfg.TypedRecords {
+		http.Error(w, "typed test API is disabled", http.StatusNotFound)
+		return
+	}
 	d.mu.Lock()
 	database := d.database
 	d.mu.Unlock()
@@ -1035,92 +1793,398 @@ func (d *NodeDaemon) handleServiceSubscribe(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "node is locked", http.StatusServiceUnavailable)
 		return
 	}
-	// Native server-sent-events subscription over the daemon API. The outer
-	// mTLS middleware authenticates this route like every other /v1 endpoint.
-	query := r.URL.Query().Get("query")
-	if query == "" {
-		http.Error(w, "query is required", http.StatusBadRequest)
-		return
+	var req struct {
+		Name string `json:"name"`
 	}
-	args, err := DecodeJSONArgs(r.URL.Query().Get("args"))
-	if err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	var opts db.SubscriptionOptions
-	if resume := r.URL.Query().Get("resume"); resume != "" {
-		cursor, err := strconv.ParseUint(resume, 10, 64)
+	count := 0
+	var err error
+	tableV1, errV1 := db.TableOf[liveTypedRecord](database, "live_typed_records")
+	if errV1 == nil {
+		count, err = tableV1.Where(db.FieldOf[liveTypedRecord, string](tableV1, "Name").Eq(req.Name)).Count()
+	} else {
+		tableV2, err := db.TableOf[liveTypedRecordV2](database, "live_typed_records")
 		if err != nil {
-			http.Error(w, "invalid resume cursor", http.StatusBadRequest)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		opts.ResumeFromCursor = cursor
+		count, err = tableV2.Where(db.FieldOf[liveTypedRecordV2, string](tableV2, "Name").Eq(req.Name)).Count()
 	}
-	sub, err := database.SubscribeWithOptions(r.Context(), query, opts, args...)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("subscribe error: %v", err), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]int{"count": count})
+}
+
+// handleTypedEnabledNames is the application-level replacement for the old
+// SQL enabled_contacts view. It deliberately recomputes from managed RIME
+// records so the endpoint cannot bypass Spool durability or replication.
+func (d *NodeDaemon) handleTypedEnabledNames(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	rows, err := table.Where(db.NumericFieldOf[liveTypedRecord, int64](table, "Count").Gt(0)).
+		OrderByAsc(db.StringFieldOf[liveTypedRecord](table, "Name")).Find()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	names := make([]string, 0, len(rows))
+	for _, row := range rows {
+		names = append(names, row.Name)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string][]string{"names": names})
+}
+
+func (d *NodeDaemon) handleTypedNames(w http.ResponseWriter, r *http.Request) {
+	database := d.databaseOrLocked(w)
+	if database == nil {
+		return
+	}
+	var names []string
+	if table, err := db.TableOf[liveTypedRecord](database, "live_typed_records"); err == nil {
+		rows, queryErr := table.Where().OrderByAsc(db.StringFieldOf[liveTypedRecord](table, "Name")).Find()
+		if queryErr != nil {
+			http.Error(w, queryErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		names = make([]string, 0, len(rows))
+		for _, row := range rows {
+			names = append(names, row.Name)
+		}
+	} else {
+		table, tableErr := db.TableOf[liveTypedRecordV2](database, "live_typed_records")
+		if tableErr != nil {
+			http.Error(w, tableErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		rows, queryErr := table.Where().OrderByAsc(db.StringFieldOf[liveTypedRecordV2](table, "Name")).Find()
+		if queryErr != nil {
+			http.Error(w, queryErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		names = make([]string, 0, len(rows))
+		for _, row := range rows {
+			names = append(names, row.Name)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string][]string{"names": names})
+}
+
+func (d *NodeDaemon) handleTypedWatch(w http.ResponseWriter, r *http.Request) {
+	if !d.cfg.TypedRecords {
+		http.Error(w, "typed test API is disabled", http.StatusNotFound)
+		return
+	}
+	d.mu.Lock()
+	database := d.database
+	d.mu.Unlock()
+	if database == nil {
+		http.Error(w, "node is locked", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	sub, err := table.Subscribe(r.Context(), db.RecordSubscriptionOptions{BufferSize: 4}, db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer sub.Close()
+	w.Header().Set("Content-Type", "application/x-ndjson")
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-	enc := json.NewEncoder(w)
-	ctx := r.Context()
-	emit := func(eventType string, cursor uint64, columns []string, rows [][]Value, errText string) bool {
-		out := map[string]any{"type": eventType, "cursor": cursor}
-		if columns != nil {
-			out["columns"] = columns
-		}
-		if rows != nil {
-			out["rows"] = rows
-		}
-		if errText != "" {
-			out["error"] = errText
-		}
-		if _, err := w.Write([]byte("data: ")); err != nil {
-			return false
-		}
-		if err := enc.Encode(out); err != nil {
-			return false
-		}
-		if _, err := w.Write([]byte("\n")); err != nil {
-			return false
-		}
-		flusher.Flush()
-		return true
-	}
+	encoder := json.NewEncoder(w)
 	for {
 		select {
-		case <-ctx.Done():
+		case event, open := <-sub.Events():
+			if !open {
+				return
+			}
+			response := map[string]any{"type": event.Type, "count": len(event.Rows)}
+			if event.Err != nil {
+				response["error"] = event.Err.Error()
+			}
+			if err := encoder.Encode(response); err != nil {
+				return
+			}
+			flusher.Flush()
+			if event.Type != db.EventInitial {
+				return
+			}
+		case <-r.Context().Done():
 			return
-		case ev, ok := <-sub.Events():
-			if !ok {
-				return
-			}
-			if ev.Err != nil {
-				emit("error", ev.Cursor, nil, nil, ev.Err.Error())
-				return
-			}
-			raw := make([][]any, len(ev.Rows))
-			for i, row := range ev.Rows {
-				raw[i] = row.Values
-			}
-			encRows, err := MarshalRows(raw)
-			if err != nil {
-				emit("error", ev.Cursor, nil, nil, err.Error())
-				return
-			}
-			if !emit(string(ev.Type), ev.Cursor, ev.Columns, encRows, "") {
-				return
-			}
 		}
 	}
+}
+
+func (d *NodeDaemon) handleTypedCounterAdd(w http.ResponseWriter, r *http.Request) {
+	if !d.cfg.TypedRecords {
+		http.Error(w, "typed test API is disabled", http.StatusNotFound)
+		return
+	}
+	d.mu.Lock()
+	database := d.database
+	d.mu.Unlock()
+	if database == nil {
+		http.Error(w, "node is locked", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Name  string `json:"name"`
+		Delta int64  `json:"delta"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name and delta are required", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	row, err := table.Where(db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name)).First()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+		return db.RecordCounterAdd(tx, table, row.ID, "Count", req.Delta)
+	}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (d *NodeDaemon) handleTypedCounterValue(w http.ResponseWriter, r *http.Request) {
+	if !d.cfg.TypedRecords {
+		http.Error(w, "typed test API is disabled", http.StatusNotFound)
+		return
+	}
+	d.mu.Lock()
+	database := d.database
+	d.mu.Unlock()
+	if database == nil {
+		http.Error(w, "node is locked", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	var value int64
+	if table, err := db.TableOf[liveTypedRecord](database, "live_typed_records"); err == nil {
+		row, queryErr := table.Where(db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name)).First()
+		if queryErr != nil {
+			http.Error(w, queryErr.Error(), http.StatusNotFound)
+			return
+		}
+		value = row.Count
+	} else {
+		table, tableErr := db.TableOf[liveTypedRecordV2](database, "live_typed_records")
+		if tableErr != nil {
+			http.Error(w, tableErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		row, queryErr := table.Where(db.FieldOf[liveTypedRecordV2, string](table, "Name").Eq(req.Name)).First()
+		if queryErr != nil {
+			http.Error(w, queryErr.Error(), http.StatusNotFound)
+			return
+		}
+		value = row.Count
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]int64{"value": value})
+}
+
+func (d *NodeDaemon) handleTypedSetAdd(w http.ResponseWriter, r *http.Request) {
+	d.handleTypedSetChange(w, r, true)
+}
+func (d *NodeDaemon) handleTypedSetRemove(w http.ResponseWriter, r *http.Request) {
+	d.handleTypedSetChange(w, r, false)
+}
+
+func (d *NodeDaemon) handleTypedSetChange(w http.ResponseWriter, r *http.Request, add bool) {
+	if !d.cfg.TypedRecords {
+		http.Error(w, "typed test API is disabled", http.StatusNotFound)
+		return
+	}
+	d.mu.Lock()
+	database := d.database
+	d.mu.Unlock()
+	if database == nil {
+		http.Error(w, "node is locked", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name and value are required", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	row, err := table.Where(db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name)).First()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	err = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+		if add {
+			return db.RecordSetAdd(tx, table, row.ID, "Tags", req.Value)
+		}
+		return db.RecordSetRemove(tx, table, row.ID, "Tags", req.Value)
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (d *NodeDaemon) handleTypedSetValues(w http.ResponseWriter, r *http.Request) {
+	if !d.cfg.TypedRecords {
+		http.Error(w, "typed test API is disabled", http.StatusNotFound)
+		return
+	}
+	d.mu.Lock()
+	database := d.database
+	d.mu.Unlock()
+	if database == nil {
+		http.Error(w, "node is locked", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	row, err := table.Where(db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name)).First()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string][]string{"values": row.Tags})
+}
+
+func (d *NodeDaemon) handleTypedExtremaUpdate(w http.ResponseWriter, r *http.Request) {
+	if !d.cfg.TypedRecords {
+		http.Error(w, "typed test API is disabled", http.StatusNotFound)
+		return
+	}
+	d.mu.Lock()
+	database := d.database
+	d.mu.Unlock()
+	if database == nil {
+		http.Error(w, "node is locked", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Name  string  `json:"name"`
+		Peak  int64   `json:"peak"`
+		Floor float64 `json:"floor"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name and extrema values are required", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	row, err := table.Where(db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name)).First()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	err = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+		if err := db.RecordMax(tx, table, row.ID, "Peak", req.Peak); err != nil {
+			return err
+		}
+		return db.RecordMin(tx, table, row.ID, "Floor", req.Floor)
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (d *NodeDaemon) handleTypedExtremaValues(w http.ResponseWriter, r *http.Request) {
+	if !d.cfg.TypedRecords {
+		http.Error(w, "typed test API is disabled", http.StatusNotFound)
+		return
+	}
+	d.mu.Lock()
+	database := d.database
+	d.mu.Unlock()
+	if database == nil {
+		http.Error(w, "node is locked", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	row, err := table.Where(db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name)).First()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"peak": row.Peak, "floor": row.Floor})
 }
 
 func (d *NodeDaemon) Close() {
@@ -1213,56 +2277,6 @@ func runUnlock(args []string) {
 		log.Fatalf("unlock failed with code %d: %s", resp.StatusCode, string(b))
 	}
 	fmt.Println("Node unlocked successfully.")
-}
-
-func runExec(args []string) {
-	fs := flag.NewFlagSet("exec", flag.ExitOnError)
-	apiFlags := addAPIClientFlags(fs)
-	_ = fs.Parse(args)
-	client, apiURL, err := apiFlags.client()
-	if err != nil {
-		log.Fatal(err)
-	}
-	if fs.NArg() < 1 {
-		log.Fatal("SQL statement argument required")
-	}
-	sqlStmt := fs.Arg(0)
-	payload, _ := json.Marshal(map[string]any{"query": sqlStmt})
-	resp, err := client.Post(apiURL+"/v1/exec", "application/json", strings.NewReader(string(payload)))
-	if err != nil {
-		log.Fatalf("exec request failed: %v", err)
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		log.Fatalf("exec failed (%d): %s", resp.StatusCode, string(respBody))
-	}
-	fmt.Println(string(respBody))
-}
-
-func runQuery(args []string) {
-	fs := flag.NewFlagSet("query", flag.ExitOnError)
-	apiFlags := addAPIClientFlags(fs)
-	_ = fs.Parse(args)
-	client, apiURL, err := apiFlags.client()
-	if err != nil {
-		log.Fatal(err)
-	}
-	if fs.NArg() < 1 {
-		log.Fatal("SQL query argument required")
-	}
-	sqlQuery := fs.Arg(0)
-	payload, _ := json.Marshal(map[string]any{"query": sqlQuery})
-	resp, err := client.Post(apiURL+"/v1/query", "application/json", strings.NewReader(string(payload)))
-	if err != nil {
-		log.Fatalf("query request failed: %v", err)
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		log.Fatalf("query failed (%d): %s", resp.StatusCode, string(respBody))
-	}
-	fmt.Println(string(respBody))
 }
 
 func runStatus(args []string) {

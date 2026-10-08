@@ -13,12 +13,9 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -33,32 +30,27 @@ func TestChunkedTransactionResumesAfterReceiverSIGKILL(t *testing.T) {
 	valueBytes := envInt("MURMUR_TXCHUNK_VALUE_BYTES", 9000)
 	maxAttempts := envInt("MURMUR_TXCHUNK_ATTEMPTS", 3)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "txchunk-resume",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "chunk_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "v", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:            "txchunk-resume",
+		NumNodes:        3,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 	senderID := cluster.Nodes[sender].NodeID.String()
 	victimID := cluster.Nodes[victim].NodeID.String()
 
 	// Positive control (honest behavior works): a multi-chunk
 	// transaction replicates to every node with no killing.
-	baseStmt := buildBigInsert("base-", 0, rows, valueBytes)
-	payloadMB := float64(len(baseStmt)) / (1 << 20)
-	t.Logf("big-tx statement %.1f MiB (%d rows x %d B values)", payloadMB, rows, valueBytes)
-	if len(baseStmt) <= 8<<20 {
-		t.Fatalf("big-tx statement is %d bytes, want > 8 MiB so the batch must travel chunked", len(baseStmt))
+	baseRows, payloadBytes := buildBigRows("base-", 0, rows, valueBytes)
+	payloadMB := float64(payloadBytes) / (1 << 20)
+	t.Logf("big typed transaction %.1f MiB (%d rows x %d B values)", payloadMB, rows, valueBytes)
+	if payloadBytes <= 8<<20 {
+		t.Fatalf("big typed transaction is %d bytes, want > 8 MiB so the batch must travel chunked", payloadBytes)
 	}
-	if err := cluster.ExecSQL(sender, baseStmt); err != nil {
+	if err := cluster.TypedContentionInsertMany(sender, baseRows); err != nil {
 		t.Fatalf("base big-tx commit: %v", err)
 	}
-	waitConverged(t, cluster, "chunk_rows", rows, 120*time.Second)
+	waitConverged(t, cluster, rows, 120*time.Second)
 	t.Logf("positive control: %.1f MiB transaction replicated to all nodes", payloadMB)
 
 	// Resume trials. Each attempt commits a fresh big transaction while
@@ -84,8 +76,8 @@ func TestChunkedTransactionResumesAfterReceiverSIGKILL(t *testing.T) {
 			t.Fatalf("victim snapshots_received = %v before trial, want 0", snapRecvPreKill)
 		}
 
-		stmt := buildBigInsert(prefix, attempt*1000000, rows, valueBytes)
-		if err := cluster.ExecSQL(sender, stmt); err != nil {
+		trialRows, _ := buildBigRows(prefix, attempt*1000000, rows, valueBytes)
+		if err := cluster.TypedContentionInsertMany(sender, trialRows); err != nil {
 			t.Fatalf("attempt %d big-tx commit: %v", attempt, err)
 		}
 		seqTx := nodeStatus(t, cluster.Nodes[sender].APIAddr).LocalSeq
@@ -108,7 +100,7 @@ func TestChunkedTransactionResumesAfterReceiverSIGKILL(t *testing.T) {
 		heal(t, cluster, victim)
 		if tooSlow := killOnceBytesFlow(t, cluster, victim, prefix, rows, bytesBefore); tooSlow {
 			t.Logf("attempt %d: victim converged before the kill landed; retrying with fresh rows", attempt)
-			waitConverged(t, cluster, "chunk_rows", expectedRows, 60*time.Second)
+			waitConverged(t, cluster, expectedRows, 60*time.Second)
 			continue
 		}
 		restartNode(t, cluster, victim)
@@ -120,7 +112,7 @@ func TestChunkedTransactionResumesAfterReceiverSIGKILL(t *testing.T) {
 			// must have applied the trial before the kill: the
 			// trial proves nothing about resume; retry fresh.
 			t.Logf("attempt %d: no post-restart apply; kill landed too late, retrying", attempt)
-			waitConverged(t, cluster, "chunk_rows", expectedRows, 60*time.Second)
+			waitConverged(t, cluster, expectedRows, 60*time.Second)
 			continue
 		}
 		resumed = true
@@ -140,7 +132,7 @@ func TestChunkedTransactionResumesAfterReceiverSIGKILL(t *testing.T) {
 	}
 
 	// Final: exact row counts and identical ordered digests everywhere.
-	waitConverged(t, cluster, "chunk_rows", expectedRows, 60*time.Second)
+	waitConverged(t, cluster, expectedRows, 60*time.Second)
 }
 
 // partition isolates idx from both peers in both directions.
@@ -208,21 +200,20 @@ func restartNode(t *testing.T, c *harness.Cluster, idx int) {
 // watchRetry polls the retry to completion and enforces the resume
 // contract on every sample: the sender always shows the full trial
 // (its commit was durable) and the victim shows none or all of it
-// (never a partial transaction; remote rows materialize into SQLite
-// in one transaction per flush, so visibility jumps 0 -> all).
+// (never a partial transaction; remote records publish atomically into RIME,
+// so visibility jumps 0 -> all).
 //
 // The victim's applied watermark for the trial origin (as acked to
-// the sender) advances on the durable Pebble apply, which leads SQL
-// visibility by up to one RemoteApplyInterval (1s default): the
-// watermark join is therefore lag-bounded rather than per-sample.
+// the sender) advances on durable Spool apply and RIME publication. The
+// watermark join is therefore checked with a bounded observation interval.
 // A watermark that advanced before the full batch applied would
 // expose partial rows (caught above) or stall completion; here the
 // first advanced-watermark sample must precede full visibility by at
-// most the materialization bound. It returns the victim's
+// most the publication bound. It returns the victim's
 // post-restart applied-batch count.
 func watchRetry(t *testing.T, c *harness.Cluster, senderID, victimID, prefix string, rows int, seqPre, seqTx uint64) int64 {
 	t.Helper()
-	const materializationBound = 10 * time.Second // 10x the 1s RemoteApplyInterval
+	const publicationBound = 10 * time.Second // generous bound for crash/rejoin scheduling
 	deadline := time.Now().Add(120 * time.Second)
 	var batches int64
 	var firstAdvanced, firstFull time.Time
@@ -249,8 +240,8 @@ func watchRetry(t *testing.T, c *harness.Cluster, senderID, victimID, prefix str
 				t.Fatalf("converged without observing watermark advance (advanced=%v full=%v)", firstAdvanced, firstFull)
 			}
 			t.Logf("watermark advanced %v before full trial visibility", firstFull.Sub(firstAdvanced))
-			if lag := firstFull.Sub(firstAdvanced); lag > materializationBound {
-				t.Fatalf("watermark advanced %v before completion, want <= %v (early advance)", lag, materializationBound)
+			if lag := firstFull.Sub(firstAdvanced); lag > publicationBound {
+				t.Fatalf("watermark advanced %v before completion, want <= %v (early advance)", lag, publicationBound)
 			}
 			return batches
 		}
@@ -261,38 +252,31 @@ func watchRetry(t *testing.T, c *harness.Cluster, senderID, victimID, prefix str
 	return 0
 }
 
-// buildBigInsert renders one single-statement multi-row INSERT whose
-// payload exceeds the 8 MiB replication frame, forcing the chunked
-// transaction path. Blob ids use x-hex literals; values carry the trial
-// prefix and pad with a quote-free alphabet.
-func buildBigInsert(prefix string, idBase, rows, valueBytes int) string {
-	var sb strings.Builder
-	sb.WriteString("INSERT INTO chunk_rows (id, v) VALUES ")
-	row := make([]byte, valueBytes)
+// buildBigRows creates one managed InsertMany transaction exceeding the 8 MiB
+// replication frame. Large Phone values carry the payload; Name carries prefix.
+func buildBigRows(prefix string, idBase, rows, valueBytes int) ([]harness.TypedContentionRow, int) {
+	values := make([]harness.TypedContentionRow, rows)
+	payloadBytes := 0
 	for i := 0; i < rows; i++ {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		copy(row, prefix)
-		for j := len(prefix); j < valueBytes; j++ {
+		row := make([]byte, valueBytes)
+		copy(row, "payload-")
+		for j := len("payload-"); j < valueBytes; j++ {
 			row[j] = byte('a' + (idBase+i+j)%26)
 		}
-		fmt.Fprintf(&sb, "(x'%032x', '%s')", idBase+i, row)
+		id := fmt.Sprintf("%032x", idBase+i)
+		name := fmt.Sprintf("%s%06d", prefix, i)
+		values[i] = harness.TypedContentionRow{ID: id, Name: name, Phone: string(row)}
+		payloadBytes += len(id) + len(name) + len(row) + 8
 	}
-	return sb.String()
+	return values, payloadBytes
 }
 
 func prefixCount(t *testing.T, c *harness.Cluster, idx int, prefix string) int {
 	t.Helper()
-	res, err := c.QuerySQL(idx, "SELECT count(*) FROM chunk_rows WHERE v LIKE ?", prefix+"%")
+	n, err := c.TypedContentionPrefixCount(idx, prefix)
 	if err != nil {
 		t.Fatalf("node %d prefix count: %v", idx, err)
 	}
-	if len(res.Rows) == 0 || len(res.Rows[0]) == 0 {
-		return 0
-	}
-	var n int
-	_, _ = fmt.Sscanf(fmt.Sprint(res.Rows[0][0]), "%d", &n)
 	return n
 }
 
@@ -308,20 +292,15 @@ func waitPrefixCount(t *testing.T, c *harness.Cluster, idx int, prefix string, w
 	t.Fatalf("node %d %q rows = %d, want %d within %v", idx, prefix, prefixCount(t, c, idx, prefix), want, timeout)
 }
 
-func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, timeout time.Duration) {
+func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, table)
+			n, d, err := c.TypedContentionDigest(i)
 			if err != nil || n != want {
-				ok = false
-				break
-			}
-			d, err := c.ComputeTableDigest(i, table, "id")
-			if err != nil {
 				ok = false
 				break
 			}
@@ -338,10 +317,10 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 		time.Sleep(200 * time.Millisecond)
 	}
 	for i := range c.Nodes {
-		n, _ := c.QueryRowCount(i, table)
-		t.Logf("node %d at timeout: count=%d", i, n)
+		n, _, err := c.TypedContentionDigest(i)
+		t.Logf("node %d at timeout: count=%d err=%v", i, n, err)
 	}
-	t.Fatalf("nodes did not converge on %d %s rows with equal digests within %v", want, table, timeout)
+	t.Fatalf("nodes did not converge on %d typed records with equal digests within %v", want, timeout)
 }
 
 func waitConnectedPeers(t *testing.T, c *harness.Cluster, idx, want int, timeout time.Duration) {
@@ -428,19 +407,8 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line == "" || line[0] == '#' || !strings.HasPrefix(line, name) {
-			continue
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(line, name))
-		if i := strings.LastIndex(rest, " "); i >= 0 {
-			rest = rest[i+1:]
-		}
-		v, err := strconv.ParseFloat(rest, 64)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		return v
+	if value, ok := harness.MetricValueFrom(string(raw), name); ok {
+		return value
 	}
 	t.Fatalf("counter %s not present in /metrics", name)
 	return 0

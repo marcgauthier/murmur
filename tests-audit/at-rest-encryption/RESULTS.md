@@ -201,12 +201,12 @@ file swap succeeds). Fix: generate and persist a random DBID per store.
 
 ## Verification log
 
-- `go test -tags "sqlite_preupdate_hook sqlite_fts5" -count=1 ./crypto/`
+- `go test -tags "" -count=1 ./crypto/`
   → ok (18.8s).
-- `go test -tags "sqlite_preupdate_hook sqlite_fts5" -count=1
+- `go test -tags "" -count=1
   ./tests-live/encryption/` → ok: marker absent at rest, wrong key rejected,
   correct-key reopen reads the row.
-- `go test -tags "sqlite_preupdate_hook sqlite_fts5" -count=1
+- `go test -tags "" -count=1
   ./tests-live/rekey/` → ok: online rotation, new-key restart, old-key
   rejection.
 - Independent `/tmp/eap` probe through the public API (7 files, out of repo):

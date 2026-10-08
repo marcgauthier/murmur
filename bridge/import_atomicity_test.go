@@ -18,7 +18,7 @@ func TestImportReceiptsAndStreamProgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	high := openHighDB(t)
+	high := openTypedContactDBAt(t, t.TempDir(), db.NewNodeID())
 	im, err := NewImporter(high)
 	if err != nil {
 		t.Fatal(err)
@@ -46,7 +46,7 @@ func TestImportReceiptsAndStreamProgress(t *testing.T) {
 	}
 
 	bundleID := ids.NewTxID()
-	sealed := sealForInboxWithManifest(t, signer, recip, Manifest{
+	sealed := sealTypedContacts(t, signer, recip, Manifest{
 		BundleID:     bundleID,
 		SourceDomain: ids.NewDBID(),
 		Stream:       "stream-1",
@@ -99,7 +99,7 @@ func TestImportDeduplicationOnReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	high := openHighDB(t)
+	high := openTypedContactDBAt(t, t.TempDir(), db.NewNodeID())
 	im, err := NewImporter(high)
 	if err != nil {
 		t.Fatal(err)
@@ -130,7 +130,7 @@ func TestImportDeduplicationOnReplay(t *testing.T) {
 		TxIDs:        []ids.TxID{txID},
 		SchemaEpoch:  1,
 	}
-	sealed := sealForInboxWithManifest(t, signer, recip, manifest, []Batch{b})
+	sealed := sealTypedContacts(t, signer, recip, manifest, []Batch{b})
 	if err := inbox.Receive(sealed); err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestImportCrashBeforeMarkAppliedRecovery(t *testing.T) {
 	}
 	highDir := t.TempDir()
 	node := db.NewNodeID()
-	high := openHighDBAt(t, highDir, node, nil)
+	high := openTypedContactDBAt(t, highDir, node)
 	im, err := NewImporter(high)
 	if err != nil {
 		t.Fatal(err)
@@ -199,12 +199,12 @@ func TestImportCrashBeforeMarkAppliedRecovery(t *testing.T) {
 		TxIDs:        []ids.TxID{txID},
 		SchemaEpoch:  1,
 	}
-	sealed := sealForInboxWithManifest(t, signer, recip, manifest, []Batch{b})
+	sealed := sealTypedContacts(t, signer, recip, manifest, []Batch{b})
 	if err := inbox.Receive(sealed); err != nil {
 		t.Fatal(err)
 	}
 
-	// Apply bundle directly into DB (simulating commit to Pebble and SQL).
+	// Apply bundle directly into DB (simulating commit to Spool and SQL).
 	opened, err := inOpenStaged(inbox, "stream-1", 1)
 	if err != nil {
 		t.Fatal(err)
@@ -215,7 +215,7 @@ func TestImportCrashBeforeMarkAppliedRecovery(t *testing.T) {
 
 	// Close high DB and reopen to simulate restart before inbox.MarkApplied.
 	_ = high.Close()
-	high = openHighDBAt(t, highDir, node, nil)
+	high = openTypedContactDBAt(t, highDir, node)
 	im2, err := NewImporter(high)
 	if err != nil {
 		t.Fatal(err)

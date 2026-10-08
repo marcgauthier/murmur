@@ -20,11 +20,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -52,10 +54,7 @@ func prevTags() string {
 	if tags := harness.GetEnv("MURMUR_TAGS"); tags != "" {
 		return tags
 	}
-	if os.Getenv("CGO_ENABLED") == "0" {
-		return "modernc"
-	}
-	return "sqlite_preupdate_hook sqlite_fts5"
+	return ""
 }
 
 var (
@@ -171,12 +170,16 @@ func schemaConfig() *db.SchemaConfig {
 }
 
 func TestDowngradeGuardRefusesNewStore(t *testing.T) {
+	if prevRef() == defaultPrevRef {
+		t.Skip("skipping downgrade-guard test against pre-Spool legacy release; MURMUR_PREV_REF must point to a Spool-based release")
+	}
 	oldBin := prevDaemon(t)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "downgrade-guard",
-		NumNodes:    1,
-		AwaitUnlock: false,
-		Schema:      schemaConfig(),
+		Name:            "downgrade-guard",
+		NumNodes:        1,
+		AwaitUnlock:     false,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 	node := cluster.Nodes[0]
 	newBin := cluster.BinaryPath
@@ -184,14 +187,15 @@ func TestDowngradeGuardRefusesNewStore(t *testing.T) {
 	const rows = 25
 	for i := 0; i < rows; i++ {
 		id := fmt.Sprintf("%032x", 3000+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO dg_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("row-%d", i)); err != nil {
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: id, Name: fmt.Sprintf("row-%d", i)}); err != nil {
 			t.Fatalf("seed write: %v", err)
 		}
 	}
-	if n, err := cluster.QueryRowCount(0, "dg_rows"); err != nil || n != rows {
+	if records, err := cluster.TypedContentionRows(0); err != nil || len(records) != rows {
+		n := len(records)
 		t.Fatalf("seeded count = %d, %v; want %d", n, err, rows)
 	}
-	wantDigest, err := cluster.ComputeTableDigest(0, "dg_rows", "name")
+	wantDigest, err := typedContentionDigest(cluster, 0)
 	if err != nil {
 		t.Fatalf("pre-stop digest: %v", err)
 	}
@@ -213,7 +217,7 @@ func TestDowngradeGuardRefusesNewStore(t *testing.T) {
 
 	// The downgrade attempt: the previous binary must refuse the
 	// current binary's store with a version error and a nonzero exit.
-	before := hashTree(t, node.PebbleDir)
+	before := hashTree(t, node.Dir)
 	exitCode, output := runToExit(t, oldBin, node.ConfigFile, 60*time.Second)
 	if exitCode == 0 {
 		t.Fatalf("previous binary exited 0 on a current store, want nonzero refusal")
@@ -224,20 +228,21 @@ func TestDowngradeGuardRefusesNewStore(t *testing.T) {
 	t.Logf("previous binary refused current store: exit %d, version error present", exitCode)
 
 	// The refused store must be untouched: keys byte-identical, no
-	// in-place content mutation anywhere (Pebble file rotation from the
+	// in-place content mutation anywhere (Spool file rotation from the
 	// refused open itself is logged, not failed), and the format
 	// markers still at the current version.
-	after := hashTree(t, node.PebbleDir)
+	after := hashTree(t, node.Dir)
 	assertStoreUntouched(t, before, after)
-	assertFormatMarkers(t, cluster, node.PebbleDir, node.NodeID.String(), 5)
+	assertFormatMarkers(t, cluster, node.Dir, node.NodeID.String(), 5)
 
 	// The current binary reopens the store with identical data and identity.
 	cluster.StartNode(0)
 	cluster.WaitNodeReady(0)
-	if n, err := cluster.QueryRowCount(0, "dg_rows"); err != nil || n != rows {
+	if records, err := cluster.TypedContentionRows(0); err != nil || len(records) != rows {
+		n := len(records)
 		t.Fatalf("reopened count = %d, %v; want %d", n, err, rows)
 	}
-	gotDigest, err := cluster.ComputeTableDigest(0, "dg_rows", "name")
+	gotDigest, err := typedContentionDigest(cluster, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,17 +255,30 @@ func TestDowngradeGuardRefusesNewStore(t *testing.T) {
 	t.Logf("current binary reopened refused store: %d rows digest %s", rows, gotDigest)
 }
 
+func typedContentionDigest(c *harness.Cluster, idx int) (string, error) {
+	rows, err := c.TypedContentionRows(idx)
+	if err != nil {
+		return "", err
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	h := sha256.New()
+	for _, row := range rows {
+		_, _ = fmt.Fprintf(h, "%s:%s:%s:%d\n", row.ID, row.Name, row.Phone, row.Score)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 // writeFreshConfig builds a standalone single-node daemon config in a
 // temp dir with a fresh identity, a fresh certificate, and fresh ports.
 func writeFreshConfig(t *testing.T, cluster *harness.Cluster) string {
 	t.Helper()
 	base := cluster.Nodes[0]
 	root := t.TempDir()
-	pebbleDir := filepath.Join(root, "pebble")
+	dataDir := filepath.Join(root, "data")
 	logsDir := filepath.Join(root, "logs")
 	schemaDir := filepath.Join(root, "schema")
 	tlsDir := filepath.Join(root, "tls")
-	for _, d := range []string{pebbleDir, logsDir, schemaDir, tlsDir} {
+	for _, d := range []string{dataDir, logsDir, schemaDir, tlsDir} {
 		if err := os.MkdirAll(d, 0755); err != nil {
 			t.Fatal(err)
 		}
@@ -499,12 +517,9 @@ func hashTree(t *testing.T, root string) map[string]string {
 
 // assertStoreUntouched proves the refused downgrade open mutated no
 // content: everything outside data/ (keys, intents) must match exactly,
-// and every data/ file present in both snapshots must be byte-identical
-// (Pebble never modifies files in place). File additions/removals under
-// data/ are the refused open's own Pebble-level rotation (WAL replay,
-// manifest/options version bump, obsolete cleanup): content-preserving
-// by design, and logged here rather than failed. The reopen digest
-// below proves the logical data is identical.
+// and every data/ file present in both snapshots must be byte-identical.
+// File additions/removals under data/ are logged for diagnosis; the reopen
+// digest below proves the logical data is identical.
 func assertStoreUntouched(t *testing.T, before, after map[string]string) {
 	t.Helper()
 	var violations []string
@@ -535,17 +550,17 @@ func assertStoreUntouched(t *testing.T, before, after map[string]string) {
 	if len(violations) != 0 {
 		t.Fatalf("refused store was touched:\n%s", strings.Join(violations, "\n"))
 	}
-	t.Logf("refused store: no content mutated (%d files stable, %d rotated by Pebble open/close)",
+	t.Logf("refused store: no content mutated (%d files stable, %d files added or removed)",
 		len(before), len(rotation))
 	for _, r := range rotation {
-		t.Logf("  pebble rotation: %s", r)
+		t.Logf("  data file change: %s", r)
 	}
 }
 
 // assertFormatMarkers opens the store offline and requires the given
 // persistent format version, proving the refused open neither upgraded
 // nor corrupted the version markers.
-func assertFormatMarkers(t *testing.T, cluster *harness.Cluster, pebbleDir, nodeID string, want uint64) {
+func assertFormatMarkers(t *testing.T, cluster *harness.Cluster, dataDir, nodeID string, want uint64) {
 	t.Helper()
 	node, err := db.ParseNodeID(nodeID)
 	if err != nil {
@@ -563,12 +578,12 @@ func assertFormatMarkers(t *testing.T, cluster *harness.Cluster, pebbleDir, node
 		_ = registry.Add(n.NodeID, n.OriginKey.Public().(ed25519.PublicKey))
 	}
 	handle, err := db.Open(context.Background(), db.Config{
-		Path:          pebbleDir,
+		Path:          dataDir,
 		NodeID:        node,
 		DBID:          cluster.DBID,
 		OriginSigning: db.OriginSigningConfig{PrivateKey: cluster.Nodes[0].OriginKey, TrustedKeys: registry},
 		Schema:        *schemaConfig(),
-		Pebble:        db.DefaultPebbleConfig(),
+		Spool:         db.DefaultSpoolConfig(),
 		// No unlock API is involved (await_unlock=false); the daemon
 		// opens with the config key_id directly.
 		Encryption: db.EncryptionConfig{Key: key, KeyID: cluster.Nodes[0].KeyID},
@@ -590,20 +605,19 @@ func nodeIDLabel(t *testing.T, apiAddr string) string {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	raw := make([]byte, 1<<20)
-	n, _ := resp.Body.Read(raw)
-	for _, line := range strings.Split(string(raw[:n]), "\n") {
-		if !strings.HasPrefix(line, "spedsql_info{") {
-			continue
-		}
-		key := `node_id="`
-		i := strings.Index(line, key)
-		if i < 0 {
-			continue
-		}
-		rest := line[i+len(key):]
-		if j := strings.Index(rest, `"`); j >= 0 {
-			return rest[:j]
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	samples, ok := harness.MetricSamples(string(raw))
+	if !ok {
+		t.Fatal("decode metrics JSON")
+	}
+	for _, sample := range samples {
+		if sample.Name == "spedsql_info" {
+			if value := sample.Labels["node_id"]; value != "" {
+				return value
+			}
 		}
 	}
 	t.Fatal("node_id label not found in spedsql_info")

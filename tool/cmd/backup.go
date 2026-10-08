@@ -15,10 +15,40 @@ import (
 
 	"github.com/marcgauthier/murmur/backup"
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/state"
 	"github.com/marcgauthier/murmur/tool/format"
 )
 
 type BackupCommand struct{}
+
+type offlineBackupSource struct {
+	store   *state.Store
+	dataDir string
+	epoch   uint64
+	hash    string
+}
+
+func (s offlineBackupSource) HoldCommits() func() { return s.store.HoldCommits() }
+func (s offlineBackupSource) Checkpoint(ctx context.Context, dest string) (func() error, error) {
+	cp, err := s.store.SpoolCheckpoint(ctx, dest)
+	if err != nil {
+		return nil, err
+	}
+	return cp.Release, nil
+}
+func (s offlineBackupSource) ClusterID() string   { return s.store.DBID().String() }
+func (s offlineBackupSource) LocalNodeID() string { return s.store.NodeID().String() }
+func (s offlineBackupSource) SchemaInfo() (uint64, uint64, string) {
+	return s.epoch, s.epoch, s.hash
+}
+func (s offlineBackupSource) DataDir() string { return filepath.Join(s.dataDir, "data") }
+func (s offlineBackupSource) FilesDir() string {
+	path := filepath.Join(s.dataDir, "files")
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		return path
+	}
+	return ""
+}
 
 func (c *BackupCommand) Name() string        { return "backup" }
 func (c *BackupCommand) Description() string { return "Create, inspect, verify, and restore backups" }
@@ -62,11 +92,23 @@ func (c *BackupCommand) runCreate(ctx context.Context, globalOpts GlobalOptions,
 	dataDir := args[0]
 	archivePath := args[1]
 
-	db, err := openLocalDB(ctx, dataDir, globalOpts, false)
+	store, err := openOfflineStore(dataDir, globalOpts)
 	if err != nil {
-		return fmt.Errorf("open database: %w", err)
+		return fmt.Errorf("open encrypted durable state: %w", err)
 	}
-	defer db.Close()
+	defer store.Close()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	manifest, err := store.LoadSchemaManifest()
+	if err != nil {
+		return fmt.Errorf("read schema manifest: %w", err)
+	}
+	source := offlineBackupSource{store: store, dataDir: dataDir}
+	if manifest != nil {
+		source.epoch = manifest.Version
+		source.hash = fmt.Sprintf("%x", manifest.Hash)
+	}
 
 	destDir := filepath.Dir(archivePath)
 	destName := filepath.Base(archivePath)
@@ -76,7 +118,7 @@ func (c *BackupCommand) runCreate(ctx context.Context, globalOpts GlobalOptions,
 	}
 
 	start := time.Now()
-	meta, err := backup.CreateBackup(ctx, db, backup.Config{
+	meta, err := backup.CreateBackup(ctx, source, backup.Config{
 		Destination: dest,
 	})
 	if err != nil {
@@ -88,10 +130,6 @@ func (c *BackupCommand) runCreate(ctx context.Context, globalOpts GlobalOptions,
 	createdPath := filepath.Join(destDir, createdFilename)
 	if _, err := os.Stat(createdPath); err == nil && createdPath != archivePath {
 		_ = os.Rename(createdPath, archivePath)
-	}
-
-	if schemaData, err := os.ReadFile(filepath.Join(dataDir, "schema.json")); err == nil && len(schemaData) > 0 {
-		_ = appendFileToTarGz(archivePath, "schema.json", schemaData)
 	}
 
 	if globalOpts.JSON {
@@ -272,10 +310,6 @@ func (c *BackupCommand) runRestore(ctx context.Context, globalOpts GlobalOptions
 	}
 	elapsed := time.Since(start)
 
-	if schemaBytes, err := readFileFromTarGz(archivePath, "schema.json"); err == nil && len(schemaBytes) > 0 {
-		_ = os.WriteFile(filepath.Join(destDir, "schema.json"), schemaBytes, 0o600)
-	}
-
 	if globalOpts.JSON {
 		return format.RenderJSON(stdout, map[string]any{
 			"success":       true,
@@ -295,106 +329,6 @@ func (c *BackupCommand) runRestore(ctx context.Context, globalOpts GlobalOptions
 		{"Source Cluster DB ID", meta.DBID},
 	})
 	return nil
-}
-
-func appendFileToTarGz(tarGzPath, entryName string, data []byte) error {
-	tmpPath := tarGzPath + ".tmp"
-	inF, err := os.Open(tarGzPath)
-	if err != nil {
-		return err
-	}
-	defer inF.Close()
-
-	outF, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	defer outF.Close()
-
-	gzr, err := gzip.NewReader(inF)
-	if err != nil {
-		return err
-	}
-	defer gzr.Close()
-
-	gzw := gzip.NewWriter(outF)
-	defer gzw.Close()
-
-	tr := tar.NewReader(gzr)
-	tw := tar.NewWriter(gzw)
-	defer tw.Close()
-
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		if err := tw.WriteHeader(hdr); err != nil {
-			return err
-		}
-		if _, err := io.Copy(tw, tr); err != nil {
-			return err
-		}
-	}
-
-	hdr := &tar.Header{
-		Name:     entryName,
-		Mode:     0o600,
-		Size:     int64(len(data)),
-		ModTime:  time.Now(),
-		Typeflag: tar.TypeReg,
-	}
-	if err := tw.WriteHeader(hdr); err != nil {
-		return err
-	}
-	if _, err := tw.Write(data); err != nil {
-		return err
-	}
-
-	if err := tw.Close(); err != nil {
-		return err
-	}
-	if err := gzw.Close(); err != nil {
-		return err
-	}
-	if err := outF.Close(); err != nil {
-		return err
-	}
-	inF.Close()
-
-	return os.Rename(tmpPath, tarGzPath)
-}
-
-func readFileFromTarGz(tarGzPath, entryName string) ([]byte, error) {
-	f, err := os.Open(tarGzPath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	gzr, err := gzip.NewReader(f)
-	if err != nil {
-		return nil, err
-	}
-	defer gzr.Close()
-
-	tr := tar.NewReader(gzr)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		if hdr.Name == entryName {
-			return io.ReadAll(tr)
-		}
-	}
-	return nil, os.ErrNotExist
 }
 
 func readArchiveMetadata(archivePath string) (*backup.Metadata, error) {

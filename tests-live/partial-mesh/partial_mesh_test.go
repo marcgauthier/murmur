@@ -1,40 +1,27 @@
 // Partial-mesh forwarding acceptance.
 //
-// Three daemons start with no static mesh; the test peers only a chain
-// (node1-node2, node2-node3). Writes on node1 must still converge on
-// node3 through origin forwarding by node2: SWIM discovery is not wired
-// into the runtime (membership stays empty and no node1-node3 session
-// ever forms), so the test pins the forwarding behavior explicitly — no
-// direct session may exist — and requires full convergence. When SWIM
-// discovery lands, this suite should grow a session-formed assertion.
+// The first test pins chain-only forwarding without a direct node1-node3
+// session. The second uses bootstrap seeds to verify dynamic discovery and
+// convergence. Both exercise the managed typed RIME record API.
 package partialmesh_test
 
 import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func TestChainPeersConvergeViaForwarding(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "partial-mesh",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		ManualPeers: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "pm_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:         "partial-mesh",
+		NumNodes:     3,
+		AwaitUnlock:  true,
+		ManualPeers:  true,
+		TypedRecords: true,
 	})
 
 	// Chain links only; nothing statically connects node1 to node3.
@@ -51,8 +38,7 @@ func TestChainPeersConvergeViaForwarding(t *testing.T) {
 	link(1, 2)
 
 	for i := 0; i < 10; i++ {
-		id := fmt.Sprintf("%032x", 7000+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO pm_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("d-%d", i)); err != nil {
+		if err := cluster.TypedInsert(0, fmt.Sprintf("d-%d", i)); err != nil {
 			t.Fatalf("seed write: %v", err)
 		}
 	}
@@ -79,21 +65,16 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
-		var first string
+		var first []string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "pm_rows")
-			if err != nil || n != want {
-				ok = false
-				break
-			}
-			d, err := c.ComputeTableDigest(i, "pm_rows", "name")
-			if err != nil {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
 			if i == 0 {
-				first = d
-			} else if d != first {
+				first = names
+			} else if !equalNames(names, first) {
 				ok = false
 				break
 			}
@@ -104,21 +85,25 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 		time.Sleep(200 * time.Millisecond)
 	}
 	c.DumpForensics("converge-timeout")
-	t.Fatalf("nodes did not converge on %d rows within %v", want, timeout)
+	t.Fatalf("nodes did not converge on %d typed records within %v", want, timeout)
+}
+
+func equalNames(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func metricValue(t *testing.T, apiAddr, name string) float64 {
 	t.Helper()
-	for _, line := range strings.Split(scrape(t, apiAddr), "\n") {
-		if !strings.HasPrefix(line, name+" ") && !strings.HasPrefix(line, name+"{") {
-			continue
-		}
-		fields := strings.Fields(line)
-		var v float64
-		if _, err := fmt.Sscanf(fields[len(fields)-1], "%g", &v); err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		return v
+	if value, ok := harness.MetricValueFrom(scrape(t, apiAddr), name); ok {
+		return value
 	}
 	t.Fatalf("metric %s not found", name)
 	return 0
@@ -126,13 +111,8 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 
 func peerConnected(t *testing.T, apiAddr, peerID string) bool {
 	t.Helper()
-	want := fmt.Sprintf("spedsql_peer_connected{peer=%q} 1", peerID)
-	for _, line := range strings.Split(scrape(t, apiAddr), "\n") {
-		if strings.TrimSpace(line) == want {
-			return true
-		}
-	}
-	return false
+	value, ok := harness.MetricValueWithLabels(scrape(t, apiAddr), "spedsql_peer_connected", map[string]string{"peer": peerID})
+	return ok && value == 1
 }
 
 func scrape(t *testing.T, apiAddr string) string {
@@ -158,13 +138,7 @@ func TestDynamicBootstrapDiscovery(t *testing.T) {
 		AwaitUnlock:    true,
 		ManualPeers:    true,
 		BootstrapSeeds: []int{0},
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "pm_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		TypedRecords:   true,
 	})
 
 	// Wait for SWIM dynamic discovery to find all cluster members without any explicit AddPeer calls
@@ -172,24 +146,21 @@ func TestDynamicBootstrapDiscovery(t *testing.T) {
 
 	// Write 10 rows on Node 0 (seed)
 	for i := 0; i < 10; i++ {
-		id := fmt.Sprintf("%032x", 8000+i)
-		if err := baseCluster.ExecSQL(0, "INSERT INTO pm_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("dyn-seed-%d", i)); err != nil {
+		if err := baseCluster.TypedInsert(0, fmt.Sprintf("dyn-seed-%d", i)); err != nil {
 			t.Fatalf("seed write: %v", err)
 		}
 	}
 
 	// Write 5 rows on Node 1 (discovered peer)
 	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("%032x", 8100+i)
-		if err := baseCluster.ExecSQL(1, "INSERT INTO pm_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("dyn-node1-%d", i)); err != nil {
+		if err := baseCluster.TypedInsert(1, fmt.Sprintf("dyn-node1-%d", i)); err != nil {
 			t.Fatalf("node 1 write: %v", err)
 		}
 	}
 
 	// Write 5 rows on Node 2 (discovered peer)
 	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("%032x", 8200+i)
-		if err := baseCluster.ExecSQL(2, "INSERT INTO pm_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("dyn-node2-%d", i)); err != nil {
+		if err := baseCluster.TypedInsert(2, fmt.Sprintf("dyn-node2-%d", i)); err != nil {
 			t.Fatalf("node 2 write: %v", err)
 		}
 	}
@@ -221,4 +192,3 @@ func waitForMembership(t *testing.T, c *harness.Cluster, wantMembers int, timeou
 	c.DumpForensics("membership-timeout")
 	t.Fatalf("nodes did not discover %d members via SWIM within %v", wantMembers, timeout)
 }
-

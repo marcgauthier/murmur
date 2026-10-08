@@ -1,14 +1,15 @@
 package rollingrestart
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -18,27 +19,22 @@ import (
 // identical digests at the end.
 func TestRollingRestartLosesNoWrites(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "rolling-restart",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "rr_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:            "rolling-restart",
+		NumNodes:        3,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 
 	for i := 0; i < 5; i++ {
 		id := fmt.Sprintf("%032x", i)
-		if err := cluster.ExecSQL(0, "INSERT INTO rr_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("base-%d", i)); err != nil {
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: id, Name: fmt.Sprintf("base-%d", i)}); err != nil {
 			t.Fatalf("baseline write: %v", err)
 		}
 	}
 	// 60s, not 30s: under a full parallel `go test ./...` the box is
 	// saturated and even a 5-row baseline can take tens of seconds.
-	waitCounts(t, cluster, "rr_rows", 5, 60*time.Second)
+	waitCounts(t, cluster, 5, 60*time.Second)
 
 	// Writers hammer every node continuously. A write to a live node must
 	// never fail (zero-downtime restart); the writer for the node being
@@ -67,7 +63,7 @@ func TestRollingRestartLosesNoWrites(t *testing.T) {
 					}
 					id := fmt.Sprintf("ff%02x%028x", node, seq)
 					seq++
-					if err := cluster.ExecSQL(node, "INSERT INTO rr_rows (id, name) VALUES (?, ?)", id, "flow"); err != nil {
+					if err := cluster.TypedContentionInsert(node, harness.TypedContentionRow{ID: id, Name: "flow"}); err != nil {
 						failed.Add(1)
 						t.Logf("node%d write failed outside its restart: %v", node+1, err)
 					}
@@ -93,7 +89,7 @@ func TestRollingRestartLosesNoWrites(t *testing.T) {
 		// 150s, not 60s: under a full parallel `go test ./...` the box
 		// runs ~10x slow and exact agreement legitimately takes over a
 		// minute; the proof (exact agreement) is unchanged.
-		quiesce(t, cluster, "rr_rows", &paused, 150*time.Second)
+		quiesce(t, cluster, &paused, 150*time.Second)
 	}
 
 	stopWriters()
@@ -101,13 +97,13 @@ func TestRollingRestartLosesNoWrites(t *testing.T) {
 	if got := failed.Load(); got != 0 {
 		t.Fatalf("%d writes failed outside restart windows, want zero-downtime", got)
 	}
-	waitConvergedCounts(t, cluster, "rr_rows", 150*time.Second)
-	want, err := cluster.ComputeTableDigest(0, "rr_rows", "id")
+	waitConvergedCounts(t, cluster, 150*time.Second)
+	want, err := rrDigest(cluster, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for idx := 1; idx < 3; idx++ {
-		d, err := cluster.ComputeTableDigest(idx, "rr_rows", "id")
+		d, err := rrDigest(cluster, idx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -117,21 +113,42 @@ func TestRollingRestartLosesNoWrites(t *testing.T) {
 	}
 }
 
+// rrRows returns the contention-table rows on one node ordered by id.
+func rrRows(c *harness.Cluster, idx int) ([]harness.TypedContentionRow, error) {
+	rows, err := c.TypedContentionRows(idx)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	return rows, nil
+}
+
+// rrDigest returns the PK-ordered digest of the contention table on one node.
+func rrDigest(c *harness.Cluster, idx int) (string, error) {
+	rows, err := rrRows(c, idx)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	for _, row := range rows {
+		fmt.Fprintf(h, "%s:%s:%s:%d\n", row.ID, row.Name, row.Phone, row.Score)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 // dumpIDDiff logs the symmetric row-id difference between nodes 1 and 2
 // (failure diagnostics).
-func dumpIDDiff(t *testing.T, c *harness.Cluster, table string) {
+func dumpIDDiff(t *testing.T, c *harness.Cluster) {
 	t.Helper()
 	ids := func(idx int) map[string]bool {
 		m := map[string]bool{}
-		res, err := c.QuerySQL(idx, "SELECT id FROM "+table)
+		rows, err := rrRows(c, idx)
 		if err != nil {
 			t.Logf("divergence: node%d ids query: %v", idx+1, err)
 			return m
 		}
-		for _, row := range res.Rows {
-			if len(row) > 0 {
-				m[string(fmt.Sprintf("%v", row[0]))] = true
-			}
+		for _, row := range rows {
+			m[row.ID] = true
 		}
 		return m
 	}
@@ -150,10 +167,10 @@ func dumpIDDiff(t *testing.T, c *harness.Cluster, table string) {
 	t.Logf("divergence: only-node1=%d %v only-node2=%d %v", len(onlyA), firstN(onlyA, 5), len(onlyB), firstN(onlyB, 5))
 	// Same id sets: show the first ordered row difference (catches
 	// column-order and encoding skew between nodes).
-	r0, _ := c.QuerySQL(0, "SELECT * FROM "+table+" ORDER BY id")
-	r2, _ := c.QuerySQL(1, "SELECT * FROM "+table+" ORDER BY id")
-	for i := 0; i < len(r0.Rows) && i < len(r2.Rows); i++ {
-		a, b := fmt.Sprintf("%v", r0.Rows[i]), fmt.Sprintf("%v", r2.Rows[i])
+	r0, _ := rrRows(c, 0)
+	r2, _ := rrRows(c, 1)
+	for i := 0; i < len(r0) && i < len(r2); i++ {
+		a, b := fmt.Sprintf("%v", r0[i]), fmt.Sprintf("%v", r2[i])
 		if a != b {
 			t.Logf("divergence: first diff at row %d:\n  node1=%q\n  node2=%q", i, a, b)
 			break
@@ -173,14 +190,14 @@ func firstN(s []string, n int) []string {
 }
 
 // waitCounts waits until every node reports the exact row count.
-func waitCounts(t *testing.T, c *harness.Cluster, table string, want int, timeout time.Duration) {
+func waitCounts(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
 		ok := true
 		for idx := range c.Nodes {
-			n, err := c.QueryRowCount(idx, table)
-			if err != nil || n != want {
+			rows, err := rrRows(c, idx)
+			if err != nil || len(rows) != want {
 				ok = false
 				break
 			}
@@ -195,9 +212,18 @@ func waitCounts(t *testing.T, c *harness.Cluster, table string, want int, timeou
 	}
 }
 
+// rrCount returns the contention-table row count on one node.
+func rrCount(c *harness.Cluster, idx int) (int, error) {
+	rows, err := rrRows(c, idx)
+	if err != nil {
+		return 0, err
+	}
+	return len(rows), nil
+}
+
 // quiesce pauses all writers, waits for exact digest agreement, then
 // resumes. Callers must hold no pause themselves.
-func quiesce(t *testing.T, c *harness.Cluster, table string, paused *[3]atomic.Bool, timeout time.Duration) {
+func quiesce(t *testing.T, c *harness.Cluster, paused *[3]atomic.Bool, timeout time.Duration) {
 	t.Helper()
 	for i := range paused {
 		paused[i].Store(true)
@@ -206,11 +232,11 @@ func quiesce(t *testing.T, c *harness.Cluster, table string, paused *[3]atomic.B
 	time.Sleep(300 * time.Millisecond)
 	deadline := time.Now().Add(timeout)
 	for {
-		want, err := c.ComputeTableDigest(0, table, "id")
+		want, err := rrDigest(c, 0)
 		if err == nil {
 			match := true
 			for idx := 1; idx < len(c.Nodes); idx++ {
-				d, err := c.ComputeTableDigest(idx, table, "id")
+				d, err := rrDigest(c, idx)
 				if err != nil || d != want {
 					match = false
 					break
@@ -224,7 +250,7 @@ func quiesce(t *testing.T, c *harness.Cluster, table string, paused *[3]atomic.B
 			}
 		}
 		if time.Now().After(deadline) {
-			dumpIDDiff(t, c, table)
+			dumpIDDiff(t, c)
 			t.Fatalf("digests did not agree within %v", timeout)
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -233,11 +259,11 @@ func quiesce(t *testing.T, c *harness.Cluster, table string, paused *[3]atomic.B
 
 // waitConvergedCounts waits until all nodes agree on the same row count
 // (the absolute value floats while writers run).
-func waitConvergedCounts(t *testing.T, c *harness.Cluster, table string, timeout time.Duration) {
+func waitConvergedCounts(t *testing.T, c *harness.Cluster, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
-		first, err := c.QueryRowCount(0, table)
+		first, err := rrCount(c, 0)
 		if err != nil {
 			if time.Now().After(deadline) {
 				t.Fatalf("node1 count query: %v", err)
@@ -247,7 +273,7 @@ func waitConvergedCounts(t *testing.T, c *harness.Cluster, table string, timeout
 		}
 		agree := true
 		for idx := 1; idx < len(c.Nodes); idx++ {
-			n, err := c.QueryRowCount(idx, table)
+			n, err := rrCount(c, idx)
 			if err != nil || n != first {
 				agree = false
 				break
@@ -258,7 +284,7 @@ func waitConvergedCounts(t *testing.T, c *harness.Cluster, table string, timeout
 			time.Sleep(500 * time.Millisecond)
 			still := true
 			for idx := range c.Nodes {
-				n, err := c.QueryRowCount(idx, table)
+				n, err := rrCount(c, idx)
 				if err != nil || n != first {
 					still = false
 					break

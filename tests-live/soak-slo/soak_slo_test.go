@@ -6,18 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -39,14 +35,11 @@ func TestThreeNodeEncryptedSustainedWriteSLO(t *testing.T) {
 	duration := seconds(t, "MURMUR_SLO_DURATION_SECONDS", 5)
 	settle := seconds(t, "MURMUR_SLO_SETTLE_SECONDS", 30)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "soak-slo",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{Name: "slo_records", Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "source", Type: schema.ColText},
-			{Name: "value", Type: schema.ColText},
-		}}}},
+		Name:            "soak-slo",
+		NumNodes:        3,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 	for _, node := range cluster.Nodes {
 		t.Logf("%s pid=%d dir=%s repl=%s", node.Label, node.Process.Process.Pid, node.Dir, node.ReplAddr)
@@ -68,7 +61,7 @@ func TestThreeNodeEncryptedSustainedWriteSLO(t *testing.T) {
 				rowID := fmt.Sprintf("%032x", int64(i+1)*1_000_000_000_000+int64(seq)+1)
 				value := fmt.Sprintf("node-%d-write-%09d", i+1, seq)
 				started := time.Now()
-				err := cluster.ExecSQL(i, `INSERT INTO slo_records (id, source, value) VALUES (?, ?, ?)`, rowID, fmt.Sprintf("node-%d", i+1), value)
+				err := cluster.TypedContentionInsert(i, harness.TypedContentionRow{ID: rowID, Name: fmt.Sprintf("node-%d", i+1), Phone: value})
 				elapsed := time.Since(started)
 				latencyMu.Lock()
 				latencies = append(latencies, elapsed)
@@ -140,8 +133,8 @@ func TestThreeNodeEncryptedSustainedWriteSLO(t *testing.T) {
 		if metricValue(metrics, "spedsql_queued_need") > 5000 || metricValue(metrics, "spedsql_queued_ctrl") > 5000 {
 			t.Fatalf("%s exceeded queue SLO: need=%v control=%v", node.Label, metricValue(metrics, "spedsql_queued_need"), metricValue(metrics, "spedsql_queued_ctrl"))
 		}
-		if metricValue(metrics, "spedsql_pebble_size_bytes") > 512<<20 {
-			t.Fatalf("%s Pebble size %.0f exceeds 512 MiB SLO", node.Label, metricValue(metrics, "spedsql_pebble_size_bytes"))
+		if metricValue(metrics, "spedsql_spool_disk_bytes") > 512<<20 {
+			t.Fatalf("%s Spool size %.0f exceeds 512 MiB SLO", node.Label, metricValue(metrics, "spedsql_spool_disk_bytes"))
 		}
 	}
 
@@ -218,51 +211,32 @@ func scrapeMetrics(apiAddr string) (string, error) {
 }
 
 func metricValue(metrics, name string) float64 {
-	for _, line := range strings.Split(metrics, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 || !(fields[0] == name || strings.HasPrefix(fields[0], name+"{")) {
-			continue
-		}
-		value, err := strconv.ParseFloat(fields[1], 64)
-		if err == nil {
-			return value
-		}
+	if value, ok := harness.MetricValueFrom(metrics, name); ok {
+		return value
 	}
 	return -1
 }
 
 func rowCount(cluster *harness.Cluster, idx int) (int, error) {
-	res, err := cluster.QuerySQL(idx, `SELECT count(*) FROM slo_records`)
-	if err != nil || len(res.Rows) != 1 || len(res.Rows[0]) != 1 {
-		return 0, fmt.Errorf("query row count: %v (%v)", res, err)
-	}
-	count, err := strconv.ParseFloat(fmt.Sprint(res.Rows[0][0]), 64)
+	rows, err := cluster.TypedContentionRows(idx)
 	if err != nil {
 		return 0, err
 	}
-	if count < 0 || count > float64(maxInt()) || math.Trunc(count) != count {
-		return 0, fmt.Errorf("invalid integral row count %v", count)
-	}
-	return int(count), nil
+	return len(rows), nil
 }
 
-func maxInt() int { return int(^uint(0) >> 1) }
-
 func tableDigest(cluster *harness.Cluster, idx int) (string, error) {
-	res, err := cluster.QuerySQL(idx, `SELECT id, source, value FROM slo_records`)
+	rows, err := cluster.TypedContentionRows(idx)
 	if err != nil {
 		return "", err
 	}
-	rows := make([]string, 0, len(res.Rows))
-	for _, row := range res.Rows {
-		if len(row) != 3 {
-			return "", fmt.Errorf("malformed row: %v", row)
-		}
-		rows = append(rows, fmt.Sprintf("%q:%q:%q", fmt.Sprint(row[0]), fmt.Sprint(row[1]), fmt.Sprint(row[2])))
-	}
-	sort.Strings(rows)
-	h := sha256.New()
+	encoded := make([]string, 0, len(rows))
 	for _, row := range rows {
+		encoded = append(encoded, fmt.Sprintf("%q:%q:%q", row.ID, row.Name, row.Phone))
+	}
+	sort.Strings(encoded)
+	h := sha256.New()
+	for _, row := range encoded {
 		_, _ = fmt.Fprintln(h, row)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil

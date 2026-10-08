@@ -18,7 +18,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/marcgauthier/murmur/tests-live/harness"
@@ -243,14 +242,6 @@ func nodeConnectedPeers(apiAddr string) (int, error) {
 
 // --- disk pressure ---
 
-func dirFreeBytes(path string) (uint64, error) {
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(path, &st); err != nil {
-		return 0, err
-	}
-	return uint64(st.Bavail) * uint64(st.Bsize), nil
-}
-
 // writeFiller consumes mb megabytes at path with incompressible-ish bytes
 // (a counter stream compresses poorly enough at this scale to hold the
 // space against sparse-file optimization).
@@ -303,21 +294,8 @@ func scrapeMetrics(apiAddr string) (string, error) {
 // metricInt parses a counter that may appear bare (`name value`) or labeled
 // (`name{...} value`). It reports false when the series is absent.
 func metricInt(body, name string) (int64, bool) {
-	for _, line := range strings.Split(body, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-		head := fields[0]
-		if head != name && !strings.HasPrefix(head, name+"{") {
-			continue
-		}
-		if v, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
-			return v, true
-		}
-		if f, err := strconv.ParseFloat(fields[1], 64); err == nil {
-			return int64(f), true
-		}
+	if value, ok := harness.MetricValueFrom(body, name); ok {
+		return int64(value), true
 	}
 	return 0, false
 }

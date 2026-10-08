@@ -14,80 +14,63 @@ import (
 	"time"
 
 	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/ids"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
-func TestStorageKeyRekeySurvivesRestart(t *testing.T) {
+func TestTypedStorageKeyRekeySurvivesRestart(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:     "rekey",
-		NumNodes: 1,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{Name: "contacts", Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-			{Name: "phone", Type: schema.ColText, Nullable: true},
-			{Name: "score", Type: schema.ColInteger, Nullable: true},
-		}}}},
+		Name: "typed-rekey", NumNodes: 1, TypedRecords: true,
 	})
 	oldKeyHex := cluster.Nodes[0].KeyHex
-
-	for i := 0; i < 25; i++ {
-		id := ids.NewRowID()
-		if err := cluster.ExecSQL(0, `INSERT INTO contacts (id, name, phone, score) VALUES (?, ?, ?, ?)`,
-			hex.EncodeToString(id[:]), fmt.Sprintf("person-%02d", i), fmt.Sprintf("phone-%02d", i), i); err != nil {
-			t.Fatalf("insert row %d: %v", i, err)
-		}
+	if err := cluster.TypedInsert(0, "typed-before-rotate"); err != nil {
+		t.Fatalf("insert typed record: %v", err)
 	}
 
-	// Zero-downtime rotation: the running node rekeys and keeps serving.
 	newKey := make([]byte, 32)
 	if _, err := rand.Read(newKey); err != nil {
 		t.Fatal(err)
 	}
 	newKeyHex := hex.EncodeToString(newKey)
-	if err := cluster.RotateKey(0, "live-new-key", newKeyHex, string(db.AES256GCM)); err != nil {
-		t.Fatalf("rotate key: %v", err)
+	if err := cluster.RotateKey(0, "typed-new-key", newKeyHex, string(db.AES256GCM)); err != nil {
+		t.Fatalf("rotate typed database key: %v", err)
 	}
-	st, err := cluster.EncryptionStatus(0)
+	status, err := cluster.EncryptionStatus(0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := st["ApplicationKeyID"].(string); got != "live-new-key" {
-		t.Fatalf("active application key id = %q, want live-new-key", got)
+	if got, _ := status["ApplicationKeyID"].(string); got != "typed-new-key" {
+		t.Fatalf("active typed key ID = %q, want typed-new-key", got)
 	}
-	afterID := ids.NewRowID()
-	if err := cluster.ExecSQL(0, `INSERT INTO contacts (id, name) VALUES (?, ?)`,
-		hex.EncodeToString(afterID[:]), "after-rotate"); err != nil {
-		t.Fatalf("post-rotate write: %v", err)
+	if err := cluster.TypedInsert(0, "typed-after-rotate"); err != nil {
+		t.Fatalf("typed write after rotation: %v", err)
 	}
 
-	// Restart on the new key: state intact, new writes accepted.
 	cluster.StopNode(0)
-	rewriteKeyConfig(t, cluster, "live-new-key", newKeyHex)
+	rewriteKeyConfig(t, cluster, "typed-new-key", newKeyHex)
 	cluster.StartNode(0)
 	cluster.WaitNodeReady(0)
-	if n := rowCount(t, cluster); n != 26 {
-		t.Fatalf("reopened row count = %d, want 26", n)
-	}
-	res, err := cluster.QuerySQL(0, `SELECT phone FROM contacts WHERE name = ?`, "person-17")
-	if err != nil || len(res.Rows) != 1 {
-		t.Fatalf("reopened query: %+v %v", res, err)
-	}
-	if phone, _ := res.Rows[0][0].(string); phone != "phone-17" {
-		t.Fatalf("reopened row phone = %q", phone)
-	}
-	postID := ids.NewRowID()
-	if err := cluster.ExecSQL(0, `INSERT INTO contacts (id, name) VALUES (?, ?)`,
-		hex.EncodeToString(postID[:]), "after-rekey"); err != nil {
-		t.Fatalf("post-rekey write: %v", err)
-	}
+	waitTypedRecordCount(t, cluster, "typed-before-rotate", 1)
+	waitTypedRecordCount(t, cluster, "typed-after-rotate", 1)
 
-	// The retired key no longer unlocks the database.
+	// The pre-rotation key no longer opens the typed Spool after rotation.
 	cluster.StopNode(0)
 	rewriteKeyConfig(t, cluster, "live-old-key", oldKeyHex)
 	cluster.StartNode(0)
 	assertNeverReady(t, cluster, 0, 8*time.Second)
+}
+
+func waitTypedRecordCount(t *testing.T, cluster *harness.Cluster, name string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err := cluster.TypedCount(0, name)
+		if err == nil && got == want {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	got, err := cluster.TypedCount(0, name)
+	t.Fatalf("typed count for %q = %d, %v; want %d", name, got, err, want)
 }
 
 // TestRekeyAwaitUnlockRestartsWithKeyID pins the rotate-then-restart
@@ -96,19 +79,14 @@ func TestStorageKeyRekeySurvivesRestart(t *testing.T) {
 // together. Unlocking with the new material but no ID 401s.
 func TestRekeyAwaitUnlockRestartsWithKeyID(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "rekey-unlock-id",
-		NumNodes:    1,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{Name: "contacts", Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-		}}}},
+		Name:         "rekey-unlock-id",
+		NumNodes:     1,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 	cluster.UnlockNode(0, cluster.Nodes[0].KeyHex)
 	cluster.WaitNodeReady(0)
-	id := ids.NewRowID()
-	if err := cluster.ExecSQL(0, `INSERT INTO contacts (id, name) VALUES (?, ?)`,
-		hex.EncodeToString(id[:]), "pre-rotate"); err != nil {
+	if err := cluster.TypedInsert(0, "pre-rotate"); err != nil {
 		t.Fatalf("pre-rotate write: %v", err)
 	}
 	newKey := make([]byte, 32)
@@ -126,24 +104,12 @@ func TestRekeyAwaitUnlockRestartsWithKeyID(t *testing.T) {
 	cluster.StartNode(0)
 	cluster.UnlockNodeWithKeyID(0, "live-new-key", newKeyHex)
 	cluster.WaitNodeReady(0)
-	if n := rowCount(t, cluster); n != 1 {
-		t.Fatalf("reopened row count = %d, want 1", n)
+	if n, err := cluster.TypedCount(0, "pre-rotate"); err != nil || n != 1 {
+		t.Fatalf("reopened typed row count = %d, %v; want 1", n, err)
 	}
-	postID := ids.NewRowID()
-	if err := cluster.ExecSQL(0, `INSERT INTO contacts (id, name) VALUES (?, ?)`,
-		hex.EncodeToString(postID[:]), "post-restart"); err != nil {
+	if err := cluster.TypedInsert(0, "post-restart"); err != nil {
 		t.Fatalf("post-restart write: %v", err)
 	}
-}
-
-func rowCount(t *testing.T, cluster *harness.Cluster) int {
-	t.Helper()
-	res, err := cluster.QuerySQL(0, `SELECT count(*) FROM contacts`)
-	if err != nil || len(res.Rows) != 1 {
-		t.Fatalf("row count: %+v %v", res, err)
-	}
-	count, _ := res.Rows[0][0].(float64)
-	return int(count)
 }
 
 func rewriteKeyConfig(t *testing.T, cluster *harness.Cluster, keyID, keyHex string) {

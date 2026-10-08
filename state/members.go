@@ -3,8 +3,6 @@ package state
 import (
 	"fmt"
 
-	"github.com/cockroachdb/pebble/v2"
-
 	"github.com/marcgauthier/murmur/ids"
 )
 
@@ -112,14 +110,13 @@ func (s *Store) isPeerExcludedLocked(key []byte) (bool, error) {
 	if err := s.failedErr(); err != nil {
 		return false, err
 	}
-	_, closer, err := s.db.Get(key)
+	_, err := s.mem.get(key)
 	if err != nil {
 		if isNotFound(err) {
 			return false, nil
 		}
 		return false, err
 	}
-	_ = closer.Close()
 	return true, nil
 }
 
@@ -147,12 +144,12 @@ func (s *Store) EnsureMemberAdmitted(node ids.NodeID, nowMillis int64, retention
 	if !isNotFound(err) {
 		return false, err
 	}
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
-	if err := b.Set(MemberKey(node), encodeMemberRecord(MemberActive, nowMillis, 0, nowMillis+retentionMillis), nil); err != nil {
+	if err := b.Set(MemberKey(node), encodeMemberRecord(MemberActive, nowMillis, 0, nowMillis+retentionMillis)); err != nil {
 		return false, err
 	}
-	if err := s.commitBatch(b, s.writeOpts); err != nil {
+	if err := s.commitBatch(b, s.syncCommits); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -184,27 +181,27 @@ func (s *Store) AdvanceMemberAck(node, origin ids.NodeID, seq uint64, nowMillis 
 	if err != nil && !isNotFound(err) {
 		return false, err
 	}
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
-	if err := b.Set(PeerAckKey(node, origin), encodeU64(seq), nil); err != nil {
+	if err := b.Set(PeerAckKey(node, origin), encodeU64(seq)); err != nil {
 		return false, err
 	}
 	if isNotFound(err) {
 		// Legacy durable progress without an admission record: admit
 		// now so the obligation is explicit and restart-stable.
-		if err := b.Set(MemberKey(node), encodeMemberRecord(MemberActive, nowMillis, nowMillis, nowMillis+retentionMillis), nil); err != nil {
+		if err := b.Set(MemberKey(node), encodeMemberRecord(MemberActive, nowMillis, nowMillis, nowMillis+retentionMillis)); err != nil {
 			return false, err
 		}
 	} else if status, admitted, _, _, derr := decodeMemberRecord(mraw); derr != nil {
 		return false, derr
 	} else if status == MemberActive {
-		if err := b.Set(MemberKey(node), encodeMemberRecord(MemberActive, admitted, nowMillis, nowMillis+retentionMillis), nil); err != nil {
+		if err := b.Set(MemberKey(node), encodeMemberRecord(MemberActive, admitted, nowMillis, nowMillis+retentionMillis)); err != nil {
 			return false, err
 		}
 	}
 	// Retired records keep their timestamps: progress on a retired member
 	// (a racing acknowledgement) must not resurrect its obligation.
-	if err := s.commitBatch(b, s.writeOpts); err != nil {
+	if err := s.commitBatch(b, s.syncCommits); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -228,12 +225,12 @@ func (s *Store) RetireMember(node ids.NodeID) error {
 	} else if !isNotFound(err) {
 		return err
 	}
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
-	if err := b.Set(MemberKey(node), encodeMemberRecord(MemberRetired, admitted, progress, deadline), nil); err != nil {
+	if err := b.Set(MemberKey(node), encodeMemberRecord(MemberRetired, admitted, progress, deadline)); err != nil {
 		return err
 	}
-	return s.commitBatch(b, pebble.Sync)
+	return s.commitBatch(b, true)
 }
 
 // ReadmitMember deletes the admission record so the next successful
@@ -244,12 +241,12 @@ func (s *Store) ReadmitMember(node ids.NodeID) error {
 	defer s.gate.RUnlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
-	if err := b.Delete(MemberKey(node), nil); err != nil {
+	if err := b.Delete(MemberKey(node)); err != nil {
 		return err
 	}
-	return s.commitBatch(b, pebble.Sync)
+	return s.commitBatch(b, true)
 }
 
 // ListMembers returns every admission record merged with the persistent
@@ -263,7 +260,7 @@ func (s *Store) ListMembers() ([]MemberRecord, error) {
 	}
 	byID := make(map[ids.NodeID]*MemberRecord)
 	collect := func(prefix []byte, parse func(k []byte) (ids.NodeID, bool)) error {
-		iter, err := s.db.NewIter(&pebble.IterOptions{
+		iter, err := s.mem.newIter(&iterOptions{
 			LowerBound: prefix,
 			UpperBound: prefixEnd(prefix),
 		})
@@ -319,7 +316,7 @@ func (s *Store) PeersWithAcks() ([]ids.NodeID, error) {
 		return nil, err
 	}
 	prefix := PeerAckPrefix()
-	iter, err := s.db.NewIter(&pebble.IterOptions{
+	iter, err := s.mem.newIter(&iterOptions{
 		LowerBound: prefix,
 		UpperBound: prefixEnd(prefix),
 	})

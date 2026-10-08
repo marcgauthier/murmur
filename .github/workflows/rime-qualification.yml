@@ -1,0 +1,57 @@
+name: RIME qualification
+on:
+  push:
+    branches: [main]
+    paths: ['rime/**', 'internal/rimequal/**', 'tests-live/rime/**', 'tests-benchmark/rime-sqlite/**', '.github/workflows/rime-qualification.yml', 'go.mod']
+  pull_request:
+    paths: ['rime/**', 'internal/rimequal/**', 'tests-live/rime/**', 'tests-benchmark/rime-sqlite/**', '.github/workflows/rime-qualification.yml', 'go.mod']
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+jobs:
+  correctness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - name: Full RIME suite with race detection
+        run: go test -race ./rime -timeout=5m
+      - name: Four-writer SQLite comparison correctness smoke
+        working-directory: tests-benchmark/rime-sqlite
+        run: RIME_BENCH_ROWS=1000 go test -race -run '^TestCompareRimeVsSQLiteConcurrent$' -count=1 -timeout=3m .
+      - name: Repeat deterministic concurrency regressions
+        run: go test -race ./rime -run '^TestQualification(CommitPublication|SnapshotRegistrationDuringGC|StaleWriter|CommitFailures|UniqueReuse|GeneratedIDs|Lifecycle|CacheBound)$' -cpu=1,2,8 -count=100 -timeout=10m
+      - name: Vet the engine and live harness
+        run: go vet ./rime ./internal/rimequal ./tests-live/rime
+  nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: correctness
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - name: Record environment
+        run: |
+          mkdir -p rime-results
+          go version > rime-results/environment.txt
+          git rev-parse HEAD >> rime-results/environment.txt
+          lscpu >> rime-results/environment.txt
+      - name: Fuzz query and transaction reference models
+        run: |
+          go test ./rime -run '^$' -fuzz '^FuzzQueryModel$' -fuzztime=10m -parallel=2 -timeout=15m
+          go test ./rime -run '^$' -fuzz '^FuzzTransactionModel$' -fuzztime=10m -parallel=2 -timeout=15m
+      - name: Thirty-minute concurrent live qualification
+        run: go run -race ./tests-live/rime -duration=30m -rows=1000 -readers=4 -writers=4 -seed=127 -sample-interval=10s > rime-results/live.jsonl
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rime-qualification
+          path: |
+            rime-results/
+            rime/testdata/fuzz/

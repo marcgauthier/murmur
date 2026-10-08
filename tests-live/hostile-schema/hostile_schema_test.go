@@ -7,16 +7,17 @@
 package hostileschema_test
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/replication"
 	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
@@ -24,24 +25,18 @@ import (
 
 func TestHostileSchemaManifestsQuarantined(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "hostile-schema",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "schema_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:         "hostile-schema",
+		NumNodes:     3,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 	target := 0 // attacker aims at node1
 
 	// Positive control (pre-attack): the honest 3-mesh converges.
-	if err := cluster.ExecSQL(0, "INSERT INTO schema_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 1), "baseline"); err != nil {
+	if err := cluster.TypedInsert(0, "baseline"); err != nil {
 		t.Fatalf("baseline insert: %v", err)
 	}
-	waitConverged(t, cluster, "schema_rows", 1, 30*time.Second)
+	waitConverged(t, cluster, 1, 30*time.Second)
 
 	api := cluster.Nodes[target].APIAddr
 	baseReplConflicts := metricValue(t, api, "spedsql_repl_schema_conflicts_total")
@@ -156,25 +151,25 @@ func TestHostileSchemaManifestsQuarantined(t *testing.T) {
 
 	// --- Positive control (post-attack): no crash, no stall. The attacked
 	// node and the honest pair all keep replicating and converge.
-	if err := cluster.ExecSQL(1, "INSERT INTO schema_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 2), "post-attack-1"); err != nil {
+	if err := cluster.TypedInsert(1, "post-attack-1"); err != nil {
 		t.Fatalf("post-attack insert node2: %v", err)
 	}
-	waitConverged(t, cluster, "schema_rows", 2, 30*time.Second)
-	if err := cluster.ExecSQL(2, "INSERT INTO schema_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 3), "post-attack-2"); err != nil {
+	waitConverged(t, cluster, 2, 30*time.Second)
+	if err := cluster.TypedInsert(2, "post-attack-2"); err != nil {
 		t.Fatalf("post-attack insert node3: %v", err)
 	}
-	waitConverged(t, cluster, "schema_rows", 3, 30*time.Second)
+	waitConverged(t, cluster, 3, 30*time.Second)
 	// The attacked node itself writes and the write replicates everywhere.
-	if err := cluster.ExecSQL(0, "INSERT INTO schema_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 4), "attacked-node-write"); err != nil {
+	if err := cluster.TypedInsert(0, "attacked-node-write"); err != nil {
 		t.Fatalf("attacked-node insert: %v", err)
 	}
-	waitConverged(t, cluster, "schema_rows", 4, 30*time.Second)
+	waitConverged(t, cluster, 4, 30*time.Second)
 	// Explicit honest-pair check: nodes 2 and 3 agree bit-for-bit.
-	d1, err := cluster.ComputeTableDigest(1, "schema_rows", "id")
+	d1, err := typedDigest(cluster, 1)
 	if err != nil {
 		t.Fatalf("honest-pair digest node2: %v", err)
 	}
-	d2, err := cluster.ComputeTableDigest(2, "schema_rows", "id")
+	d2, err := typedDigest(cluster, 2)
 	if err != nil {
 		t.Fatalf("honest-pair digest node3: %v", err)
 	}
@@ -225,23 +220,19 @@ func frameSummary(frames []*replication.Frame) string {
 	return strings.Join(parts, ",")
 }
 
-func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, timeout time.Duration) {
+func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, table)
-			if err != nil || n != want {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, table, "id")
-			if err != nil {
-				ok = false
-				break
-			}
+			d := digestNames(names)
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -255,11 +246,24 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 		time.Sleep(200 * time.Millisecond)
 	}
 	for i := range c.Nodes {
-		n, nerr := c.QueryRowCount(i, table)
-		d, derr := c.ComputeTableDigest(i, table, "id")
-		t.Logf("node %d at timeout: count=%d countErr=%v digest=%s digestErr=%v", i, n, nerr, d, derr)
+		names, err := c.TypedNames(i)
+		t.Logf("node %d at timeout: count=%d readErr=%v digest=%s", i, len(names), err, digestNames(names))
 	}
-	t.Fatalf("nodes did not converge on %d %s rows with equal digests within %v", want, table, timeout)
+	t.Fatalf("nodes did not converge on %d typed records with equal digests within %v", want, timeout)
+}
+
+func typedDigest(c *harness.Cluster, idx int) (string, error) {
+	names, err := c.TypedNames(idx)
+	if err != nil {
+		return "", err
+	}
+	return digestNames(names), nil
+}
+
+func digestNames(names []string) string {
+	sort.Strings(names)
+	h := sha256.Sum256([]byte(strings.Join(names, "\n")))
+	return hex.EncodeToString(h[:])
 }
 
 func metricValue(t *testing.T, apiAddr, name string) float64 {
@@ -273,22 +277,8 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line == "" || line[0] == '#' {
-			continue
-		}
-		if !strings.HasPrefix(line, name) {
-			continue
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(line, name))
-		if i := strings.LastIndex(rest, " "); i >= 0 {
-			rest = rest[i+1:]
-		}
-		v, err := strconv.ParseFloat(rest, 64)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		return v
+	if value, ok := harness.MetricValueFrom(string(raw), name); ok {
+		return value
 	}
 	t.Fatalf("counter %s not present in /metrics", name)
 	return 0

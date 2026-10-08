@@ -9,7 +9,7 @@ import (
 	"math"
 )
 
-// ValueType preserves SQLite type semantics across the wire.
+// ValueType identifies the scalar type stored in a replicated cell.
 type ValueType byte
 
 const (
@@ -55,39 +55,7 @@ func Real(v float64) Value { return Value{Type: TypeReal, F: v} }
 func Text(v string) Value  { return Value{Type: TypeText, S: v} }
 func Blob(v []byte) Value  { return Value{Type: TypeBlob, B: v} }
 
-// FromAny converts driver-level values (as returned by database/sql and the
-// pre-update hook) into a Value.
-func FromAny(v any) (Value, error) {
-	switch t := v.(type) {
-	case nil:
-		return Null(), nil
-	case int64:
-		return Int(t), nil
-	case int:
-		return Int(int64(t)), nil
-	case int32:
-		return Int(int64(t)), nil
-	case float64:
-		return Real(t), nil
-	case float32:
-		return Real(float64(t)), nil
-	case string:
-		return Text(t), nil
-	case []byte:
-		cp := make([]byte, len(t))
-		copy(cp, t)
-		return Blob(cp), nil
-	case bool:
-		if t {
-			return Int(1), nil
-		}
-		return Int(0), nil
-	default:
-		return Value{}, fmt.Errorf("codec: unsupported value type %T", v)
-	}
-}
-
-// ToAny converts back to a driver-level value.
+// ToAny returns the Go scalar represented by the cell.
 func (v Value) ToAny() any {
 	switch v.Type {
 	case TypeNull:
@@ -105,7 +73,7 @@ func (v Value) ToAny() any {
 	}
 }
 
-// Equal reports SQLite-semantic equality (BLOB compared by bytes).
+// Equal reports value equality, comparing byte slices by contents.
 func (v Value) Equal(o Value) bool {
 	if v.Type != o.Type {
 		return false

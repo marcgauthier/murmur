@@ -88,7 +88,7 @@ func FuzzBatchesMessage(f *testing.F) {
 }
 
 // FuzzSnapshotChunkMessage decodes arbitrary snapshot-chunk payloads,
-// including the zstd flag path (decompression is size-bounded).
+// including the compression flag path (decompression is size-bounded).
 func FuzzSnapshotChunkMessage(f *testing.F) {
 	c := &SnapshotChunk{Last: true, Cells: []codec.SnapshotCell{{Value: codec.Int(1)}}}
 	f.Add(EncodeSnapshotChunk(nil, c))

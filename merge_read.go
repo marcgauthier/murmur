@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-// ColumnMergePolicy describes a replicated column without relying on SQLite DDL.
+// ColumnMergePolicy returns the merge policy for a replicated schema field.
 func (db *DB) ColumnMergePolicy(table, column string) (schema.MergePolicy, error) {
 	r := db.schemaRegistry()
 	if r != nil {

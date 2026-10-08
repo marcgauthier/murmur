@@ -1,6 +1,7 @@
 # Certificate expiry rejects, rotation heals
 
-Run with `go test -count=1 ./tests-live/cert-lifecycle`. A node's
+Run with `bash tests-live/run.sh cert-lifecycle`. The fixture uses typed
+records and runs with CGO disabled. A node's
 certificate is swapped for a short-expiry cert
 (`MURMUR_CERT_LIFECYCLE_TTL_S`, default 25) minted for the same
 NodeID; the mesh must stay connected pre-expiry. After NotAfter

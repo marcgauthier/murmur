@@ -1,6 +1,7 @@
 # Log-GC maintenance under sustained load
 
-Run with `go test -count=1 ./tests-live/maintenance-under-load`.
+Run with `CGO_ENABLED=0 bash tests-live/run.sh maintenance-under-load`. The
+scenario uses managed typed records without SQLite or CGO.
 Three nodes take sustained concurrent writes
 (`MURMUR_MAINT_LOAD_SEED`, `MURMUR_MAINT_LOAD_MAX_INSERTS`) with
 zero failed writes allowed while tight retention forces origin-log

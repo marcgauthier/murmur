@@ -17,45 +17,22 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
-
-func baseTables() []schema.TableSchema {
-	return []schema.TableSchema{{
-		Name: "mg_rows",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-		},
-	}}
-}
-
-func evolvedTables() []schema.TableSchema {
-	return []schema.TableSchema{{
-		Name: "mg_rows",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-			{Name: "score", Type: schema.ColInteger, Nullable: true},
-		},
-	}}
-}
 
 func TestSimultaneousMigrationConverges(t *testing.T) {
 	seedRows := envInt("MURMUR_MIGRATION_CONCURRENCY_SEED", 60)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "migration-concurrency",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		Schema:      &db.SchemaConfig{Version: 1, Tables: baseTables()},
+		Name:         "migration-concurrency",
+		NumNodes:     3,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 
 	// Honest baseline: all old, seed converged everywhere.
 	for i := 0; i < seedRows; i++ {
-		id := fmt.Sprintf("%032x", 9000+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO mg_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("seed-%d", i)); err != nil {
+		if err := cluster.TypedInsertWithID(0, ids.NewRowID(), fmt.Sprintf("seed-%d", i)); err != nil {
 			t.Fatalf("seed write: %v", err)
 		}
 	}
@@ -94,8 +71,7 @@ func TestSimultaneousMigrationConverges(t *testing.T) {
 				}
 				seq := seqs[node].Add(1)
 				name := fmt.Sprintf("flow-n%d-%08d", node+1, seq)
-				id := fmt.Sprintf("ff%02x%028x", node, seq)
-				if err := cluster.ExecSQL(node, "INSERT INTO mg_rows (id, name) VALUES (?, ?)", id, name); err == nil {
+				if err := cluster.TypedInsertWithID(node, ids.NewRowID(), name); err == nil {
 					ackMu.Lock()
 					acked[name] = struct{}{}
 					ackMu.Unlock()
@@ -116,7 +92,7 @@ func TestSimultaneousMigrationConverges(t *testing.T) {
 	for _, idx := range []int{1, 2} {
 		go func(idx int) {
 			<-start
-			results <- migrateResult{idx, cluster.Migrate(idx, evolvedTables())}
+			results <- migrateResult{idx, cluster.MigrateTypedRecords(idx)}
 		}(idx)
 	}
 	close(start)
@@ -151,7 +127,7 @@ func TestSimultaneousMigrationConverges(t *testing.T) {
 	t.Logf("simultaneous trigger: %d/2 nodes new; sequentially migrating laggards", newCount)
 	for _, idx := range []int{1, 2} {
 		if statusEpoch(t, cluster.Nodes[idx].APIAddr) != 2 {
-			if err := cluster.Migrate(idx, evolvedTables()); err != nil {
+			if err := cluster.MigrateTypedRecords(idx); err != nil {
 				t.Fatalf("honest migrate node%d: %v", idx+1, err)
 			}
 		}
@@ -179,24 +155,21 @@ func TestSimultaneousMigrationConverges(t *testing.T) {
 	// proves continued flow plus score replication.
 	assertEpoch(t, cluster, 1, 2)
 	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("%032x", 9000+i)
-		if err := cluster.ExecSQL(1, "UPDATE mg_rows SET score=? WHERE id=?", int64(100+i), id); err != nil {
+		if err := cluster.TypedSetNote(1, fmt.Sprintf("seed-%d", i), fmt.Sprintf("%d", 100+i)); err != nil {
 			t.Fatalf("score write: %v", err)
 		}
 	}
-	if err := cluster.ExecSQL(0, "INSERT INTO mg_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 20001), "post-race"); err != nil {
+	if err := cluster.TypedInsertWithID(0, ids.NewRowID(), "post-race"); err != nil {
 		t.Fatalf("post-race write: %v", err)
 	}
 	waitNamesConverged(t, cluster, total+1, 90*time.Second)
 
 	// Migrate the third (unless it already auto-adopted), then full
 	// convergence: exact counts, PK-ordered digests, epoch 2 everywhere.
-	if statusEpoch(t, cluster.Nodes[0].APIAddr) != 2 {
-		if err := cluster.Migrate(0, evolvedTables()); err != nil {
-			t.Fatalf("honest migrate node1: %v", err)
+	for i := range cluster.Nodes {
+		if err := cluster.MigrateTypedRecords(i); err != nil {
+			t.Fatalf("bind migrated record schema on node%d: %v", i+1, err)
 		}
-	} else {
-		t.Log("node1 auto-adopted the revision after healing; explicit migrate unneeded")
 	}
 	waitFullConverged(t, cluster, total+1, 90*time.Second)
 	for i := 0; i < 3; i++ {
@@ -204,8 +177,8 @@ func TestSimultaneousMigrationConverges(t *testing.T) {
 	}
 	// Materialized-query check: the new column reads identically everywhere.
 	for i := 0; i < 3; i++ {
-		assertScore(t, cluster, i, fmt.Sprintf("%032x", 9000), 100)
-		assertScore(t, cluster, i, fmt.Sprintf("%032x", 9004), 104)
+		assertNote(t, cluster, i, "seed-0", "100")
+		assertNote(t, cluster, i, "seed-4", "104")
 	}
 	t.Log("migration concurrency proven: simultaneous trigger, defined states, full convergence")
 }
@@ -219,20 +192,20 @@ func classifyNode(t *testing.T, c *harness.Cluster, idx int) {
 	if epoch != 1 && epoch != 2 {
 		t.Fatalf("node%d epoch = %d, want exactly 1 or 2 (mixed state)", idx+1, epoch)
 	}
-	_, scoreErr := c.QuerySQL(idx, "SELECT score FROM mg_rows LIMIT 1")
-	if epoch == 1 && scoreErr == nil {
-		t.Fatalf("node%d epoch 1 yet exposes score (mixed state)", idx+1)
+	_, noteErr := c.TypedNote(idx, "seed-0")
+	if epoch == 1 && noteErr == nil {
+		t.Fatalf("node%d epoch 1 yet exposes Note (mixed state)", idx+1)
 	}
-	if epoch == 2 && scoreErr != nil {
-		t.Fatalf("node%d epoch 2 yet hides score (mixed state): %v", idx+1, scoreErr)
+	if epoch == 2 && noteErr != nil {
+		t.Fatalf("node%d epoch 2 yet hides Note (mixed state): %v", idx+1, noteErr)
 	}
-	n, err := c.QueryRowCount(idx, "mg_rows")
+	names, err := c.TypedNames(idx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// No exact count here: in-window rows may still be converging.
 	// waitNamesConverged below proves exact totals everywhere.
-	t.Logf("node%d classified: epoch=%d rows=%d (converging)", idx+1, epoch, n)
+	t.Logf("node%d classified: epoch=%d rows=%d (converging)", idx+1, epoch, len(names))
 }
 
 func assertEpoch(t *testing.T, c *harness.Cluster, idx int, want uint64) {
@@ -265,34 +238,36 @@ func waitNamesConverged(t *testing.T, c *harness.Cluster, want int, timeout time
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
-		counts := map[string]int{}
+		var first []string
 		for i := range c.Nodes {
-			res, err := c.QuerySQL(i, "SELECT name FROM mg_rows ORDER BY name")
-			if err != nil || len(res.Rows) != want {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
-			key := fmt.Sprintf("%v", res.Rows)
-			counts[key]++
+			if i == 0 {
+				first = names
+			} else if !equalNames(first, names) {
+				ok = false
+				break
+			}
 		}
-		if ok && len(counts) == 1 {
+		if ok {
 			return
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	sets := make([]map[string]bool, len(c.Nodes))
 	for i := range c.Nodes {
-		res, err := c.QuerySQL(i, "SELECT name FROM mg_rows ORDER BY name")
+		names, err := c.TypedNames(i)
 		if err != nil {
-			t.Logf("node %d at timeout: query err=%v", i+1, err)
+			t.Logf("node %d at timeout: typed names err=%v", i+1, err)
 			continue
 		}
-		t.Logf("node %d at timeout: names=%d", i+1, len(res.Rows))
-		sets[i] = make(map[string]bool, len(res.Rows))
-		for _, r := range res.Rows {
-			if s, _ := r[0].(string); s != "" {
-				sets[i][s] = true
-			}
+		t.Logf("node %d at timeout: names=%d", i+1, len(names))
+		sets[i] = make(map[string]bool, len(names))
+		for _, name := range names {
+			sets[i][name] = true
 		}
 	}
 	union := map[string]bool{}
@@ -326,16 +301,12 @@ func waitFullConverged(t *testing.T, c *harness.Cluster, want int, timeout time.
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "mg_rows")
-			if err != nil || n != want {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, "mg_rows", "id")
-			if err != nil {
-				ok = false
-				break
-			}
+			d := digestNames(names)
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -349,24 +320,33 @@ func waitFullConverged(t *testing.T, c *harness.Cluster, want int, timeout time.
 		time.Sleep(200 * time.Millisecond)
 	}
 	for i := range c.Nodes {
-		n, _ := c.QueryRowCount(i, "mg_rows")
-		d, _ := c.ComputeTableDigest(i, "mg_rows", "id")
-		t.Logf("node %d at timeout: count=%d digest=%s", i, n, d)
+		names, _ := c.TypedNames(i)
+		t.Logf("node %d at timeout: count=%d digest=%s", i, len(names), digestNames(names))
 	}
 	t.Fatalf("nodes did not fully converge on %d rows within %v", want, timeout)
 }
 
-func assertScore(t *testing.T, c *harness.Cluster, idx int, idHex string, want int64) {
+func assertNote(t *testing.T, c *harness.Cluster, idx int, name, want string) {
 	t.Helper()
-	res, err := c.QuerySQL(idx, "SELECT score FROM mg_rows WHERE id=?", idHex)
-	if err != nil || len(res.Rows) != 1 {
-		t.Fatalf("node %d score read: %+v %v", idx, res, err)
-	}
-	got, _ := res.Rows[0][0].(float64)
-	if int64(got) != want {
-		t.Fatalf("node %d score = %v, want %d", idx, got, want)
+	got, err := c.TypedNote(idx, name)
+	if err != nil || got != want {
+		t.Fatalf("node %d Note(%q) = %q (err=%v), want %q", idx, name, got, err, want)
 	}
 }
+
+func equalNames(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func digestNames(names []string) string { return fmt.Sprintf("%q", names) }
 
 func envInt(name string, fallback int) int {
 	if v, err := strconv.Atoi(harness.GetEnv(name)); err == nil && v > 0 {

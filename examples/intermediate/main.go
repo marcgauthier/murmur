@@ -1,59 +1,27 @@
-// Command intermediate shows one encrypted node with explicit cipher
-// options, a local-only secondary index, an explicit multi-statement
-// transaction, and close/reopen durability: rows written before Close
-// are still there after Open.
+// Command intermediate shows an encrypted typed table with a local secondary
+// index, an atomic batch transaction, and close/reopen durability.
 //
-// Run it:
+// Run it with:
 //
-//	go run -tags "sqlite_preupdate_hook sqlite_fts5" ./examples/intermediate
+//	go run ./examples/intermediate
 package main
 
 import (
 	"context"
 	"fmt"
-	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 	"time"
 
 	"github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
+	"github.com/marcgauthier/murmur/ids"
 )
 
-func openNode(ctx context.Context, dir string, nodeID murmur.NodeID) *murmur.DB {
-	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
-		Path: dir,
-		// The NodeID must be stable across restarts: the data
-		// directory is bound to the identity that created it.
-		NodeID: nodeID,
-		Schema: murmur.SchemaConfig{
-			Version: 1,
-			Tables: []schema.TableSchema{{
-				Name: "orders",
-				Columns: []schema.ColumnSchema{
-					{Name: "id", Type: schema.ColBlob},
-					{Name: "sku", Type: schema.ColText, Nullable: true},
-					{Name: "qty", Type: schema.ColInteger, Nullable: true},
-				},
-			}},
-			// LocalDDL objects live only on this node: they are
-			// re-applied after every open and never replicated.
-			LocalDDL: []string{
-				`CREATE INDEX IF NOT EXISTS idx_orders_sku ON orders(sku)`,
-			},
-		},
-		Pebble: murmur.DefaultPebbleConfig(),
-		Encryption: murmur.EncryptionConfig{
-			Algorithm:       murmur.AES256GCM,
-			Key:             []byte("0123456789abcdef0123456789abcdef"),
-			KeyID:           "intermediate-key",
-			DataKeyRotation: 24 * time.Hour,
-		},
-	}))
-	if err != nil {
-		log.Fatal(err)
-	}
-	return db
+type order struct {
+	ID  ids.RowID `rime:"primary"`
+	SKU string    `rime:"index"`
+	Qty int
 }
 
 func main() {
@@ -65,30 +33,46 @@ func main() {
 	defer os.RemoveAll(dir)
 
 	nodeID := murmur.NewNodeID()
-	db := openNode(ctx, dir, nodeID)
-
-	// One explicit transaction with many statements commits atomically.
-	tx, err := db.BeginTx(ctx, nil)
+	definition, err := murmur.Define[order]("orders", 2, murmur.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "SKU": 2, "Qty": 3},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	for i := 0; i < 100; i++ {
-		id := murmur.NewRowID()
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO orders (id, sku, qty) VALUES (?, ?, ?)`,
-			id[:], fmt.Sprintf("sku-%03d", i%10), i); err != nil {
-			_ = tx.Rollback()
+	openNode := func() *murmur.DB {
+		db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
+			Path: dir, NodeID: nodeID,
+			Schema: murmur.SchemaConfig{Version: 1},
+			Tables: []murmur.TableDefinition{definition},
+			Spool:  murmur.DefaultSpoolConfig(),
+			Encryption: murmur.EncryptionConfig{
+				Algorithm: murmur.AES256GCM, Key: []byte("0123456789abcdef0123456789abcdef"),
+				KeyID: "intermediate-key", DataKeyRotation: 24 * time.Hour,
+			},
+		}))
+		if err != nil {
 			log.Fatal(err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		log.Fatal(err)
+		return db
 	}
 
-	// The local index serves this lookup; it costs zero replication.
-	var n int
-	if err := db.QueryRowContext(ctx,
-		`SELECT count(*) FROM orders WHERE sku = ?`, "sku-003").Scan(&n); err != nil {
+	db := openNode()
+	orders, err := murmur.TableOf[order](db, "orders")
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+		batch := make([]*order, 100)
+		for i := range batch {
+			batch[i] = &order{ID: murmur.NewRowID(), SKU: fmt.Sprintf("sku-%03d", i%10), Qty: i}
+		}
+		return orders.InsertMany(tx, batch)
+	}); err != nil {
+		log.Fatal(err)
+	}
+	n, err := orders.Where(murmur.FieldOf[order, string](orders, "SKU").Eq("sku-003")).Count()
+	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("rows with sku-003: %d\n", n)
@@ -96,12 +80,14 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Reopen the same directory with the same NodeID: the 100 rows
-	// must survive the restart.
-	db = openNode(ctx, dir, nodeID)
+	db = openNode()
 	defer db.Close()
-	if err := db.QueryRowContext(ctx,
-		`SELECT count(*) FROM orders`).Scan(&n); err != nil {
+	orders, err = murmur.TableOf[order](db, "orders")
+	if err != nil {
+		log.Fatal(err)
+	}
+	n, err = orders.Where().Count()
+	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("rows after reopen: %d\n", n)

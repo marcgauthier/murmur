@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/internal/recordcodec"
 )
 
 // Manifest is one immutable schema revision.
@@ -76,8 +77,11 @@ func EncodeManifest(m *Manifest) []byte {
 		return bytes.Compare(parents[i][:], parents[j][:]) < 0
 	})
 	var dst []byte
-	policyEncoding := hasMergePolicies(m.Tables)
-	if policyEncoding {
+	richEncoding := hasRecordDescriptors(m.Tables)
+	policyEncoding := richEncoding || hasMergePolicies(m.Tables)
+	if richEncoding {
+		dst = append(dst, []byte("SMF3")...)
+	} else if policyEncoding {
 		dst = append(dst, []byte("SMF2")...)
 	} else {
 		dst = append(dst, manifestMagic...)
@@ -114,6 +118,10 @@ func EncodeManifest(m *Manifest) []byte {
 			dst = binary.BigEndian.AppendUint32(dst, uint32(len(c.Name)))
 			dst = append(dst, c.Name...)
 		}
+		if richEncoding {
+			dst = binary.BigEndian.AppendUint32(dst, uint32(len(t.RecordDescriptor)))
+			dst = append(dst, t.RecordDescriptor...)
+		}
 	}
 	return dst
 }
@@ -137,7 +145,8 @@ func DecodeManifest(src []byte) (*Manifest, error) {
 	if err != nil {
 		return nil, err
 	}
-	policyEncoding := bytes.Equal(magic, []byte("SMF2"))
+	richEncoding := bytes.Equal(magic, []byte("SMF3"))
+	policyEncoding := richEncoding || bytes.Equal(magic, []byte("SMF2"))
 	if !policyEncoding && !bytes.Equal(magic, manifestMagic) {
 		return nil, fmt.Errorf("schema: bad manifest magic")
 	}
@@ -253,6 +262,21 @@ func DecodeManifest(src []byte) (*Manifest, error) {
 			c.Name = string(append([]byte(nil), cname...))
 			t.Columns = append(t.Columns, c)
 		}
+		if richEncoding {
+			rawLen, err := need(4)
+			if err != nil {
+				return nil, err
+			}
+			descriptorLen := binary.BigEndian.Uint32(rawLen)
+			if descriptorLen > maxManifestBytes || descriptorLen > uint32(len(rest)) {
+				return nil, fmt.Errorf("schema: invalid rich descriptor length %d", descriptorLen)
+			}
+			raw, err := need(int(descriptorLen))
+			if err != nil {
+				return nil, err
+			}
+			t.RecordDescriptor = append([]byte(nil), raw...)
+		}
 		m.Tables = append(m.Tables, t)
 	}
 	if len(rest) != 0 {
@@ -272,14 +296,24 @@ func ContentHash(version uint64, tables []TableSchema) [32]byte {
 	for i := range tables {
 		t := tables[i]
 		ptrs[i] = &TableSchema{
-			ID:      t.ID,
-			Name:    t.Name,
-			PK:      t.PK,
-			Columns: append([]ColumnSchema(nil), t.Columns...),
+			ID:               t.ID,
+			Name:             t.Name,
+			PK:               t.PK,
+			Columns:          append([]ColumnSchema(nil), t.Columns...),
+			RecordDescriptor: append([]byte(nil), t.RecordDescriptor...),
 		}
 	}
 	r := &Registry{Epoch: version, Tables: ptrs}
 	return r.canonicalHash()
+}
+
+func hasRecordDescriptors(tables []TableSchema) bool {
+	for _, t := range tables {
+		if len(t.RecordDescriptor) != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Registry builds the validated ID-resolved registry for a manifest. IDs in
@@ -439,6 +473,16 @@ func unionTable(at *TableSchema, bt *TableSchema) error {
 		return fmt.Errorf("schema: table %q changes primary key id %d to %d: %w",
 			at.Name, at.PK, bt.PK, ErrUnsupportedSchema)
 	}
+	if !bytes.Equal(at.RecordDescriptor, bt.RecordDescriptor) {
+		if len(at.RecordDescriptor) == 0 || len(bt.RecordDescriptor) == 0 {
+			return fmt.Errorf("schema: table %q has conflicting rich record descriptors: %w", at.Name, ErrUnsupportedSchema)
+		}
+		merged, err := recordcodec.UnionDescriptors(at.RecordDescriptor, bt.RecordDescriptor)
+		if err != nil {
+			return fmt.Errorf("schema: table %q rich descriptor conflict: %v: %w", at.Name, err, ErrUnsupportedSchema)
+		}
+		at.RecordDescriptor = merged
+	}
 	byName := make(map[string]*ColumnSchema, len(at.Columns))
 	byID := make(map[uint32]*ColumnSchema, len(at.Columns))
 	for i := range at.Columns {
@@ -495,6 +539,9 @@ func checkSuperset(base, next []TableSchema) error {
 		}
 		if nt.PK != bt.PK {
 			return fmt.Errorf("schema: table %q changes primary key: %w", bt.Name, ErrUnsupportedSchema)
+		}
+		if !recordcodec.DescriptorSuperset(bt.RecordDescriptor, nt.RecordDescriptor) {
+			return fmt.Errorf("schema: migration changes rich record descriptor for table %q: %w", bt.Name, ErrUnsupportedSchema)
 		}
 		ncols := make(map[string]*ColumnSchema, len(nt.Columns))
 		for i := range nt.Columns {
@@ -708,55 +755,6 @@ func greaterTuple(a, b *Manifest) bool {
 	return bytes.Compare(a.CreatedOnNode[:], b.CreatedOnNode[:]) > 0
 }
 
-// MigrationDDL renders additive DDL taking old to next: CREATE TABLE for
-// new tables, ALTER TABLE ADD COLUMN for new columns. Both inputs must carry
-// resolved IDs; next must be an additive superset of old.
-func MigrationDDL(oldTables, nextTables []TableSchema) ([]string, error) {
-	if err := checkSuperset(oldTables, nextTables); err != nil {
-		return nil, err
-	}
-	oldByName := make(map[string]*TableSchema, len(oldTables))
-	oldByID := make(map[uint32]*TableSchema, len(oldTables))
-	for i := range oldTables {
-		t := &oldTables[i]
-		oldByName[lowerName(t.Name)] = t
-		oldByID[t.ID] = t
-	}
-	ordered := append([]TableSchema(nil), nextTables...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].ID < ordered[j].ID })
-	var out []string
-	for _, nt := range ordered {
-		ot, ok := oldByName[lowerName(nt.Name)]
-		if !ok {
-			ot, ok = oldByID[nt.ID]
-			if ok {
-				out = append(out, "ALTER TABLE \""+ot.Name+"\" RENAME TO \""+nt.Name+"\"")
-			}
-		}
-		if !ok {
-			out = append(out, nt.CreateTableDDL())
-			continue
-		}
-		known := make(map[string]bool, len(ot.Columns))
-		for _, c := range ot.Columns {
-			known[lowerName(c.Name)] = true
-		}
-		cols := append([]ColumnSchema(nil), nt.Columns...)
-		sort.Slice(cols, func(i, j int) bool { return cols[i].ID < cols[j].ID })
-		for _, c := range cols {
-			if known[lowerName(c.Name)] {
-				continue
-			}
-			q := "ALTER TABLE \"" + nt.Name + "\" ADD COLUMN \"" + c.Name + "\" " + c.Type.String()
-			if !c.Nullable {
-				q += " NOT NULL"
-			}
-			out = append(out, q)
-		}
-	}
-	return out, nil
-}
-
 func lowerName(s string) string { return strings.ToLower(s) }
 
 func cloneTables(in []TableSchema) []TableSchema {
@@ -764,6 +762,7 @@ func cloneTables(in []TableSchema) []TableSchema {
 	for i := range in {
 		out[i] = in[i]
 		out[i].Columns = append([]ColumnSchema(nil), in[i].Columns...)
+		out[i].RecordDescriptor = append([]byte(nil), in[i].RecordDescriptor...)
 	}
 	return out
 }

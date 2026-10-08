@@ -6,19 +6,19 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/cockroachdb/pebble/v2"
-	"github.com/cockroachdb/pebble/v2/sstable"
-	"github.com/cockroachdb/pebble/v2/vfs"
 
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crdt"
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/origin"
 	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/spool"
 )
 
 // Options configures the durable store.
@@ -28,32 +28,13 @@ type Options struct {
 	// Conversion finishes before Open returns; no unsigned runtime mode is exposed.
 	MigrateUnsignedBaseline bool
 	MigrateMergePolicies    bool
-	// FS is the filesystem Pebble uses (the encrypted VFS in production).
-	// Nil means vfs.Default.
-	FS vfs.FS
-	// WALDir overrides the WAL directory. Empty keeps Pebble's default
-	// (the data directory itself).
-	WALDir string
-	// CacheBytes sizes Pebble's unified block cache. Default 256 MiB.
-	CacheBytes int64
-	// MemTableSize caps one memtable. Default 4 MiB (small hot set).
-	MemTableSize uint64
-	// MemTableStopWritesThreshold caps live memtables. Zero keeps default (2).
-	MemTableStopWritesThreshold int
-	// MaxOpenFiles caps open handles. Zero keeps Pebble's default.
-	MaxOpenFiles int
-	// CompactionConcurrency caps background compactions as (1, n).
-	// Zero keeps Pebble's default (1, 1).
-	CompactionConcurrency int
-	// DisableAutomaticCompactions stops Pebble from scheduling automatic
-	// compactions (flushes still run). Production leaves it false; tests
-	// use it to simulate stalled compaction and prove the node stays
-	// correct while L0 debt piles up.
-	DisableAutomaticCompactions bool
-	// Compression overrides every level's block profile. Nil keeps default.
-	Compression *sstable.CompressionProfile
-	// WALBytesPerSync smooths WAL writes. Zero keeps Pebble's default.
-	WALBytesPerSync int
+	// Spool configures the persistence backend: buffering, blocks,
+	// segments, workers, pending-memory bounds, compaction, compression,
+	// and key material. Open fills Path (the state directory itself)
+	// and ContextID (the cluster DBID); callers must not set them.
+	// MasterKey or Passphrase is required unless Encryption is
+	// EncryptionNone; WrappingKeyID selects provider material.
+	Spool spool.Options
 	// Limits bounds decoded values/mutations.
 	Limits codec.Limits
 	// Restore, when non-nil, adopts a fresh writer identity for restored
@@ -61,16 +42,16 @@ type Options struct {
 	// replaced by Restore.Fresh. Nil means ordinary open, where a stored
 	// identity mismatch is rejected.
 	Restore *RestoreAdoption
-	// AsyncDurability configures commits to return without waiting for synchronous fsync (pebble.NoSync).
+	// AsyncDurability configures commits to return once Spool accepts
+	// them, without waiting for synchronous fsync.
 	AsyncDurability bool
-	// Logger receives Pebble logs (Info maps to Debug). Nil discards.
-	Logger Logger
 	// SnapshotAtomicMergeBytes caps the encoded size merged in one atomic
-	// Pebble batch during snapshot import. Larger validated snapshots
+	// Spool commit during snapshot import. Larger validated snapshots
 	// merge chunk by chunk with durable resume progress and publish
-	// watermarks/generation in one final atomic batch. Zero selects
+	// watermarks/generation in one final atomic commit. Zero selects
 	// DefaultSnapshotAtomicMergeBytes.
 	SnapshotAtomicMergeBytes uint64
+	Logger                   Logger
 }
 
 // Logger mirrors the root Logger to avoid an import cycle.
@@ -79,38 +60,6 @@ type Logger interface {
 	Info(msg string, args ...any)
 	Warn(msg string, args ...any)
 	Error(msg string, args ...any)
-}
-
-type pebbleLogAdapter struct {
-	l     Logger
-	fatal *fatalCapture
-}
-
-func (a pebbleLogAdapter) Infof(f string, v ...any)    { a.l.Debug(fmt.Sprintf(f, v...)) }
-func (a pebbleLogAdapter) Warningf(f string, v ...any) { a.l.Warn(fmt.Sprintf(f, v...)) }
-func (a pebbleLogAdapter) Errorf(f string, v ...any)   { a.l.Error(fmt.Sprintf(f, v...)) }
-
-// Fatalf records Pebble's terminal errors (commit/WAL/MANIFEST failures)
-// into the fail-closed capture. Pebble's contract treats Fatalf as
-// non-returning, but a library must not exit the host process; the capture
-// converts the signal into a sticky ErrStorageFailed instead.
-func (a pebbleLogAdapter) Fatalf(f string, v ...any) {
-	msg := fmt.Sprintf(f, v...)
-	a.l.Error(msg)
-	if a.fatal != nil {
-		a.fatal.noteFatal(msg)
-	}
-}
-
-type discardPebbleLog struct{ fatal *fatalCapture }
-
-func (discardPebbleLog) Infof(string, ...any)    {}
-func (discardPebbleLog) Warningf(string, ...any) {}
-func (discardPebbleLog) Errorf(string, ...any)   {}
-func (d discardPebbleLog) Fatalf(f string, v ...any) {
-	if d.fatal != nil {
-		d.fatal.noteFatal(fmt.Sprintf(f, v...))
-	}
 }
 
 // WinningChange is one winner to materialize into the query engine.
@@ -156,16 +105,19 @@ type retentionLease struct {
 	watermarks map[ids.NodeID]uint64
 }
 
-// Store is the Pebble-backed authoritative state. All read-modify-write
-// commits serialize on one writer mutex and apply atomically through a
-// Pebble batch; multi-key reads use point-in-time snapshots.
+// Store is the Spool-backed authoritative state. Current state lives in
+// an in-memory radix tree; all read-modify-write commits serialize on
+// one writer mutex, build a candidate root, persist the mutations
+// through one atomic Spool commit, and publish the root only after
+// Spool acknowledges it. Multi-key reads use pinned immutable roots.
 type Store struct {
 	policyMergeAttempts atomic.Uint64
 	policyMergeNanos    atomic.Uint64
 	policyRejected      atomic.Uint64
 	mergeRegistry       atomic.Pointer[schema.Registry]
 	migratingOrigin     bool
-	db                  *pebble.DB
+	spool               *spool.Store
+	mem                 *memStore
 	clock               crdt.Clock
 	limits              codec.Limits
 
@@ -173,13 +125,14 @@ type Store struct {
 	dbID   ids.DBID
 
 	writeMu sync.Mutex
-	// gate drains state operations for maintenance: every Pebble-touching
-	// method holds RLock; CloseForMaintenance takes Lock across the
-	// close/rewrite/reopen window. Lock order is always gate -> writeMu.
+	// gate drains state operations for maintenance: every
+	// storage-touching method holds RLock; CloseForMaintenance takes
+	// Lock across the maintenance window. Lock order is always
+	// gate -> writeMu.
 	gate sync.RWMutex
-	// maintClosed reports that Pebble was closed (or close was attempted
-	// past a successful flush) for maintenance, so the holder must call
-	// ReopenAfterMaintenance even when CloseForMaintenance failed.
+	// maintClosed reports that a maintenance window is open (state
+	// synced and the gate held), so the holder must call
+	// ReopenAfterMaintenance before the store is usable again.
 	maintClosed atomic.Bool
 
 	leaseMu      sync.Mutex
@@ -190,17 +143,24 @@ type Store struct {
 	openPath string
 	openOpt  Options
 
-	writeOpts *pebble.WriteOptions
-	// unsyncedBytes estimates WAL bytes written without a sync. Every
-	// NoSync commit through commitBatch/dbSet adds its size; Sync
-	// subtracts the pre-sync total. Reads are approximate (batch bytes,
-	// not exact WAL framing) and exist only to drive the asynchronous
-	// size-triggered durability sync.
+	// syncCommits selects synchronous Spool durability for ordinary
+	// commits. Critical paths (identity, schema, prepare records,
+	// snapshot progress) always commit synchronously.
+	syncCommits bool
+	// unsyncedBytes estimates bytes committed without a sync. Every
+	// async commit through commitBatch/dbSet adds its size; Sync
+	// subtracts the pre-sync total. Reads are approximate (mutation
+	// bytes, not exact storage framing) and exist only to drive the
+	// asynchronous size-triggered durability sync.
 	unsyncedBytes atomic.Uint64
-	// fatal is the sticky fail-closed capture: once Pebble reports a
+	// fatal is the sticky fail-closed capture: once Spool reports a
 	// terminal storage error, every operation returns ErrStorageFailed
 	// until the process restarts.
 	fatal *fatalCapture
+	// bindSpoolContext requests a Spool context rebind to the cluster
+	// DBID after identity resolution: fresh stores and reseed adoptions
+	// persist a DBID the Spool context does not know yet.
+	bindSpoolContext bool
 	// snapshotMergeFault, when non-nil, fails chunked snapshot merges
 	// after committing the chunk that advances progress to nextChunk.
 	// Tests use it to prove crash-resume; production leaves it nil.
@@ -216,73 +176,70 @@ type Store struct {
 	transactionStageFault       func() error
 	stagedTransactionByteLimit  int64
 	stagedTransactionCountLimit int
+	stagedTransactionBytes      int64
+	stagedTransactionCount      int
+	closed                      bool
 }
 
 // Open opens (or creates) the store. nodeID must match any stored identity;
 // dbID zero loads the stored id, nonzero must match or initialize.
+// The state directory holds Spool files directly; a directory holding
+// a legacy Pebble database is rejected without modification.
 func Open(path string, nodeID ids.NodeID, dbID ids.DBID, opt Options) (*Store, error) {
 	if err := opt.OriginSigning.Validate(nodeID); err != nil {
 		return nil, err
 	}
 	opt.OriginSigning.PrivateKey = append([]byte(nil), opt.OriginSigning.PrivateKey...)
-	fs := opt.FS
-	if fs == nil {
-		fs = vfs.Default
+	if err := rejectLegacyStore(path); err != nil {
+		return nil, err
 	}
 	fatal := &fatalCapture{}
-	fs = &watchFS{FS: fs, fatal: fatal}
-	opt.FS = fs
-	if opt.CacheBytes <= 0 {
-		opt.CacheBytes = 256 << 20
-	}
-	if opt.MemTableSize == 0 {
-		opt.MemTableSize = 4 << 20
-	}
-	popt := &pebble.Options{
-		FS:              fs,
-		WALDir:          opt.WALDir,
-		CacheSize:       opt.CacheBytes,
-		MemTableSize:    opt.MemTableSize,
-		WALBytesPerSync: opt.WALBytesPerSync,
-		EventListener:   pebbleFatalListener(fatal),
-	}
-	if opt.Logger == nil {
-		popt.Logger = discardPebbleLog{fatal: fatal}
+	spopt := opt.Spool
+	spopt.Path = path
+	// A reseed adoption legitimately disagrees with the persisted
+	// context: the intent validation below authorizes the swap and the
+	// store rebinds to the new DBID afterwards.
+	if opt.Restore != nil && !opt.Restore.NewDBID.IsZero() {
+		spopt.ContextID = nil
+	} else if !dbID.IsZero() {
+		spopt.ContextID = append([]byte(nil), dbID[:]...)
 	} else {
-		popt.Logger = pebbleLogAdapter{l: opt.Logger, fatal: fatal}
+		spopt.ContextID = nil
 	}
-	if opt.MemTableStopWritesThreshold > 0 {
-		popt.MemTableStopWritesThreshold = opt.MemTableStopWritesThreshold
-	}
-	if opt.MaxOpenFiles > 0 {
-		popt.MaxOpenFiles = opt.MaxOpenFiles
-	}
-	if opt.CompactionConcurrency > 0 {
-		n := opt.CompactionConcurrency
-		popt.CompactionConcurrencyRange = func() (int, int) { return 1, n }
-	}
-	popt.DisableAutomaticCompactions = opt.DisableAutomaticCompactions
-	popt.EnsureDefaults()
-	if opt.Compression != nil {
-		for i := range popt.Levels {
-			popt.Levels[i].Compression = func() *sstable.CompressionProfile { return opt.Compression }
+	prevOnErr := spopt.OnStorageError
+	spopt.OnStorageError = func(err error) {
+		fatal.noteTerminal("spool storage failure", err)
+		if prevOnErr != nil {
+			prevOnErr(err)
 		}
 	}
-	db, err := pebble.Open(path, popt)
+	mem := newMemStore()
+	txn := mem.load().Txn()
+	sp, err := spool.OpenAndLoad(spopt, func(records []spool.Record) error {
+		for i := range records {
+			r := &records[i]
+			if len(r.Key) == 0 {
+				return fmt.Errorf("state: spool load: empty key")
+			}
+			if r.Deleted {
+				continue
+			}
+			txn.Insert(append([]byte(nil), r.Key...), append([]byte(nil), r.Value...))
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("state: open pebble: %w", err)
+		return nil, fmt.Errorf("state: open spool: %w", err)
 	}
-	writeOpts := pebble.Sync
-	if opt.AsyncDurability {
-		writeOpts = pebble.NoSync
-	}
+	mem.publish(txn.Commit())
 	s := &Store{
-		db:                          db,
+		spool:                       sp,
+		mem:                         mem,
 		limits:                      opt.Limits,
 		nodeID:                      nodeID,
 		openPath:                    path,
 		openOpt:                     opt,
-		writeOpts:                   writeOpts,
+		syncCommits:                 !opt.AsyncDurability,
 		stagedTransactionByteLimit:  MaxStagedTransactionBytes,
 		stagedTransactionCountLimit: MaxStagedTransactions,
 		fatal:                       fatal,
@@ -292,47 +249,95 @@ func Open(path string, nodeID ids.NodeID, dbID ids.DBID, opt Options) (*Store, e
 	if s.limits.MaxValueBytes == 0 {
 		s.limits = codec.DefaultLimits()
 	}
-	if err := s.initMeta(nodeID, dbID); err != nil {
-		db.Close()
+	if _, err := s.mem.get(SysKey(sysDBID)); err != nil {
+		if !isNotFound(err) {
+			sp.Close()
+			return nil, err
+		}
+		s.bindSpoolContext = true
+	}
+	fail := func(err error) (*Store, error) {
+		sp.Close()
 		return nil, err
 	}
-	if err := cleanupSnapshotIngestTemps(fs, path); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("state: clean interrupted snapshot ingest: %w", err)
+	if err := s.initMeta(nodeID, dbID); err != nil {
+		return fail(err)
+	}
+	if s.bindSpoolContext {
+		if err := sp.RebindContext(s.dbID); err != nil {
+			return fail(fmt.Errorf("state: bind spool context: %w", err))
+		}
+		s.bindSpoolContext = false
 	}
 	if err := s.loadMergeRegistry(); err != nil {
-		db.Close()
-		return nil, err
+		return fail(err)
 	}
 	if err := s.recoverPreparedRemote(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("state: recover prepared remote transaction: %w", err)
+		return fail(fmt.Errorf("state: recover prepared remote transaction: %w", err))
 	}
 	if s.migratingOrigin {
 		if err := s.finishOriginBaseline(); err != nil {
-			db.Close()
-			return nil, err
+			return fail(err)
 		}
 	}
+	if err := s.initStagedAccounting(); err != nil {
+		return fail(fmt.Errorf("state: init staged accounting: %w", err))
+	}
 	return s, nil
+}
+
+// rejectLegacyStore refuses to open a directory holding a legacy Pebble
+// database. There is no migration path: operators start a fresh
+// database (optionally reseeding from a Spool backup or a peer).
+func rejectLegacyStore(path string) error {
+	paths := []string{path}
+	if dir := filepath.Dir(path); dir != "" && dir != path && dir != "." && dir != "/" {
+		paths = append(paths, dir)
+	}
+	for _, p := range paths {
+		entries, err := os.ReadDir(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		for _, e := range entries {
+			name := e.Name()
+			switch {
+			// Note: a bare LOCK file is not evidence; Spool locks its own
+			// store directory the same way. Every non-empty Pebble
+			// directory also carries CURRENT/MANIFEST/OPTIONS markers.
+			case name == "CURRENT" || name == "OPTIONS" || name == "pebble" || name == "pebble-wal":
+				return fmt.Errorf("state: %s holds a legacy Pebble database; start fresh (no migration path)", p)
+			case strings.HasPrefix(name, "MANIFEST-") || strings.HasPrefix(name, "OPTIONS-"):
+				return fmt.Errorf("state: %s holds a legacy Pebble database; start fresh (no migration path)", p)
+			case strings.HasSuffix(name, ".sst") || (strings.HasSuffix(name, ".log") && !strings.Contains(name, "testnode")):
+				return fmt.Errorf("state: %s holds a legacy Pebble database; start fresh (no migration path)", p)
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Store) initMeta(nodeID ids.NodeID, dbID ids.DBID) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
-	set := func(k, v []byte) error { return b.Set(k, v, nil) }
-	// Format version: this binary opens [MinFormatVersion, FormatVersion].
-	// Ordinary open requires signed format 5. Format 4 requires explicit
-	// offline merge-policy migration. Legacy formats 2/3 are
-	// recognized only during explicit offline trusted-baseline migration.
+	set := func(k, v []byte) error { return b.Set(k, v) }
+	// Format version: format 5 belongs to the removed SQL runtime and is never
+	// opened or rewritten by the RIME cutover. Older origin-policy formats
+	// remain available only through their explicit offline migration options.
 	raw, err := s.getDirect(SysKey(sysFormat))
 	var storedFormat uint64
 	if err == nil {
 		v, ok := decodeU64(raw)
 		if !ok || v < MinFormatVersion || v > FormatVersion {
 			return fmt.Errorf("state: unsupported format version %d (want %d..%d)", v, MinFormatVersion, FormatVersion)
+		}
+		if v == 5 {
+			return fmt.Errorf("state: format 5 belongs to the removed SQL runtime; start with a fresh directory")
 		}
 		if v == 4 {
 			if !s.openOpt.MigrateMergePolicies {
@@ -421,6 +426,7 @@ func (s *Store) initMeta(nodeID ids.NodeID, dbID ids.DBID) error {
 				return err
 			}
 			s.dbID = swap
+			s.bindSpoolContext = true
 		}
 	} else if isNotFound(err) {
 		if dbID.IsZero() {
@@ -453,7 +459,7 @@ func (s *Store) initMeta(nodeID ids.NodeID, dbID ids.DBID) error {
 	if b.Len() == 0 {
 		return nil
 	}
-	return s.commitBatch(b, pebble.Sync)
+	return s.commitBatch(b, true)
 }
 
 // DBID returns the cluster identity.
@@ -468,138 +474,124 @@ func (s *Store) ClockNow() uint64 { return s.clock.Now() }
 // ClockMax returns the highest issued/observed HLC timestamp.
 func (s *Store) ClockMax() uint64 { return s.clock.Max() }
 
-// Close closes Pebble, waiting out any maintenance window.
+// Close closes Spool, waiting out any maintenance window.
 func (s *Store) Close() error {
 	s.gate.Lock()
 	defer s.gate.Unlock()
-	return s.db.Close()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	return s.spool.Close()
 }
 
-// CloseForMaintenance drains state operations, flushes, and closes Pebble.
-// The gate stays write-locked: every operation blocks until
-// ReopenAfterMaintenance. On flush failure nothing is closed and the gate
-// is released; past a successful flush the handle is dead either way, the
-// gate stays locked, and the caller must still call ReopenAfterMaintenance
-// to recover. MaintenanceClosed distinguishes the two outcomes.
+// CloseForMaintenance drains state operations and syncs the store for
+// maintenance. The gate stays write-locked: every operation blocks
+// until ReopenAfterMaintenance. Spool stays open (rotation and rewrite
+// run online); on sync failure the gate is released and nothing is
+// held. MaintenanceClosed distinguishes the two outcomes.
 func (s *Store) CloseForMaintenance() error {
 	s.gate.Lock()
-	if err := s.db.Flush(); err != nil {
+	if err := s.spool.Sync(); err != nil {
 		s.gate.Unlock()
-		return err
+		return s.noteTerminal("maintenance sync", err)
 	}
 	s.maintClosed.Store(true)
-	if err := s.db.Close(); err != nil {
-		return err
-	}
 	return nil
 }
 
-// MaintenanceClosed reports whether the last CloseForMaintenance closed (or
-// attempted to close past flush) Pebble: true means ReopenAfterMaintenance
-// is required before the store is usable again.
+// MaintenanceClosed reports whether the last CloseForMaintenance opened
+// a maintenance window: true means ReopenAfterMaintenance is required
+// before the store is usable again.
 func (s *Store) MaintenanceClosed() bool { return s.maintClosed.Load() }
 
-// ReopenAfterMaintenance reopens Pebble with the original parameters,
-// verifies identity, and resumes operations.
+// ReopenAfterMaintenance verifies identity and resumes operations after
+// a maintenance window. The gate stays held until it succeeds.
 func (s *Store) ReopenAfterMaintenance() error {
-	popt := &pebble.Options{
-		FS:              s.openOpt.FS,
-		WALDir:          s.openOpt.WALDir,
-		CacheSize:       s.openOpt.CacheBytes,
-		MemTableSize:    s.openOpt.MemTableSize,
-		WALBytesPerSync: s.openOpt.WALBytesPerSync,
-		EventListener:   pebbleFatalListener(s.fatal),
-	}
-	if s.openOpt.Logger == nil {
-		popt.Logger = discardPebbleLog{fatal: s.fatal}
-	} else {
-		popt.Logger = pebbleLogAdapter{l: s.openOpt.Logger, fatal: s.fatal}
-	}
-	if s.openOpt.MemTableStopWritesThreshold > 0 {
-		popt.MemTableStopWritesThreshold = s.openOpt.MemTableStopWritesThreshold
-	}
-	if s.openOpt.MaxOpenFiles > 0 {
-		popt.MaxOpenFiles = s.openOpt.MaxOpenFiles
-	}
-	if s.openOpt.CompactionConcurrency > 0 {
-		n := s.openOpt.CompactionConcurrency
-		popt.CompactionConcurrencyRange = func() (int, int) { return 1, n }
-	}
-	popt.EnsureDefaults()
-	if s.openOpt.Compression != nil {
-		for i := range popt.Levels {
-			popt.Levels[i].Compression = func() *sstable.CompressionProfile { return s.openOpt.Compression }
-		}
-	}
-	db, err := pebble.Open(s.openPath, popt)
-	if err != nil {
-		return fmt.Errorf("state: reopen pebble: %w (maintenance gate still held)", err)
-	}
-	s.db = db
+	s.bindSpoolContext = false
 	if err := s.initMeta(s.nodeID, s.dbID); err != nil {
-		// Release the handle (and its LOCK) so a retry or a fresh Open
-		// can proceed; the gate stays held until a successful reopen.
-		_ = db.Close()
 		return fmt.Errorf("state: reopen verify: %w (maintenance gate still held)", err)
 	}
-	if err := cleanupSnapshotIngestTemps(s.openOpt.FS, s.openPath); err != nil {
-		_ = db.Close()
-		return fmt.Errorf("state: reopen cleanup: %w (maintenance gate still held)", err)
+	if s.bindSpoolContext {
+		if err := s.spool.RebindContext(s.dbID); err != nil {
+			return fmt.Errorf("state: reopen bind context: %w (maintenance gate still held)", err)
+		}
+		s.bindSpoolContext = false
 	}
 	s.maintClosed.Store(false)
 	s.gate.Unlock()
 	return nil
 }
 
-// Flush flushes the memtable (manual hook for tests and operations).
+// Flush persists buffered writes (manual hook for tests and operations).
 func (s *Store) Flush() error {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
 	if err := s.failedErr(); err != nil {
 		return err
 	}
-	return s.db.Flush()
+	if err := s.spool.Flush(); err != nil {
+		return s.noteTerminal("flush", err)
+	}
+	return nil
 }
 
-// Compact runs a manual compaction over [start, end).
-func (s *Store) Compact(ctx context.Context, start, end []byte, parallelize bool) error {
+// Compact runs one manual reclamation pass: tombstone cleanup, dead-file
+// deletion, and at most one compaction rewrite.
+func (s *Store) Compact() error {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
 	if err := s.failedErr(); err != nil {
 		return err
 	}
-	return s.db.Compact(ctx, start, end, parallelize)
+	if err := s.spool.Reclaim(); err != nil {
+		return s.noteTerminal("compact", err)
+	}
+	return nil
 }
 
-// Checkpoint snapshots the database files into destDir (backup primitive;
-// the key registry must be copied alongside by the caller).
+// Checkpoint captures a point-in-time copy of the store files into
+// destDir (backup primitive). The copy is standalone: it includes the
+// encrypted manifest, keyring, and segments.
 func (s *Store) Checkpoint(destDir string) error {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
 	if err := s.failedErr(); err != nil {
 		return err
 	}
-	return s.db.Checkpoint(destDir)
+	cp, err := s.spool.Checkpoint(context.Background(), destDir)
+	if err != nil {
+		return s.noteTerminal("checkpoint", err)
+	}
+	return cp.Release()
 }
 
-// PebbleMetrics is a focused subset of Pebble metrics for status.
-type PebbleMetrics struct {
-	DiskBytes     uint64
-	MemTableBytes uint64
-	CacheHits     int64
-	CacheMisses   int64
+// StorageMetrics is a focused subset of storage stats for status.
+type StorageMetrics struct {
+	DiskBytes      uint64
+	Keys           uint64
+	PendingBytes   uint64
+	PendingRecords uint64
+	BlocksWritten  uint64
+	BytesWritten   uint64
+	Compactions    uint64
+	StorageFailure bool
 }
 
-// Metrics returns current Pebble metrics.
-func (s *Store) Metrics() PebbleMetrics {
+// Metrics returns current storage metrics.
+func (s *Store) Metrics() StorageMetrics {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
-	m := s.db.Metrics()
-	return PebbleMetrics{
-		DiskBytes:     m.DiskSpaceUsage(),
-		MemTableBytes: m.MemTable.Size,
-		CacheHits:     m.BlockCache.Hits,
-		CacheMisses:   m.BlockCache.Misses,
+	m := s.spool.Stats()
+	return StorageMetrics{
+		DiskBytes:      m.DiskBytes,
+		Keys:           m.Keys,
+		PendingBytes:   m.PendingBytes,
+		PendingRecords: m.PendingRecords,
+		BlocksWritten:  m.BlocksWritten,
+		BytesWritten:   m.BytesWritten,
+		Compactions:    m.Compactions,
+		StorageFailure: m.StorageFailures > 0,
 	}
 }
 
@@ -610,49 +602,126 @@ func (s *Store) Metrics() PebbleMetrics {
 // after the operator resolves the underlying problem.
 func (s *Store) Failed() error { return s.fatal.err() }
 
-// failedErr is the entry gate: every Pebble-touching operation fails fast
-// once the store has failed closed.
-func (s *Store) failedErr() error { return s.fatal.err() }
-
-// commitBatch commits a batch and converts a Pebble commit-pipeline failure
-// into a returned error. Pebble reports WAL sync failures through
-// Logger.Fatalf and still returns nil from Commit; the post-commit capture
-// check turns that silent data loss into an explicit failure.
-func (s *Store) commitBatch(b *pebble.Batch, o *pebble.WriteOptions) error {
-	n := int64(b.Len())
-	if err := b.Commit(o); err != nil {
+// failedErr is the entry gate: every storage-touching operation fails
+// fast once the store has failed closed. Spool's terminal failure is
+// authoritative: if Spool failed without tripping the capture yet (an
+// error path that bypassed commitBatch), trip it here so the node
+// fails closed instead of serving a diverged memory image.
+func (s *Store) failedErr() error {
+	if err := s.fatal.err(); err != nil {
 		return err
 	}
-	if o == pebble.NoSync {
-		s.unsyncedBytes.Add(uint64(n))
+	if s.spool != nil {
+		if serr := s.spool.StorageError(); serr != nil {
+			s.fatal.noteTerminal("spool storage failure", serr)
+			return s.fatal.err()
+		}
 	}
-	return s.failedErr()
+	return nil
 }
 
-// dbSet is s.db.Set plus the post-write fail-closed check.
-func (s *Store) dbSet(key, value []byte, o *pebble.WriteOptions) error {
-	if err := s.db.Set(key, value, o); err != nil {
+// noteTerminal converts a Spool error into the sticky fail-closed error
+// when Spool reports a terminal storage failure, and returns the
+// original error otherwise. Failed commits publish nothing.
+func (s *Store) noteTerminal(op string, err error) error {
+	if s.spool != nil {
+		if serr := s.spool.StorageError(); serr != nil {
+			s.fatal.noteTerminal(op+": spool storage failure", serr)
+			return s.fatal.err()
+		}
+	}
+	return err
+}
+
+// commitBatch persists a batch through one atomic Spool commit and
+// publishes the candidate root only after Spool acknowledges it.
+// Async publication follows acceptance; synchronous publication follows
+// durable acknowledgement. A failed commit publishes nothing and, when
+// the failure is terminal, fails the store closed.
+func (s *Store) commitBatch(b *batch, sync bool) error {
+	if err := s.failedErr(); err != nil {
 		return err
 	}
-	if o == pebble.NoSync {
-		s.unsyncedBytes.Add(uint64(int64(len(key)) + int64(len(value))))
+	if len(b.muts) == 0 {
+		return nil
 	}
-	return s.failedErr()
+	candidate := b.candidate()
+	d := spool.DurabilityAsync
+	if sync {
+		d = spool.DurabilitySync
+	}
+	n := int64(b.Len())
+	if err := s.spool.Commit(b.muts, d); err != nil {
+		return s.noteTerminal("commit", err)
+	}
+	s.mem.publish(candidate)
+	if !sync {
+		s.unsyncedBytes.Add(uint64(n))
+	}
+	return nil
+}
+
+// dbSet commits one key through the standard batch path plus the
+// post-write fail-closed check.
+func (s *Store) dbSet(key, value []byte, sync bool) error {
+	if err := s.failedErr(); err != nil {
+		return err
+	}
+	b := s.mem.newBatch()
+	defer b.Close()
+	if err := b.Set(key, value); err != nil {
+		return err
+	}
+	return s.commitBatch(b, sync)
 }
 
 func (s *Store) getDirect(key []byte) ([]byte, error) {
 	if err := s.failedErr(); err != nil {
 		return nil, err
 	}
-	v, closer, err := s.db.Get(key)
-	if err != nil {
-		return nil, err
-	}
-	defer closer.Close()
-	return append([]byte(nil), v...), nil
+	return s.mem.get(key)
 }
 
-func isNotFound(err error) bool { return errors.Is(err, pebble.ErrNotFound) }
+// deletePrefixRange removes every key under prefix in bounded synchronous
+// commits. Open-time use only: the caller holds writeMu and no other
+// operations run concurrently, so the multi-commit clear is safe and a
+// crash simply re-runs the idempotent clear on the next Open.
+func (s *Store) deletePrefixRange(prefix []byte) error {
+	const keysPerCommit = 20000
+	upper := prefixEnd(prefix)
+	for {
+		it, err := s.mem.newIter(&iterOptions{LowerBound: prefix, UpperBound: upper})
+		if err != nil {
+			return err
+		}
+		var keys [][]byte
+		for it.SeekGE(prefix); it.Valid() && len(keys) < keysPerCommit; it.Next() {
+			keys = append(keys, append([]byte(nil), it.Key()...))
+		}
+		ierr := it.Error()
+		it.Close()
+		if ierr != nil {
+			return ierr
+		}
+		if len(keys) == 0 {
+			return nil
+		}
+		b := s.mem.newBatch()
+		for _, k := range keys {
+			if err := b.Delete(k); err != nil {
+				b.Close()
+				return err
+			}
+		}
+		if err := s.commitBatch(b, true); err != nil {
+			b.Close()
+			return err
+		}
+		b.Close()
+	}
+}
+
+func isNotFound(err error) bool { return errors.Is(err, errNotFound) }
 
 // prefixEnd returns the exclusive upper bound for prefix scans, or nil when
 // the prefix is all 0xFF (unbounded above).
@@ -668,16 +737,16 @@ func prefixEnd(prefix []byte) []byte {
 }
 
 // snapshot runs fn with a point-in-time snapshot for consistent multi-key reads.
-func (s *Store) snapshot(fn func(snap *pebble.Snapshot) error) error {
+func (s *Store) snapshot(fn func(snap *snapshot) error) error {
 	if err := s.failedErr(); err != nil {
 		return err
 	}
-	snap := s.db.NewSnapshot()
+	snap := s.mem.newSnapshot()
 	defer snap.Close()
 	return fn(snap)
 }
 
-func snapGet(snap *pebble.Snapshot, key []byte) ([]byte, error) {
+func snapGet(snap *snapshot, key []byte) ([]byte, error) {
 	v, closer, err := snap.Get(key)
 	if err != nil {
 		return nil, err
@@ -702,7 +771,7 @@ func (s *Store) readU64Direct(name string) (uint64, error) {
 	return v, nil
 }
 
-func readU64Snap(snap *pebble.Snapshot, name string) (uint64, error) {
+func readU64Snap(snap *snapshot, name string) (uint64, error) {
 	raw, err := snapGet(snap, SysKey(name))
 	if err != nil {
 		if isNotFound(err) {
@@ -719,7 +788,7 @@ func readU64Snap(snap *pebble.Snapshot, name string) (uint64, error) {
 
 // CommitLocal durably records a local transaction's batch. It assigns the
 // origin sequence and performs the merge, log write, receipt, HLC persist,
-// and generation bump in one atomic Pebble batch.
+// and generation bump in one atomic Spool commit.
 func (s *Store) CommitLocal(_ context.Context, batch *codec.MutationBatch) (MergeResult, error) {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
@@ -752,7 +821,7 @@ func (s *Store) CommitLocal(_ context.Context, batch *codec.MutationBatch) (Merg
 	}
 	seq++
 	batch.Sequence = seq
-	batch.ProtocolVersion = 5
+	batch.ProtocolVersion = 6
 	if err := s.finalizeLocalPolicies(batch, make(map[string]*remoteGroupCell), new([]string)); err != nil {
 		return MergeResult{}, err
 	}
@@ -763,7 +832,7 @@ func (s *Store) CommitLocal(_ context.Context, batch *codec.MutationBatch) (Merg
 		return MergeResult{}, err
 	}
 	ver := batch.Version()
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
 	winners, err := s.mergeIntoBatch(b, batch, ver)
 	if err != nil {
@@ -771,23 +840,23 @@ func (s *Store) CommitLocal(_ context.Context, batch *codec.MutationBatch) (Merg
 	}
 	res.Winners = winners
 	// Log under local origin.
-	if err := b.Set(LogKey(s.nodeID, seq), codec.EncodeBatch(nil, batch), nil); err != nil {
+	if err := b.Set(LogKey(s.nodeID, seq), codec.EncodeBatch(nil, batch)); err != nil {
 		return MergeResult{}, err
 	}
 	// Receive watermark for our own origin advances with the log.
-	if err := b.Set(RecvKey(s.nodeID), encodeU64(seq), nil); err != nil {
+	if err := b.Set(RecvKey(s.nodeID), encodeU64(seq)); err != nil {
 		return MergeResult{}, err
 	}
-	if err := b.Set(SysKey(sysLocalSeq), encodeU64(seq), nil); err != nil {
+	if err := b.Set(SysKey(sysLocalSeq), encodeU64(seq)); err != nil {
 		return MergeResult{}, err
 	}
-	if err := b.Set(SysKey(sysHLC), encodeU64(maxU64(batch.HLC, s.clock.Max())), nil); err != nil {
+	if err := b.Set(SysKey(sysHLC), encodeU64(maxU64(batch.HLC, s.clock.Max()))); err != nil {
 		return MergeResult{}, err
 	}
 	var receipt [24]byte
 	copy(receipt[:16], s.nodeID[:])
 	binary.BigEndian.PutUint64(receipt[16:], seq)
-	if err := b.Set(ReceiptKey(batch.TxID), receipt[:], nil); err != nil {
+	if err := b.Set(ReceiptKey(batch.TxID), receipt[:]); err != nil {
 		return MergeResult{}, err
 	}
 	gen, err := s.readU64Direct(sysGeneration)
@@ -795,10 +864,10 @@ func (s *Store) CommitLocal(_ context.Context, batch *codec.MutationBatch) (Merg
 		return MergeResult{}, err
 	}
 	gen++
-	if err := b.Set(SysKey(sysGeneration), encodeU64(gen), nil); err != nil {
+	if err := b.Set(SysKey(sysGeneration), encodeU64(gen)); err != nil {
 		return MergeResult{}, err
 	}
-	if err := s.commitBatch(b, s.writeOpts); err != nil {
+	if err := s.commitBatch(b, s.syncCommits); err != nil {
 		return MergeResult{}, err
 	}
 	res.Applied = true
@@ -853,19 +922,19 @@ func (s *Store) CommitRemote(_ context.Context, batch *codec.MutationBatch) (Mer
 	if batch.Sequence <= wm {
 		// A redelivery under a new TxID needs only a receipt, which is already
 		// atomic by itself and must not strand an intent on duplicate input.
-		b := s.db.NewBatch()
+		b := s.mem.newBatch()
 		defer b.Close()
 		var receipt [24]byte
 		copy(receipt[:16], batch.OriginNode[:])
 		binary.BigEndian.PutUint64(receipt[16:], batch.Sequence)
-		if err := b.Set(ReceiptKey(batch.TxID), receipt[:], nil); err != nil {
+		if err := b.Set(ReceiptKey(batch.TxID), receipt[:]); err != nil {
 			return MergeResult{}, err
 		}
 		gen, err := s.readU64Direct(sysGeneration)
 		if err != nil {
 			return MergeResult{}, err
 		}
-		if err := s.commitBatch(b, s.writeOpts); err != nil {
+		if err := s.commitBatch(b, s.syncCommits); err != nil {
 			return MergeResult{}, err
 		}
 		res.Generation = gen
@@ -884,12 +953,12 @@ func (s *Store) CommitRemote(_ context.Context, batch *codec.MutationBatch) (Mer
 			return MergeResult{}, fmt.Errorf("state: another remote transaction requires recovery")
 		}
 	} else if isNotFound(err) {
-		prepare := s.db.NewBatch()
-		if err := prepare.Set(SysKey(sysRemotePrepare), encoded, nil); err != nil {
+		prepare := s.mem.newBatch()
+		if err := prepare.Set(SysKey(sysRemotePrepare), encoded); err != nil {
 			prepare.Close()
 			return MergeResult{}, err
 		}
-		if err := s.commitBatch(prepare, pebble.Sync); err != nil {
+		if err := s.commitBatch(prepare, true); err != nil {
 			prepare.Close()
 			return MergeResult{}, err
 		}
@@ -902,7 +971,7 @@ func (s *Store) CommitRemote(_ context.Context, batch *codec.MutationBatch) (Mer
 	} else {
 		return MergeResult{}, err
 	}
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
 	ver := batch.Version()
 	winners, err := s.mergeIntoBatch(b, batch, ver)
@@ -910,20 +979,20 @@ func (s *Store) CommitRemote(_ context.Context, batch *codec.MutationBatch) (Mer
 		return MergeResult{}, err
 	}
 	res.Winners = winners
-	if err := b.Set(LogKey(batch.OriginNode, batch.Sequence), codec.EncodeBatch(nil, batch), nil); err != nil {
+	if err := b.Set(LogKey(batch.OriginNode, batch.Sequence), codec.EncodeBatch(nil, batch)); err != nil {
 		return MergeResult{}, err
 	}
-	if err := b.Set(RecvKey(batch.OriginNode), encodeU64(batch.Sequence), nil); err != nil {
+	if err := b.Set(RecvKey(batch.OriginNode), encodeU64(batch.Sequence)); err != nil {
 		return MergeResult{}, err
 	}
 	var receipt [24]byte
 	copy(receipt[:16], batch.OriginNode[:])
 	binary.BigEndian.PutUint64(receipt[16:], batch.Sequence)
-	if err := b.Set(ReceiptKey(batch.TxID), receipt[:], nil); err != nil {
+	if err := b.Set(ReceiptKey(batch.TxID), receipt[:]); err != nil {
 		return MergeResult{}, err
 	}
 	s.clock.Observe(batch.HLC)
-	if err := b.Set(SysKey(sysHLC), encodeU64(maxU64(batch.HLC, s.clock.Max())), nil); err != nil {
+	if err := b.Set(SysKey(sysHLC), encodeU64(maxU64(batch.HLC, s.clock.Max()))); err != nil {
 		return MergeResult{}, err
 	}
 	gen, err := s.readU64Direct(sysGeneration)
@@ -931,13 +1000,13 @@ func (s *Store) CommitRemote(_ context.Context, batch *codec.MutationBatch) (Mer
 		return MergeResult{}, err
 	}
 	gen++
-	if err := b.Set(SysKey(sysGeneration), encodeU64(gen), nil); err != nil {
+	if err := b.Set(SysKey(sysGeneration), encodeU64(gen)); err != nil {
 		return MergeResult{}, err
 	}
-	if err := b.Delete(SysKey(sysRemotePrepare), nil); err != nil {
+	if err := b.Delete(SysKey(sysRemotePrepare)); err != nil {
 		return MergeResult{}, err
 	}
-	if err := s.commitBatch(b, s.writeOpts); err != nil {
+	if err := s.commitBatch(b, s.syncCommits); err != nil {
 		return MergeResult{}, err
 	}
 	res.Applied = true
@@ -947,7 +1016,7 @@ func (s *Store) CommitRemote(_ context.Context, batch *codec.MutationBatch) (Mer
 
 // mergeIntoBatch LWW-merges every mutation against stored state, staging
 // winner writes into b. Callers hold writeMu.
-func (s *Store) mergeIntoBatch(b *pebble.Batch, batch *codec.MutationBatch, ver crdt.Version) ([]WinningChange, error) {
+func (s *Store) mergeIntoBatch(b *batch, batch *codec.MutationBatch, ver crdt.Version) ([]WinningChange, error) {
 	staged := make(map[string]*remoteGroupCell)
 	var order []string
 	if err := s.mergeRemoteGroupBatch(b, batch, staged, &order); err != nil {
@@ -986,7 +1055,7 @@ func (s *Store) getTombDirect(table uint32, row ids.RowID) (crdt.Version, bool, 
 	return v, true, nil
 }
 
-func getCellSnap(snap *pebble.Snapshot, limits codec.Limits, table uint32, row ids.RowID, col uint32) (codec.CellState, bool, error) {
+func getCellSnap(snap *snapshot, limits codec.Limits, table uint32, row ids.RowID, col uint32) (codec.CellState, bool, error) {
 	raw, err := snapGet(snap, CellKey(table, row, col))
 	if err != nil {
 		if isNotFound(err) {
@@ -1001,7 +1070,7 @@ func getCellSnap(snap *pebble.Snapshot, limits codec.Limits, table uint32, row i
 	return st, true, nil
 }
 
-func getTombSnap(snap *pebble.Snapshot, table uint32, row ids.RowID) (crdt.Version, bool, error) {
+func getTombSnap(snap *snapshot, table uint32, row ids.RowID) (crdt.Version, bool, error) {
 	raw, err := snapGet(snap, TombKey(table, row))
 	if err != nil {
 		if isNotFound(err) {
@@ -1045,7 +1114,7 @@ func (s *Store) recvWatermarkDirect(origin ids.NodeID) (uint64, error) {
 	return v, nil
 }
 
-func recvWatermarkSnap(snap *pebble.Snapshot, origin ids.NodeID) (uint64, error) {
+func recvWatermarkSnap(snap *snapshot, origin ids.NodeID) (uint64, error) {
 	raw, err := snapGet(snap, RecvKey(origin))
 	if err != nil {
 		if isNotFound(err) {
@@ -1076,9 +1145,9 @@ func (s *Store) ReceiveWatermarks() ([]codec.OriginWatermark, error) {
 
 func (s *Store) receiveWatermarksCore() ([]codec.OriginWatermark, error) {
 	var out []codec.OriginWatermark
-	err := s.snapshot(func(snap *pebble.Snapshot) error {
+	err := s.snapshot(func(snap *snapshot) error {
 		prefix := []byte{prefixRecv}
-		it, err := snap.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixEnd(prefix)})
+		it, err := snap.NewIter(&iterOptions{LowerBound: prefix, UpperBound: prefixEnd(prefix)})
 		if err != nil {
 			return err
 		}
@@ -1115,26 +1184,6 @@ func (s *Store) StateGeneration() (uint64, error) {
 	return s.readU64Direct(sysGeneration)
 }
 
-// BumpGeneration advances the monotonic mutation generation without
-// mutating data. Materializer rebuilds call it before discarding
-// SQLite: group members whose inline applies the rebuild drops must
-// observe a generation change at their durable commit so the repair
-// probe re-materializes them.
-func (s *Store) BumpGeneration() error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	gen, err := s.readU64Direct(sysGeneration)
-	if err != nil {
-		return err
-	}
-	b := s.db.NewBatch()
-	defer b.Close()
-	if err := b.Set(SysKey(sysGeneration), encodeU64(gen+1), nil); err != nil {
-		return err
-	}
-	return s.commitBatch(b, s.writeOpts)
-}
-
 // SchemaEpoch returns the stored schema epoch and hash.
 func (s *Store) SchemaEpoch() (uint64, [32]byte, error) {
 	s.gate.RLock()
@@ -1147,7 +1196,7 @@ func (s *Store) schemaEpochCore() (uint64, [32]byte, error) {
 		epoch uint64
 		hash  [32]byte
 	)
-	err := s.snapshot(func(snap *pebble.Snapshot) error {
+	err := s.snapshot(func(snap *snapshot) error {
 		e, err := readU64Snap(snap, sysSchemaEpoch)
 		if err != nil {
 			return err
@@ -1175,15 +1224,15 @@ func (s *Store) SetSchemaEpoch(epoch uint64, hash [32]byte) error {
 	defer s.gate.RUnlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
-	if err := b.Set(SysKey(sysSchemaEpoch), encodeU64(epoch), nil); err != nil {
+	if err := b.Set(SysKey(sysSchemaEpoch), encodeU64(epoch)); err != nil {
 		return err
 	}
-	if err := b.Set(SysKey(sysSchemaHash), hash[:], nil); err != nil {
+	if err := b.Set(SysKey(sysSchemaHash), hash[:]); err != nil {
 		return err
 	}
-	return s.commitBatch(b, pebble.Sync)
+	return s.commitBatch(b, true)
 }
 
 // PeerAck returns the highest contiguous sequence peer confirmed for origin.
@@ -1222,41 +1271,35 @@ func (s *Store) SetPeerAck(peer, origin ids.NodeID, seq uint64) error {
 	} else if !isNotFound(err) {
 		return err
 	}
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
-	if err := b.Set(PeerAckKey(peer, origin), encodeU64(seq), nil); err != nil {
+	if err := b.Set(PeerAckKey(peer, origin), encodeU64(seq)); err != nil {
 		return err
 	}
-	return s.commitBatch(b, s.writeOpts)
-}
-
-// DurabilityWriteOptions returns the WriteOptions configured for this store.
-func (s *Store) DurabilityWriteOptions() *pebble.WriteOptions {
-	return s.writeOpts
+	return s.commitBatch(b, s.syncCommits)
 }
 
 // AsyncDurability reports whether the store was opened in asynchronous durability mode.
 func (s *Store) AsyncDurability() bool {
-	return s.writeOpts == pebble.NoSync
+	return !s.syncCommits
 }
 
-// UnsyncedBytes estimates WAL bytes written without a sync (see
+// UnsyncedBytes estimates bytes committed without a sync (see
 // unsyncedBytes). It drives the asynchronous size-triggered durability
 // sync and is always zero in synchronous mode.
 func (s *Store) UnsyncedBytes() uint64 {
 	return s.unsyncedBytes.Load()
 }
 
-// Sync appends a WAL-only record and syncs it, ensuring durability of all
-// previously committed transactions. Pebble skips an empty batch entirely.
+// Sync fences all previously committed transactions to durable storage.
 func (s *Store) Sync() error {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	before := s.unsyncedBytes.Load()
-	if err := s.db.LogData(nil, pebble.Sync); err != nil {
-		return err
+	if err := s.spool.Sync(); err != nil {
+		return s.noteTerminal("sync", err)
 	}
 	if err := s.failedErr(); err != nil {
 		return err
@@ -1275,7 +1318,7 @@ func (s *Store) Size() (uint64, error) {
 	if err := s.failedErr(); err != nil {
 		return 0, err
 	}
-	return s.db.Metrics().DiskSpaceUsage(), nil
+	return s.spool.Stats().DiskBytes, nil
 }
 
 // FormatInfo returns the persisted format, minimum-reader, and
@@ -1316,19 +1359,19 @@ func (s *Store) SetPeerExcluded(node ids.NodeID, excluded bool) error {
 	defer s.gate.RUnlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
 	k := PeerExcludedKey(node)
 	if excluded {
-		if err := b.Set(k, []byte{1}, nil); err != nil {
+		if err := b.Set(k, []byte{1}); err != nil {
 			return err
 		}
 	} else {
-		if err := b.Delete(k, nil); err != nil {
+		if err := b.Delete(k); err != nil {
 			return err
 		}
 	}
-	return s.commitBatch(b, pebble.Sync)
+	return s.commitBatch(b, true)
 }
 
 // IsPeerExcluded reports whether the peer is locally excluded in persistent store.
@@ -1338,14 +1381,13 @@ func (s *Store) IsPeerExcluded(node ids.NodeID) (bool, error) {
 	if err := s.failedErr(); err != nil {
 		return false, err
 	}
-	_, closer, err := s.db.Get(PeerExcludedKey(node))
+	_, err := s.mem.get(PeerExcludedKey(node))
 	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) {
+		if isNotFound(err) {
 			return false, nil
 		}
 		return false, err
 	}
-	_ = closer.Close()
 	return true, nil
 }
 
@@ -1357,7 +1399,7 @@ func (s *Store) ListExcludedPeers() ([]ids.NodeID, error) {
 		return nil, err
 	}
 	prefix := PeerExcludedPrefix()
-	iter, err := s.db.NewIter(&pebble.IterOptions{
+	iter, err := s.mem.newIter(&iterOptions{
 		LowerBound: prefix,
 		UpperBound: prefixEnd(prefix),
 	})
@@ -1388,7 +1430,7 @@ func (s *Store) ClearAllPeerExclusions() error {
 		return err
 	}
 	prefix := PeerExcludedPrefix()
-	iter, err := s.db.NewIter(&pebble.IterOptions{
+	iter, err := s.mem.newIter(&iterOptions{
 		LowerBound: prefix,
 		UpperBound: prefixEnd(prefix),
 	})
@@ -1396,17 +1438,17 @@ func (s *Store) ClearAllPeerExclusions() error {
 		return err
 	}
 	defer iter.Close()
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
 	for iter.First(); iter.Valid(); iter.Next() {
-		if err := b.Delete(iter.Key(), nil); err != nil {
+		if err := b.Delete(iter.Key()); err != nil {
 			return err
 		}
 	}
 	if err := iter.Error(); err != nil {
 		return err
 	}
-	return s.commitBatch(b, pebble.Sync)
+	return s.commitBatch(b, true)
 }
 
 func checkBatchLimits(batch *codec.MutationBatch, lim codec.Limits) error {
@@ -1452,7 +1494,7 @@ func checkBatchLimits(batch *codec.MutationBatch, lim codec.Limits) error {
 }
 
 // IsConflict reports whether err is a transaction conflict (safe to retry).
-// The Pebble port serializes writers, so commits never conflict; this is
+// The store serializes writers, so commits never conflict; this is
 // kept for API compatibility and always reports false.
 func IsConflict(err error) bool { return false }
 
@@ -1592,6 +1634,13 @@ func (s *Store) HasReceipt(txID ids.TxID) (bool, error) {
 	if err == nil {
 		return true, nil
 	}
+	if !isNotFound(err) {
+		return false, err
+	}
+	_, err = s.getDirect(LocalReceiptKey(txID))
+	if err == nil {
+		return true, nil
+	}
 	if isNotFound(err) {
 		return false, nil
 	}
@@ -1613,7 +1662,7 @@ func (s *Store) RecordReceipt(txID ids.TxID) error {
 	}
 	var receipt [24]byte
 	copy(receipt[:16], s.nodeID[:])
-	return s.dbSet(ReceiptKey(txID), receipt[:], s.writeOpts)
+	return s.dbSet(ReceiptKey(txID), receipt[:], s.syncCommits)
 }
 
 // SetBridgeStreamProgress records the highest contiguous applied sequence for a bridge stream.
@@ -1622,7 +1671,7 @@ func (s *Store) SetBridgeStreamProgress(stream string, applied uint64) error {
 	defer s.gate.RUnlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return s.dbSet(BridgeProgressKey(stream), encodeU64(applied), s.writeOpts)
+	return s.dbSet(BridgeProgressKey(stream), encodeU64(applied), s.syncCommits)
 }
 
 // BridgeStreamProgress returns the highest contiguous applied sequence for a bridge stream.

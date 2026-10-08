@@ -5,8 +5,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/cockroachdb/pebble/v2"
-
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/ids"
 )
@@ -30,8 +28,8 @@ func closeStore(t *testing.T, s *Store) {
 func countPrefix(t *testing.T, s *Store, prefix []byte) int {
 	t.Helper()
 	var n int
-	err := s.snapshot(func(snap *pebble.Snapshot) error {
-		it, err := snap.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixEnd(prefix)})
+	err := s.snapshot(func(snap *snapshot) error {
+		it, err := snap.NewIter(&iterOptions{LowerBound: prefix, UpperBound: prefixEnd(prefix)})
 		if err != nil {
 			return err
 		}
@@ -70,10 +68,10 @@ func TestRestoreAdoptionResetsWriterIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Incomplete snapshot staging and peer acks the fresh node must shed.
-	if err := a.db.Set(SnapshotKey("recv/active"), []byte("transfer"), pebble.Sync); err != nil {
+	if err := a.dbSet(SnapshotKey("recv/active"), []byte("transfer"), true); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.db.Set(SnapshotKey("recv/abcd/manifest"), []byte("manifest"), pebble.Sync); err != nil {
+	if err := a.dbSet(SnapshotKey("recv/abcd/manifest"), []byte("manifest"), true); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.SetPeerAck(nodeX, nodeA, 7); err != nil {

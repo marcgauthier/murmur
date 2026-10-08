@@ -42,7 +42,7 @@ type LocalGroupResult struct {
 }
 
 // CommitLocalGroup durably records and merges an ordered group of local
-// transactions in one Pebble commit. Each transaction keeps its own log row,
+// transactions in one Spool commit. Each transaction keeps its own log row,
 // receipt, and assigned origin sequence, and bumps the generation once,
 // exactly as if the members had committed sequentially in input order —
 // concurrent writers therefore share one fsync while keeping synchronous
@@ -86,7 +86,7 @@ func (s *Store) CommitLocalGroup(_ context.Context, batches []*codec.MutationBat
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
 	result := LocalGroupResult{Members: make([]LocalGroupMember, len(batches))}
 	staged := make(map[string]*remoteGroupCell)
@@ -120,7 +120,7 @@ func (s *Store) CommitLocalGroup(_ context.Context, batches []*codec.MutationBat
 		}
 		seq++
 		batch.Sequence = seq
-		batch.ProtocolVersion = 5
+		batch.ProtocolVersion = 6
 		if err := s.finalizeLocalPolicies(batch, staged, &order); err != nil {
 			return LocalGroupResult{}, err
 		}
@@ -133,13 +133,13 @@ func (s *Store) CommitLocalGroup(_ context.Context, batches []*codec.MutationBat
 		if err := s.mergeRemoteGroupBatch(b, batch, staged, &order); err != nil {
 			return LocalGroupResult{}, err
 		}
-		if err := b.Set(LogKey(s.nodeID, seq), codec.EncodeBatch(nil, batch), nil); err != nil {
+		if err := b.Set(LogKey(s.nodeID, seq), codec.EncodeBatch(nil, batch)); err != nil {
 			return LocalGroupResult{}, err
 		}
 		var receipt [24]byte
 		copy(receipt[:16], s.nodeID[:])
 		binary.BigEndian.PutUint64(receipt[16:], seq)
-		if err := b.Set(ReceiptKey(batch.TxID), receipt[:], nil); err != nil {
+		if err := b.Set(ReceiptKey(batch.TxID), receipt[:]); err != nil {
 			return LocalGroupResult{}, err
 		}
 		maxHLC = maxU64(maxHLC, batch.HLC)
@@ -158,19 +158,19 @@ func (s *Store) CommitLocalGroup(_ context.Context, batches []*codec.MutationBat
 		return LocalGroupResult{}, writeErr
 	}
 
-	if err := b.Set(RecvKey(s.nodeID), encodeU64(seq), nil); err != nil {
+	if err := b.Set(RecvKey(s.nodeID), encodeU64(seq)); err != nil {
 		return LocalGroupResult{}, err
 	}
-	if err := b.Set(SysKey(sysLocalSeq), encodeU64(seq), nil); err != nil {
+	if err := b.Set(SysKey(sysLocalSeq), encodeU64(seq)); err != nil {
 		return LocalGroupResult{}, err
 	}
-	if err := b.Set(SysKey(sysHLC), encodeU64(maxU64(maxHLC, s.clock.Max())), nil); err != nil {
+	if err := b.Set(SysKey(sysHLC), encodeU64(maxU64(maxHLC, s.clock.Max()))); err != nil {
 		return LocalGroupResult{}, err
 	}
-	if err := b.Set(SysKey(sysGeneration), encodeU64(gen), nil); err != nil {
+	if err := b.Set(SysKey(sysGeneration), encodeU64(gen)); err != nil {
 		return LocalGroupResult{}, err
 	}
-	if err := s.commitBatch(b, s.writeOpts); err != nil {
+	if err := s.commitBatch(b, s.syncCommits); err != nil {
 		return LocalGroupResult{}, err
 	}
 	result.Generation = gen

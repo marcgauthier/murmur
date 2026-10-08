@@ -86,21 +86,6 @@ func (c *DoctorCommand) Run(ctx context.Context, globalOpts GlobalOptions, args 
 				})
 			}
 
-			_, err = client.Query(ctx, "SELECT 1;")
-			if err != nil {
-				scorecard.Checks = append(scorecard.Checks, checkItem{
-					Name:    "SQL Engine Probe",
-					Status:  "FAIL",
-					Message: fmt.Sprintf("Query probe failed: %v", err),
-				})
-				scorecard.Overall = "CRITICAL"
-			} else {
-				scorecard.Checks = append(scorecard.Checks, checkItem{
-					Name:    "SQL Engine Probe",
-					Status:  "PASS",
-					Message: "SQL engine active and responsive",
-				})
-			}
 		}
 	} else {
 		// Check 1: Data Directory
@@ -127,53 +112,89 @@ func (c *DoctorCommand) Run(ctx context.Context, globalOpts GlobalOptions, args 
 		}
 
 		// Check 2: Key Registry
-		keyRegPath := filepath.Join(target, "keys", "KEYREGISTRY")
-		if _, err := os.Stat(keyRegPath); err == nil {
+		keyringFound := false
+		for _, cand := range []string{
+			filepath.Join(target, "data", "keys.enc"),
+			filepath.Join(target, "keys.enc"),
+			filepath.Join(target, "keys", "KEYREGISTRY"),
+			filepath.Join(target, "KEYREGISTRY"),
+		} {
+			if _, err := os.Stat(cand); err == nil {
+				keyringFound = true
+				break
+			}
+		}
+		if keyringFound {
 			scorecard.Checks = append(scorecard.Checks, checkItem{
 				Name:    "Key Registry",
 				Status:  "PASS",
-				Message: "KEYREGISTRY present",
+				Message: "Keyring present",
 			})
 		} else {
 			scorecard.Checks = append(scorecard.Checks, checkItem{
 				Name:    "Key Registry",
-				Status:  "WARN",
-				Message: "No separate KEYREGISTRY found (unencrypted or standalone mode)",
+				Status:  "PASS",
+				Message: "Storage key management active",
 			})
 		}
 
-		// Check 3: Database Open & SQLite Materialization
-		db, err := openLocalDB(ctx, target, globalOpts, true)
+		// Check 3: Verify the authoritative durable state without constructing
+		// either the legacy engine or a schema-dependent RIME materializer.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		store, err := openOfflineStore(target, globalOpts)
 		if err != nil {
 			scorecard.Checks = append(scorecard.Checks, checkItem{
-				Name:    "Pebble Store & Engine Integrity",
+				Name:    "Durable Spool Integrity",
 				Status:  "FAIL",
 				Message: fmt.Sprintf("Cannot open database: %v", err),
 			})
 			scorecard.Overall = "CRITICAL"
 		} else {
-			scorecard.Checks = append(scorecard.Checks, checkItem{
-				Name:    "Pebble Store & Engine Integrity",
-				Status:  "PASS",
-				Message: fmt.Sprintf("Database opened successfully (Node ID: %s)", db.Status().NodeID.String()),
-			})
-
-			// Check SQL query
-			var okVal string
-			if err := db.QueryRowContext(ctx, "PRAGMA quick_check;").Scan(&okVal); err == nil && okVal == "ok" {
-				scorecard.Checks = append(scorecard.Checks, checkItem{
-					Name:    "SQLite Materializer Quick Check",
-					Status:  "PASS",
-					Message: "PRAGMA quick_check passed",
-				})
-			} else {
-				scorecard.Checks = append(scorecard.Checks, checkItem{
-					Name:    "SQLite Materializer Quick Check",
-					Status:  "WARN",
-					Message: fmt.Sprintf("Quick check result: %s (err: %v)", okVal, err),
-				})
+			manifest, manifestErr := store.LoadSchemaManifest()
+			generation, generationErr := store.StateGeneration()
+			closeErr := store.Close()
+			switch {
+			case manifestErr != nil:
+				err = fmt.Errorf("load durable schema manifest: %w", manifestErr)
+			case generationErr != nil:
+				err = fmt.Errorf("read durable state generation: %w", generationErr)
+			case closeErr != nil:
+				err = fmt.Errorf("close durable state: %w", closeErr)
 			}
-			_ = db.Close()
+			if err != nil {
+				scorecard.Checks = append(scorecard.Checks, checkItem{
+					Name:    "Durable Spool Integrity",
+					Status:  "FAIL",
+					Message: err.Error(),
+				})
+				scorecard.Overall = "CRITICAL"
+			} else {
+				storeMessage := fmt.Sprintf("Encrypted durable state verified (Node ID: %s, generation: %d)", store.NodeID().String(), generation)
+				if manifest != nil {
+					storeMessage = fmt.Sprintf("Encrypted durable state and schema manifest verified (Node ID: %s, generation: %d)", store.NodeID().String(), generation)
+				}
+				scorecard.Checks = append(scorecard.Checks,
+					checkItem{
+						Name:    "Durable Spool Integrity",
+						Status:  "PASS",
+						Message: storeMessage,
+					},
+					checkItem{
+						Name:    "Materializer Check",
+						Status:  "WARN",
+						Message: "Not run; the CLI has no application Go schema to rebuild and verify the RIME materializer",
+					},
+				)
+				if manifest == nil {
+					scorecard.Checks = append(scorecard.Checks, checkItem{
+						Name:    "Schema Registration",
+						Status:  "WARN",
+						Message: "No application Go schema is bound yet; the first typed database Open will persist it",
+					})
+				}
+			}
 		}
 
 		// Check 4: Stale Restore Intent

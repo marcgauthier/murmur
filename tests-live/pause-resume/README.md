@@ -6,4 +6,5 @@ while survivors keep writing. Freeze detection is asserted (alive-view
 dip or failed SWIM probes on survivors); after SIGCONT every
 acknowledged write must be present on all nodes with equal digests,
 and the rejoin path (range repair vs snapshot) is recorded from
-counters.
+counters. Rows are written and verified through managed typed RIME
+records; the runner builds without SQLite tags and with CGO disabled.

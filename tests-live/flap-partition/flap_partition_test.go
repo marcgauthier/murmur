@@ -14,8 +14,6 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -27,22 +25,15 @@ func TestFlappingPartitionLosesNoWrites(t *testing.T) {
 	healGap := time.Duration(envInt("MURMUR_FLAP_HEAL_SECONDS", 2)) * time.Second
 
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "flap-partition",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: tableName,
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:         "flap-partition",
+		NumNodes:     3,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 
 	// Baseline converges before flapping (honest-path control).
 	for i := 0; i < 6; i++ {
-		id := fmt.Sprintf("%032x", 1000+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)", id, fmt.Sprintf("base-%d", i)); err != nil {
+		if err := cluster.TypedInsert(0, fmt.Sprintf("base-%d", i)); err != nil {
 			t.Fatalf("baseline write: %v", err)
 		}
 	}
@@ -65,9 +56,7 @@ func TestFlappingPartitionLosesNoWrites(t *testing.T) {
 					return
 				case <-ticker.C:
 				}
-				id := fmt.Sprintf("%032x", int64(node+1)*1_000_000+seq)
-				if err := cluster.ExecSQL(node, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)", id,
-					fmt.Sprintf("n%d-s%d", node, seq)); err != nil {
+				if err := cluster.TypedInsert(node, fmt.Sprintf("n%d-s%d", node, seq)); err != nil {
 					failed.Add(1)
 					continue
 				}
@@ -112,8 +101,8 @@ func TestFlappingPartitionLosesNoWrites(t *testing.T) {
 // travel), while node 2 must not observe it during the whole window.
 func proveIsolated(t *testing.T, c *harness.Cluster, written *atomic.Int64) {
 	t.Helper()
-	marker := fmt.Sprintf("%032x", 9_000_000)
-	if err := c.ExecSQL(0, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)", marker, "isolation-marker"); err != nil {
+	marker := "isolation-marker"
+	if err := c.TypedInsert(0, marker); err != nil {
 		t.Fatalf("isolation marker write: %v", err)
 	}
 	written.Add(1)
@@ -121,10 +110,10 @@ func proveIsolated(t *testing.T, c *harness.Cluster, written *atomic.Int64) {
 	// the intact side while we watch node 2 for leaks.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if hasRow(t, c, 1, marker) {
+		if hasName(t, c, 1, marker) {
 			break
 		}
-		if hasRow(t, c, 2, marker) {
+		if hasName(t, c, 2, marker) {
 			t.Fatal("isolation violated: node2 observed the marker while split (RemovePeer ineffective?)")
 		}
 		if time.Now().After(deadline) {
@@ -134,21 +123,24 @@ func proveIsolated(t *testing.T, c *harness.Cluster, written *atomic.Int64) {
 	}
 	// Node 1 has it; give a leak one more second to show on node 2.
 	time.Sleep(time.Second)
-	if hasRow(t, c, 2, marker) {
+	if hasName(t, c, 2, marker) {
 		t.Fatal("isolation violated: node2 observed the marker while split (RemovePeer ineffective?)")
 	}
 	t.Log("isolation proven: marker reached node1, never node2")
 }
 
-func hasRow(t *testing.T, c *harness.Cluster, idx int, id string) bool {
+func hasName(t *testing.T, c *harness.Cluster, idx int, name string) bool {
 	t.Helper()
-	res, err := c.QuerySQL(idx, "SELECT count(*) FROM "+tableName+" WHERE id = ?", id)
-	if err != nil || len(res.Rows) == 0 || len(res.Rows[0]) == 0 {
+	names, err := c.TypedNames(idx)
+	if err != nil {
 		return false
 	}
-	var n int
-	_, _ = fmt.Sscanf(fmt.Sprintf("%v", res.Rows[0][0]), "%d", &n)
-	return n == 1
+	for _, got := range names {
+		if got == name {
+			return true
+		}
+	}
+	return false
 }
 
 // setPartition isolates (true) or rejoins (false) node index 2.
@@ -175,21 +167,16 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 	lastLog := time.Now()
 	for time.Now().Before(deadline) {
 		ok := true
-		var first string
+		var first []string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, tableName)
-			if err != nil || n != want {
-				ok = false
-				break
-			}
-			d, err := c.ComputeTableDigest(i, tableName, "id")
-			if err != nil {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
 			if i == 0 {
-				first = d
-			} else if d != first {
+				first = names
+			} else if !sameNames(names, first) {
 				ok = false
 				break
 			}
@@ -201,19 +188,30 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 			lastLog = time.Now()
 			counts := make([]int, len(c.Nodes))
 			for i := range c.Nodes {
-				n, _ := c.QueryRowCount(i, tableName)
-				counts[i] = n
+				names, _ := c.TypedNames(i)
+				counts[i] = len(names)
 			}
 			t.Logf("converge progress: counts=%v want=%d", counts, want)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	for i := range c.Nodes {
-		n, _ := c.QueryRowCount(i, tableName)
-		d, _ := c.ComputeTableDigest(i, tableName, "id")
-		t.Logf("node %d at timeout: count=%d digest=%s", i, n, d)
+		names, _ := c.TypedNames(i)
+		t.Logf("node %d at timeout: count=%d", i, len(names))
 	}
-	t.Fatalf("nodes did not converge on %d rows with equal digests within %v", want, timeout)
+	t.Fatalf("nodes did not converge on %d typed records with equal contents within %v", want, timeout)
+}
+
+func sameNames(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func envInt(name string, fallback int) int {

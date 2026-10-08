@@ -6,59 +6,54 @@
 package snapshotresync_test
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func TestStaleNodeRejoinsViaSingleSnapshotSource(t *testing.T) {
 	const victim = 3
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "snapshot-multisource",
-		NumNodes:    4,
-		AwaitUnlock: true,
+		Name:            "snapshot-multisource",
+		NumNodes:        4,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 		Replication: &harness.ReplicationOptions{
 			MinLogRetentionMs:        1000,
 			MaxOfflineLogRetentionMs: 20000,
 			MinRetainedBatches:       10,
 		},
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "snap_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
 	})
 
 	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("%032x", 1000+i)
-		if err := cluster.ExecSQL(victim, "INSERT INTO snap_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("stale-%d", i)); err != nil {
+		if err := insertRows(cluster, victim, 1000+i, 1, "stale"); err != nil {
 			t.Fatalf("victim pre-stop write: %v", err)
 		}
 	}
-	waitConverged(t, cluster, "snap_rows", 5, 30*time.Second)
+	waitConverged(t, cluster, 5, 30*time.Second)
 
 	// Victim stops; survivors write thousands of rows so the resync
 	// snapshot spans many chunks (a 1-2 chunk snapshot rarely
 	// interleaves badly enough to expose source contention).
 	cluster.StopNode(victim)
+	// Batched multi-row INSERTs: the test needs snapshot volume (many
+	// chunks), not round trips. One commit per row is ~100x slower on
+	// fsync-heavy disks (NTFS/USB) and blew the 10m scenario timeout
+	// without ever hanging.
 	const freshRows = 6000
+	const batchSize = 100
 	start := time.Now()
-	for i := 0; i < freshRows; i++ {
-		id := fmt.Sprintf("%032x", 2000+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO snap_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("fresh-%d", i)); err != nil {
-			t.Fatalf("survivor write: %v", err)
+	for base := 0; base < freshRows; base += batchSize {
+		if err := insertRows(cluster, 0, 2000+base, batchSize, "fresh"); err != nil {
+			t.Fatalf("survivor write batch %d: %v", base/batchSize, err)
 		}
 	}
 	t.Logf("wrote %d survivor rows in %s", freshRows, time.Since(start).Round(time.Second))
 	want := 5 + freshRows
 	for i := 0; i < 3; i++ {
-		if _, err := waitRowCount(t, cluster, i, "snap_rows", want, 60*time.Second); err != nil {
+		if _, err := waitRowCount(t, cluster, i, want, 60*time.Second); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -71,7 +66,7 @@ func TestStaleNodeRejoinsViaSingleSnapshotSource(t *testing.T) {
 	cluster.StartNode(victim)
 	cluster.UnlockNode(victim, cluster.Nodes[victim].KeyHex)
 	cluster.WaitNodeReady(victim)
-	waitConverged(t, cluster, "snap_rows", want, 120*time.Second)
+	waitConverged(t, cluster, want, 120*time.Second)
 
 	// The rejoin used the snapshot path (not log catch-up) under real
 	// multi-source contention: at least one rival source's frames were
@@ -83,11 +78,11 @@ func TestStaleNodeRejoinsViaSingleSnapshotSource(t *testing.T) {
 		t.Fatalf("victim suppressed frames = %v, want >= 1 (no multi-source contention observed)", got)
 	}
 
-	res, err := cluster.QuerySQL(victim, "SELECT name FROM snap_rows WHERE name LIKE 'stale-%'")
+	rows, err := cluster.TypedContentionRows(victim)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Rows) != 5 {
-		t.Fatalf("victim stale rows = %d, want 5", len(res.Rows))
+	if countPrefix(rows, "stale-") != 5 {
+		t.Fatalf("victim stale rows = %d, want 5", countPrefix(rows, "stale-"))
 	}
 }

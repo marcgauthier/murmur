@@ -47,7 +47,7 @@ func TestHelloRoundTrip(t *testing.T) {
 		ProtocolVersion: ProtocolVersion, MinProtocolVersion: MinProtocolVersion,
 		NodeID: ids.NewNodeID(), DBID: fixtureDBID,
 		SchemaEpoch: 9, SchemaAuthorNode: ids.NewNodeID(), SchemaTimeCreated: 77,
-		Capabilities: CapMergePolicies | CapOriginSignatures | (CapZstd),
+		Capabilities: CapMergePolicies | CapOriginSignatures | (CapCompression),
 		Have:         []codec.OriginWatermark{{Origin: ids.NewNodeID(), Sequence: 12}},
 	}
 	h.SchemaHash[31] = 7
@@ -134,7 +134,7 @@ func TestSnapshotChunkRoundTrip(t *testing.T) {
 	if !got.Last || got.Index != 7 || len(got.Cells) != 1 {
 		t.Fatalf("mismatch: %+v", got)
 	}
-	if ProtocolVersion != 5 || MinProtocolVersion != 5 {
-		t.Fatal("snapshot format requires replication protocol v5")
+	if ProtocolVersion != 6 || MinProtocolVersion != 6 {
+		t.Fatal("RIME cutover requires replication protocol v6")
 	}
 }

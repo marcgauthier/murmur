@@ -186,6 +186,11 @@ func (s *Store) keyCopyFor(gen uint32) ([32]byte, error) {
 func (s *Store) resolve(digest Digest) (string, [32]byte, uint32, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.resolveLocked(digest)
+}
+
+// resolveLocked requires s.mu to be held for reading or writing.
+func (s *Store) resolveLocked(digest Digest) (string, [32]byte, uint32, error) {
 	if s.dead {
 		return "", [32]byte{}, 0, ErrClosed
 	}

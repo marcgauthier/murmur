@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2"
-
 	"github.com/marcgauthier/murmur/ids"
 )
 
@@ -104,7 +102,7 @@ func (s *Store) RestoreMarker() (marker RestoreMarker, ok bool, err error) {
 //     are preserved untouched.
 //
 // The whole adoption commits atomically with the surrounding initMeta batch.
-func (s *Store) adoptRestoreIdentity(b *pebble.Batch, fresh ids.NodeID, stored []byte) error {
+func (s *Store) adoptRestoreIdentity(b *batch, fresh ids.NodeID, stored []byte) error {
 	adoption := s.openOpt.Restore
 	if adoption == nil {
 		return fmt.Errorf("state: data directory belongs to another node")
@@ -146,14 +144,6 @@ func (s *Store) adoptRestoreIdentity(b *pebble.Batch, fresh ids.NodeID, stored [
 	var dbSwap ids.DBID
 	if !adoption.NewDBID.IsZero() {
 		mode = "reseed"
-		for _, prefix := range []byte{prefixLog, prefixTxnStage} {
-			if err := b.DeleteRange([]byte{prefix}, []byte{prefix + 1}, nil); err != nil {
-				return err
-			}
-		}
-		if err := b.Set(SysKey("origin_trusted_baseline"), encodeU64(s.clock.Max()), nil); err != nil {
-			return err
-		}
 		storedDB, err := s.getDirect(SysKey(sysDBID))
 		if err != nil {
 			if isNotFound(err) {
@@ -169,6 +159,16 @@ func (s *Store) adoptRestoreIdentity(b *pebble.Batch, fresh ids.NodeID, stored [
 			return fmt.Errorf("%w: reseed DBID equals the source cluster", ErrRestoreIdentityReuse)
 		}
 		dbSwap = swap
+		// Validated: the old cluster log and staging go now, in bounded
+		// commits ahead of the atomic identity swap below.
+		for _, prefix := range []byte{prefixLog, prefixTxnStage} {
+			if err := s.deletePrefixRange([]byte{prefix}); err != nil {
+				return err
+			}
+		}
+		if err := b.Set(SysKey("origin_trusted_baseline"), encodeU64(s.clock.Max())); err != nil {
+			return err
+		}
 	}
 	marker, err := json.Marshal(RestoreMarker{
 		BackupID:      adoption.BackupID,
@@ -180,18 +180,18 @@ func (s *Store) adoptRestoreIdentity(b *pebble.Batch, fresh ids.NodeID, stored [
 	if err != nil {
 		return fmt.Errorf("state: encode restore marker: %w", err)
 	}
-	if err := b.Set(SysKey(sysLocalNode), fresh[:], nil); err != nil {
+	if err := b.Set(SysKey(sysLocalNode), fresh[:]); err != nil {
 		return err
 	}
-	if err := b.Set(SysKey(sysLocalSeq), encodeU64(0), nil); err != nil {
+	if err := b.Set(SysKey(sysLocalSeq), encodeU64(0)); err != nil {
 		return err
 	}
 	if !dbSwap.IsZero() {
-		if err := b.Set(SysKey(sysDBID), dbSwap[:], nil); err != nil {
+		if err := b.Set(SysKey(sysDBID), dbSwap[:]); err != nil {
 			return err
 		}
 	}
-	if err := b.Set(SysKey(sysRestoreMarker), marker, nil); err != nil {
+	if err := b.Set(SysKey(sysRestoreMarker), marker); err != nil {
 		return err
 	}
 	// Clear snapshot receive staging (incomplete transfers only; committed
@@ -200,14 +200,14 @@ func (s *Store) adoptRestoreIdentity(b *pebble.Batch, fresh ids.NodeID, stored [
 	// and inherited peer exclusion/retirement policy. The fresh node re-establishes
 	// its own observations, membership decisions, and GC gating obligations.
 	for _, prefix := range [][]byte{SnapshotKey("recv/"), {prefixPeerAck}, {prefixMember}, {prefixPeerExcluded}} {
-		if err := s.snapshot(func(snap *pebble.Snapshot) error {
-			it, err := snap.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixEnd(prefix)})
+		if err := s.snapshot(func(snap *snapshot) error {
+			it, err := snap.NewIter(&iterOptions{LowerBound: prefix, UpperBound: prefixEnd(prefix)})
 			if err != nil {
 				return err
 			}
 			defer it.Close()
 			for it.SeekGE(prefix); it.Valid(); it.Next() {
-				if err := b.Delete(append([]byte(nil), it.Key()...), nil); err != nil {
+				if err := b.Delete(append([]byte(nil), it.Key()...)); err != nil {
 					return err
 				}
 			}

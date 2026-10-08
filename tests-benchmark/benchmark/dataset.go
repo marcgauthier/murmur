@@ -3,8 +3,8 @@
 // Dataset sizes: 10K rows always; 100K rows unless -short; 1M rows when
 // MURMUR_BENCH_ROWS=1000000. Run with:
 //
-//	go test ./tests-benchmark/benchmark/ -bench . -benchtime 2s
-//	go test ./tests-benchmark/benchmark/ -bench . -short          # 10K datasets only
+//	go -C tests-benchmark/benchmark test -bench . -benchtime 2s
+//	go -C tests-benchmark/benchmark test -bench . -short          # 10K datasets only
 package benchmark
 
 import (
@@ -19,7 +19,7 @@ import (
 
 	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/crypto"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/ids"
 )
 
 // randNew is math/rand.New exposed for the sync benchmarks (which seed
@@ -29,45 +29,39 @@ func randNew(seed int64) *rand.Rand { return rand.New(rand.NewSource(seed)) }
 var firstNames = []string{"ann", "bob", "cid", "dan", "eve", "fin", "gus", "hal", "ivy", "jay", "kay", "leo", "max", "ned", "oda", "pam", "quin", "ray", "sue", "tim"}
 var lastNames = []string{"smith", "jones", "taylor", "brown", "davies", "evans", "wilson", "thomas", "taylor2", "moore"}
 
-// benchSchema is the benchmark schema: a contacts table plus an orders table
-// for join/group workloads.
-func benchSchema() []schema.TableSchema {
-	return []schema.TableSchema{
-		{
-			Name: "contacts",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-				{Name: "phone", Type: schema.ColText, Nullable: true},
-				{Name: "score", Type: schema.ColInteger, Nullable: true},
-			},
-		},
-		{
-			Name: "orders",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "contact_id", Type: schema.ColBlob, Nullable: true},
-				{Name: "amount", Type: schema.ColInteger, Nullable: true},
-			},
-		},
-	}
+// benchContact is the benchmark contacts record plus an orders record for
+// join/group workloads.
+type benchContact struct {
+	ID    ids.RowID `rime:"primary"`
+	Name  string
+	Phone string
+	Score int64
 }
 
-// benchLocalDDL holds local-only indexes and a derived FTS index with
-// maintenance triggers (rebuilt, never replicated).
-func benchLocalDDL() []string {
-	return []string{
-		`CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(name)`,
-		`CREATE INDEX IF NOT EXISTS idx_contacts_score ON contacts(score)`,
-		`CREATE INDEX IF NOT EXISTS idx_orders_contact ON orders(contact_id)`,
-		`CREATE VIRTUAL TABLE IF NOT EXISTS contacts_fts USING fts5(name, phone)`,
-		`CREATE TRIGGER IF NOT EXISTS contacts_ai AFTER INSERT ON contacts BEGIN
-			INSERT INTO contacts_fts(rowid, name, phone) VALUES (new.rowid, new.name, new.phone); END`,
-		`CREATE TRIGGER IF NOT EXISTS contacts_ad AFTER DELETE ON contacts BEGIN
-			DELETE FROM contacts_fts WHERE rowid = old.rowid; END`,
-		`CREATE TRIGGER IF NOT EXISTS contacts_au AFTER UPDATE OF name, phone ON contacts BEGIN
-			UPDATE contacts_fts SET name = new.name, phone = new.phone WHERE rowid = new.rowid; END`,
+type benchOrder struct {
+	ID        ids.RowID `rime:"primary"`
+	ContactID ids.RowID
+	Amount    int64
+}
+
+// mustBenchTables returns the compiled benchmark table definitions.
+// Definition failures are programmer errors, so it panics.
+func mustBenchTables() []murmur.TableDefinition {
+	contacts, err := murmur.Define[benchContact]("contacts", 91, murmur.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Phone": 3, "Score": 4},
+	})
+	if err != nil {
+		panic(err)
 	}
+	orders, err := murmur.Define[benchOrder]("orders", 92, murmur.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "ContactID": 2, "Amount": 3},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return []murmur.TableDefinition{contacts, orders}
 }
 
 // datasetSizes returns the row counts to benchmark.
@@ -107,17 +101,14 @@ func benchProvider() *crypto.MapProvider {
 }
 
 // benchConfig returns the standard single-node benchmark configuration:
-// benchmark schema with local indexes/FTS plus explicit encryption and
-// database identity.
+// typed benchmark tables plus explicit encryption and database identity.
 func benchConfig(path string, node murmur.NodeID, dbid murmur.DBID) murmur.Config {
 	return testdb.Configure(murmur.Config{
 		Path:   path,
 		NodeID: node,
 		DBID:   dbid,
-		Schema: murmur.SchemaConfig{
-			Version: 1, Tables: benchSchema(), LocalDDL: benchLocalDDL(),
-		},
-		Pebble: murmur.DefaultPebbleConfig(),
+		Tables: mustBenchTables(),
+		Spool:  murmur.DefaultSpoolConfig(),
 		Encryption: murmur.EncryptionConfig{
 			Key: bytes.Clone(benchKey), KeyID: "bench",
 		},
@@ -141,11 +132,19 @@ func openBenchDB(b *testing.B, path string) *murmur.DB {
 func populate(b testing.TB, db *murmur.DB, n int) []murmur.RowID {
 	b.Helper()
 	ctx := context.Background()
+	contacts, err := murmur.TableOf[benchContact](db, "contacts")
+	if err != nil {
+		b.Fatal(err)
+	}
+	orders, err := murmur.TableOf[benchOrder](db, "orders")
+	if err != nil {
+		b.Fatal(err)
+	}
 	rng := rand.New(rand.NewSource(42))
 	ids := make([]murmur.RowID, 0, n)
 	const perTx = 5000
 	for base := 0; base < n; base += perTx {
-		tx, err := db.BeginTx(ctx, nil)
+		tx, err := db.BeginTx(ctx)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -158,16 +157,15 @@ func populate(b testing.TB, db *murmur.DB, n int) []murmur.RowID {
 			ids = append(ids, id)
 			name := fmt.Sprintf("%s %s %d", firstNames[i%len(firstNames)], lastNames[(i/len(firstNames))%len(lastNames)], i)
 			phone := fmt.Sprintf("555-%04d", i%10000)
-			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO contacts (id, name, phone, score) VALUES (?, ?, ?, ?)`,
-				id[:], name, phone, rng.Intn(1000)); err != nil {
+			if err := contacts.Insert(tx, &benchContact{
+				ID: id, Name: name, Phone: phone, Score: int64(rng.Intn(1000)),
+			}); err != nil {
 				b.Fatal(err)
 			}
 			for o := 0; o < 2; o++ {
-				oid := murmur.NewRowID()
-				if _, err := tx.ExecContext(ctx,
-					`INSERT INTO orders (id, contact_id, amount) VALUES (?, ?, ?)`,
-					oid[:], id[:], rng.Intn(500)); err != nil {
+				if err := orders.Insert(tx, &benchOrder{
+					ID: murmur.NewRowID(), ContactID: id, Amount: int64(rng.Intn(500)),
+				}); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -177,28 +175,4 @@ func populate(b testing.TB, db *murmur.DB, n int) []murmur.RowID {
 		}
 	}
 	return ids
-}
-
-// drainRows fully consumes and closes rows (read benchmarks must do this;
-// an open Rows stalls writers).
-func drainRows(b *testing.B, rows *murmur.Rows) int {
-	b.Helper()
-	defer rows.Close()
-	n := 0
-	cols := rows.Columns()
-	dest := make([]any, len(cols))
-	ptrs := make([]any, len(cols))
-	for i := range dest {
-		ptrs[i] = &dest[i]
-	}
-	for rows.Next() {
-		if err := rows.Scan(ptrs...); err != nil {
-			b.Fatal(err)
-		}
-		n++
-	}
-	if err := rows.Err(); err != nil {
-		b.Fatal(err)
-	}
-	return n
 }

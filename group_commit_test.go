@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/origin"
+	"github.com/marcgauthier/murmur/rime"
 )
 
 // groupTestConfig provisions testConfig plus origin-signing identity.
@@ -77,10 +79,8 @@ func TestGroupCommitConfigValidation(t *testing.T) {
 	}
 }
 
-// TestGroupCommitConcurrentWriters proves concurrent synchronous writers
-// share fsyncs: every insert is acknowledged only after durability, all
-// rows survive a reopen, and fewer Pebble group commits ran than
-// transactions committed.
+// TestGroupCommitConcurrentWriters proves managed synchronous writes share
+// Spool commits and every acknowledged record survives reopen.
 func TestGroupCommitConcurrentWriters(t *testing.T) {
 	ctx := context.Background()
 	cfg := groupTestConfig(t)
@@ -89,9 +89,17 @@ func TestGroupCommitConcurrentWriters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !db.groupCommitEnabled() {
+		_ = db.Close()
+		t.Fatalf("group commit disabled: mode=%d delay=%s", cfg.Durability.Mode, cfg.Durability.GroupCommit.MaxDelay)
+	}
 	const writers = 8
 	const perWriter = 25
 	total := writers * perWriter
+	table, err := TableOf[testContactRecord](db, "contacts")
+	if err != nil {
+		t.Fatal(err)
+	}
 	startGate := make(chan struct{})
 	var ready sync.WaitGroup
 	ready.Add(writers)
@@ -104,8 +112,10 @@ func TestGroupCommitConcurrentWriters(t *testing.T) {
 			<-startGate
 			for i := 0; i < perWriter; i++ {
 				id := ids.NewRowID()
-				if _, err := db.ExecContext(ctx,
-					`INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], fmt.Sprintf("w%d-%d", worker, i)); err != nil {
+				name := fmt.Sprintf("w%d-%d", worker, i)
+				if err := db.WriteTxContext(ctx, func(tx *Tx) error {
+					return table.Insert(tx, &testContactRecord{ID: id, Name: name})
+				}); err != nil {
 					first = err
 					return
 				}
@@ -141,8 +151,12 @@ func TestGroupCommitConcurrentWriters(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	var count int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM contacts`).Scan(&count); err != nil {
+	table, err = TableOf[testContactRecord](db, "contacts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, err := table.Where().Count()
+	if err != nil {
 		t.Fatal(err)
 	}
 	if count != total {
@@ -166,7 +180,13 @@ func TestGroupCommitDisabledCommitsAlone(t *testing.T) {
 		t.Fatal("group commit enabled despite negative MaxDelay")
 	}
 	id := ids.NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "solo"); err != nil {
+	table, err := TableOf[testContactRecord](db, "contacts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WriteTxContext(ctx, func(tx *Tx) error {
+		return table.Insert(tx, &testContactRecord{ID: id, Name: "solo"})
+	}); err != nil {
 		t.Fatal(err)
 	}
 	m := db.Metrics()
@@ -178,8 +198,8 @@ func TestGroupCommitDisabledCommitsAlone(t *testing.T) {
 	}
 }
 
-// TestGroupCommitContendedRowConverges proves intra-group conflicts resolve
-// to the last SQL commit both durably and in the materializer.
+// TestGroupCommitContendedRowConverges proves concurrent managed replacements
+// resolve to the same durable and query-visible record.
 func TestGroupCommitContendedRowConverges(t *testing.T) {
 	ctx := context.Background()
 	cfg := groupTestConfig(t)
@@ -188,8 +208,15 @@ func TestGroupCommitContendedRowConverges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	table, err := TableOf[testContactRecord](db, "contacts")
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
 	id := ids.NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "seed"); err != nil {
+	if err := db.WriteTxContext(ctx, func(tx *Tx) error {
+		return table.Insert(tx, &testContactRecord{ID: id, Name: "seed"})
+	}); err != nil {
 		_ = db.Close()
 		t.Fatal(err)
 	}
@@ -206,8 +233,17 @@ func TestGroupCommitContendedRowConverges(t *testing.T) {
 			ready.Done()
 			<-startGate
 			for i := 0; i < perWriter; i++ {
-				if _, err := db.ExecContext(ctx,
-					`UPDATE contacts SET name = ? WHERE id = ?`, fmt.Sprintf("w%d-%d", worker, i), id[:]); err != nil {
+				name := fmt.Sprintf("w%d-%d", worker, i)
+				for attempt := 0; attempt < 100; attempt++ {
+					err := db.WriteTxContext(ctx, func(tx *Tx) error {
+						return table.Save(tx, &testContactRecord{ID: id, Name: name})
+					})
+					if err == nil {
+						break
+					}
+					if errors.Is(err, rime.ErrConflict) && attempt < 99 {
+						continue
+					}
 					first = err
 					return
 				}
@@ -222,11 +258,12 @@ func TestGroupCommitContendedRowConverges(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	var before string
-	if err := db.QueryRowContext(ctx, `SELECT name FROM contacts WHERE id = ?`, id[:]).Scan(&before); err != nil {
+	current, err := table.Get(id)
+	if err != nil {
 		_ = db.Close()
 		t.Fatal(err)
 	}
+	before := current.Name
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -235,26 +272,16 @@ func TestGroupCommitContendedRowConverges(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	var after string
-	if err := db.QueryRowContext(ctx, `SELECT name FROM contacts WHERE id = ?`, id[:]).Scan(&after); err != nil {
+	table, err = TableOf[testContactRecord](db, "contacts")
+	if err != nil {
 		t.Fatal(err)
 	}
+	current, err = table.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := current.Name
 	if before != after {
 		t.Fatalf("materialized %q != durable %q after contended group commits", before, after)
-	}
-}
-
-func TestGroupMemberNeedsRepair(t *testing.T) {
-	if groupMemberNeedsRepair(10, 12, 5, 7) {
-		t.Fatal("equal deltas (local-only interleave) require no repair")
-	}
-	if !groupMemberNeedsRepair(10, 13, 5, 7) {
-		t.Fatal("generation ahead of local sequence must repair")
-	}
-	if !groupMemberNeedsRepair(12, 10, 7, 7) {
-		t.Fatal("non-monotonic generation probe must repair")
-	}
-	if !groupMemberNeedsRepair(10, 10, 7, 5) {
-		t.Fatal("non-monotonic sequence probe must repair")
 	}
 }

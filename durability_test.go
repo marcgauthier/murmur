@@ -3,11 +3,13 @@ package murmur
 import (
 	"context"
 	"path/filepath"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/spool"
 )
 
 func TestDurabilityConfigValidation(t *testing.T) {
@@ -43,16 +45,29 @@ func TestDurabilityConfigValidation(t *testing.T) {
 	}
 }
 
+func durabilityTypedConfig(t *testing.T, path string) Config {
+	t.Helper()
+	cfg := testConfig(path)
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	return cfg
+}
+
 func TestDurabilityPeriodicSync(t *testing.T) {
 	ctx := context.Background()
-	cfg := testConfig(filepath.Join(t.TempDir(), "node1"))
+	cfg := durabilityTypedConfig(t, filepath.Join(t.TempDir(), "node1"))
 	cfg.Durability = DurabilityConfig{Mode: DurabilityAsync, SyncInterval: 20 * time.Millisecond}
 	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
 	id := ids.NewRowID()
-	if _, err := db.ExecContext(ctx, "INSERT INTO contacts (id, name) VALUES (?, ?)", id[:], "periodic"); err != nil {
+	if err := insertRecord(ctx, db, table, &facadeRecord{ID: id, Name: "periodic"}); err != nil {
 		_ = db.Close()
 		t.Fatal(err)
 	}
@@ -72,31 +87,46 @@ func TestDurabilityPeriodicSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	var name string
-	if err := db.QueryRowContext(ctx, "SELECT name FROM contacts WHERE id = ?", id[:]).Scan(&name); err != nil || name != "periodic" {
-		t.Fatalf("reopened row: name=%q err=%v", name, err)
+	table, err = TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := table.Get(id)
+	if err != nil || got.Name != "periodic" {
+		t.Fatalf("reopened row: %+v err=%v", got, err)
 	}
 }
 
 func TestDurabilityPeriodicSyncFailureFailsClosed(t *testing.T) {
 	ctx := context.Background()
-	fsys := &failFS{FS: vfs.Default}
-	cfg := testConfig(t.TempDir())
-	cfg.Pebble.BaseFS = fsys
+	var armed atomic.Bool
+	faults := &spool.FaultHooks{
+		SegmentSync: func() error {
+			if armed.Load() {
+				return syscall.ENOSPC
+			}
+			return nil
+		},
+	}
+	cfg := durabilityTypedConfig(t, t.TempDir())
+	cfg.Spool.Faults = faults
 	cfg.Durability = DurabilityConfig{Mode: DurabilityAsync, SyncInterval: 20 * time.Millisecond}
 	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
-		fsys.armed.Store(false)
+		armed.Store(false)
 		_ = db.Close()
 	}()
-	id := ids.NewRowID()
-	if _, err := db.ExecContext(ctx, "INSERT INTO contacts (id, name) VALUES (?, ?)", id[:], "before failure"); err != nil {
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
 		t.Fatal(err)
 	}
-	fsys.armed.Store(true)
+	if err := insertRecord(ctx, db, table, &facadeRecord{ID: ids.NewRowID(), Name: "before failure"}); err != nil {
+		t.Fatal(err)
+	}
+	armed.Store(true)
 	deadline := time.Now().Add(2 * time.Second)
 	for db.Metrics().PeriodicSyncFailures == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
@@ -107,8 +137,7 @@ func TestDurabilityPeriodicSyncFailureFailsClosed(t *testing.T) {
 	if state := db.Status().State; state != StateFailed {
 		t.Fatalf("state = %s after sync failure, want failed", state)
 	}
-	afterID := ids.NewRowID()
-	if _, err := db.ExecContext(ctx, "INSERT INTO contacts (id, name) VALUES (?, ?)", afterID[:], "after failure"); err == nil {
+	if err := insertRecord(ctx, db, table, &facadeRecord{ID: ids.NewRowID(), Name: "after failure"}); err == nil {
 		t.Fatal("write succeeded after periodic sync failure")
 	}
 }
@@ -116,12 +145,16 @@ func TestDurabilityPeriodicSyncFailureFailsClosed(t *testing.T) {
 func TestDurabilityAsyncTransactionsAndSync(t *testing.T) {
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "node1")
-	cfg := testConfig(dir)
+	cfg := durabilityTypedConfig(t, dir)
 	cfg.Durability = DurabilityConfig{Mode: DurabilityAsync}
 
 	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
+	}
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatalf("TableOf failed: %v", err)
 	}
 
 	if db.DurabilityMode() != DurabilityAsync {
@@ -129,15 +162,14 @@ func TestDurabilityAsyncTransactionsAndSync(t *testing.T) {
 	}
 
 	rowID := ids.NewRowID()
-	if _, err := db.ExecContext(ctx, "INSERT INTO contacts (id, name) VALUES (?, ?)", rowID[:], "async_contact"); err != nil {
-		t.Fatalf("ExecContext failed: %v", err)
+	if err := insertRecord(ctx, db, table, &facadeRecord{ID: rowID, Name: "async_contact"}); err != nil {
+		t.Fatalf("insert failed: %v", err)
 	}
 
 	// Verify query inside active database
-	var name string
-	row := db.QueryRowContext(ctx, "SELECT name FROM contacts WHERE id = ?", rowID[:])
-	if err := row.Scan(&name); err != nil || name != "async_contact" {
-		t.Fatalf("QueryRowContext failed: name=%q err=%v", name, err)
+	got, err := table.Get(rowID)
+	if err != nil || got.Name != "async_contact" {
+		t.Fatalf("Get failed: %+v err=%v", got, err)
 	}
 
 	// Call explicit Sync to disk
@@ -156,9 +188,12 @@ func TestDurabilityAsyncTransactionsAndSync(t *testing.T) {
 	}
 	defer db2.Close()
 
-	var name2 string
-	row2 := db2.QueryRowContext(ctx, "SELECT name FROM contacts WHERE id = ?", rowID[:])
-	if err := row2.Scan(&name2); err != nil || name2 != "async_contact" {
-		t.Fatalf("reopened query failed: name=%q err=%v", name2, err)
+	table2, err := TableOf[facadeRecord](db2, "records")
+	if err != nil {
+		t.Fatalf("TableOf failed: %v", err)
+	}
+	got2, err := table2.Get(rowID)
+	if err != nil || got2.Name != "async_contact" {
+		t.Fatalf("reopened query failed: %+v err=%v", got2, err)
 	}
 }

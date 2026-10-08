@@ -1,28 +1,26 @@
-// Command transactions shows explicit transactions: a multi-statement
-// atomic commit, a rollback that leaves no trace, and the transaction ID.
+// Command transactions shows managed typed transactions: an atomic batch and
+// rollback when the application callback returns an error.
 //
-// Run it:
+// Run it with:
 //
-//	go run -tags "sqlite_preupdate_hook sqlite_fts5" ./examples/transactions
+//	go run ./examples/transactions
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 
 	"github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
+	"github.com/marcgauthier/murmur/ids"
 )
 
-func count(ctx context.Context, db *murmur.DB) int {
-	var n int
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM ledger`).Scan(&n); err != nil {
-		log.Fatal(err)
-	}
-	return n
+type ledgerEntry struct {
+	ID    ids.RowID `rime:"primary"`
+	Entry string
 }
 
 func main() {
@@ -33,65 +31,64 @@ func main() {
 	}
 	defer os.RemoveAll(dir)
 
+	definition, err := murmur.Define[ledgerEntry]("ledger", 18, murmur.RecordOptions{
+		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Entry": 2},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path:   dir,
 		NodeID: murmur.NewNodeID(),
-		Schema: murmur.SchemaConfig{
-			Version: 1,
-			Tables: []schema.TableSchema{{
-				Name: "ledger",
-				Columns: []schema.ColumnSchema{
-					{Name: "id", Type: schema.ColBlob},
-					{Name: "entry", Type: schema.ColText, Nullable: true},
-				},
-			}},
-		},
-		Pebble: murmur.DefaultPebbleConfig(),
+		Schema: murmur.SchemaConfig{Version: 1},
+		Tables: []murmur.TableDefinition{definition},
+		Spool:  murmur.DefaultSpoolConfig(),
 		Encryption: murmur.EncryptionConfig{
-			Key:   []byte("0123456789abcdef0123456789abcdef"),
-			KeyID: "transactions-key",
+			Key: []byte("0123456789abcdef0123456789abcdef"), KeyID: "transactions-key",
 		},
 	}))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
-
-	// Atomic commit: all three statements land together.
-	tx, err := db.BeginTx(ctx, nil)
+	ledger, err := murmur.TableOf[ledgerEntry](db, "ledger")
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("tx id: %s\n", tx.TxID())
-	for _, entry := range []string{"debit", "credit", "fee"} {
-		id := murmur.NewRowID()
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO ledger (id, entry) VALUES (?, ?)`, id[:], entry); err != nil {
-			_ = tx.Rollback()
+	count := func() int {
+		n, err := ledger.Where().Count()
+		if err != nil {
 			log.Fatal(err)
 		}
+		return n
 	}
-	if err := tx.Commit(); err != nil {
-		log.Fatal(err)
-	}
-	fmt.Printf("rows after commit: %d\n", count(ctx, db))
 
-	// Rollback: the insert never becomes visible.
-	tx, err = db.BeginTx(ctx, nil)
-	if err != nil {
+	// The callback commits all three records together.
+	if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+		entries := []*ledgerEntry{
+			{ID: murmur.NewRowID(), Entry: "debit"},
+			{ID: murmur.NewRowID(), Entry: "credit"},
+			{ID: murmur.NewRowID(), Entry: "fee"},
+		}
+		return ledger.InsertMany(tx, entries)
+	}); err != nil {
 		log.Fatal(err)
 	}
-	id := murmur.NewRowID()
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO ledger (id, entry) VALUES (?, ?)`, id[:], "abandoned"); err != nil {
-		_ = tx.Rollback()
-		log.Fatal(err)
+	fmt.Printf("rows after commit: %d\n", count())
+
+	// Returning an error aborts every staged write in the callback.
+	rollback := errors.New("demonstration rollback")
+	err = db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+		if err := ledger.Insert(tx, &ledgerEntry{ID: murmur.NewRowID(), Entry: "abandoned"}); err != nil {
+			return err
+		}
+		return rollback
+	})
+	if !errors.Is(err, rollback) {
+		log.Fatalf("rollback callback returned %v, want %v", err, rollback)
 	}
-	if err := tx.Rollback(); err != nil {
-		log.Fatal(err)
-	}
-	fmt.Printf("rows after rollback: %d\n", count(ctx, db))
-	if got := count(ctx, db); got != 3 {
+	fmt.Printf("rows after rollback: %d\n", count())
+	if got := count(); got != 3 {
 		log.Fatalf("want 3 rows after rollback, got %d", got)
 	}
 }

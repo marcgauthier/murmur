@@ -1,18 +1,14 @@
 package bridge
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
-	"github.com/marcgauthier/murmur/internal/testdb"
 	"testing"
 
-	"github.com/cockroachdb/pebble/v2/vfs"
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/ids"
-	"github.com/marcgauthier/murmur/schema"
 )
 
 func openHighDB(t *testing.T) *db.DB {
@@ -21,32 +17,10 @@ func openHighDB(t *testing.T) *db.DB {
 }
 
 // openHighDBAt opens the test High database at an explicit path, node, and
-// base filesystem so failure tests can arm faults and reopen.
-func openHighDBAt(t *testing.T, dir string, node db.NodeID, fs vfs.FS) *db.DB {
+// fault storage so failure tests can arm faults and reopen.
+func openHighDBAt(t *testing.T, dir string, node db.NodeID, faults *failStorage) *db.DB {
 	t.Helper()
-	pebbleCfg := db.DefaultPebbleConfig()
-	if fs != nil {
-		pebbleCfg.BaseFS = fs
-	}
-	database, err := db.Open(context.Background(), testdb.Configure(db.Config{
-		Path:   dir,
-		NodeID: node,
-		Schema: db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "contacts",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-				{Name: "score", Type: schema.ColInteger, Nullable: true},
-			},
-		}}},
-		Pebble:     pebbleCfg,
-		Encryption: db.EncryptionConfig{Key: bytes.Repeat([]byte{0x44}, 32), KeyID: "test-key"},
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = database.Close() })
-	return database
+	return openTypedContactDBWithFaults(t, dir, node, faults, false)
 }
 
 func inboxKeys(t *testing.T, stream string) (*SignerKey, *RecipientKey, *TrustStore) {
@@ -105,69 +79,80 @@ func sealForInbox(t *testing.T, signer *SignerKey, recip *RecipientKey, stream s
 
 func queryNames(t *testing.T, database *db.DB) map[string]int64 {
 	t.Helper()
-	rows, err := database.QueryContext(context.Background(), `SELECT name, score FROM contacts`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-	out := make(map[string]int64)
-	for rows.Next() {
-		var name string
-		var score sqlNullInt64
-		if err := rows.Scan(&name, &score); err != nil {
+	if table, err := db.TableOf[typedBridgeContactRecord](database, "contacts"); err == nil {
+		rows, err := table.Where().Find()
+		if err != nil {
 			t.Fatal(err)
 		}
-		if score.Valid {
-			out[name] = score.Int64
-		} else {
-			out[name] = -1
+		out := make(map[string]int64, len(rows))
+		for _, row := range rows {
+			name := ""
+			if row.Name != nil {
+				name = *row.Name
+			}
+			if row.Score == nil {
+				out[name] = -1
+			} else {
+				out[name] = *row.Score
+			}
 		}
+		return out
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
+	if table, err := db.TableOf[typedBridgeContactExpanded](database, "contacts"); err == nil {
+		rows, err := table.Where().Find()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := make(map[string]int64, len(rows))
+		for _, row := range rows {
+			name := ""
+			if row.Name != nil {
+				name = *row.Name
+			}
+			if row.Score == nil {
+				out[name] = -1
+			} else {
+				out[name] = *row.Score
+			}
+		}
+		return out
 	}
-	return out
-}
-
-// sqlNullInt64 mirrors sql.NullInt64 without importing database/sql.
-type sqlNullInt64 struct {
-	Int64 int64
-	Valid bool
-}
-
-// Scan implements sql.Scanner for INTEGER columns.
-func (n *sqlNullInt64) Scan(value any) error {
-	switch v := value.(type) {
-	case nil:
-		n.Int64, n.Valid = 0, false
-		return nil
-	case int64:
-		n.Int64, n.Valid = v, true
-		return nil
-	default:
-		return errScanType
+	if table, err := db.TableOf[typedBridgeContactRatioRecord](database, "contacts"); err == nil {
+		rows, err := table.Where().Find()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := make(map[string]int64, len(rows))
+		for _, row := range rows {
+			name := ""
+			if row.Name != nil {
+				name = *row.Name
+			}
+			if row.Score == nil {
+				out[name] = -1
+			} else {
+				out[name] = *row.Score
+			}
+		}
+		return out
 	}
+	t.Fatal("contacts table is not registered with a typed binding")
+	return nil
 }
-
-type scanError string
-
-func (e scanError) Error() string { return string(e) }
-
-const errScanType = scanError("bridge: unexpected scan type")
 
 func TestInboxDrainInOrder(t *testing.T) {
 	ctx := context.Background()
-	high := openHighDB(t)
+	high := openTypedContactDBAt(t, t.TempDir(), db.NewNodeID())
 	signer, recip, trust := inboxKeys(t, "s")
 	inbox, err := OpenInbox(t.TempDir(), trust, Limits{}.withDefaults())
 	if err != nil {
 		t.Fatal(err)
 	}
 	rowAnn, rowBob := ids.NewRowID(), ids.NewRowID()
-	b1 := sealForInbox(t, signer, recip, "s", 1, []Batch{
+	b1 := sealTypedContactsForInbox(t, signer, recip, "s", 1, []Batch{
 		putBatch(1, rowAnn, ColumnValue{Column: "name", Value: codec.Text("ann")}, ColumnValue{Column: "score", Value: codec.Int(1)}),
 	})
-	b23 := sealForInbox(t, signer, recip, "s", 2, []Batch{
+	b23 := sealTypedContactsForInbox(t, signer, recip, "s", 2, []Batch{
 		putBatch(2, rowBob, ColumnValue{Column: "name", Value: codec.Text("bob")}),
 		delBatch(3, rowAnn),
 	})
@@ -222,7 +207,7 @@ func TestInboxDrainInOrder(t *testing.T) {
 
 func TestInboxConflictQuarantine(t *testing.T) {
 	ctx := context.Background()
-	high := openHighDB(t)
+	high := openTypedContactDBAt(t, t.TempDir(), db.NewNodeID())
 	signer, recip, trust := inboxKeys(t, "s")
 	// A second trusted signer lets us craft conflicting same-seq content.
 	signer2, err := GenerateSigningKey()
@@ -237,10 +222,10 @@ func TestInboxConflictQuarantine(t *testing.T) {
 		t.Fatal(err)
 	}
 	row := ids.NewRowID()
-	a1 := sealForInbox(t, signer, recip, "s", 1, []Batch{
+	a1 := sealTypedContactsForInbox(t, signer, recip, "s", 1, []Batch{
 		putBatch(1, row, ColumnValue{Column: "name", Value: codec.Text("a")}),
 	})
-	a1conflict := sealForInbox(t, signer2, recip, "s", 1, []Batch{
+	a1conflict := sealTypedContactsForInbox(t, signer2, recip, "s", 1, []Batch{
 		putBatch(1, ids.NewRowID(), ColumnValue{Column: "name", Value: codec.Text("b")}),
 	})
 
@@ -282,8 +267,8 @@ func TestInboxApplyFailureQuarantine(t *testing.T) {
 	ctx := context.Background()
 	highDir := t.TempDir()
 	node := db.NewNodeID()
-	fsys := &failFS{FS: vfs.Default}
-	high := openHighDBAt(t, highDir, node, fsys)
+	fsys := &failStorage{}
+	high := openTypedContactDBWithFaults(t, highDir, node, fsys, false)
 	signer, recip, trust := inboxKeys(t, "s")
 	dir := t.TempDir()
 	inbox, err := OpenInbox(dir, trust, Limits{}.withDefaults())
@@ -293,11 +278,11 @@ func TestInboxApplyFailureQuarantine(t *testing.T) {
 	// Both bundles are schema-valid; the failure is a full disk mid-apply.
 	// Bundle 2 is fine but held behind bundle 1's quarantine.
 	row1 := ids.NewRowID()
-	bad := sealForInbox(t, signer, recip, "s", 1, []Batch{
+	bad := sealTypedContactsForInbox(t, signer, recip, "s", 1, []Batch{
 		putBatch(1, row1, ColumnValue{Column: "name", Value: codec.Text("ann")}),
 	})
 	row := ids.NewRowID()
-	good := sealForInbox(t, signer, recip, "s", 2, []Batch{
+	good := sealTypedContactsForInbox(t, signer, recip, "s", 2, []Batch{
 		putBatch(2, row, ColumnValue{Column: "name", Value: codec.Text("bob")}),
 	})
 	if err := inbox.Receive(bad); err != nil {
@@ -348,7 +333,7 @@ func TestInboxApplyFailureQuarantine(t *testing.T) {
 	// Space returns and the node restarts: replay applies both bundles.
 	fsys.disarm()
 	_ = high.Close() // a failed node may report its fatal cause on close
-	high = openHighDBAt(t, highDir, node, fsys)
+	high = openTypedContactDBWithFaults(t, highDir, node, fsys, false)
 	im2, err := NewImporter(high)
 	if err != nil {
 		t.Fatal(err)
@@ -372,10 +357,10 @@ func TestImportAtomicity(t *testing.T) {
 	// whole bundle rolls back and quarantines with nothing applied.
 	highDir := t.TempDir()
 	node := db.NewNodeID()
-	fsys := &failFS{FS: vfs.Default}
-	high := openHighDBAt(t, highDir, node, fsys)
+	fsys := &failStorage{}
+	high := openTypedContactDBWithFaults(t, highDir, node, fsys, false)
 	row, row2 := ids.NewRowID(), ids.NewRowID()
-	b := sealForInbox(t, signer, recip, "s", 1, []Batch{
+	b := sealTypedContactsForInbox(t, signer, recip, "s", 1, []Batch{
 		putBatch(1, row, ColumnValue{Column: "name", Value: codec.Text("ann")}),
 		putBatch(2, row2, ColumnValue{Column: "name", Value: codec.Text("bob")}),
 	})
@@ -398,7 +383,7 @@ func TestImportAtomicity(t *testing.T) {
 	}
 	fsys.disarm()
 	_ = high.Close() // a failed node may report its fatal cause on close
-	high = openHighDBAt(t, highDir, node, fsys)
+	high = openTypedContactDBWithFaults(t, highDir, node, fsys, false)
 	// The failed commit may have reached the memtable and flushed at
 	// close, but never partially: the bundle is one storage batch, so
 	// the reopened state holds all or nothing of it.
@@ -428,10 +413,10 @@ func TestImportAtomicity(t *testing.T) {
 
 func TestCrossReceiverConvergence(t *testing.T) {
 	ctx := context.Background()
-	highA, highB := openHighDB(t), openHighDB(t)
+	highA, highB := openTypedContactDBAt(t, t.TempDir(), db.NewNodeID()), openTypedContactDBAt(t, t.TempDir(), db.NewNodeID())
 	signer, recip, trust := inboxKeys(t, "s")
 	row := ids.NewRowID()
-	a := sealForInbox(t, signer, recip, "s", 1, []Batch{
+	a := sealTypedContactsForInbox(t, signer, recip, "s", 1, []Batch{
 		putBatch(1, row,
 			ColumnValue{Column: "name", Value: codec.Text("ann")},
 			ColumnValue{Column: "score", Value: codec.Int(7)}),
@@ -461,7 +446,7 @@ func TestCrossReceiverConvergence(t *testing.T) {
 
 func TestInboxRestartRecovery(t *testing.T) {
 	ctx := context.Background()
-	high := openHighDB(t)
+	high := openTypedContactDBAt(t, t.TempDir(), db.NewNodeID())
 	signer, recip, trust := inboxKeys(t, "s")
 	dir := t.TempDir()
 	inbox, err := OpenInbox(dir, trust, Limits{}.withDefaults())
@@ -469,10 +454,10 @@ func TestInboxRestartRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	row := ids.NewRowID()
-	a1 := sealForInbox(t, signer, recip, "s", 1, []Batch{
+	a1 := sealTypedContactsForInbox(t, signer, recip, "s", 1, []Batch{
 		putBatch(1, row, ColumnValue{Column: "name", Value: codec.Text("ann")}),
 	})
-	a2 := sealForInbox(t, signer, recip, "s", 2, []Batch{
+	a2 := sealTypedContactsForInbox(t, signer, recip, "s", 2, []Batch{
 		putBatch(2, ids.NewRowID(), ColumnValue{Column: "name", Value: codec.Text("bob")}),
 	})
 	if err := inbox.Receive(a1); err != nil {

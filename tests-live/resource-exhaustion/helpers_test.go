@@ -4,30 +4,46 @@
 package resourceexhaustion_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
-const tableName = "rx_rows"
+// The suite shares the harness's typed contention fixture table
+// (live_typed_contention); every cluster sets TypedRecords and
+// TypedContention instead of a SchemaConfig.
 
-func rxSchema() *db.SchemaConfig {
-	return &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-		Name: tableName,
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-		},
-	}}}
+// rxCount returns the contention-table row count on one node.
+func rxCount(cluster *harness.Cluster, idx int) (int, error) {
+	rows, err := cluster.TypedContentionRows(idx)
+	if err != nil {
+		return 0, err
+	}
+	return len(rows), nil
+}
+
+// rxDigest returns the PK-ordered digest of the contention table on one node.
+func rxDigest(cluster *harness.Cluster, idx int) (string, error) {
+	rows, err := cluster.TypedContentionRows(idx)
+	if err != nil {
+		return "", err
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	h := sha256.New()
+	for _, row := range rows {
+		fmt.Fprintf(h, "%s:%s:%s:%d\n", row.ID, row.Name, row.Phone, row.Score)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func getenv(name, fallback string) string {
@@ -44,7 +60,7 @@ func waitCounts(t *testing.T, cluster *harness.Cluster, nodes []int, want int, t
 	for time.Now().Before(deadline) {
 		ok := true
 		for _, i := range nodes {
-			n, err := cluster.QueryRowCount(i, tableName)
+			n, err := rxCount(cluster, i)
 			if err != nil || n != want {
 				ok = false
 				break
@@ -70,7 +86,7 @@ func waitDigests(t *testing.T, cluster *harness.Cluster, nodes []int, timeout ti
 		var first string
 		ok := true
 		for k, i := range nodes {
-			d, err := cluster.ComputeTableDigest(i, tableName, "id")
+			d, err := rxDigest(cluster, i)
 			if err != nil {
 				lastErr = fmt.Errorf("node %d: %w", i+1, err)
 				ok = false
@@ -97,9 +113,9 @@ func waitDigests(t *testing.T, cluster *harness.Cluster, nodes []int, timeout ti
 	return ""
 }
 
-// countSSTs counts Pebble data files under dir (recursive), an observable
+// countSSTs counts segment and data files under dir (recursive), an observable
 // proxy for compaction debt: a node with stalled compactions accumulates
-// L0 tables while a healthy node folds them away.
+// segment tables while a healthy node folds them away.
 func countSSTs(t *testing.T, dir string) int {
 	t.Helper()
 	n := 0
@@ -107,7 +123,7 @@ func countSSTs(t *testing.T, dir string) int {
 		if err != nil {
 			return nil
 		}
-		if !d.IsDir() && strings.HasSuffix(d.Name(), ".sst") {
+		if !d.IsDir() && (strings.HasSuffix(d.Name(), ".seg") || strings.HasSuffix(d.Name(), ".sst")) {
 			n++
 		}
 		return nil

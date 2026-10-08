@@ -1,8 +1,8 @@
-# SQL injection via the API is contained
+# Removed SQL application routes
 
-Run with `go test -count=1 ./tests-live/sqli-api`. Classic SQLi
-payloads (tautologies, stacked queries, comment truncation, UNION
-probes) are sent through the service API's exec/query paths. Every
-payload must be contained (parameterized or rejected, never executed
-as SQL): no out-of-scope rows appear, honest data is untouched, and
-digests stay equal.
+This live test starts two native typed nodes and verifies that the retired
+`/v1/query` and `/v1/exec` routes return HTTP 410 with typed RIME migration
+guidance, including for stacked statements and data-exfiltration payloads.
+It then proves typed writes still replicate after those requests.
+
+Run with `CGO_ENABLED=0 bash tests-live/run.sh sqli-api`.

@@ -1,21 +1,26 @@
-# MURMUR-SQL Benchmark Suites
+# MURMUR Benchmark Suites
 
 Performance-only suites: they measure throughput/latency and are not
 correctness gates. Each test folder has its own runner — this one runs
 only the suites below:
 
-- `benchmark/` — in-process Go benchmarks and throughput tests
-  (reads, writes, FTS, replication, maintenance, cipher matrix).
-- `replication/` — live two-node replication throughput benchmark
-  (multi-process daemons via the shared `tests-live` harness).
-- `sqlite-bench/` — `:memory:` SQLite driver comparison
-  (mattn vs modernc) over 100k-row tables.
+- `benchmark/` — nested module for in-process Go benchmarks and throughput
+  tests (reads, writes, replication, maintenance, cipher matrix) against
+  the typed RIME backend. It is tested explicitly in CI and excluded
+  from root `go test ./...`. The historical FTS and stock
+  reference benches were removed with the old backend; comparisons
+  live in `sqlite-bench/` and `rime-sqlite/` only.
+- `replication/` — nested module for the live two-node replication throughput
+  benchmark (multi-process daemons via the shared `tests-live` harness).
+- `sqlite-bench/` — standalone nested module for the historical `:memory:` baseline over 100k-row tables.
+- `rime-sqlite/` — separately enabled historical RIME comparison tests.
 
 Run one suite or everything:
 
 ```sh
 bash tests-benchmark/run.sh replication
 bash tests-benchmark/run.sh sqlite-bench
+bash tests-benchmark/run.sh rime-sqlite
 bash tests-benchmark/run.sh benchmark
 bash tests-benchmark/run.sh perf-matrix   # characterization matrix (tiers below)
 bash tests-benchmark/run.sh all
@@ -47,4 +52,6 @@ The runner builds its own daemon binary at
 `tests-benchmark/runtime/` (failures under
 `tests-benchmark/failures/`); overrides: `MURMUR_BIN`,
 `MURMUR_LIVE_RUNTIME`, `MURMUR_LIVE_FAILURES`, `MURMUR_TAGS`
-(default `"sqlite_preupdate_hook sqlite_fts5"`).
+(default `""`, used for the harness
+suites and daemon builds; the typed `benchmark`/`perf-matrix` suites
+run without build tags unless `MURMUR_TAGS` is set explicitly).

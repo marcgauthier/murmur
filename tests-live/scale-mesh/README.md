@@ -1,8 +1,9 @@
 # Ten-node mesh (multi-process)
 
 Run with `go test -count=1 ./tests-live/scale-mesh` (tags required; or
-`bash tests-live/run.sh scale-mesh`). Ten Murmur-SQL daemons mesh with the
-default fanout of 4 while two origins write 400 rows.
+`bash tests-live/run.sh scale-mesh`). Ten Murmur daemons mesh with the
+default fanout of 4 while two origins write 400 managed typed contention
+records through RIME.
 
 Smaller suites never exceed the fanout, so this is the only live proof
 that peer selection and rotation hold at scale: every node must converge

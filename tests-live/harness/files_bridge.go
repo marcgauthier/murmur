@@ -359,6 +359,25 @@ func (c *Cluster) Provenance(idx int, table, rowHex, column string) (bool, strin
 	return res.Present, res.Owner, nil
 }
 
+// BridgeRelease returns one typed High field to Low ownership.
+func (c *Cluster) BridgeRelease(idx int, table, rowHex, column string) error {
+	node := c.Nodes[idx]
+	payload, err := json.Marshal(map[string]string{"table": table, "row_hex": rowHex, "column": column})
+	if err != nil {
+		return err
+	}
+	resp, err := http.Post(fmt.Sprintf("https://%s/v1/admin/bridge/release", node.APIAddr), "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("node %s bridge ownership release failed (%d): %s", node.Label, resp.StatusCode, string(b))
+	}
+	return nil
+}
+
 // ReleaseOwnership returns a High-overridden field to Low ownership.
 func (c *Cluster) ReleaseOwnership(idx int, table, rowHex, column string) error {
 	node := c.Nodes[idx]
@@ -371,22 +390,6 @@ func (c *Cluster) ReleaseOwnership(idx int, table, rowHex, column string) error 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("node %s release failed (%d): %s", node.Label, resp.StatusCode, string(b))
-	}
-	return nil
-}
-
-// Migrate applies a schema migration (full table list) on one node.
-func (c *Cluster) Migrate(idx int, tables any) error {
-	node := c.Nodes[idx]
-	payload, _ := json.Marshal(map[string]any{"tables": tables})
-	resp, err := http.Post(fmt.Sprintf("https://%s/v1/admin/migrate", node.APIAddr), "application/json", bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		return fmt.Errorf("node %s migrate failed (%d): %s", node.Label, resp.StatusCode, string(b))
 	}
 	return nil
 }

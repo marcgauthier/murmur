@@ -54,7 +54,7 @@ Exchange, with bounded/paginated messages:
 - Missing inclusive sequence ranges and partial transaction identities with missing chunk ranges.
 - The earliest retained log sequence and latest available sequence per origin, plus snapshot availability.
 
-Implemented today: optional paginated applied/observed and retained-history advertisements; observed reflects the highest durable staged sequence. Peers also exchange paginated staged transaction IDs and chunk bitmaps. Missing tails can be fetched from another connected peer that advertises the required retained sequence, with snapshot fallback when no retained source is available. Oversized transactions use canonical `TXCH` frames. Each validated fragment is committed to the configured Pebble filesystem (encrypted at rest in production), under a 256 MiB and 4096-transfer global cap. Partial transactions survive restart, request missing chunk indexes from the original and alternate peers, and advance applied progress only after digest-verified reassembly and the normal atomic whole-batch commit. A source that cannot serve requested chunks returns `ErrRangeUnavailable`; the receiver tries other peers and falls back to a snapshot if all sources are unavailable. A crash before staging cleanup is safe because the committed receipt deduplicates replay.
+Implemented today: optional paginated applied/observed and retained-history advertisements; observed reflects the highest durable staged sequence. Peers also exchange paginated staged transaction IDs and chunk bitmaps. Missing tails can be fetched from another connected peer that advertises the required retained sequence, with snapshot fallback when no retained source is available. Oversized transactions use canonical `TXCH` frames. Each validated fragment is committed to Spool storage (encrypted at rest with AES-256-GCM in production), under a 256 MiB and 4096-transfer global cap. Partial transactions survive restart, request missing chunk indexes from the original and alternate peers, and advance applied progress only after digest-verified reassembly and the normal atomic whole-batch commit. A source that cannot serve requested chunks returns `ErrRangeUnavailable`; the receiver tries other peers and falls back to a snapshot if all sources are unavailable. A crash before staging cleanup is safe because the committed receipt deduplicates replay.
 
 Request only missing data the selected source advertises as available. A source that lacks a range returns an explicit unavailable-history response; try another source or obtain a current-state snapshot. Advertised staged/observed heads, chunk availability, and `IHAVE` notices are hints, never durable applied watermarks or GC acknowledgements.
 
@@ -66,7 +66,7 @@ Transactions fitting a frame may use the existing complete-batch encoding. Large
 
 The `codec` package implements the version-2 `TXCH` frame and canonical transaction encoding/assembly in `EncodeTransactionChunks`, `EncodeTransactionChunk`, `DecodeTransactionChunk`, and `AssembleTransactionChunks`. It fixes payload chunks at 64 KiB, bounds the transaction at the configured codec limit (64 MiB by default), rejects inconsistent metadata and duplicate/missing chunks, and verifies the canonical digest and mutation identity before returning an assembled batch. `state.Store.StageTransactionChunk` persists fragments and the received count atomically; `replication.Manager` resumes incomplete transfers from the source or up to two alternate peers and applies only the fully assembled batch. Progress pages advertise the observed head, and separate cursor pages advertise the durable chunk bitmap.
 
-Stage chunks in package-owned encrypted Pebble storage outside authoritative current state, atomically persisting chunk receipt and transfer metadata. Byte-identical duplicates are harmless; conflicting digest/length/chunk definitions fail closed. Advertise only durably staged chunks for resumable transfer. When all chunks validate against the transaction digest, reconstruct the bounded transaction and atomically commit its complete mutations, log, receipt, and contiguous watermark through the normal apply coordinator. Staged data never appears in SQL queries. A crash before the apply commit resumes/retries staging; a crash after it deduplicates by the committed identity.
+Stage chunks in package-owned encrypted Spool storage outside authoritative current state, atomically persisting chunk receipt and transfer metadata. Byte-identical duplicates are harmless; conflicting digest/length/chunk definitions fail closed. Advertise only durably staged chunks for resumable transfer. When all chunks validate against the transaction digest, reconstruct the bounded transaction and atomically commit its complete mutations, log, receipt, and contiguous watermark through the normal apply coordinator. Staged data never appears in SQL queries. A crash before the apply commit resumes/retries staging; a crash after it deduplicates by the committed identity.
 
 Bound staging disk bytes and transfer count globally and per peer. Expired, canceled, or over-budget unapplied transfers may be evicted and requested again; eviction must not advance applied watermarks or delete committed data. Release staging only after the apply commit succeeds or an explicit resumable-transfer eviction. Pin source log entries during active chunk reads within bounded transfer leases; after expiry, use retained-history/snapshot repair rather than claiming the chunks still exist.
 
@@ -98,7 +98,7 @@ These are benchmark values, not protocol constants.
 
 Do not batch unrelated transactions into one replication identity. A network frame may contain several `MutationBatch` objects, but each original transaction keeps its TxID and sequence.
 
-`MaxBatchBytes` limits a frame, not a complete transaction. `MaxTransactionBytes` limits the canonical encoded transaction and is checked before local SQL/Pebble commit, including coalesced multi-row statements. Transactions above one frame use [Section 31](synchronization-and-overload.md#31-sequence-and-gap-handling)'s chunk protocol; outbound chunk encoding and retained-log repair visit one reusable frame at a time instead of retaining a second transaction-sized frame slice. The canonical batch remains bounded in memory for digesting. Transactions above the total limit fail the local transaction without success acknowledgement. Bound decode/reassembly memory for the one apply coordinator separately from queue and staging budgets; chunking is not permission to allocate the entire database.
+`MaxBatchBytes` limits a frame, not a complete transaction. `MaxTransactionBytes` limits the canonical encoded transaction and is checked before local Spool commit, including coalesced multi-row operations. Transactions above one frame use [Section 31](synchronization-and-overload.md#31-sequence-and-gap-handling)'s chunk protocol; outbound chunk encoding and retained-log repair visit one reusable frame at a time instead of retaining a second transaction-sized frame slice. The canonical batch remains bounded in memory for digesting. Transactions above the total limit fail the local transaction without success acknowledgement. Bound decode/reassembly memory for the one apply coordinator separately from queue and staging budgets; chunking is not permission to allocate the entire database.
 
 ### Overload budgets and defaults
 
@@ -131,7 +131,7 @@ Implemented overload controls: the `overload` package provides `Counter` byte/en
 
 Implemented send fairness and wake coalescing: local commit wakeups use a one-slot nonblocking channel. The send loop rotates its starting peer each round, caps ordinary log service at 128 batches per peer per round, drains at most 16 queued control frames per peer per round, and serves chunk repairs in groups of at most 16 chunks before yielding back to control traffic. Explicit range requests are coalesced and served in bounded batches. This bounds work between peers and message classes; an individual frame write still follows the transport's configured deadline.
 
-Implemented remote apply groups start at one transaction, double after successful groups up to 64, and halve after a failed group. Groups contain only contiguous sequences from one origin and are capped at 64 MiB of encoded batches. `Store.CommitRemoteGroup` writes each transaction log row and receipt, each contiguous watermark, merged winners, HLC, and per-transaction generation increments in one synced Pebble batch. A gap aborts the whole group. `DB.ApplyRemoteGroup` queues the affected row identities after the durable commit. SQLite materializes the final Pebble state in one transaction at the one-second tick or after 1,000 received transactions. The receive watermark and acknowledgement certify Pebble receipt, while `MaterializedGeneration` tracks SQLite query visibility. The manager uses the grouped applier when available and falls back to single-batch applies for other appliers.
+Implemented remote apply groups start at one transaction, double after successful groups up to 64, and halve after a failed group. Groups contain only contiguous sequences from one origin and are capped at 64 MiB of encoded batches. `Store.CommitRemoteGroup` writes each transaction log row and receipt, each contiguous watermark, merged winners, HLC, and per-transaction generation increments in one synced Spool commit. A gap aborts the whole group. `DB.ApplyRemoteGroup` publishes final winning rows through the managed RIME adapter after the durable commit and before returning the acknowledgement. `MaterializedGeneration` tracks RIME query visibility; no deferred SQLite queue or worker remains. The manager uses the grouped applier when available and falls back to single-batch applies for other appliers.
 
 ---
 
@@ -166,20 +166,14 @@ Do not use JSON on the replication hot path.
 
 ## 34. Compression
 
-### Pebble storage compression
+### Spool storage compression
 
-Default to enabled Zstd level 3 on every LSM level. After initializing all level options, apply `pebble.UniformDBCompressionSettings(block.ZstdCompression)` with `Options.ApplyCompressionSettings`. Use the v2.1.6 `sstable/block` profile, whose Zstd setting is level 3. Explicit none/snappy map to their uniform built-in profiles. Supported Zstd levels are 3 (default), 9, and 12; level 3 uses Pebble's shared built-in profile, while 9 and 12 copy it and override the per-block level without mutating the shared profile. Reject unsupported modes and any other Zstd level.
+Spool supports configurable compression modes:
+- `CompressNone`: records and segments stored uncompressed.
+- `CompressSnappy`: Snappy compression for fast write/read throughput.
+- `CompressDeflate`: Zstandard compression (default level 3; configurable levels 3, 9, 12).
 
-```go
-opts.EnsureDefaults()
-opts.ApplyCompressionSettings(func() pebble.DBCompressionSettings {
-    return pebble.UniformDBCompressionSettings(block.ZstdCompression)
-})
-// block is github.com/cockroachdb/pebble/v2/sstable/block.
-// opts.FS must already be the encrypted VFS before pebble.Open.
-```
-
-Pebble may store blocks uncompressed when compression does not achieve its profile's minimum reduction. This is compatible with compression being enabled. Configuration changes affect newly written tables; existing tables remain readable until compaction rewrites them. WAL/manifests are encrypted by the VFS but do not gain SSTable compression. Do not add a second compression layer inside the VFS.
+Spool applies compression to segment payload records before encryption. Configuration changes affect newly created segments; existing segments remain readable.
 
 ### Replication compression
 
@@ -210,9 +204,9 @@ A peer periodically reports:
 origin -> highest contiguous sequence received durably
 ```
 
-"Received" means committed to Pebble, not merely received over QUIC.
+"Received" means committed to Spool, not merely received over QUIC.
 
-Acknowledgement must never be sent before the Pebble synchronized batch succeeds.
+Acknowledgement must never be sent before the Spool commit succeeds.
 
 Distinguish transfer/staging confirmations from applied transaction acknowledgements on the wire. Only the latter advances contiguous progress or renews a GC obligation. `IHAVE` and observed heads never substitute for a durable acknowledgement.
 
@@ -231,6 +225,9 @@ MaxReplicatedValueBytes
 ```
 
 Default to 16 MiB and allow an explicit higher limit only when the total transaction/apply/staging budgets accommodate it.
+Typed record writes that exceed the configured per-value limit fail with
+`ErrValueTooLarge` before the Spool commit and leave the materialized row
+unchanged.
 
 For very large files, use the planned [separate encrypted object store](file-replication.md)
 rather than allocating whole files as SQL values. A content-addressed chunk model

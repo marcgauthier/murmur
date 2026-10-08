@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -138,6 +140,136 @@ func TestActiveReadPinsObjectAgainstCollection(t *testing.T) {
 	removed, err = store.Collect(nil, 0)
 	if err != nil || len(removed) != 1 || removed[0] != info.Digest {
 		t.Fatalf("post-read collection removed=%v err=%v", removed, err)
+	}
+}
+
+func TestPinConcurrentWithCollect(t *testing.T) {
+	store, err := New(t.TempDir(), bytes.Repeat([]byte{0x57}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	plain := []byte("concurrent pin retention")
+	type result struct {
+		mode int
+		ok   bool
+		err  error
+	}
+	var successes [3]int
+	for round := 0; round < 512; round++ {
+		info, err := store.Put(context.Background(), bytes.NewReader(plain))
+		if err != nil {
+			t.Fatal(err)
+		}
+		start, stop := make(chan struct{}), make(chan struct{})
+		collected := make(chan error, 1)
+		go func() {
+			<-start
+			for {
+				if _, err := store.Collect(nil, 0); err != nil {
+					collected <- err
+					return
+				}
+				select {
+				case <-stop:
+					collected <- nil
+					return
+				default:
+					runtime.Gosched()
+				}
+			}
+		}()
+		// No publisher runs during acquisition: a successful handle cannot
+		// hide a collection error behind recreation of the same digest.
+		checkRetained := func() error {
+			if _, err := store.Collect(nil, 0); err != nil {
+				return err
+			}
+			var got bytes.Buffer
+			if _, err := store.Read(context.Background(), info.Digest, &got); err != nil {
+				return fmt.Errorf("retained object is unreadable: %v", err)
+			}
+			if !bytes.Equal(got.Bytes(), plain) {
+				return fmt.Errorf("retained object plaintext differs")
+			}
+			return nil
+		}
+		results := make(chan result, 12)
+		for worker := 0; worker < 12; worker++ {
+			go func(mode int) {
+				<-start
+				var err error
+				switch mode {
+				case 0:
+					pin, pinErr := store.Pin(info.Digest)
+					if pinErr != nil {
+						err = pinErr
+						break
+					}
+					err = checkRetained()
+					_ = pin.Close()
+					results <- result{mode: mode, ok: true, err: err}
+					return
+				case 1:
+					served, serveErr := store.Serve(info.Digest)
+					if serveErr != nil {
+						err = serveErr
+						break
+					}
+					err = checkRetained()
+					if err == nil {
+						var header [headerLen]byte
+						_, err = served.ReadAt(header[:], 0)
+					}
+					_ = served.Close()
+					results <- result{mode: mode, ok: true, err: err}
+					return
+				case 2:
+					var got bytes.Buffer
+					_, err = store.Read(context.Background(), info.Digest, &got)
+					if err == nil && !bytes.Equal(got.Bytes(), plain) {
+						err = fmt.Errorf("concurrent read plaintext differs")
+					}
+				}
+				if errors.Is(err, os.ErrNotExist) {
+					// GC may win before this operation acquires a pin.
+					results <- result{mode: mode}
+				} else {
+					results <- result{mode: mode, ok: err == nil, err: err}
+				}
+			}(worker % 3)
+		}
+		close(start)
+		var firstErr error
+		for worker := 0; worker < 12; worker++ {
+			r := <-results
+			if r.ok {
+				successes[r.mode]++
+			}
+			if r.err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("round %d mode %d: %w", round, r.mode, r.err)
+			}
+		}
+		close(stop)
+		if err := <-collected; err != nil {
+			t.Fatal(err)
+		}
+		if firstErr != nil {
+			t.Fatal(firstErr)
+		}
+		// Every successful operation has closed its pin. The digest must
+		// become collectible again, including after nested Read pins.
+		if _, err := store.Collect(nil, 0); err != nil {
+			t.Fatal(err)
+		}
+		if store.Has(info.Digest) {
+			t.Fatalf("round %d: object retained after all handles closed", round)
+		}
+	}
+	for mode, count := range successes {
+		if count == 0 {
+			t.Fatalf("mode %d never acquired an object", mode)
+		}
 	}
 }
 

@@ -28,7 +28,7 @@ type dbMetrics struct {
 	writeAcquisitions    atomic.Uint64
 	writeQueueWaitNanos  atomic.Uint64
 
-	// Remote apply and deferred SQLite materialization.
+	// Remote apply and managed RIME materialization.
 	remoteApplies           atomic.Uint64
 	remoteApplyMutations    atomic.Uint64
 	remoteApplyWinners      atomic.Uint64
@@ -107,10 +107,6 @@ type MetricsSnapshot struct {
 	SchemaAgreements uint64
 	SchemaSyncNeeds  uint64
 
-	// StmtCacheHits/Misses count prepared-statement cache lookups
-	// summed over the engine's read and write caches.
-	StmtCacheHits    uint64
-	StmtCacheMisses  uint64
 	SchemaAdoptions  uint64
 	SchemaMerges     uint64
 	SchemaMergeReuse uint64
@@ -177,8 +173,5 @@ func (m *dbMetrics) snapshot() MetricsSnapshot {
 func (db *DB) Metrics() MetricsSnapshot {
 	m := db.metrics.snapshot()
 	m.Scheduler = db.sched.Snapshot()
-	if db.engine != nil {
-		m.StmtCacheHits, m.StmtCacheMisses = db.engine.StmtCacheStats()
-	}
 	return m
 }

@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crdt"
 	"github.com/marcgauthier/murmur/ids"
@@ -26,7 +25,7 @@ type remoteGroupCell struct {
 }
 
 // CommitRemoteGroup durably records and merges an ordered group of remote
-// transactions in one Pebble commit. Each transaction keeps its own log row,
+// transactions in one Spool commit. Each transaction keeps its own log row,
 // receipt, origin sequence, and generation increment. A gap aborts the whole
 // group, so no caller can acknowledge a partially applied group.
 func (s *Store) CommitRemoteGroup(ctx context.Context, batches []*codec.MutationBatch) (MergeResult, error) {
@@ -62,7 +61,7 @@ func (s *Store) CommitRemoteGroup(ctx context.Context, batches []*codec.Mutation
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
 	result := MergeResult{}
 	dirty := false
@@ -128,7 +127,7 @@ func (s *Store) CommitRemoteGroup(ctx context.Context, batches []*codec.Mutation
 		if err := s.mergeRemoteGroupBatch(b, batch, staged, &order); err != nil {
 			return MergeResult{}, err
 		}
-		if err := b.Set(LogKey(batch.OriginNode, batch.Sequence), codec.EncodeBatch(nil, batch), nil); err != nil {
+		if err := b.Set(LogKey(batch.OriginNode, batch.Sequence), codec.EncodeBatch(nil, batch)); err != nil {
 			return MergeResult{}, err
 		}
 		if err := putRemoteReceipt(b, batch); err != nil {
@@ -136,7 +135,7 @@ func (s *Store) CommitRemoteGroup(ctx context.Context, batches []*codec.Mutation
 		}
 		wm = batch.Sequence
 		watermarks[batch.OriginNode] = wm
-		if err := b.Set(RecvKey(batch.OriginNode), encodeU64(wm), nil); err != nil {
+		if err := b.Set(RecvKey(batch.OriginNode), encodeU64(wm)); err != nil {
 			return MergeResult{}, err
 		}
 		maxHLC = maxU64(maxHLC, batch.HLC)
@@ -154,15 +153,15 @@ func (s *Store) CommitRemoteGroup(ctx context.Context, batches []*codec.Mutation
 		return MergeResult{}, writeErr
 	}
 
-	if err := b.Set(SysKey(sysHLC), encodeU64(maxHLC), nil); err != nil {
+	if err := b.Set(SysKey(sysHLC), encodeU64(maxHLC)); err != nil {
 		return MergeResult{}, err
 	}
 	if result.Applied {
-		if err := b.Set(SysKey(sysGeneration), encodeU64(gen), nil); err != nil {
+		if err := b.Set(SysKey(sysGeneration), encodeU64(gen)); err != nil {
 			return MergeResult{}, err
 		}
 	}
-	if err := s.commitBatch(b, s.writeOpts); err != nil {
+	if err := s.commitBatch(b, s.syncCommits); err != nil {
 		return MergeResult{}, err
 	}
 	result.Generation = gen
@@ -170,14 +169,14 @@ func (s *Store) CommitRemoteGroup(ctx context.Context, batches []*codec.Mutation
 	return result, nil
 }
 
-func putRemoteReceipt(b *pebble.Batch, batch *codec.MutationBatch) error {
+func putRemoteReceipt(b *batch, batch *codec.MutationBatch) error {
 	var receipt [24]byte
 	copy(receipt[:16], batch.OriginNode[:])
 	binary.BigEndian.PutUint64(receipt[16:], batch.Sequence)
-	return b.Set(ReceiptKey(batch.TxID), receipt[:], nil)
+	return b.Set(ReceiptKey(batch.TxID), receipt[:])
 }
 
-func (s *Store) mergeRemoteGroupBatch(b *pebble.Batch, batch *codec.MutationBatch, staged map[string]*remoteGroupCell, order *[]string) error {
+func (s *Store) mergeRemoteGroupBatch(b *batch, batch *codec.MutationBatch, staged map[string]*remoteGroupCell, order *[]string) error {
 	ver := batch.Version()
 	seen := make(map[string]struct{}, len(batch.Mutations))
 	for i := range batch.Mutations {

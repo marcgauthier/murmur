@@ -30,6 +30,8 @@ var (
 // Metadata stores the manifest descriptor inside the backup archive (backup-metadata.json).
 type Metadata struct {
 	Version        int       `json:"version"`
+	Backend        string    `json:"backend,omitempty"`
+	StorageFormat  uint64    `json:"storage_format,omitempty"`
 	BackupID       string    `json:"backup_id"`
 	DBID           string    `json:"db_id"`
 	NodeID         string    `json:"node_id"`
@@ -39,11 +41,11 @@ type Metadata struct {
 	CreatedAt      time.Time `json:"created_at"`
 	DataFilesCount int       `json:"data_files_count"`
 	TotalBytes     int64     `json:"total_bytes"`
-	PebbleFormat   uint64    `json:"pebble_format"`
+	PebbleFormat   uint64    `json:"pebble_format,omitempty"`
 	Compression    string    `json:"compression"` // "gzip" or "none"
 	// FilesMode declares file-object coverage: "objects" when the archive
 	// carries files/objects, "" (metadata-only) otherwise. File metadata
-	// always rides inside the Pebble checkpoint; only object bytes vary.
+	// always rides inside the Spool checkpoint; only object bytes vary.
 	FilesMode string `json:"files_mode,omitempty"`
 	// FilesObjects and FilesBytes declare the archived object payload.
 	FilesObjects int   `json:"files_objects,omitempty"`
@@ -107,7 +109,7 @@ type Config struct {
 	// to guarantee hard-link support.
 	StagingDir string
 	// IncludeFiles packs files/objects plus the key-generation marker
-	// alongside the Pebble checkpoint (object-inclusive backup). False
+	// alongside the Spool checkpoint (object-inclusive backup). False
 	// leaves object bytes out (metadata-only): file metadata still
 	// restores from the checkpoint, and missing payloads repair through
 	// mesh fetch. The object key itself never enters the archive: the
@@ -145,7 +147,7 @@ type RestoreConfig struct {
 	Source Destination
 	// BackupName is the specific backup file name to restore. If empty, the latest is used.
 	BackupName string
-	// TargetPath is the directory where the restored Pebble data directory will be placed.
+	// TargetPath is the directory where the restored Spool data directory will be placed.
 	TargetPath string
 	// KeysPath is the directory where the restored KEYREGISTRY will be placed.
 	KeysPath string

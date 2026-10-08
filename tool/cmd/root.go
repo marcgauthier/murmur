@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 
 	"github.com/marcgauthier/murmur/tool/client"
@@ -46,6 +45,13 @@ func Register(cmd Command) {
 func Lookup(name string) Command {
 	return commandRegistry[name]
 }
+
+type aliasCmd struct {
+	Command
+	name string
+}
+
+func (a *aliasCmd) Name() string { return a.name }
 
 // ParseGlobalOptions parses global options from args and returns the options and remaining positional args.
 func ParseGlobalOptions(args []string) (GlobalOptions, []string) {
@@ -97,7 +103,7 @@ func ParseGlobalOptions(args []string) (GlobalOptions, []string) {
 	return globalOpts, positional
 }
 
-// Execute parses args and dispatches to the requested command or starts the shell.
+// Execute parses args and dispatches to the requested command.
 func Execute(args []string, stdout, stderr io.Writer) int {
 	for _, arg := range args {
 		if arg == "--version" || arg == "-v" {
@@ -120,19 +126,6 @@ func Execute(args []string, stdout, stderr io.Writer) int {
 	subcommand := positional[0]
 	cmd, ok := commandRegistry[subcommand]
 	if !ok {
-		// If first argument is not a known command, check if it's a directory or URL to open interactive shell
-		// (e.g. `murmur ./data` or `murmur https://localhost:8443`)
-		if _, err := os.Stat(subcommand); err == nil || strings.HasPrefix(subcommand, "http://") || strings.HasPrefix(subcommand, "https://") || subcommand == ":memory:" {
-			shellCmd := commandRegistry["shell"]
-			if shellCmd != nil {
-				if err := shellCmd.Run(context.Background(), globalOpts, positional, stdout, stderr); err != nil {
-					handleError(err, globalOpts, stderr)
-					return 1
-				}
-				return 0
-			}
-		}
-
 		fmt.Fprintf(stderr, "unknown command: %q. Run 'murmur --help' for usage.\n", subcommand)
 		return 1
 	}
@@ -155,26 +148,20 @@ func handleError(err error, opts GlobalOptions, stderr io.Writer) {
 
 // PrintUsage prints global help to w.
 func PrintUsage(w io.Writer) {
-	fmt.Fprintf(w, `Murmur CLI - Embedded & Replicated SQL Database Tool (v%s)
+	fmt.Fprintf(w, `Murmur CLI - Embedded & Replicated Database Tool (v%s)
 
 Usage:
   murmur [command] [options] [arguments]
-  murmur <data-dir | node-url>          (starts interactive SQL shell)
 
 Core Database Commands:
-  shell <data-dir | url>                Start interactive SQL REPL
-  query <data-dir | url> <sql>          Execute one-shot SQL query
   init  <data-dir>                      Initialize a new encrypted database directory
-  import <data-dir> --table=T <csv-file> Bulk import CSV/JSON into table
-  export <data-dir> --table=T           Export table records (CSV, JSON, SQL)
-  dump   <data-dir>                     Dump complete database to SQL
 
 Storage & Diagnostics:
   doctor  <data-dir | url>              Run automated multi-check health scorecard
   inspect <data-dir>                    Inspect offline database state, watermarks, schema
-  verify  <data-dir> [--deep]           Verify cell checksums, WAL continuity, and signatures
-  repair  <data-dir> [--rebuild-sqlite] Rebuild SQLite materialization and repair log state
-  schema  <data-dir>                    Inspect schema manifest DAG & table column stable IDs
+  verify  <data-dir> [--deep]           Replay and verify authoritative durable state
+  repair  <data-dir> [--clear-intent] [--dry-run] Check Spool or clear a restore intent
+  schema  <data-dir>                    Inspect schema manifest tables and stable column IDs
   keys    <data-dir>                    Inspect key registry and verify passphrase
 
 Cluster & Replication Operations:
@@ -190,7 +177,7 @@ Backup Management:
   backup restore <archive.tar.gz> <dir>   Restore database from backup archive
 
 Performance & Benchmarks:
-  bench  [--duration=5s]                Benchmark storage I/O, ciphers, and SQLite speed
+  bench  [--duration=5s]                Benchmark typed RIME writes, reads, and ciphers
 
 Global Options:
   --json                                Output results in structured JSON format

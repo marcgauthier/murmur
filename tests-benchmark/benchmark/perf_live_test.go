@@ -1,11 +1,13 @@
 // Live perf-matrix cells: mesh scaling (1-10 nodes), network impairment
 // (LAN/WAN shaping via tc/netem on replication ports only), and reconnect
 // backlogs. All cells run real multi-process daemons through the shared
-// tests-live harness; measurements are convergence throughput and sampled
-// full-mesh visibility latency.
+// tests-live harness in typed-records mode; measurements are convergence
+// throughput and sampled full-mesh visibility latency.
 package benchmark
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -17,11 +19,8 @@ import (
 	"time"
 
 	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
-
-const perfLiveTable = "perf_rows"
 
 func perfMeshNodes(tier string) []int {
 	switch tier {
@@ -54,14 +53,26 @@ func perfMeshRows() int {
 	return 2000
 }
 
-func perfLiveSchema() *db.SchemaConfig {
-	return &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-		Name: perfLiveTable,
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-		},
-	}}}
+// perfRowID derives the deterministic typed-record ID for worker w and
+// sequence seq, preserving the pre-migration 16-byte layout (4-byte worker
+// prefix, 12-byte big-endian sequence).
+func perfRowID(w int, seq int64) (db.RowID, error) {
+	raw, err := hex.DecodeString(fmt.Sprintf("%08x%024x", w, seq))
+	if err != nil {
+		return db.RowID{}, err
+	}
+	var id db.RowID
+	copy(id[:], raw)
+	return id, nil
+}
+
+func perfDigestNames(names []string) string {
+	h := sha256.New()
+	for _, n := range names {
+		h.Write([]byte(n))
+		h.Write([]byte("\n"))
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func perfLiveCells(t *testing.T, rep *perfReport, tier, only string) {
@@ -89,10 +100,10 @@ func perfLiveCells(t *testing.T, rep *perfReport, tier, only string) {
 func perfMeshCell(t *testing.T, rep *perfReport, nodes, total int) {
 	t.Helper()
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        fmt.Sprintf("perf-mesh-%dn", nodes),
-		NumNodes:    nodes,
-		AwaitUnlock: true,
-		Schema:      perfLiveSchema(),
+		Name:         fmt.Sprintf("perf-mesh-%dn", nodes),
+		NumNodes:     nodes,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 
 	start := time.Now()
@@ -105,9 +116,12 @@ func perfMeshCell(t *testing.T, rep *perfReport, nodes, total int) {
 			var seq int64
 			for i := w; i < total; i += nodes {
 				seq++
-				id := fmt.Sprintf("%08x%024x", w, seq)
-				if err := cluster.ExecSQL(w, "INSERT INTO "+perfLiveTable+" (id, name) VALUES (?, ?)",
-					id, fmt.Sprintf("m%d", i)); err != nil {
+				id, err := perfRowID(w, seq)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if err := cluster.TypedInsertWithID(w, id, fmt.Sprintf("m%d", i)); err != nil {
 					errCh <- err
 					return
 				}
@@ -130,9 +144,12 @@ func perfMeshCell(t *testing.T, rep *perfReport, nodes, total int) {
 	var lat perfLat
 	for s := 0; s < samples; s++ {
 		name := fmt.Sprintf("vis-%d", s)
-		id := fmt.Sprintf("%08x%024x", 999, s+1)
+		id, err := perfRowID(999, int64(s+1))
+		if err != nil {
+			t.Fatalf("mesh-%d visibility id: %v", nodes, err)
+		}
 		op := time.Now()
-		if err := cluster.ExecSQL(s%nodes, "INSERT INTO "+perfLiveTable+" (id, name) VALUES (?, ?)", id, name); err != nil {
+		if err := cluster.TypedInsertWithID(s%nodes, id, name); err != nil {
 			t.Fatalf("mesh-%d visibility write: %v", nodes, err)
 		}
 		perfWaitRowVisible(t, cluster, nodes, name, 2*time.Minute)
@@ -183,10 +200,10 @@ func perfImpairCells(t *testing.T, rep *perfReport) {
 	} {
 		func() {
 			cluster := harness.NewCluster(t, harness.ClusterOptions{
-				Name:        fmt.Sprintf("perf-impair-%s", v.name),
-				NumNodes:    3,
-				AwaitUnlock: true,
-				Schema:      perfLiveSchema(),
+				Name:         fmt.Sprintf("perf-impair-%s", v.name),
+				NumNodes:     3,
+				AwaitUnlock:  true,
+				TypedRecords: true,
 			})
 			ports, err := perfReplPorts(cluster)
 			if err != nil {
@@ -198,8 +215,11 @@ func perfImpairCells(t *testing.T, rep *perfReport) {
 			defer perfTcClear()
 			start := time.Now()
 			for i := 0; i < total; i++ {
-				if err := cluster.ExecSQL(i%3, "INSERT INTO "+perfLiveTable+" (id, name) VALUES (?, ?)",
-					fmt.Sprintf("%08x%024x", i%3, i+1), fmt.Sprintf("w%d", i)); err != nil {
+				id, err := perfRowID(i%3, int64(i+1))
+				if err != nil {
+					t.Fatalf("impair %s id: %v", v.name, err)
+				}
+				if err := cluster.TypedInsertWithID(i%3, id, fmt.Sprintf("w%d", i)); err != nil {
 					t.Fatalf("impair %s write: %v", v.name, err)
 				}
 			}
@@ -213,9 +233,12 @@ func perfImpairCells(t *testing.T, rep *perfReport) {
 			var lat perfLat
 			for s := 0; s < 20; s++ {
 				name := fmt.Sprintf("iv-%d", s)
+				id, err := perfRowID(777, int64(s+1))
+				if err != nil {
+					t.Fatalf("impair %s vis id: %v", v.name, err)
+				}
 				op := time.Now()
-				if err := cluster.ExecSQL(s%3, "INSERT INTO "+perfLiveTable+" (id, name) VALUES (?, ?)",
-					fmt.Sprintf("%08x%024x", 777, s+1), name); err != nil {
+				if err := cluster.TypedInsertWithID(s%3, id, name); err != nil {
 					t.Fatalf("impair %s vis write: %v", v.name, err)
 				}
 				perfWaitRowVisible(t, cluster, 3, name, 5*time.Minute)
@@ -239,14 +262,17 @@ func perfImpairCells(t *testing.T, rep *perfReport) {
 func perfReconnectCell(t *testing.T, rep *perfReport, backlog int) {
 	t.Helper()
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        fmt.Sprintf("perf-reconnect-%d", backlog),
-		NumNodes:    2,
-		AwaitUnlock: true,
-		Schema:      perfLiveSchema(),
+		Name:         fmt.Sprintf("perf-reconnect-%d", backlog),
+		NumNodes:     2,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 	for i := 0; i < 10; i++ {
-		if err := cluster.ExecSQL(0, "INSERT INTO "+perfLiveTable+" (id, name) VALUES (?, ?)",
-			fmt.Sprintf("%032x", i), fmt.Sprintf("base-%d", i)); err != nil {
+		id, err := perfRowID(0, int64(i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cluster.TypedInsertWithID(0, id, fmt.Sprintf("base-%d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -256,8 +282,11 @@ func perfReconnectCell(t *testing.T, rep *perfReport, backlog int) {
 	snapBefore := perfCounter(cluster.FetchPath(1, "/metrics"), "spedsql_repl_snapshots_received_total")
 	cluster.StopNode(1)
 	for i := 0; i < backlog; i++ {
-		if err := cluster.ExecSQL(0, "INSERT INTO "+perfLiveTable+" (id, name) VALUES (?, ?)",
-			fmt.Sprintf("%08x%024x", 5, i+1), fmt.Sprintf("bl-%d", i)); err != nil {
+		id, err := perfRowID(5, int64(i+1))
+		if err != nil {
+			t.Fatalf("backlog id: %v", err)
+		}
+		if err := cluster.TypedInsertWithID(0, id, fmt.Sprintf("bl-%d", i)); err != nil {
 			t.Fatalf("backlog write: %v", err)
 		}
 	}
@@ -290,22 +319,21 @@ func perfReconnectCell(t *testing.T, rep *perfReport, backlog int) {
 	cluster.Cleanup()
 }
 
+// perfWaitConverged polls until every node holds the same want rows. Names
+// are unique per row within a cell and TypedNames returns them sorted, so
+// digest equality over the name list implies the same row set everywhere.
 func perfWaitConverged(cluster *harness.Cluster, nodes, want int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
 		var first string
 		for i := 0; i < nodes; i++ {
-			n, err := cluster.QueryRowCount(i, perfLiveTable)
-			if err != nil || n != want {
+			names, err := cluster.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
-			d, err := cluster.ComputeTableDigest(i, perfLiveTable, "id")
-			if err != nil {
-				ok = false
-				break
-			}
+			d := perfDigestNames(names)
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -327,8 +355,8 @@ func perfWaitRowVisible(t *testing.T, cluster *harness.Cluster, nodes int, name 
 	for time.Now().Before(deadline) {
 		ok := true
 		for i := 0; i < nodes; i++ {
-			res, err := cluster.QuerySQL(i, "SELECT count(*) FROM "+perfLiveTable+" WHERE name = ?", name)
-			if err != nil || len(res.Rows) == 0 || len(res.Rows[0]) == 0 || fmt.Sprint(res.Rows[0][0]) != "1" {
+			n, err := cluster.TypedCount(i, name)
+			if err != nil || n != 1 {
 				ok = false
 				break
 			}
@@ -342,17 +370,8 @@ func perfWaitRowVisible(t *testing.T, cluster *harness.Cluster, nodes int, name 
 }
 
 func perfCounter(metrics, name string) int64 {
-	for _, line := range strings.Split(metrics, "\n") {
-		f := strings.Fields(line)
-		if len(f) != 2 {
-			continue
-		}
-		if f[0] != name && !strings.HasPrefix(f[0], name+"{") {
-			continue
-		}
-		if v, err := strconv.ParseInt(f[1], 10, 64); err == nil {
-			return v
-		}
+	if value, ok := harness.MetricValueFrom(metrics, name); ok {
+		return int64(value)
 	}
 	return 0
 }

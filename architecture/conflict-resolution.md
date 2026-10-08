@@ -52,7 +52,7 @@ That metadata belongs in the batch header.
 
 ### Value types
 
-Use a binary encoding preserving SQLite type semantics:
+Use the versioned typed value encoding for record fields:
 
 ```text
 NULL
@@ -132,7 +132,7 @@ clock.Observe(remoteHLC)
 
 The next local write must be greater than all observed remote clocks according to the HLC algorithm.
 
-Persist enough HLC state in Pebble so a restart cannot move the logical clock backwards.
+Persist enough HLC state in Spool so a restart cannot move the logical clock backwards.
 
 ---
 
@@ -140,7 +140,7 @@ Persist enough HLC state in Pebble so a restart cannot move the logical clock ba
 
 Use a row-level tombstone.
 
-Pebble stores:
+Spool stores:
 
 ```text
 row tombstone version
@@ -178,11 +178,13 @@ Result: row deleted.
 
 When a row is resurrected because a single cell update has a higher HLC than the row tombstone (e.g. `phone` updated at version 101 > delete at version 100), any other columns whose last update was older than the tombstone are treated as absent/NULL.
 
-If any non-updated column has a `NOT NULL` constraint in the SQL schema:
-- Materializing the row with absent columns will violate SQL constraints.
+If any non-updated field is required by the typed table definition and has no
+default:
+- Materializing the row with an absent field will violate the record schema.
 - Therefore, a resurrection transaction must either:
-  1. Supply values for all required `NOT NULL` columns, or
-  2. The schema definition must declare default values for non-primary-key `NOT NULL` columns, allowing the engine to safely materialize the resurrected row.
+  1. Supply values for all required `NOT NULL` fields, or
+  2. The record definition must declare defaults for required non-primary-key
+     fields, allowing the engine to safely materialize the resurrected row.
 
 Document this behavior clearly.
 

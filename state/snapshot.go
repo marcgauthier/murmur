@@ -10,16 +10,14 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2"
-
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crdt"
 	"github.com/marcgauthier/murmur/ids"
 )
 
 // DefaultSnapshotAtomicMergeBytes caps the encoded snapshot size merged in
-// one atomic Pebble batch (8 MiB keeps the transient batch far below the
-// memtable/RAM budget). Larger validated snapshots merge chunk by chunk
+// one atomic Spool commit (8 MiB keeps the transient batch far below the
+// memory budget). Larger validated snapshots merge chunk by chunk
 // with durable resume progress and publish watermarks/generation atomically
 // last. Selectable via Options.SnapshotAtomicMergeBytes.
 const DefaultSnapshotAtomicMergeBytes = 8 << 20
@@ -32,7 +30,7 @@ func (s *Store) ExportSnapshot(chunkCells int, fn func(manifest *codec.SnapshotM
 }
 
 // ExportSnapshotContext exports from one read cut, stopping if the transfer
-// lease expires so Pebble's source snapshot is released promptly. It acquires
+// lease expires so the source snapshot is released promptly. It acquires
 // a bounded source log-retention lease covering the snapshot's watermarks so
 // concurrent local writes and log GC preserve tail repair history.
 func (s *Store) ExportSnapshotContext(ctx context.Context, chunkCells int, fn func(manifest *codec.SnapshotManifest, chunk []codec.SnapshotCell, last bool) error) error {
@@ -41,7 +39,7 @@ func (s *Store) ExportSnapshotContext(ctx context.Context, chunkCells int, fn fu
 	if chunkCells < 1 {
 		chunkCells = 1
 	}
-	return s.snapshot(func(snap *pebble.Snapshot) error {
+	return s.snapshot(func(snap *snapshot) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -153,8 +151,8 @@ func (s *Store) ExportSnapshotContext(ctx context.Context, chunkCells int, fn fu
 	})
 }
 
-func (s *Store) snapshotManifest(snap *pebble.Snapshot) (*codec.SnapshotManifest, error) {
-	m := &codec.SnapshotManifest{FormatVersion: 2, SnapshotID: ids.NewTxID(), DBID: s.dbID}
+func (s *Store) snapshotManifest(snap *snapshot) (*codec.SnapshotManifest, error) {
+	m := &codec.SnapshotManifest{FormatVersion: 3, SnapshotID: ids.NewTxID(), DBID: s.dbID}
 	var err error
 	if m.CreatedHLC, err = readU64Snap(snap, sysHLC); err != nil {
 		return nil, err
@@ -177,7 +175,7 @@ func (s *Store) snapshotManifest(snap *pebble.Snapshot) (*codec.SnapshotManifest
 		copy(m.SchemaHash[:], raw)
 	}
 	prefix := []byte{prefixRecv}
-	it, err := snap.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixEnd(prefix)})
+	it, err := snap.NewIter(&iterOptions{LowerBound: prefix, UpperBound: prefixEnd(prefix)})
 	if err != nil {
 		return nil, err
 	}
@@ -236,8 +234,8 @@ func decodeMergeProgress(raw []byte) (mergeProgress, error) {
 // from prevKey (nil at the start). It returns the last merged key and
 // whether any winner was staged. Both the atomic and the chunked merge
 // paths share it, so large snapshots merge with identical semantics.
-func (s *Store) mergeSnapshotChunk(b *pebble.Batch, raw []byte, prevKey []byte) (lastKey []byte, changed bool, err error) {
-	return s.mergeSnapshotChunkWithSet(func(key, value []byte) error { return b.Set(key, value, nil) }, raw, prevKey)
+func (s *Store) mergeSnapshotChunk(b *batch, raw []byte, prevKey []byte) (lastKey []byte, changed bool, err error) {
+	return s.mergeSnapshotChunkWithSet(func(key, value []byte) error { return b.Set(key, value) }, raw, prevKey)
 }
 
 func (s *Store) mergeSnapshotChunkWithSet(set func(key, value []byte) error, raw []byte, prevKey []byte) (lastKey []byte, changed bool, err error) {
@@ -366,7 +364,7 @@ func (s *Store) ImportSnapshotChunk(ctx context.Context, manifest *codec.Snapsho
 	var res MergeResult
 	s.gate.RLock()
 	defer s.gate.RUnlock()
-	if manifest.FormatVersion != 2 || manifest.SnapshotID.IsZero() || manifest.DBID != s.dbID || manifest.ChunkCount == 0 || manifest.ChunkCount > 65_536 || index >= manifest.ChunkCount || last != (index+1 == manifest.ChunkCount) {
+	if manifest.FormatVersion != 3 || manifest.SnapshotID.IsZero() || manifest.DBID != s.dbID || manifest.ChunkCount == 0 || manifest.ChunkCount > 65_536 || index >= manifest.ChunkCount || last != (index+1 == manifest.ChunkCount) {
 		return res, false, fmt.Errorf("state: invalid snapshot chunk position")
 	}
 	for i, w := range manifest.Watermarks {
@@ -453,11 +451,11 @@ func (s *Store) stageSnapshotChunk(manifest *codec.SnapshotManifest, index uint6
 			return activeErr
 		}
 		if !bytes.Equal(active, manifest.SnapshotID[:]) {
-			b := s.db.NewBatch()
+			b := s.mem.newBatch()
 			defer b.Close()
-			if err := s.snapshot(func(snap *pebble.Snapshot) error {
+			if err := s.snapshot(func(snap *snapshot) error {
 				prefix := []byte{prefixSnapshot}
-				it, err := snap.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixEnd(prefix)})
+				it, err := snap.NewIter(&iterOptions{LowerBound: prefix, UpperBound: prefixEnd(prefix)})
 				if err != nil {
 					return err
 				}
@@ -465,7 +463,7 @@ func (s *Store) stageSnapshotChunk(manifest *codec.SnapshotManifest, index uint6
 				for it.SeekGE(prefix); it.Valid(); it.Next() {
 					key := append([]byte(nil), it.Key()...)
 					if bytes.HasPrefix(key, SnapshotKey("recv/")) {
-						if err := b.Delete(key, nil); err != nil {
+						if err := b.Delete(key); err != nil {
 							return err
 						}
 					}
@@ -474,13 +472,13 @@ func (s *Store) stageSnapshotChunk(manifest *codec.SnapshotManifest, index uint6
 			}); err != nil {
 				return err
 			}
-			if err := b.Set(activeKey, manifest.SnapshotID[:], nil); err != nil {
+			if err := b.Set(activeKey, manifest.SnapshotID[:]); err != nil {
 				return err
 			}
-			if err := b.Set(manifestKey, codec.EncodeManifest(nil, manifest), nil); err != nil {
+			if err := b.Set(manifestKey, codec.EncodeManifest(nil, manifest)); err != nil {
 				return err
 			}
-			if err := s.commitBatch(b, pebble.Sync); err != nil {
+			if err := s.commitBatch(b, true); err != nil {
 				return err
 			}
 		}
@@ -495,7 +493,7 @@ func (s *Store) stageSnapshotChunk(manifest *codec.SnapshotManifest, index uint6
 		return err
 	}
 	if isNotFound(err) && (chunked || index+1 != manifest.ChunkCount) {
-		if err := s.dbSet(chunkKey, chunkRaw, pebble.Sync); err != nil {
+		if err := s.dbSet(chunkKey, chunkRaw, true); err != nil {
 			return err
 		}
 	}
@@ -513,7 +511,7 @@ func (s *Store) publishSnapshotAtomic(manifest *codec.SnapshotManifest, chunks [
 	if err := s.checkSnapshotActive(manifest, manifestKey, activeKey); err != nil {
 		return res, false, err
 	}
-	b := s.db.NewIndexedBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
 	changed := false
 	var previousKey []byte
@@ -561,16 +559,16 @@ func (s *Store) mergeSnapshotChunked(ctx context.Context, manifest *codec.Snapsh
 			}
 			return res, false, err
 		}
-		lastKey, changed, merr := s.ingestSnapshotChunkToSST(ctx, raw, prog.prevKey)
+		lastKey, changed, merr := s.commitSnapshotChunk(raw, prog.prevKey)
 		if merr == nil && s.snapshotIngestFault != nil {
 			merr = s.snapshotIngestFault()
 		}
-		b := s.db.NewBatch()
+		b := s.mem.newBatch()
 		if merr == nil {
-			merr = b.Set(progressKey, encodeMergeProgress(prog.nextChunk+1, lastKey), nil)
+			merr = b.Set(progressKey, encodeMergeProgress(prog.nextChunk+1, lastKey))
 		}
 		if merr == nil {
-			merr = s.commitBatch(b, pebble.Sync)
+			merr = s.commitBatch(b, true)
 		}
 		_ = b.Close()
 		if merr != nil {
@@ -595,7 +593,7 @@ func (s *Store) mergeSnapshotChunked(ctx context.Context, manifest *codec.Snapsh
 	if err := s.checkSnapshotActive(manifest, manifestKey, activeKey); err != nil {
 		return res, false, err
 	}
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
 	return s.commitSnapshotPublication(b, manifest, mergedChanged, stagePrefix, manifestKey, activeKey, progressKey)
 }
@@ -645,7 +643,7 @@ func (s *Store) readMergeProgress(progressKey []byte) (mergeProgress, error) {
 // (max wins), merges HLC, bumps the storage generation when anything
 // changed, and deletes the transfer staging, all in one synced batch: the
 // crash-safe publication boundary. progressKey is nil for atomic merges.
-func (s *Store) commitSnapshotPublication(b *pebble.Batch, manifest *codec.SnapshotManifest, changed bool, stagePrefix string, manifestKey, activeKey, progressKey []byte) (MergeResult, bool, error) {
+func (s *Store) commitSnapshotPublication(b *batch, manifest *codec.SnapshotManifest, changed bool, stagePrefix string, manifestKey, activeKey, progressKey []byte) (MergeResult, bool, error) {
 	var res MergeResult
 	if err := s.reprojectSnapshot(b, progressKey == nil); err != nil {
 		return res, false, err
@@ -657,7 +655,7 @@ func (s *Store) commitSnapshotPublication(b *pebble.Batch, manifest *codec.Snaps
 		}
 		if w.Sequence > cur {
 			changed = true
-			if err := b.Set(RecvKey(w.Origin), encodeU64(w.Sequence), nil); err != nil {
+			if err := b.Set(RecvKey(w.Origin), encodeU64(w.Sequence)); err != nil {
 				return res, false, err
 			}
 		}
@@ -672,7 +670,7 @@ func (s *Store) commitSnapshotPublication(b *pebble.Batch, manifest *codec.Snaps
 	mergedHLC := maxU64(storedHLC, maxU64(manifest.CreatedHLC, s.clock.Max()))
 	if mergedHLC > storedHLC {
 		changed = true
-		if err := b.Set(SysKey(sysHLC), encodeU64(mergedHLC), nil); err != nil {
+		if err := b.Set(SysKey(sysHLC), encodeU64(mergedHLC)); err != nil {
 			return res, false, err
 		}
 	}
@@ -682,27 +680,27 @@ func (s *Store) commitSnapshotPublication(b *pebble.Batch, manifest *codec.Snaps
 	}
 	if changed {
 		gen++
-		if err := b.Set(SysKey(sysGeneration), encodeU64(gen), nil); err != nil {
+		if err := b.Set(SysKey(sysGeneration), encodeU64(gen)); err != nil {
 			return res, false, err
 		}
 	}
 	for i := uint64(0); i < manifest.ChunkCount; i++ {
-		if err := b.Delete(SnapshotKey(fmt.Sprintf("%schunk/%020d", stagePrefix, i)), nil); err != nil {
+		if err := b.Delete(SnapshotKey(fmt.Sprintf("%schunk/%020d", stagePrefix, i))); err != nil {
 			return res, false, err
 		}
 	}
-	if err := b.Delete(manifestKey, nil); err != nil {
+	if err := b.Delete(manifestKey); err != nil {
 		return res, false, err
 	}
-	if err := b.Delete(activeKey, nil); err != nil {
+	if err := b.Delete(activeKey); err != nil {
 		return res, false, err
 	}
 	if progressKey != nil {
-		if err := b.Delete(progressKey, nil); err != nil {
+		if err := b.Delete(progressKey); err != nil {
 			return res, false, err
 		}
 	}
-	if err := s.commitBatch(b, pebble.Sync); err != nil {
+	if err := s.commitBatch(b, true); err != nil {
 		return res, false, err
 	}
 	res.Applied = changed
@@ -716,10 +714,10 @@ func (s *Store) SnapshotMetadata(name string, val []byte) error {
 	defer s.gate.RUnlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
-	if err := b.Set(SnapshotKey(name), val, nil); err != nil {
+	if err := b.Set(SnapshotKey(name), val); err != nil {
 		return err
 	}
-	return s.commitBatch(b, pebble.Sync)
+	return s.commitBatch(b, true)
 }

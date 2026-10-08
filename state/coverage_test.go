@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2/vfs"
-
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/ids"
 )
@@ -18,7 +16,6 @@ import (
 // is not maintenance-closed, reports no sticky failure, has disk usage, and
 // supports the manual Flush/Compact/Checkpoint operations.
 func TestStoreMaintenanceAccessors(t *testing.T) {
-	ctx := context.Background()
 	s := openTestStore(t, ids.NewNodeID())
 	if s.MaintenanceClosed() {
 		t.Fatal("fresh store reports maintenance-closed")
@@ -40,7 +37,7 @@ func TestStoreMaintenanceAccessors(t *testing.T) {
 	if err := s.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	if err := s.Compact(ctx, []byte{0x00}, []byte{0xff}, false); err != nil {
+	if err := s.Compact(); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 	if err := s.Checkpoint(filepath.Join(t.TempDir(), "ckpt")); err != nil {
@@ -288,88 +285,25 @@ func TestSnapshotMetadataPersists(t *testing.T) {
 	}
 }
 
-type stubStateLogger struct{ msgs []string }
-
-func (l *stubStateLogger) log(msg string, args ...any) {
-	l.msgs = append(l.msgs, msg)
-	_ = args
-}
-
-func (l *stubStateLogger) Debug(msg string, args ...any) { l.log(msg, args...) }
-func (l *stubStateLogger) Info(msg string, args ...any)  { l.log(msg, args...) }
-func (l *stubStateLogger) Warn(msg string, args ...any)  { l.log(msg, args...) }
-func (l *stubStateLogger) Error(msg string, args ...any) { l.log(msg, args...) }
-
-// TestPebbleLogAdapters proves the Pebble log shims forward (or discard)
-// messages and route Fatalf into the fail-closed capture.
-func TestPebbleLogAdapters(t *testing.T) {
+// TestFatalCaptureTerminal proves the fail-closed capture trips once with
+// the first message and cause, and stays nil-safe.
+func TestFatalCaptureTerminal(t *testing.T) {
 	var fatal fatalCapture
-	stub := &stubStateLogger{}
-	a := pebbleLogAdapter{l: stub, fatal: &fatal}
-	a.Infof("i%d", 1)
-	a.Warningf("w")
-	a.Errorf("e")
-	if len(stub.msgs) != 3 {
-		t.Fatalf("adapter forwarded %d messages, want 3", len(stub.msgs))
+	fatal.noteTerminal("boom", errTestCause)
+	fatal.noteTerminal("second", errTestCause)
+	err := fatal.err()
+	if !IsStorageFailure(err) {
+		t.Fatalf("err = %v, want storage failure", err)
 	}
-	a.Fatalf("fatal-%s", "boom")
-	if err := fatal.err(); err == nil || !strings.Contains(err.Error(), "fatal-boom") {
-		t.Fatalf("Fatalf err = %v, want fatal-boom", err)
+	if got := err.Error(); !strings.Contains(got, "boom") || strings.Contains(got, "second") {
+		t.Fatalf("err = %q, want first message to win", got)
 	}
-	// Nil fatal capture must not panic.
-	pebbleLogAdapter{l: stub}.Fatalf("x")
-
-	var fatal2 fatalCapture
-	d := discardPebbleLog{fatal: &fatal2}
-	d.Infof("i")
-	d.Warningf("w")
-	d.Errorf("e")
-	d.Fatalf("d-%d", 2)
-	if err := fatal2.err(); err == nil || !strings.Contains(err.Error(), "d-2") {
-		t.Fatalf("discard Fatalf err = %v, want d-2", err)
+	if !errors.Is(err, errTestCause) {
+		t.Fatalf("err = %v, want test cause", err)
 	}
-	discardPebbleLog{}.Fatalf("x")
-}
-
-// TestWatchFSPassthrough proves the healthy paths of the watchFS wrappers
-// that normal operation rarely exercises: OpenReadWrite, ReuseForWrite,
-// WriteAt, and SyncTo.
-func TestWatchFSPassthrough(t *testing.T) {
-	var fatal fatalCapture
-	mem := vfs.NewMem()
-	fs := &watchFS{FS: mem, fatal: &fatal}
-	if fs.Unwrap() == nil {
-		t.Fatal("Unwrap = nil")
-	}
-	var cat vfs.DiskWriteCategory
-	f, err := fs.Create("f", cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
-	rw, err := fs.OpenReadWrite("f", cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := rw.WriteAt([]byte("hi"), 0); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := rw.SyncTo(2); err != nil {
-		t.Fatal(err)
-	}
-	if err := rw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	moved, err := fs.ReuseForWrite("f", "g", cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := moved.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := fatal.err(); err != nil {
-		t.Fatalf("healthy ops tripped gate: %v", err)
+	var nilCap *fatalCapture
+	nilCap.noteTerminal("x", errTestCause)
+	if err := nilCap.err(); err != nil {
+		t.Fatalf("nil capture err = %v, want nil", err)
 	}
 }

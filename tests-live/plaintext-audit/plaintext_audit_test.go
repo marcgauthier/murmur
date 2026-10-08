@@ -21,26 +21,40 @@ import (
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/backup"
 	"github.com/marcgauthier/murmur/origin"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
-func schemaConfig() *db.SchemaConfig {
-	return &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-		Name: "audit_rows",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "value", Type: schema.ColText, Nullable: true},
+type auditTypedRecord struct {
+	ID    db.RowID `rime:"primary"`
+	Name  string
+	Count int64
+	Tags  []string
+	Peak  int64
+	Floor float64
+}
+
+func typedDefinition(t *testing.T) db.TableDefinition {
+	t.Helper()
+	definition, err := db.Define[auditTypedRecord]("live_typed_records", 901, db.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
+		MergePolicies: map[string]db.RecordMergePolicy{
+			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
+			"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
 		},
-	}}}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return definition
 }
 
 func TestPlaintextAuditMarkersAndKeysAbsentOnDisk(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "plaintext-audit",
-		NumNodes:    2,
-		AwaitUnlock: true,
-		Schema:      schemaConfig(),
+		Name:         "plaintext-audit",
+		NumNodes:     2,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 	node := cluster.Nodes[0]
 
@@ -49,8 +63,7 @@ func TestPlaintextAuditMarkersAndKeysAbsentOnDisk(t *testing.T) {
 	markers := make([]string, 8)
 	for i := range markers {
 		markers[i] = "MURMUR-AUDIT-" + randHex(t, 32) + fmt.Sprintf("-ROW%d", i)
-		if err := cluster.ExecSQL(0, "INSERT INTO audit_rows (id, value) VALUES (?, ?)",
-			fmt.Sprintf("%032x", 7000+i), markers[i]); err != nil {
+		if err := cluster.TypedInsert(0, markers[i]); err != nil {
 			t.Fatalf("insert marker %d: %v", i, err)
 		}
 	}
@@ -58,8 +71,7 @@ func TestPlaintextAuditMarkersAndKeysAbsentOnDisk(t *testing.T) {
 	// Sustained load around the markers to exercise WAL, memtables,
 	// compaction, and replication paths.
 	for i := 0; i < 200; i++ {
-		if err := cluster.ExecSQL(i%2, "INSERT INTO audit_rows (id, value) VALUES (?, ?)",
-			fmt.Sprintf("%032x", 8000+i), fmt.Sprintf("load-filler-%d-padding-%s", i, strings.Repeat("x", 64))); err != nil {
+		if err := cluster.TypedInsert(i%2, fmt.Sprintf("load-filler-%d-padding-%s", i, strings.Repeat("x", 64))); err != nil {
 			t.Fatalf("load write %d: %v", i, err)
 		}
 	}
@@ -72,21 +84,25 @@ func TestPlaintextAuditMarkersAndKeysAbsentOnDisk(t *testing.T) {
 	cluster.WaitNodeReady(0)
 	waitConverged(t, cluster, 208, 60*time.Second)
 
-	// Positive control: every marker round-trips byte-identical through
-	// SQL, proving the rows exist and the scan below is meaningful.
+	// Positive control: every marker round-trips byte-identically through
+	// the managed typed table, proving the scan below is meaningful.
+	rows, err := cluster.TypedNames(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	present := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		present[row] = true
+	}
 	for i, want := range markers {
-		res, err := cluster.QuerySQL(0, "SELECT value FROM audit_rows WHERE id = ?", fmt.Sprintf("%032x", 7000+i))
-		if err != nil || len(res.Rows) != 1 {
-			t.Fatalf("marker %d query: err=%v res=%v", i, err, res)
-		}
-		if got := fmt.Sprintf("%v", res.Rows[0][0]); got != want {
-			t.Fatalf("marker %d = %q, want %q", i, got, want)
+		if !present[want] {
+			t.Fatalf("marker %d did not round-trip through the typed table", i)
 		}
 	}
 	t.Logf("positive control: all %d markers round-trip intact", len(markers))
 
 	// Stop both nodes so the on-disk image is quiescent, then scan the
-	// ENTIRE node directory of BOTH nodes: pebble, WAL, keys, tmp,
+	// ENTIRE node directory of BOTH nodes: spool, segments, keys, tmp,
 	// scratch, logs. Node 1 learned the rows via replication apply (not
 	// local commit), so its disk image exercises different code paths
 	// and must be audited too.
@@ -235,16 +251,12 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "audit_rows")
-			if err != nil || n != want {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, "audit_rows", "value")
-			if err != nil {
-				ok = false
-				break
-			}
+			d := strings.Join(names, "\x00")
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -284,12 +296,13 @@ func openNodeDir(t *testing.T, ctx context.Context, cluster *harness.Cluster, no
 		_ = registry.Add(n.NodeID, n.OriginKey.Public().(ed25519.PublicKey))
 	}
 	handle, err := db.Open(ctx, db.Config{
-		Path:          node.PebbleDir,
+		Path:          node.Dir,
 		NodeID:        node.NodeID,
 		DBID:          cluster.DBID,
 		OriginSigning: db.OriginSigningConfig{PrivateKey: node.OriginKey, TrustedKeys: registry},
-		Schema:        *schemaConfig(),
-		Pebble:        db.DefaultPebbleConfig(),
+		Schema:        db.SchemaConfig{Version: 1},
+		Tables:        []db.TableDefinition{typedDefinition(t)},
+		Spool:         db.DefaultSpoolConfig(),
 		Encryption:    db.EncryptionConfig{Key: raw, KeyID: "remote-unlock-key"},
 	})
 	if err != nil {

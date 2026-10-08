@@ -1,16 +1,12 @@
 package state
 
 import (
-	"context"
 	"encoding/binary"
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/pebble/v2"
-	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crdt"
-	spedsqlcrypto "github.com/marcgauthier/murmur/crypto"
 	"github.com/marcgauthier/murmur/ids"
 )
 
@@ -33,26 +29,11 @@ func BenchmarkSnapshotChunkMergeEncrypted(batch *testing.B) {
 		}
 		return codec.EncodeSnapshotCells(nil, cells)
 	}
-	for _, mode := range []string{"batch", "sstable-ingest"} {
+	for _, mode := range []string{"batch", "chunk-commit"} {
 		batch.Run(mode, func(b *testing.B) {
 			dir := b.TempDir()
 			dbID, node := ids.NewDBID(), ids.NewNodeID()
-			var cryptoDBID [16]byte
-			copy(cryptoDBID[:], dbID[:])
-			key := make([]byte, 32)
-			for i := range key {
-				key[i] = byte(i + 1)
-			}
-			registry, err := spedsqlcrypto.OpenRegistry(dir+"/keys", spedsqlcrypto.Static(key), cryptoDBID)
-			if err != nil {
-				b.Fatal(err)
-			}
-			defer registry.Close()
-			encFS, err := spedsqlcrypto.NewEncryptedFS(spedsqlcrypto.FSOptions{Base: vfs.Default, Registry: registry, DBID: cryptoDBID})
-			if err != nil {
-				b.Fatal(err)
-			}
-			s, err := openSignedFixture(dir+"/data", node, dbID, Options{FS: encFS, Limits: codec.DefaultLimits()})
+			s, err := openSignedFixture(dir+"/data", node, dbID, Options{Limits: codec.DefaultLimits()})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -63,17 +44,17 @@ func BenchmarkSnapshotChunkMergeEncrypted(batch *testing.B) {
 			for i := 0; i < b.N; i++ {
 				raw := makeChunk()
 				if mode == "batch" {
-					writeBatch := s.db.NewBatch()
+					writeBatch := s.mem.newBatch()
 					_, _, err := s.mergeSnapshotChunk(writeBatch, raw, nil)
 					if err == nil {
-						err = s.commitBatch(writeBatch, pebble.Sync)
+						err = s.commitBatch(writeBatch, true)
 					}
 					_ = writeBatch.Close()
 					if err != nil {
 						b.Fatal(fmt.Errorf("batch merge: %w", err))
 					}
-				} else if _, _, err := s.ingestSnapshotChunkToSST(context.Background(), raw, nil); err != nil {
-					b.Fatal(fmt.Errorf("sstable ingest: %w", err))
+				} else if _, _, err := s.commitSnapshotChunk(raw, nil); err != nil {
+					b.Fatal(fmt.Errorf("chunk commit: %w", err))
 				}
 			}
 		})

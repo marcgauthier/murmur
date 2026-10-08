@@ -1,6 +1,6 @@
 # Operational Tooling and CLI Architecture
 
-This document describes the design, architecture, and operational capabilities of the Murmur SQL command-line utility (`murmur`).
+This document describes the design, architecture, and operational capabilities of the Murmur command-line utility (`murmur`).
 
 ---
 
@@ -10,10 +10,10 @@ The Murmur CLI is an all-in-one operational, diagnostic, and administrative tool
 
 ### Key Architectural Tenets
 
-1. **Zero-CGO Portability**: The CLI compiles without requiring a C compiler or shared C libraries (`CGO_ENABLED=0`), ensuring straightforward cross-compilation and single-binary deployment across Linux (x86_64, ARM64), macOS (Intel, Apple Silicon), and Windows.
+1. **Storage-Aware Operations**: Durable-state inspection, verification, repair, doctor, and key inspection open encrypted Spool directly and do not construct a query materializer. Doctor reports the materializer as unchecked because it has no application Go schema. RIME materialization is rebuilt when the application opens with its typed schema.
 2. **Dual Operation Modes**:
-   - **Offline / Direct Mode**: Opens local database directories directly via Pebble and the pure-Go SQLite driver for offline diagnostics, low-level inspection, materialization repairs, and cold/hot backup operations.
-   - **Online / Remote Mode**: Communicates with live Murmur nodes over mutual TLS (mTLS) and QUIC/HTTPS to query runtime status, inspect replication lag matrices, view SWIM cluster topologies, and trigger garbage collection sweeps.
+  - **Offline / Direct Mode**: Initialization creates encrypted Spool without a query engine; metadata inspection, verification, repair, doctor, and key inspection read Spool and schema manifests directly. Backup operations checkpoint authoritative durable state.
+  - **Online / Remote Mode**: Communicates with live Murmur nodes over mutual TLS (mTLS) and QUIC/HTTPS to query runtime status, retrieve the schema manifest through `GET /v1/schema`, inspect replication lag matrices, view SWIM cluster topologies, and trigger retention-aware garbage collection through `POST /v1/admin/gc`.
 3. **Structured Automation First**: Every command provides machine-readable `--json` output alongside human-friendly ASCII tables and Markdown tables (`--markdown`), simplifying integration into CI/CD pipelines, Kubernetes health probes, and metrics collectors.
 4. **Resilient Backup Lifecycle**: Provides complete backup creation, checksum verification, metadata introspection, and fresh-identity restoration without requiring external tools.
 
@@ -29,20 +29,15 @@ tool/
 │   └── client.go          # Pure-Go mTLS HTTPS/QUIC client for remote operations
 ├── cmd/
 │   ├── root.go            # Command registry, global flag parser, exit handler
-│   ├── db_helper.go       # Storage initialization, key derivation, schema management
-│   ├── ddl_helper.go      # DDL statement parser & migration router
+│   ├── offline_store.go   # Direct encrypted Spool access for metadata-only commands
 │   ├── init.go            # Database initialization command
-│   ├── shell.go           # Interactive SQL REPL with dot-command suite
-│   ├── query.go           # Script and query execution engine
-│   ├── import.go          # CSV/JSON bulk ingest with UUID/BLOB conversion
-│   ├── export.go          # CSV, JSON, and SQL table dumper
-│   ├── inspect.go         # Storage and metadata inspector
-│   ├── verify.go          # Deep integrity verifier (Pebble + SQLite PRAGMAs)
-│   ├── repair.go          # SQLite materialization rebuilder
+│   ├── inspect.go         # Storage and metadata inspector; table count from schema manifest
+│   ├── verify.go          # Direct Spool replay and schema-manifest verifier
+│   ├── repair.go          # Direct Spool verification and restore-intent repair
 │   ├── schema.go          # Schema DAG and column manifest inspector
-│   ├── keys.go            # KEYREGISTRY inspector & credential verifier
+│   ├── keys.go            # Keyring inspector & credential verifier
 │   ├── doctor.go          # Multi-check automated health scorecard
-│   ├── bench.go           # Microbenchmark suite (I/O, ciphers, SQLite Tx)
+│   ├── bench.go           # Typed RIME storage and cipher microbenchmarks
 │   ├── cluster.go         # SWIM membership and topology inspector
 │   ├── lag.go             # Replication lag matrix
 │   ├── gc.go              # Garbage collection inspector & online trigger
@@ -59,29 +54,25 @@ tool/
 
 ## 3. Core Functional Domains
 
-### 3.1 Database & Interactive Shell
+### 3.1 Database Initialization and Application API
 
-- **Interactive Shell (`murmur shell` / `murmur <path>`)**:
-  - Provides a complete REPL for running interactive SQL queries.
-  - Supports dot-commands: `.tables`, `.schema`, `.mode`, `.headers`, `.timer`, `.read`, `.dump`, `.status`, `.help`, `.quit`.
-  - Automatically handles multiline SQL statements and transaction rollbacks.
-- **DDL Migration Routing**:
-  - SQL `CREATE TABLE` and schema modifications are intercepted by `ddl_helper.go` and executed via `db.Migrate(...)`.
-  - Active schema definitions and epochs are persisted in `schema.json` to guarantee strict epoch consistency across reopens.
-- **Bulk Data Ingest & Export**:
-  - `murmur import` supports CSV and JSON datasets with automatic primary key UUID-to-BLOB conversion.
-  - `murmur export` and `murmur dump` generate CSV, JSON arrays, and SQL schema/insert scripts.
+- **Initialization (`murmur init`)**:
+  - Creates encrypted Spool and a node identity without choosing an application schema. The application binds its Go definitions on first typed `Open`.
+- **Managed data access**:
+  - Applications declare records through `Config.Tables` and use Murmur's typed CRUD, transaction, query, subscription, backup, and replication APIs. The CLI does not parse SQL or synthesize application table definitions.
 
 ### 3.2 Storage Inspection and Forensics
 
 - **Low-Level Storage Inspection (`murmur inspect`)**:
-  - Reads Pebble manifests, WAL files, HLC watermarks, and key registry metadata without requiring SQLite engine locks.
+  - Opens encrypted durable state directly, reads its schema manifest and watermarks, and does not instantiate the RIME query materializer.
 - **Deep Integrity Verification (`murmur verify`)**:
-  - Validates Pebble SSTable block checksums, log sequence continuity, and executes `PRAGMA integrity_check` / `quick_check` against SQLite materializations.
-- **Offline Materializer Repair (`murmur repair`)**:
-  - Reconstructs missing or corrupt SQLite `materialized.db` files by replaying transactions from the underlying encrypted Pebble store.
+  - Opens and replays encrypted Spool state and validates the durable schema manifest without a query engine. It reports that materializer verification was not run because the CLI has no application Go table definitions.
+- **Health Scorecard (`murmur doctor`)**:
+  - Local mode checks durable Spool and manifest integrity without opening a query materializer. It marks materializer health as unchecked; remote mode checks TLS setup and the live node status endpoint.
+- **Durable State Repair (`murmur repair`)**:
+  - Replays encrypted Spool directly and can clear a restore intent. The application rebuilds its private RIME materializer on typed Open.
 - **Cryptographic Key Inspection (`murmur keys`)**:
-  - Inspects `KEYREGISTRY` headers, active/expired data keys, generations, cipher suites, and pinned backup checkpoints.
+  - Opens encrypted Spool directly and reports key inventory, active/retired data keys, and key generations without starting a query engine.
 
 ### 3.3 Remote Cluster Diagnostics
 
@@ -93,7 +84,7 @@ tool/
 ### 3.4 Backup Lifecycle Workflows
 
 - **Consistent Snapshot (`murmur backup create`)**:
-  - Generates an encrypted, streaming gzip archive containing database state, key registry metadata, and schema manifests.
+  - Checkpoints encrypted Spool directly and streams an archive containing durable state and schema manifests without opening a query engine.
 - **Archive Introspection (`murmur backup info`)**:
   - Inspects `backup-metadata.json` without extracting the archive.
 - **Integrity Validation (`murmur backup verify`)**:

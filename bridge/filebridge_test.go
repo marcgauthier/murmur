@@ -14,7 +14,6 @@ import (
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/ids"
-	"github.com/marcgauthier/murmur/schema"
 )
 
 // fileBridgeHarness wires a real Low/High pair with the full bridge pipeline.
@@ -48,25 +47,7 @@ func openFileDB(t *testing.T, objectKey []byte) *db.DB {
 
 func openFileDBAt(t *testing.T, dir string, objectKey []byte) *db.DB {
 	t.Helper()
-	database, err := db.Open(context.Background(), testdb.Configure(db.Config{
-		Path:   dir,
-		NodeID: db.NewNodeID(),
-		Schema: db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name:    "contacts",
-			Columns: []schema.ColumnSchema{{Name: "id", Type: schema.ColBlob}},
-		}}},
-		Pebble:     db.DefaultPebbleConfig(),
-		Encryption: db.EncryptionConfig{Key: bytes.Repeat([]byte{0x44}, 32), KeyID: "test-key"},
-		Files: db.FilesConfig{
-			Enabled:   true,
-			ObjectKey: append([]byte(nil), objectKey...),
-		},
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = database.Close() })
-	return database
+	return openFileDBAtNode(t, dir, db.NewNodeID(), objectKey)
 }
 
 func newFileBridge(t *testing.T, lowKey, highKey []byte) *fileBridgeHarness {
@@ -574,15 +555,10 @@ func TestFileBridgeDisabledFilesHold(t *testing.T) {
 	highNode := db.NewNodeID()
 	low := openFileDBAt(t, lowDir, bytes.Repeat([]byte{0x10}, 32))
 	// High starts without files: build the harness around it manually.
-	pebbleCfg := db.DefaultPebbleConfig()
 	high, err := db.Open(ctx, testdb.Configure(db.Config{
-		Path:   highDir,
-		NodeID: highNode,
-		Schema: db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name:    "contacts",
-			Columns: []schema.ColumnSchema{{Name: "id", Type: schema.ColBlob}},
-		}}},
-		Pebble:     pebbleCfg,
+		Path:       highDir,
+		NodeID:     highNode,
+		Tables:     []db.TableDefinition{defineBaseContact(t)},
 		Encryption: db.EncryptionConfig{Key: bytes.Repeat([]byte{0x44}, 32), KeyID: "test-key"},
 	}))
 	if err != nil {
@@ -637,13 +613,9 @@ func TestFileBridgeDisabledFilesHold(t *testing.T) {
 		t.Fatal(err)
 	}
 	high2, err := db.Open(ctx, testdb.Configure(db.Config{
-		Path:   highDir,
-		NodeID: highNode,
-		Schema: db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name:    "contacts",
-			Columns: []schema.ColumnSchema{{Name: "id", Type: schema.ColBlob}},
-		}}},
-		Pebble:     pebbleCfg,
+		Path:       highDir,
+		NodeID:     highNode,
+		Tables:     []db.TableDefinition{defineBaseContact(t)},
 		Encryption: db.EncryptionConfig{Key: bytes.Repeat([]byte{0x44}, 32), KeyID: "test-key"},
 		Files:      db.FilesConfig{Enabled: true, ObjectKey: bytes.Repeat([]byte{0x20}, 32)},
 	}))

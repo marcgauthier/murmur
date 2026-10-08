@@ -32,10 +32,6 @@ func TestBuildRegistryValid(t *testing.T) {
 	if reg.Hash == ([32]byte{}) {
 		t.Fatal("empty hash")
 	}
-	ddl := tb.CreateTableDDL()
-	if ddl == "" {
-		t.Fatal("empty DDL")
-	}
 }
 
 func TestBuildRegistryRejects(t *testing.T) {

@@ -10,63 +10,52 @@
 package snapshotresync_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func TestStaleNodeRejoinsViaSnapshot(t *testing.T) {
-	// NOTE: the table must ride in the replicated SchemaConfig. Tables
-	// created only from schema.sql exist in the local engine but never
-	// enter the replication registry, so their writes stay local-only and
-	// peers silently skip them as unknown tables.
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "snapshot-resync",
-		NumNodes:    3,
-		AwaitUnlock: true,
+		Name:            "snapshot-resync",
+		NumNodes:        3,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 		Replication: &harness.ReplicationOptions{
 			MinLogRetentionMs:        1000,
 			MaxOfflineLogRetentionMs: 20000,
 			MinRetainedBatches:       10,
 		},
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "snap_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
 	})
 
 	// Phase 1: node3 writes acknowledged rows, then all three converge.
 	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("%032x", 1000+i)
-		if err := cluster.ExecSQL(2, "INSERT INTO snap_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("stale-%d", i)); err != nil {
+		if err := insertRows(cluster, 2, 1000+i, 1, "stale"); err != nil {
 			t.Fatalf("node3 pre-stop write: %v", err)
 		}
 	}
-	waitConverged(t, cluster, "snap_rows", 5, 30*time.Second)
+	waitConverged(t, cluster, 5, 30*time.Second)
 
 	// Phase 2: node3 stops; survivors write far past retention.
 	cluster.StopNode(2)
 	for i := 0; i < 60; i++ {
-		id := fmt.Sprintf("%032x", 2000+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO snap_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("fresh-%d", i)); err != nil {
+		if err := insertRows(cluster, 0, 2000+i, 1, "fresh"); err != nil {
 			t.Fatalf("survivor write: %v", err)
 		}
 	}
-	if _, err := waitRowCount(t, cluster, 0, "snap_rows", 65, 30*time.Second); err != nil {
+	if _, err := waitRowCount(t, cluster, 0, 65, 30*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := waitRowCount(t, cluster, 1, "snap_rows", 65, 30*time.Second); err != nil {
+	if _, err := waitRowCount(t, cluster, 1, 65, 30*time.Second); err != nil {
 		t.Fatal(err)
 	}
 
@@ -82,7 +71,7 @@ func TestStaleNodeRejoinsViaSnapshot(t *testing.T) {
 	cluster.StartNode(2)
 	cluster.UnlockNode(2, cluster.Nodes[2].KeyHex)
 	cluster.WaitNodeReady(2)
-	waitConverged(t, cluster, "snap_rows", 65, 90*time.Second)
+	waitConverged(t, cluster, 65, 90*time.Second)
 
 	// The rejoin must have used the snapshot path, not log catch-up.
 	if got := snapshotCounter(t, cluster.Nodes[2].APIAddr, "spedsql_repl_snapshots_received_total"); got < 1 {
@@ -90,12 +79,12 @@ func TestStaleNodeRejoinsViaSnapshot(t *testing.T) {
 	}
 
 	// Node3's acknowledged pre-stop state survives the snapshot merge.
-	res, err := cluster.QuerySQL(2, "SELECT name FROM snap_rows WHERE name LIKE 'stale-%'")
+	rows, err := cluster.TypedContentionRows(2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Rows) != 5 {
-		t.Fatalf("node3 stale rows = %d, want 5", len(res.Rows))
+	if countPrefix(rows, "stale-") != 5 {
+		t.Fatalf("node3 stale rows = %d, want 5", countPrefix(rows, "stale-"))
 	}
 }
 
@@ -106,40 +95,33 @@ func TestStaleNodeRejoinsViaSnapshot(t *testing.T) {
 // stalling on a silently dropped request.
 func TestDualStaleNodesRejoinViaSnapshot(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "snapshot-resync-dual",
-		NumNodes:    3,
-		AwaitUnlock: true,
+		Name:            "snapshot-resync-dual",
+		NumNodes:        3,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 		Replication: &harness.ReplicationOptions{
 			MinLogRetentionMs:        1000,
 			MaxOfflineLogRetentionMs: 20000,
 			MinRetainedBatches:       10,
 		},
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "snap_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
 	})
 
 	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("%032x", 1000+i)
-		if err := cluster.ExecSQL(2, "INSERT INTO snap_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("stale-%d", i)); err != nil {
+		if err := insertRows(cluster, 2, 1000+i, 1, "stale"); err != nil {
 			t.Fatalf("node3 pre-stop write: %v", err)
 		}
 	}
-	waitConverged(t, cluster, "snap_rows", 5, 30*time.Second)
+	waitConverged(t, cluster, 5, 30*time.Second)
 
 	cluster.StopNode(1)
 	cluster.StopNode(2)
 	for i := 0; i < 60; i++ {
-		id := fmt.Sprintf("%032x", 2000+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO snap_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("fresh-%d", i)); err != nil {
+		if err := insertRows(cluster, 0, 2000+i, 1, "fresh"); err != nil {
 			t.Fatalf("survivor write: %v", err)
 		}
 	}
-	if _, err := waitRowCount(t, cluster, 0, "snap_rows", 65, 30*time.Second); err != nil {
+	if _, err := waitRowCount(t, cluster, 0, 65, 30*time.Second); err != nil {
 		t.Fatal(err)
 	}
 
@@ -156,7 +138,7 @@ func TestDualStaleNodesRejoinViaSnapshot(t *testing.T) {
 	cluster.UnlockNode(2, cluster.Nodes[2].KeyHex)
 	cluster.WaitNodeReady(1)
 	cluster.WaitNodeReady(2)
-	waitConverged(t, cluster, "snap_rows", 65, 120*time.Second)
+	waitConverged(t, cluster, 65, 120*time.Second)
 
 	for _, idx := range []int{1, 2} {
 		if got := snapshotCounter(t, cluster.Nodes[idx].APIAddr, "spedsql_repl_snapshots_received_total"); got < 1 {
@@ -172,37 +154,33 @@ func TestDualStaleNodesRejoinViaSnapshot(t *testing.T) {
 	}
 }
 
-func waitRowCount(t *testing.T, c *harness.Cluster, idx int, table string, want int, timeout time.Duration) (int, error) {
+func waitRowCount(t *testing.T, c *harness.Cluster, idx int, want int, timeout time.Duration) (int, error) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		n, err := c.QueryRowCount(idx, table)
-		if err == nil && n == want {
-			return n, nil
+		rows, err := c.TypedContentionRows(idx)
+		if err == nil && len(rows) == want {
+			return len(rows), nil
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	n, _ := c.QueryRowCount(idx, table)
-	return n, fmt.Errorf("node %d %s count = %d, want %d within %v", idx, table, n, want, timeout)
+	rows, _ := c.TypedContentionRows(idx)
+	return len(rows), fmt.Errorf("node %d typed row count = %d, want %d within %v", idx, len(rows), want, timeout)
 }
 
-func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, timeout time.Duration) {
+func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, table)
-			if err != nil || n != want {
+			rows, err := c.TypedContentionRows(i)
+			if err != nil || len(rows) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, table, "name")
-			if err != nil {
-				ok = false
-				break
-			}
+			d := digestRows(rows)
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -216,11 +194,43 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 		time.Sleep(200 * time.Millisecond)
 	}
 	for i := range c.Nodes {
-		n, nerr := c.QueryRowCount(i, table)
-		d, derr := c.ComputeTableDigest(i, table, "name")
-		t.Logf("node %d at timeout: count=%d countErr=%v digest=%s digestErr=%v", i, n, nerr, d, derr)
+		rows, err := c.TypedContentionRows(i)
+		t.Logf("node %d at timeout: count=%d err=%v digest=%s", i, len(rows), err, digestRows(rows))
 	}
-	t.Fatalf("nodes did not converge on %d %s rows with equal digests within %v", want, table, timeout)
+	t.Fatalf("nodes did not converge on %d typed rows with equal digests within %v", want, timeout)
+}
+
+func insertRows(c *harness.Cluster, node, start, count int, prefix string) error {
+	rows := make([]harness.TypedContentionRow, 0, count)
+	for i := 0; i < count; i++ {
+		n := start + i
+		rows = append(rows, harness.TypedContentionRow{ID: typedRowID(n), Name: fmt.Sprintf("%s-%d", prefix, n)})
+	}
+	if count == 1 {
+		return c.TypedContentionInsert(node, rows[0])
+	}
+	return c.TypedContentionInsertMany(node, rows)
+}
+
+func typedRowID(n int) string { return fmt.Sprintf("%08x-0000-4000-8000-%012x", n, n) }
+
+func digestRows(rows []harness.TypedContentionRow) string {
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	h := sha256.New()
+	for _, row := range rows {
+		_, _ = fmt.Fprintf(h, "%q\x00%q\x00%q\x00%d\n", row.ID, row.Name, row.Phone, row.Score)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func countPrefix(rows []harness.TypedContentionRow, prefix string) int {
+	n := 0
+	for _, row := range rows {
+		if strings.HasPrefix(row.Name, prefix) {
+			n++
+		}
+	}
+	return n
 }
 
 func snapshotCounter(t *testing.T, apiAddr, name string) float64 {
@@ -234,23 +244,8 @@ func snapshotCounter(t *testing.T, apiAddr, name string) float64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line == "" || line[0] == '#' {
-			continue
-		}
-		if !strings.HasPrefix(line, name) {
-			continue
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(line, name))
-		// Tolerate `name{labels} value` as well as `name value`.
-		if i := strings.LastIndex(rest, " "); i >= 0 {
-			rest = rest[i+1:]
-		}
-		v, err := strconv.ParseFloat(rest, 64)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		return v
+	if value, ok := harness.MetricValueFrom(string(raw), name); ok {
+		return value
 	}
 	t.Fatalf("counter %s not present in /metrics", name)
 	return 0

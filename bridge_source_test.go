@@ -10,14 +10,27 @@ import (
 
 func TestBridgeLogSource(t *testing.T) {
 	ctx := context.Background()
-	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
+	cfg := testConfig(t.TempDir())
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
-	id := NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name, score) VALUES (?, ?, ?)`, id[:], "ann", 3); err != nil {
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := table.Insert(tx, &facadeRecord{ID: NewRowID(), Name: "ann"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	src := db.BridgeLogSource()
@@ -43,14 +56,27 @@ func TestBridgeLogSource(t *testing.T) {
 
 func TestBridgeSchema(t *testing.T) {
 	ctx := context.Background()
-	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
+	cfg := testConfig(t.TempDir())
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
-	id := NewRowID()
-	if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "ann"); err != nil {
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := table.Insert(tx, &facadeRecord{ID: NewRowID(), Name: "ann"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	resolver, err := db.BridgeSchema()
@@ -61,9 +87,9 @@ func TestBridgeSchema(t *testing.T) {
 	src := db.BridgeLogSource()
 	_, err = src.ScanLog(ctx, db.NodeID(), 1, 8, 1<<20, func(mb *codec.MutationBatch) error {
 		for _, m := range mb.Mutations {
-			table, err := resolver.TableName(m.TableID)
-			if err != nil || table != "contacts" {
-				t.Fatalf("table %d = %q, %v", m.TableID, table, err)
+			name, err := resolver.TableName(m.TableID)
+			if err != nil || name != "records" {
+				t.Fatalf("table %d = %q, %v", m.TableID, name, err)
 			}
 			if _, err := resolver.ColumnName(m.TableID, m.ColumnID); err != nil {
 				t.Fatalf("column (%d,%d): %v", m.TableID, m.ColumnID, err)
@@ -81,15 +107,28 @@ func TestBridgeSchema(t *testing.T) {
 
 func TestBridgeLogSourceProtectResume(t *testing.T) {
 	ctx := context.Background()
-	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
+	cfg := testConfig(t.TempDir())
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 5; i++ {
-		id := NewRowID()
-		if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name, score) VALUES (?, ?, ?)`, id[:], fmt.Sprintf("u%d", i), i); err != nil {
+		tx, err := db.BeginTx(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := table.Insert(tx, &facadeRecord{ID: NewRowID(), Name: fmt.Sprintf("u%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
 			t.Fatal(err)
 		}
 	}

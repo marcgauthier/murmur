@@ -1,5 +1,5 @@
-// Multi-process two-node replication benchmark: one spedsql daemon writes
-// continuously while its peer converges; the report covers statement and
+// Multi-process two-node replication benchmark: one daemon writes
+// continuously while its peer converges; the report covers transaction and
 // mutation rates, convergence time, and logical protocol byte rates, and
 // the test gates on identical row counts plus matching SHA-256
 // application-data hashes.
@@ -7,18 +7,15 @@ package benchmark_test
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/ids"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -39,24 +36,21 @@ func TestTwoNodeReplicationBenchmark(t *testing.T) {
 	writeFor := envSeconds(t, "MURMUR_LIVE_BENCHMARK_WRITE_SECONDS", 10)
 	syncTimeout := envSeconds(t, "MURMUR_LIVE_BENCHMARK_SYNC_TIMEOUT_SECONDS", 120)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:     "benchmark",
-		NumNodes: 2,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{Name: "bench", Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "val", Type: schema.ColText, Nullable: true},
-		}}}},
+		Name:            "benchmark",
+		NumNodes:        2,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 
 	// Seed hot rows that every update round touches.
 	const hotRows = 100
 	hot := make([]string, 0, hotRows)
 	for i := 0; i < hotRows; i++ {
-		id := ids.NewRowID()
-		hexID := hex.EncodeToString(id[:])
-		if err := cluster.ExecSQL(0, `INSERT INTO bench (id, val) VALUES (?, ?)`, hexID, fmt.Sprintf("hot-%d-v0", i)); err != nil {
+		id := ids.NewRowID().String()
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: id, Name: fmt.Sprintf("hot-%d-v0", i)}); err != nil {
 			t.Fatal(err)
 		}
-		hot = append(hot, hexID)
+		hot = append(hot, id)
 	}
 
 	sentBefore, recvBefore := replBatchBytes(t, cluster)
@@ -67,15 +61,13 @@ func TestTwoNodeReplicationBenchmark(t *testing.T) {
 	for time.Now().Before(deadline) {
 		version++
 		// One insert plus one hot-row update per round; the daemon's
-		// single-statement service surface issues one transaction each.
-		id := ids.NewRowID()
-		if err := cluster.ExecSQL(0, `INSERT INTO bench (id, val) VALUES (?, ?)`,
-			hex.EncodeToString(id[:]), fmt.Sprintf("row-v%d", version)); err != nil {
+		// typed service surface issues one transaction each.
+		id := ids.NewRowID().String()
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: id, Name: fmt.Sprintf("row-v%d", version)}); err != nil {
 			t.Fatalf("insert: %v", err)
 		}
 		inserts++
-		if err := cluster.ExecSQL(0, `UPDATE bench SET val=? WHERE id=?`,
-			fmt.Sprintf("hot-%d-v%d", version%hotRows, version), hot[version%hotRows]); err != nil {
+		if err := cluster.TypedContentionUpdate(0, hot[version%hotRows], "name", fmt.Sprintf("hot-%d-v%d", version%hotRows, version)); err != nil {
 			t.Fatalf("update: %v", err)
 		}
 		updates++
@@ -105,11 +97,12 @@ func TestTwoNodeReplicationBenchmark(t *testing.T) {
 
 func stateOf(t *testing.T, cluster *harness.Cluster, idx int) (int, [32]byte) {
 	t.Helper()
-	res, err := cluster.QuerySQL(idx, `SELECT id, val FROM bench ORDER BY id`)
+	rows, err := cluster.TypedContentionRows(idx)
 	if err != nil {
 		t.Fatalf("state query: %v", err)
 	}
-	return len(res.Rows), sha256.Sum256([]byte(fmt.Sprintf("%v", res.Rows)))
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	return len(rows), sha256.Sum256([]byte(fmt.Sprintf("%v", rows)))
 }
 
 func replBatchBytes(t *testing.T, cluster *harness.Cluster) (sent, received uint64) {
@@ -124,23 +117,16 @@ func replBatchBytes(t *testing.T, cluster *harness.Cluster) (sent, received uint
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, line := range strings.Split(string(body), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) != 2 {
-				continue
-			}
-			// Counters render as float64 text; large values use
-			// scientific notation, which ParseUint rejects.
-			fv, err := strconv.ParseFloat(fields[1], 64)
-			if err != nil {
-				continue
-			}
-			v := uint64(fv)
-			switch {
-			case strings.HasPrefix(line, "spedsql_repl_batch_bytes_sent_total"):
-				sent += v
-			case strings.HasPrefix(line, "spedsql_repl_batch_bytes_received_total"):
-				received += v
+		samples, ok := harness.MetricSamples(string(body))
+		if !ok {
+			t.Fatal("decode metrics JSON")
+		}
+		for _, sample := range samples {
+			switch sample.Name {
+			case "spedsql_repl_batch_bytes_sent_total":
+				sent += uint64(sample.Value)
+			case "spedsql_repl_batch_bytes_received_total":
+				received += uint64(sample.Value)
 			}
 		}
 	}

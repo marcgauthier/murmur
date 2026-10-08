@@ -10,7 +10,6 @@ import (
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/ids"
-	"github.com/marcgauthier/murmur/schema"
 )
 
 type stubLogSource struct {
@@ -239,25 +238,14 @@ func TestCaptureFailsLoud(t *testing.T) {
 	}
 }
 
-func testLowDBConfig(dir string, nodeID ids.NodeID, dbid ids.DBID) db.Config {
+func testLowDBConfig(t *testing.T, dir string, nodeID ids.NodeID, dbid ids.DBID) db.Config {
+	t.Helper()
 	return testdb.Configure(db.Config{
 		Path:   dir,
 		NodeID: nodeID,
 		DBID:   dbid,
-		Schema: db.SchemaConfig{
-			Version: 1,
-			Tables: []schema.TableSchema{
-				{
-					Name: "contacts",
-					Columns: []schema.ColumnSchema{
-						{Name: "id", Type: schema.ColBlob},
-						{Name: "name", Type: schema.ColText, Nullable: true},
-						{Name: "score", Type: schema.ColInteger, Nullable: true},
-					},
-				},
-			},
-		},
-		Pebble: db.DefaultPebbleConfig(),
+		Tables: []db.TableDefinition{defineBaseContact(t)},
+		Spool:  db.DefaultSpoolConfig(),
 		Encryption: db.EncryptionConfig{
 			Key:   []byte("0123456789abcdef0123456789abcdef"),
 			KeyID: "bridge-test-key",
@@ -272,7 +260,7 @@ func TestBridgeExportProtectUncapturedFromGC(t *testing.T) {
 	node := db.NewNodeID()
 	dbid := db.NewDBID()
 
-	lowDB, err := db.Open(ctx, testLowDBConfig(dir, node, dbid))
+	lowDB, err := db.Open(ctx, testLowDBConfig(t, dir, node, dbid))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,10 +283,7 @@ func TestBridgeExportProtectUncapturedFromGC(t *testing.T) {
 	// Insert 10 rows on Low node.
 	for i := 0; i < 10; i++ {
 		id := db.NewRowID()
-		if _, err := lowDB.ExecContext(ctx, `INSERT INTO contacts (id, name, score) VALUES (?, ?, ?)`,
-			id[:], fmt.Sprintf("u%02d", i), i); err != nil {
-			t.Fatal(err)
-		}
+		insertTypedContact(t, lowDB, id, fmt.Sprintf("u%02d", i), int64(i))
 	}
 
 	// Delayed polling: GC runs aggressively BEFORE CaptureOnce is called.
@@ -328,7 +313,7 @@ func TestBridgeExportCrashRestartAndRemotelyLearnedChanges(t *testing.T) {
 	dbid := db.NewDBID()
 
 	// Step 1: Open Low DB, commit local transaction and prepare remotely learned transaction.
-	cfg := testLowDBConfig(dir, nodeLow, dbid)
+	cfg := testLowDBConfig(t, dir, nodeLow, dbid)
 	dbLow, err := db.Open(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -336,10 +321,7 @@ func TestBridgeExportCrashRestartAndRemotelyLearnedChanges(t *testing.T) {
 
 	// Local commit (Low origin).
 	id1 := db.NewRowID()
-	if _, err := dbLow.ExecContext(ctx, `INSERT INTO contacts (id, name, score) VALUES (?, ?, ?)`,
-		id1[:], "local-user", 42); err != nil {
-		t.Fatal(err)
-	}
+	insertTypedContact(t, dbLow, id1, "local-user", 42)
 
 	// Simulate crash BEFORE capture: close DB without running capture.
 	if err := dbLow.Close(); err != nil {

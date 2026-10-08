@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -41,9 +40,8 @@ type Node struct {
 	// while the node is stopped (rolling-upgrade tests).
 	BinaryPath    string
 	Dir           string
-	PebbleDir     string
+	DataDir       string
 	LogsDir       string
-	SchemaDir     string
 	TLSDir        string
 	ConfigFile    string
 	LogFile       string
@@ -84,15 +82,18 @@ type ClusterOptions struct {
 	NumNodes                     int
 	AwaitUnlock                  bool
 	Schema                       *db.SchemaConfig
-	SchemaSQL                    string
-	BaseReplPort                 int
-	BaseAPIPort                  int
-	AllowedNetworks              []string
-	AllowedNetworksByNode        map[int][]string
-	AllowedPeersByNode           map[int][]db.NodeID
-	NodeIDs                      []db.NodeID
-	Files                        *FilesOptions
-	Bridge                       *BridgeOptions
+	// TypedRecords starts testnodes with the native Config.Tables facade and
+	// its dedicated typed insert/count API.
+	TypedRecords          bool
+	TypedContention       bool
+	BaseReplPort          int
+	BaseAPIPort           int
+	AllowedNetworks       []string
+	AllowedNetworksByNode map[int][]string
+	AllowedPeersByNode    map[int][]db.NodeID
+	NodeIDs               []db.NodeID
+	Files                 *FilesOptions
+	Bridge                *BridgeOptions
 	// ManualPeers omits the automatic full-mesh peer list so the test can
 	// establish peering later via AddPeer (delayed-mesh scenarios).
 	ManualPeers bool
@@ -104,14 +105,14 @@ type ClusterOptions struct {
 	// scenarios that must deterministically trip budget rejection.
 	// Nil selects production defaults.
 	Limits *LimitsOptions
-	// Pebble carries optional storage overrides for scenarios that
-	// must shrink the cache/memtables or stall compactions. Nil
-	// selects production defaults.
-	Pebble *PebbleOptions
-	// PebbleByNode replaces the pebble section per node. Nodes with
-	// no entry fall back to opts.Pebble; a nil entry and nil base
+	// Spool carries optional storage overrides for scenarios that
+	// must shrink block buffers or pending memory. Nil selects
+	// production defaults.
+	Spool *SpoolOptions
+	// SpoolByNode replaces the spool section per node. Nodes with
+	// no entry fall back to opts.Spool; a nil entry and nil base
 	// omit the section.
-	PebbleByNode map[int]*PebbleOptions
+	SpoolByNode map[int]*SpoolOptions
 	// NodeEnv appends KEY=VALUE pairs to the daemon process
 	// environment per node (resource-pressure scenarios, e.g.
 	// GOMEMLIMIT). Entries replace same-key inherited variables.
@@ -163,10 +164,13 @@ type LimitsOptions struct {
 	MaxBatchMutations   int
 }
 
-// PebbleOptions mirrors the daemon's pebble config section (storage
-// sizing and compaction control). Zero values select production
+// SpoolOptions mirrors the daemon's spool config section (storage
+// sizing and buffer control). Zero values select production
 // defaults; per-node entries replace the cluster-wide section.
-type PebbleOptions struct {
+type SpoolOptions struct {
+	TargetBlockBytes            int
+	MaxBlockBytes               int
+	MaxPendingBytes             int64
 	CacheBytes                  int64
 	MemTableBytes               uint64
 	MemTableCount               int
@@ -220,7 +224,7 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 	if override := getEnv("MURMUR_BIN"); override != "" {
 		binPath = override
 	} else {
-		binPath = findOrBuildTestNode(t)
+		binPath = findOrBuildTestNode(t, opts.TypedRecords)
 	}
 
 	// Runtime root: the override env names a root shared by concurrent
@@ -263,14 +267,12 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 			label = labels[i]
 		}
 		nodeDir := filepath.Join(runtimeRoot, label)
-		pebbleDir := filepath.Join(nodeDir, "pebble")
+		dataDir := filepath.Join(nodeDir, "data")
 		logsDir := filepath.Join(nodeDir, "logs")
-		schemaDir := filepath.Join(nodeDir, "schema")
 		tlsDir := filepath.Join(nodeDir, "tls")
 
-		_ = os.MkdirAll(pebbleDir, 0755)
+		_ = os.MkdirAll(dataDir, 0755)
 		_ = os.MkdirAll(logsDir, 0755)
-		_ = os.MkdirAll(schemaDir, 0755)
 		_ = os.MkdirAll(tlsDir, 0755)
 
 		nodeID := db.NewNodeID()
@@ -289,10 +291,6 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 		_ = os.WriteFile(caFile, ca.CertPEM, 0644)
 		_ = os.WriteFile(certFile, certPEM, 0644)
 		_ = os.WriteFile(keyFile, keyPEM, 0600)
-
-		if opts.SchemaSQL != "" {
-			_ = os.WriteFile(filepath.Join(schemaDir, "schema.sql"), []byte(opts.SchemaSQL), 0644)
-		}
 
 		replPort := getFreePort(t)
 		apiPort := getFreePort(t)
@@ -318,9 +316,8 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 			NodeID:     nodeID,
 			BinaryPath: nodeBin,
 			Dir:        nodeDir,
-			PebbleDir:  pebbleDir,
+			DataDir:    dataDir,
 			LogsDir:    logsDir,
-			SchemaDir:  schemaDir,
 			TLSDir:     tlsDir,
 			ConfigFile: filepath.Join(nodeDir, "config.json"),
 			LogFile:    filepath.Join(logsDir, "node.log"),
@@ -411,7 +408,6 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 			"await_unlock":             opts.AwaitUnlock,
 			"key_hex":                  node.KeyHex,
 			"key_id":                   node.KeyID,
-			"schema_path":              node.SchemaDir,
 			"tls_ca_cert_file":         filepath.Join(node.TLSDir, "ca.crt"),
 			"tls_node_cert_file":       filepath.Join(node.TLSDir, "node.crt"),
 			"tls_node_key_file":        filepath.Join(node.TLSDir, "node.key"),
@@ -447,6 +443,12 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 		if opts.Schema != nil {
 			cfgJSON["schema"] = opts.Schema
 		}
+		if opts.TypedRecords {
+			cfgJSON["typed_records"] = true
+		}
+		if opts.TypedContention {
+			cfgJSON["typed_contention"] = true
+		}
 		repOpts := opts.Replication
 		if perNode, ok := opts.ReplicationByNode[i]; ok {
 			repOpts = perNode
@@ -473,18 +475,21 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 				"max_batch_mutations":   opts.Limits.MaxBatchMutations,
 			}
 		}
-		pebOpts := opts.Pebble
-		if perNode, ok := opts.PebbleByNode[i]; ok {
-			pebOpts = perNode
+		spoolOpts := opts.Spool
+		if perNode, ok := opts.SpoolByNode[i]; ok {
+			spoolOpts = perNode
 		}
-		if pebOpts != nil {
-			cfgJSON["pebble"] = map[string]any{
-				"cache_bytes":                   pebOpts.CacheBytes,
-				"memtable_bytes":                pebOpts.MemTableBytes,
-				"memtable_count":                pebOpts.MemTableCount,
-				"max_open_files":                pebOpts.MaxOpenFiles,
-				"max_concurrent_compactions":    pebOpts.MaxConcurrentCompactions,
-				"disable_automatic_compactions": pebOpts.DisableAutomaticCompactions,
+		if spoolOpts != nil {
+			cfgJSON["spool"] = map[string]any{
+				"target_block_bytes":            spoolOpts.TargetBlockBytes,
+				"max_block_bytes":               spoolOpts.MaxBlockBytes,
+				"max_pending_bytes":             spoolOpts.MaxPendingBytes,
+				"cache_bytes":                   spoolOpts.CacheBytes,
+				"memtable_bytes":                spoolOpts.MemTableBytes,
+				"memtable_count":                spoolOpts.MemTableCount,
+				"max_open_files":                spoolOpts.MaxOpenFiles,
+				"max_concurrent_compactions":    spoolOpts.MaxConcurrentCompactions,
+				"disable_automatic_compactions": spoolOpts.DisableAutomaticCompactions,
 			}
 		}
 		if opts.Files != nil {
@@ -659,6 +664,118 @@ func (c *Cluster) KillNode(idx int) {
 	}
 }
 
+// WaitNodeExit reaps a process that exited on its own and returns its exit
+// code. If the process is still alive at timeout it is killed and an error is
+// returned; this is used for fixture-injected crash boundaries.
+func (c *Cluster) WaitNodeExit(idx int, timeout time.Duration) (int, error) {
+	if idx < 0 || idx >= len(c.Nodes) {
+		return -1, fmt.Errorf("node index %d out of range", idx)
+	}
+	node := c.Nodes[idx]
+	if node.Process == nil || node.Process.Process == nil {
+		return -1, fmt.Errorf("node %s has no process to wait for", node.Label)
+	}
+	cmd := node.Process
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var waitErr error
+	select {
+	case waitErr = <-done:
+	case <-timer.C:
+		_ = cmd.Process.Kill()
+		waitErr = <-done
+		node.Process = nil
+		if node.LogFileWriter != nil {
+			_ = node.LogFileWriter.Close()
+			node.LogFileWriter = nil
+		}
+		return -1, fmt.Errorf("node %s did not exit within %s (wait result: %v)", node.Label, timeout, waitErr)
+	}
+	node.Process = nil
+	if node.LogFileWriter != nil {
+		_ = node.LogFileWriter.Close()
+		node.LogFileWriter = nil
+	}
+	if waitErr == nil {
+		return 0, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(waitErr, &exitErr) {
+		return exitErr.ExitCode(), nil
+	}
+	return -1, waitErr
+}
+
+// SetTypedSchemaVersion selects the typed testnode's application schema for
+// its next start. Use it when a crash-recovery fixture restarts with the new
+// application descriptor for a durably migrated store.
+func (c *Cluster) SetTypedSchemaVersion(idx, version int) error {
+	if idx < 0 || idx >= len(c.Nodes) {
+		return fmt.Errorf("node index %d out of range", idx)
+	}
+	if version < 1 || version > 2 {
+		return fmt.Errorf("unsupported typed test schema version %d", version)
+	}
+	path := c.Nodes[idx].ConfigFile
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read node config: %w", err)
+	}
+	var config map[string]json.RawMessage
+	if err := json.Unmarshal(data, &config); err != nil {
+		return fmt.Errorf("decode node config: %w", err)
+	}
+	value, err := json.Marshal(version)
+	if err != nil {
+		return fmt.Errorf("encode typed schema version: %w", err)
+	}
+	config["typed_schema_version"] = value
+	data, err = json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode node config: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("write node config: %w", err)
+	}
+	return nil
+}
+
+// SetTypedSchemaCrashPhase arms a test-only schema-store process exit for the
+// next migration request handled by this node. The testnode must be built with
+// the murmur_testhooks tag; an empty phase disables the hook.
+func (c *Cluster) SetTypedSchemaCrashPhase(idx int, phase string) error {
+	if idx < 0 || idx >= len(c.Nodes) {
+		return fmt.Errorf("node index %d out of range", idx)
+	}
+	if phase != "" && phase != "before-store" && phase != "after-store" {
+		return fmt.Errorf("unsupported typed schema crash phase %q", phase)
+	}
+	path := c.Nodes[idx].ConfigFile
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read node config: %w", err)
+	}
+	var config map[string]json.RawMessage
+	if err := json.Unmarshal(data, &config); err != nil {
+		return fmt.Errorf("decode node config: %w", err)
+	}
+	value, err := json.Marshal(phase)
+	if err != nil {
+		return fmt.Errorf("encode typed schema crash phase: %w", err)
+	}
+	config["typed_schema_crash_phase"] = value
+	data, err = json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode node config: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("write node config: %w", err)
+	}
+	return nil
+}
+
 func (c *Cluster) UnlockNode(idx int, keyHex string) {
 	c.UnlockNodeWithKeyID(idx, "", keyHex)
 }
@@ -714,71 +831,372 @@ func (c *Cluster) WaitNodeReady(idx int) {
 	c.T.Fatalf("node %s at %s failed readiness check", node.Label, url)
 }
 
-func (c *Cluster) ExecSQL(idx int, query string, args ...any) error {
-	node := c.Nodes[idx]
-	url := fmt.Sprintf("https://%s/v1/exec", node.APIAddr)
-	payload, err := json.Marshal(map[string]any{
-		"query": query,
-		"args":  args,
-	})
+// APIClient returns the mutual-TLS client configured for this cluster's API
+// addresses. Tests use it for routes that do not have a dedicated helper.
+func (c *Cluster) APIClient() *http.Client {
+	return liveHTTPClient
+}
+
+// TypedInsert inserts one named record through the node's managed typed API.
+func (c *Cluster) TypedInsert(idx int, name string) error {
+	return c.typedRequest(idx, "/v1/typed/insert", map[string]any{"name": name}, nil)
+}
+
+// TypedLocalInsert writes a row to the persistent node-local typed table.
+func (c *Cluster) TypedLocalInsert(idx int, name string) error {
+	return c.typedRequest(idx, "/v1/typed/local-insert", map[string]any{"name": name}, nil)
+}
+
+// TypedLocalCount returns the count of node-local rows matching name.
+func (c *Cluster) TypedLocalCount(idx int, name string) (int, error) {
+	var result struct {
+		Count int `json:"count"`
+	}
+	if err := c.typedRequest(idx, "/v1/typed/local-count", map[string]any{"name": name}, &result); err != nil {
+		return 0, err
+	}
+	return result.Count, nil
+}
+
+// TypedInsertWithID inserts a record using a caller-selected shared ID. Live
+// partition tests use it to create one logical record independently on nodes.
+func (c *Cluster) TypedInsertWithID(idx int, id db.RowID, name string) error {
+	return c.TypedInsertScoredWithID(idx, id, name, 0)
+}
+
+// TypedInsertScoredWithID inserts one row and its initial PN_COUNTER value in
+// the same managed transaction, producing one bridge source event.
+func (c *Cluster) TypedInsertScoredWithID(idx int, id db.RowID, name string, count int64) error {
+	return c.typedRequest(idx, "/v1/typed/insert", map[string]any{"id": id.String(), "name": name, "count": count}, nil)
+}
+
+type TypedContentionRow struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Phone string `json:"phone"`
+	Score int64  `json:"score"`
+}
+
+func (c *Cluster) TypedContentionInsert(idx int, row TypedContentionRow) error {
+	return c.typedRequest(idx, "/v1/typed/contention/insert", map[string]any{
+		"id": row.ID, "name": row.Name, "phone": row.Phone, "score": row.Score,
+	}, nil)
+}
+
+// TypedContentionInsertMany writes a batch through the managed typed API.
+func (c *Cluster) TypedContentionInsertMany(idx int, rows []TypedContentionRow) error {
+	return c.typedRequest(idx, "/v1/typed/contention/insert-many", map[string]any{"rows": rows}, nil)
+}
+
+func (c *Cluster) TypedContentionUpdate(idx int, id, field, value string) error {
+	request := map[string]string{"id": id, "field": field, "value": value}
+	var err error
+	for attempt := 0; attempt < 32; attempt++ {
+		err = c.typedRequest(idx, "/v1/typed/contention/update", request, nil)
+		if err == nil || !strings.Contains(err.Error(), "rime: write conflict") {
+			return err
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return err
+}
+
+func (c *Cluster) TypedContentionDelete(idx int, id string) error {
+	return c.typedRequest(idx, "/v1/typed/contention/delete", map[string]string{"id": id}, nil)
+}
+
+func (c *Cluster) TypedContentionRead(idx int, id string) (TypedContentionRow, error) {
+	var row TypedContentionRow
+	err := c.typedRequest(idx, "/v1/typed/contention/read", map[string]string{"id": id}, &row)
+	return row, err
+}
+
+func (c *Cluster) TypedContentionRows(idx int) ([]TypedContentionRow, error) {
+	var rows []TypedContentionRow
+	err := c.typedRequest(idx, "/v1/typed/contention/all", map[string]any{}, &rows)
+	return rows, err
+}
+
+// TypedContentionPrefixCount counts managed contention records by name prefix.
+func (c *Cluster) TypedContentionPrefixCount(idx int, prefix string) (int, error) {
+	var result struct {
+		Count int `json:"count"`
+	}
+	err := c.typedRequest(idx, "/v1/typed/contention/prefix-count", map[string]string{"prefix": prefix}, &result)
+	return result.Count, err
+}
+
+// TypedContentionDigest returns the node-local count and deterministic digest
+// of the managed contention table without transferring large field values.
+func (c *Cluster) TypedContentionDigest(idx int) (int, string, error) {
+	var result struct {
+		Count  int    `json:"count"`
+		Digest string `json:"digest"`
+	}
+	err := c.typedRequest(idx, "/v1/typed/contention/digest", map[string]any{}, &result)
+	return result.Count, result.Digest, err
+}
+
+// TriggerGC runs the node's retention-aware operator GC through its admin API.
+func (c *Cluster) TriggerGC(idx int) error {
+	if idx < 0 || idx >= len(c.Nodes) {
+		return fmt.Errorf("node index %d out of range", idx)
+	}
+	resp, err := liveHTTPClient.Post("https://"+c.Nodes[idx].APIAddr+"/v1/admin/gc", "application/json", bytes.NewReader(nil))
 	if err != nil {
 		return err
 	}
-	resp, err := liveHTTPClient.Post(url, "application/json", bytes.NewReader(payload))
-	if err != nil {
-		return fmt.Errorf("node %s exec POST: %w", node.Label, err)
-	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("node %s exec failed (%d): %s", node.Label, resp.StatusCode, string(b))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return fmt.Errorf("operator GC returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
 }
 
-type QueryResult struct {
-	Columns []string `json:"columns"`
-	Rows    [][]any  `json:"rows"`
+// TypedExplicitTransaction commits one row and rolls another back through the
+// host-managed typed transaction lifecycle.
+func (c *Cluster) TypedExplicitTransaction(idx int, name string) error {
+	return c.typedRequest(idx, "/v1/typed/explicit-tx", map[string]string{"name": name}, nil)
 }
 
-func (c *Cluster) QuerySQL(idx int, query string, args ...any) (*QueryResult, error) {
-	node := c.Nodes[idx]
-	url := fmt.Sprintf("https://%s/v1/query", node.APIAddr)
-	payload, err := json.Marshal(map[string]any{
-		"query": query,
-		"args":  args,
-	})
-	if err != nil {
+// MigrateTypedRecords adds the test fixture's V2 Note field at runtime.
+func (c *Cluster) MigrateTypedRecords(idx int) error {
+	return c.typedRequest(idx, "/v1/typed/migrate-v2", map[string]any{}, nil)
+}
+
+// MigrateTypedRecordsRegion creates the schema branch that adds Region.
+func (c *Cluster) MigrateTypedRecordsRegion(idx int) error {
+	return c.typedRequest(idx, "/v1/typed/migrate-region", map[string]any{}, nil)
+}
+
+// MigrateTypedRecordsV4 rebinds the complete two-branch record definition.
+func (c *Cluster) MigrateTypedRecordsV4(idx int) error {
+	return c.typedRequest(idx, "/v1/typed/migrate-v4", map[string]any{}, nil)
+}
+
+// TypedSetNote updates the V2-only field through the managed typed API.
+func (c *Cluster) TypedSetNote(idx int, name, note string) error {
+	return c.typedRequest(idx, "/v1/typed/set-note", map[string]string{"name": name, "note": note}, nil)
+}
+
+// TypedSetRegion updates the field added by the Region schema branch.
+func (c *Cluster) TypedSetRegion(idx int, name, region string) error {
+	return c.typedRequest(idx, "/v1/typed/set-region", map[string]string{"name": name, "region": region}, nil)
+}
+
+// TypedBranchValues reads both fields after the application binds their union.
+func (c *Cluster) TypedBranchValues(idx int, name string) (note, region string, err error) {
+	var result struct {
+		Note   string `json:"note"`
+		Region string `json:"region"`
+	}
+	if err = c.typedRequest(idx, "/v1/typed/branch-values", map[string]string{"name": name}, &result); err != nil {
+		return "", "", err
+	}
+	return result.Note, result.Region, nil
+}
+
+// TypedRename updates a field known to an older typed writer.
+func (c *Cluster) TypedRename(idx int, name, newName string) error {
+	return c.typedRequest(idx, "/v1/typed/rename", map[string]string{"name": name, "new_name": newName}, nil)
+}
+
+// TypedNote reads the V2-only field through a native typed table handle.
+func (c *Cluster) TypedNote(idx int, name string) (string, error) {
+	var result struct {
+		Note string `json:"note"`
+	}
+	if err := c.typedRequest(idx, "/v1/typed/note", map[string]string{"name": name}, &result); err != nil {
+		return "", err
+	}
+	return result.Note, nil
+}
+
+// TypedSchemaEpoch returns the current typed schema version.
+func (c *Cluster) TypedSchemaEpoch(idx int) (uint64, error) {
+	var result struct {
+		Epoch uint64 `json:"epoch"`
+	}
+	if err := c.typedRequest(idx, "/v1/typed/schema-epoch", map[string]any{}, &result); err != nil {
+		return 0, err
+	}
+	return result.Epoch, nil
+}
+
+// TypedCount returns the number of typed records matching name.
+func (c *Cluster) TypedCount(idx int, name string) (int, error) {
+	var result struct {
+		Count int `json:"count"`
+	}
+	if err := c.typedRequest(idx, "/v1/typed/count", map[string]any{"name": name}, &result); err != nil {
+		return 0, err
+	}
+	return result.Count, nil
+}
+
+// TypedEnabledNames evaluates the test application's managed RIME view.
+func (c *Cluster) TypedEnabledNames(idx int) ([]string, error) {
+	var result struct {
+		Names []string `json:"names"`
+	}
+	if err := c.typedRequest(idx, "/v1/typed/enabled-names", map[string]any{}, &result); err != nil {
 		return nil, err
 	}
-	resp, err := liveHTTPClient.Post(url, "application/json", bytes.NewReader(payload))
+	return result.Names, nil
+}
+
+// TypedNames returns all names from the managed typed-record table in order.
+func (c *Cluster) TypedNames(idx int) ([]string, error) {
+	var result struct {
+		Names []string `json:"names"`
+	}
+	if err := c.typedRequest(idx, "/v1/typed/names", map[string]any{}, &result); err != nil {
+		return nil, err
+	}
+	return result.Names, nil
+}
+
+// TypedCounterAdd applies one typed PN_COUNTER delta.
+func (c *Cluster) TypedCounterAdd(idx int, name string, delta int64) error {
+	return c.typedRequest(idx, "/v1/typed/counter-add", map[string]any{"name": name, "delta": delta}, nil)
+}
+
+// TypedCounterValue reads a typed PN_COUNTER projection.
+func (c *Cluster) TypedCounterValue(idx int, name string) (int64, error) {
+	var result struct {
+		Value int64 `json:"value"`
+	}
+	if err := c.typedRequest(idx, "/v1/typed/counter-value", map[string]string{"name": name}, &result); err != nil {
+		return 0, err
+	}
+	return result.Value, nil
+}
+
+// TypedSetAdd and TypedSetRemove apply causal typed OR_SET operations.
+func (c *Cluster) TypedSetAdd(idx int, name, value string) error {
+	return c.typedRequest(idx, "/v1/typed/set-add", map[string]string{"name": name, "value": value}, nil)
+}
+
+func (c *Cluster) TypedSetRemove(idx int, name, value string) error {
+	return c.typedRequest(idx, "/v1/typed/set-remove", map[string]string{"name": name, "value": value}, nil)
+}
+
+// TypedSetValues reads the currently materialized typed set projection.
+func (c *Cluster) TypedSetValues(idx int, name string) ([]string, error) {
+	var result struct {
+		Values []string `json:"values"`
+	}
+	if err := c.typedRequest(idx, "/v1/typed/set-values", map[string]string{"name": name}, &result); err != nil {
+		return nil, err
+	}
+	return result.Values, nil
+}
+
+// TypedExtremaUpdate applies a typed MAX and MIN operation in one transaction.
+func (c *Cluster) TypedExtremaUpdate(idx int, name string, peak int64, floor float64) error {
+	return c.typedRequest(idx, "/v1/typed/extrema-update", map[string]any{"name": name, "peak": peak, "floor": floor}, nil)
+}
+
+// TypedExtremaValues reads typed MAX and MIN projections.
+func (c *Cluster) TypedExtremaValues(idx int, name string) (int64, float64, error) {
+	var result struct {
+		Peak  int64   `json:"peak"`
+		Floor float64 `json:"floor"`
+	}
+	if err := c.typedRequest(idx, "/v1/typed/extrema-values", map[string]string{"name": name}, &result); err != nil {
+		return 0, 0, err
+	}
+	return result.Peak, result.Floor, nil
+}
+
+type TypedWatchEvent struct {
+	Type  string `json:"type"`
+	Count int    `json:"count"`
+	Error string `json:"error,omitempty"`
+}
+
+type TypedWatch struct {
+	response *http.Response
+	decoder  *json.Decoder
+}
+
+// StartTypedWatch opens a streaming typed subscription and returns after its
+// initial snapshot has arrived.
+func (c *Cluster) StartTypedWatch(idx int, name string) (*TypedWatch, TypedWatchEvent, error) {
+	node := c.Nodes[idx]
+	payload, err := json.Marshal(map[string]string{"name": name})
 	if err != nil {
-		return nil, fmt.Errorf("node %s query POST: %w", node.Label, err)
+		return nil, TypedWatchEvent{}, err
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://"+node.APIAddr+"/v1/typed/watch", bytes.NewReader(payload))
+	if err != nil {
+		return nil, TypedWatchEvent{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := liveHTTPClient.Do(req)
+	if err != nil {
+		return nil, TypedWatchEvent{}, fmt.Errorf("node %s typed watch: %w", node.Label, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return nil, TypedWatchEvent{}, fmt.Errorf("node %s typed watch failed (%d): %s", node.Label, resp.StatusCode, string(b))
+	}
+	watch := &TypedWatch{response: resp, decoder: json.NewDecoder(resp.Body)}
+	var initial TypedWatchEvent
+	if err := watch.decoder.Decode(&initial); err != nil {
+		_ = watch.Close()
+		return nil, TypedWatchEvent{}, err
+	}
+	if initial.Type != "initial" {
+		_ = watch.Close()
+		return nil, initial, fmt.Errorf("node %s typed watch began with %q, want initial", node.Label, initial.Type)
+	}
+	return watch, initial, nil
+}
+
+// Next reads one later typed subscription event.
+func (w *TypedWatch) Next() (TypedWatchEvent, error) {
+	if w == nil || w.decoder == nil {
+		return TypedWatchEvent{}, errors.New("typed watch is closed")
+	}
+	var event TypedWatchEvent
+	if err := w.decoder.Decode(&event); err != nil {
+		return TypedWatchEvent{}, err
+	}
+	return event, nil
+}
+
+// Close ends the typed watch HTTP stream.
+func (w *TypedWatch) Close() error {
+	if w == nil || w.response == nil || w.response.Body == nil {
+		return nil
+	}
+	err := w.response.Body.Close()
+	w.response = nil
+	return err
+}
+
+func (c *Cluster) typedRequest(idx int, path string, body any, result any) error {
+	node := c.Nodes[idx]
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	resp, err := liveHTTPClient.Post("https://"+node.APIAddr+path, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("node %s typed request: %w", node.Label, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("node %s query failed (%d): %s", node.Label, resp.StatusCode, string(b))
+		return fmt.Errorf("node %s typed request failed (%d): %s", node.Label, resp.StatusCode, string(b))
 	}
-	var res QueryResult
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return nil, err
+	if result != nil {
+		return json.NewDecoder(resp.Body).Decode(result)
 	}
-	return &res, nil
-}
-
-func (c *Cluster) QueryRowCount(idx int, table string) (int, error) {
-	res, err := c.QuerySQL(idx, fmt.Sprintf("SELECT count(*) FROM %s", table))
-	if err != nil {
-		return 0, err
-	}
-	if len(res.Rows) == 0 || len(res.Rows[0]) == 0 {
-		return 0, nil
-	}
-	val := fmt.Sprintf("%v", res.Rows[0][0])
-	var count int
-	_, _ = fmt.Sscanf(val, "%d", &count)
-	return count, nil
+	return nil
 }
 
 func (c *Cluster) AddPeer(fromIdx, targetIdx int) error {
@@ -818,21 +1236,6 @@ func (c *Cluster) RemovePeer(fromIdx, targetIdx int) error {
 		return fmt.Errorf("remove peer failed (%d): %s", resp.StatusCode, string(b))
 	}
 	return nil
-}
-
-func (c *Cluster) ComputeTableDigest(idx int, table string, orderBy string) (string, error) {
-	res, err := c.QuerySQL(idx, fmt.Sprintf("SELECT * FROM %s ORDER BY %s", table, orderBy))
-	if err != nil {
-		return "", err
-	}
-	h := sha256.New()
-	for _, row := range res.Rows {
-		for _, cell := range row {
-			h.Write([]byte(fmt.Sprintf("%v:", cell)))
-		}
-		h.Write([]byte("\n"))
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func (c *Cluster) MarkFailed(reason string) {
@@ -892,26 +1295,24 @@ func getEnv(name string) string {
 	return GetEnv(name)
 }
 
-func findOrBuildTestNode(t *testing.T) string {
+func findOrBuildTestNode(t *testing.T, typedRecords bool) string {
 	t.Helper()
 	root := repoRoot(t)
-	bin := filepath.Join(root, "tests-live", "bin", "testnode")
-	// The default CGO build requires the SQLite feature tags; MURMUR_TAGS
-	// overrides them (e.g. MURMUR_TAGS=modernc for the pure-Go backend).
-	// Without an override, a CGO-disabled environment implies the
-	// pure-Go backend so bare `CGO_ENABLED=0 go test -tags modernc`
-	// runs build a working daemon instead of a mattn/modernc mix.
+	name := "testnode"
 	tags := getEnv("MURMUR_TAGS")
-	if tags == "" {
-		tags = "sqlite_preupdate_hook sqlite_fts5"
-		if os.Getenv("CGO_ENABLED") == "0" {
-			tags = "modernc"
-		}
+	if typedRecords {
+		// Typed scenarios use Murmur managed records.
+		// Build a separate fixture so these live tests qualify the
+		// CGO-free RIME path without racing or replacing the legacy binary.
+		name = "testnode-typed"
+		tags = getEnv("MURMUR_TYPED_TAGS")
 	}
+	race := getEnv("MURMUR_RACE") == "1"
+	bin := filepath.Join(root, "tests-live", "bin", name)
 	// A bare `go test ./tests-live/<scenario>` must never silently reuse a
 	// binary built from older sources: rebuild when any build input is
 	// newer than the binary or the tags stamp disagrees.
-	if reason := testNodeStaleReason(bin, root, tags); reason == "" {
+	if reason := testNodeStaleReason(bin, root, tags, race); reason == "" {
 		return bin
 	} else {
 		t.Logf("rebuilding testnode binary: %s", reason)
@@ -919,13 +1320,21 @@ func findOrBuildTestNode(t *testing.T) string {
 	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
 		t.Fatalf("create test bin dir: %v", err)
 	}
-	cmd := exec.Command("go", "build", "-tags", tags, "-o", bin, "./tests-live/harness/testnode")
+	args := []string{"build"}
+	if race {
+		args = append(args, "-race")
+	}
+	if tags != "" {
+		args = append(args, "-tags", tags)
+	}
+	args = append(args, "-o", bin, "./tests-live/harness/testnode")
+	cmd := exec.Command("go", args...)
 	cmd.Dir = root
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("build testnode binary: %v, output: %s", err, string(out))
 	}
-	if err := os.WriteFile(bin+".tags", []byte(tags), 0o644); err != nil {
+	if err := os.WriteFile(bin+".tags", []byte(testNodeBuildStamp(tags, race)), 0o644); err != nil {
 		t.Fatalf("write testnode tags stamp: %v", err)
 	}
 	return bin
@@ -934,13 +1343,17 @@ func findOrBuildTestNode(t *testing.T) string {
 // testNodeStaleReason returns "" when bin exists, was built with tags, and is
 // newer than every build input under root. Otherwise it returns a
 // human-readable reason so the caller can log why a rebuild happens.
-func testNodeStaleReason(bin, root, tags string) string {
+func testNodeBuildStamp(tags string, race bool) string {
+	return fmt.Sprintf("tags=%s\nrace=%t", tags, race)
+}
+
+func testNodeStaleReason(bin, root, tags string, race bool) string {
 	st, err := os.Stat(bin)
 	if err != nil {
 		return "binary missing"
 	}
 	stamp, err := os.ReadFile(bin + ".tags")
-	if err != nil || strings.TrimSpace(string(stamp)) != tags {
+	if err != nil || strings.TrimSpace(string(stamp)) != testNodeBuildStamp(tags, race) {
 		return "build tags changed or unknown"
 	}
 	newer, err := newestSourceAfter(root, st.ModTime())
@@ -1115,36 +1528,4 @@ func getFreePort(t *testing.T) int {
 	}
 	t.Fatal("could not draw an unclaimed ephemeral port after 50 attempts")
 	return 0
-}
-
-// MergeOperation invokes an explicit transaction operation on a live daemon.
-func (c *Cluster) MergeOperation(node int, request map[string]string) error {
-	raw, err := json.Marshal(request)
-	if err != nil {
-		return err
-	}
-	response, err := liveHTTPClient.Post(fmt.Sprintf("https://%s/v1/crdt", c.Nodes[node].APIAddr), "application/json", bytes.NewReader(raw))
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != 204 {
-		body, _ := io.ReadAll(response.Body)
-		return fmt.Errorf("merge operation HTTP %d: %s", response.StatusCode, body)
-	}
-	return nil
-}
-func (c *Cluster) MergeState(node int, table, row string) (map[string]string, error) {
-	response, err := liveHTTPClient.Get(fmt.Sprintf("https://%s/v1/crdt/state?table=%s&row=%s", c.Nodes[node].APIAddr, table, row))
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != 200 {
-		body, _ := io.ReadAll(response.Body)
-		return nil, fmt.Errorf("state HTTP %d: %s", response.StatusCode, body)
-	}
-	var state map[string]string
-	err = json.NewDecoder(response.Body).Decode(&state)
-	return state, err
 }

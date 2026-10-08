@@ -1,14 +1,15 @@
 package scalemesh
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -19,16 +20,11 @@ import (
 func TestTenNodeMeshConvergesBounded(t *testing.T) {
 	const nodes = 10
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "scale-mesh",
-		NumNodes:    nodes,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "mesh_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:            "scale-mesh",
+		NumNodes:        nodes,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 
 	// Bound sampling runs for the whole test. The sampler reports
@@ -50,14 +46,14 @@ func TestTenNodeMeshConvergesBounded(t *testing.T) {
 
 	for i := 0; i < 300; i++ {
 		id := fmt.Sprintf("%032x", i)
-		if err := cluster.ExecSQL(0, "INSERT INTO mesh_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("w-%d", i)); err != nil {
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: id, Name: fmt.Sprintf("w-%d", i)}); err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}
 	}
 	// A second origin proves multi-hop forwarding, not just hub fan-out.
 	for i := 300; i < 400; i++ {
 		id := fmt.Sprintf("%032x", i)
-		if err := cluster.ExecSQL(7, "INSERT INTO mesh_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("w-%d", i)); err != nil {
+		if err := cluster.TypedContentionInsert(7, harness.TypedContentionRow{ID: id, Name: fmt.Sprintf("w-%d", i)}); err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}
 	}
@@ -65,13 +61,13 @@ func TestTenNodeMeshConvergesBounded(t *testing.T) {
 	// 300s, not 120s: ten daemons converging 400 multi-hop rows need
 	// headroom on a saturated box (a full `go test -race ./...`
 	// exceeds two minutes on writes+convergence alone).
-	waitAllCounts(t, cluster, "mesh_rows", 400, 300*time.Second)
-	want, err := cluster.ComputeTableDigest(0, "mesh_rows", "id")
+	waitAllCounts(t, cluster, 400, 300*time.Second)
+	want, err := meshDigest(cluster, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for idx := 1; idx < nodes; idx++ {
-		d, err := cluster.ComputeTableDigest(idx, "mesh_rows", "id")
+		d, err := meshDigest(cluster, idx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -92,14 +88,14 @@ func TestTenNodeMeshConvergesBounded(t *testing.T) {
 drained:
 }
 
-func waitAllCounts(t *testing.T, c *harness.Cluster, table string, want int, timeout time.Duration) {
+func waitAllCounts(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
 		ok := true
 		for idx := range c.Nodes {
-			n, err := c.QueryRowCount(idx, table)
-			if err != nil || n != want {
+			rows, err := c.TypedContentionRows(idx)
+			if err != nil || len(rows) != want {
 				ok = false
 				break
 			}
@@ -112,6 +108,20 @@ func waitAllCounts(t *testing.T, c *harness.Cluster, table string, want int, tim
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// meshDigest returns the PK-ordered digest of the contention table on one node.
+func meshDigest(c *harness.Cluster, idx int) (string, error) {
+	rows, err := c.TypedContentionRows(idx)
+	if err != nil {
+		return "", err
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	h := sha256.New()
+	for _, row := range rows {
+		fmt.Fprintf(h, "%s:%s:%s:%d\n", row.ID, row.Name, row.Phone, row.Score)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 var meshStatusClient = &http.Client{Timeout: 5 * time.Second}

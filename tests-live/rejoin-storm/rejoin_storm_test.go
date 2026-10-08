@@ -2,7 +2,7 @@
 // once while the survivor keeps taking tracked writes, then both dead
 // nodes restart simultaneously (thundering-herd rejoin behind a start
 // barrier). Both must rejoin un-wedged, every outage write must land
-// everywhere, counts plus PK-ordered digests must match exactly, and
+// everywhere, counts plus sorted logical-record digests must match exactly, and
 // each node's rejoin path (range repair vs snapshot) is recorded via
 // its receiver counter — correctness is mandatory on either path.
 package rejoinstorm_test
@@ -12,35 +12,28 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func TestDualKillSimultaneousRejoin(t *testing.T) {
 	outageRows := envInt("MURMUR_REJOIN_STORM_OUTAGE_ROWS", 40)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "rejoin-storm",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "rs_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:         "rejoin-storm",
+		NumNodes:     3,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 
 	// Positive control: honest 3-node convergence before any crash.
 	for node := 0; node < 3; node++ {
 		name := fmt.Sprintf("base-node%d", node+1)
-		if err := cluster.ExecSQL(node, "INSERT INTO rs_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", node+1), name); err != nil {
+		if err := cluster.TypedInsert(node, name); err != nil {
 			t.Fatalf("baseline write node%d: %v", node+1, err)
 		}
 	}
@@ -53,7 +46,7 @@ func TestDualKillSimultaneousRejoin(t *testing.T) {
 	cluster.KillNode(1)
 	cluster.KillNode(2)
 	for _, idx := range []int{1, 2} {
-		if _, err := cluster.QueryRowCount(idx, "rs_rows"); err == nil {
+		if _, err := cluster.TypedNames(idx); err == nil {
 			t.Fatalf("node%d answers queries after SIGKILL; outage not real", idx+1)
 		}
 	}
@@ -65,12 +58,13 @@ func TestDualKillSimultaneousRejoin(t *testing.T) {
 	}
 	for i := 0; i < outageRows; i++ {
 		name := fmt.Sprintf("outage-%04d", i)
-		if err := cluster.ExecSQL(0, "INSERT INTO rs_rows (id, name) VALUES (?, ?)", fmt.Sprintf("aa%030x", i), name); err != nil {
+		if err := cluster.TypedInsert(0, name); err != nil {
 			t.Fatalf("outage write %d: %v", i, err)
 		}
 		acked[name] = struct{}{}
 	}
-	if n, err := cluster.QueryRowCount(0, "rs_rows"); err != nil || n != 3+outageRows {
+	if names, err := cluster.TypedNames(0); err != nil || len(names) != 3+outageRows {
+		n := len(names)
 		t.Fatalf("survivor count = %d (err=%v), want %d", n, err, 3+outageRows)
 	}
 
@@ -78,7 +72,7 @@ func TestDualKillSimultaneousRejoin(t *testing.T) {
 	// so their catch-up overlaps instead of serializing.
 	start := make(chan struct{})
 	type readyResult struct {
-		idx int
+		idx  int
 		took time.Duration
 	}
 	ready := make(chan readyResult, 2)
@@ -123,7 +117,7 @@ func TestDualKillSimultaneousRejoin(t *testing.T) {
 	post := map[string]struct{}{}
 	for _, idx := range []int{1, 2} {
 		name := fmt.Sprintf("post-rejoin-node%d", idx+1)
-		if err := cluster.ExecSQL(idx, "INSERT INTO rs_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 5000+idx), name); err != nil {
+		if err := cluster.TypedInsert(idx, name); err != nil {
 			t.Fatalf("post-rejoin write node%d: %v", idx+1, err)
 		}
 		post[name] = struct{}{}
@@ -175,16 +169,13 @@ func waitForConvergence(t *testing.T, c *harness.Cluster, want int, timeout time
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "rs_rows")
-			if err != nil || n != want {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, "rs_rows", "id")
-			if err != nil {
-				ok = false
-				break
-			}
+			sort.Strings(names)
+			d := strings.Join(names, "\n")
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -198,9 +189,9 @@ func waitForConvergence(t *testing.T, c *harness.Cluster, want int, timeout time
 		time.Sleep(100 * time.Millisecond)
 	}
 	for i := range c.Nodes {
-		n, _ := c.QueryRowCount(i, "rs_rows")
-		d, _ := c.ComputeTableDigest(i, "rs_rows", "id")
-		t.Logf("node %d at timeout: count=%d digest=%s", i+1, n, d)
+		names, _ := c.TypedNames(i)
+		sort.Strings(names)
+		t.Logf("node %d at timeout: count=%d digest=%s", i+1, len(names), digestNames(names))
 	}
 	t.Fatalf("nodes did not converge on %d rows with equal PK digests within %v", want, timeout)
 }
@@ -208,15 +199,13 @@ func waitForConvergence(t *testing.T, c *harness.Cluster, want int, timeout time
 func assertAcknowledgedPresent(t *testing.T, c *harness.Cluster, acknowledged map[string]struct{}) {
 	t.Helper()
 	for i := range c.Nodes {
-		res, err := c.QuerySQL(i, "SELECT name FROM rs_rows")
+		names, err := c.TypedNames(i)
 		if err != nil {
 			t.Fatalf("node%d recovery query: %v", i+1, err)
 		}
-		present := make(map[string]struct{}, len(res.Rows))
-		for _, row := range res.Rows {
-			if len(row) > 0 {
-				present[fmt.Sprint(row[0])] = struct{}{}
-			}
+		present := make(map[string]struct{}, len(names))
+		for _, name := range names {
+			present[name] = struct{}{}
 		}
 		for name := range acknowledged {
 			if _, ok := present[name]; !ok {
@@ -224,6 +213,11 @@ func assertAcknowledgedPresent(t *testing.T, c *harness.Cluster, acknowledged ma
 			}
 		}
 	}
+}
+
+func digestNames(names []string) string {
+	sort.Strings(names)
+	return strings.Join(names, "\n")
 }
 
 func snapshotCounter(t *testing.T, apiAddr, name string) float64 {
@@ -237,19 +231,8 @@ func snapshotCounter(t *testing.T, apiAddr, name string) float64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line == "" || line[0] == '#' || !strings.HasPrefix(line, name) {
-			continue
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(line, name))
-		if i := strings.LastIndex(rest, " "); i >= 0 {
-			rest = rest[i+1:]
-		}
-		v, err := strconv.ParseFloat(rest, 64)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		return v
+	if value, ok := harness.MetricValueFrom(string(raw), name); ok {
+		return value
 	}
 	t.Fatalf("counter %s not present in /metrics", name)
 	return 0

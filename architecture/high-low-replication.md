@@ -33,7 +33,7 @@ a shared artifact filename/size policy and a logical `Batch`/`Record` carrier
 (logical values, never storage encodings) that the bundle codec, outbox,
 inbox, and provenance slices build on.
 
-The bridge transports logical records rather than raw Pebble files or ordinary
+The bridge transports logical records rather than raw Spool storage files or ordinary
 cross-DBID mesh frames. Preserve source transaction boundaries and lineage while
 mapping validated imports into the High domain's schema and mutation model. Low
 origin sequences are bridge progress, not High mesh receive watermarks.
@@ -61,7 +61,7 @@ wrapping, but compatibility with that bundle format is not assumed.
 Implemented (bundles): `bridge/bundle.go` suite v1 (`SPB1` magic) carries a
 canonical manifest (bundle/transaction identities, source domain + stream,
 contiguous sequence range, schema epoch/hash, payload digest) plus canonical
-logical batches, zstd-compressed, sealed with a fresh XChaCha20-Poly1305
+logical batches, compressed (deflate or custom), sealed with a fresh XChaCha20-Poly1305
 content key per bundle. The content key wraps to the recipient via X25519
 ECDH + HKDF with identity-bound AAD (no RSA dependency); an Ed25519
 signature covers the header and sealed payload (verify before decrypt).
@@ -141,34 +141,67 @@ per-stream observed/applied watermarks, explicit gap lists, quarantine
 records, and a bounded digest window; identical replays are idempotent while
 conflicting content is quarantined terminally (bytes preserved, never
 re-driven) without blocking the known original. `bridge/import.go` applies
-each bundle atomically in authoritative storage (`ApplyBundle`), preserving
-source transaction boundaries and recording stable source-transaction receipts
-(`DB.RecordTransactionReceipt` / `Store.RecordReceipt` / `ReceiptKey`) in Pebble
-alongside contiguous stream progress (`Store.SetBridgeStreamProgress` /
-`BridgeProgressKey`). Batches with existing receipts are skipped, ensuring that
-replays after crashes or independent imports by concurrent High receivers
-deduplicate without creating fresh local writes, duplicate mutations, or
-diverging HLC timestamps. Each import transaction mints a fresh local TxID
+row effects and their source receipts atomically in authoritative storage
+(`ApplyBundle` / `DB.CommitTypedBridgeImport`). File metadata commits
+separately with its provenance; mixed row/file bundles use both commits.
+After all effects succeed, `DB.CompleteBridgeImport` / `Store.CompleteBridgeImport`
+publish missing bundle/source receipts (`ReceiptKey`) and contiguous stream
+progress (`BridgeProgressKey`) in one atomic Spool commit. Completion errors
+are returned, existing authenticated receipts are preserved, and replay cannot
+decrease progress. Row-only bundles with existing source receipts skip row
+application but still repair missing completion metadata. File-containing
+bundles also require the bundle completion receipt before skipping effects,
+so an interrupted mixed import cannot skip its unfinished file commit.
+Until completion commits, an error can leave applied effects with no progress;
+retry converges through stable row identities and ownership policy. A failed
+sync can recover either the entire completion batch or none on restart; it is
+never acknowledged as success. Effects and completion are separate commits;
+a single atomic commit spanning all effects and completion remains a target.
+Each import transaction mints a fresh local TxID
 (source identity stays in provenance and receipts): reusing the source
 BundleID would give independent importers identical TxIDs, and on the High
 mesh those batches hit duplicate-TxID acknowledgement without origin
 watermark advance, gaping every later batch forever. `Drain` reconciles inbox watermarks with authoritative
-storage on startup and recovery via `Inbox.SyncAuthoritativeProgress`.
+storage on startup and recovery via `Inbox.SyncAuthoritativeProgress`; read
+and journal-write errors during reconciliation are returned rather than ignored.
 Schema-incompatible bundles enter durable `waiting-schema` holds instead of
 quarantine: `bridge/holds.go` journals the hold with the bundle's required
 schema epoch/hash and the missing objects, `NextImport` skips held heads
 (other streams still drain), and every `Drain` rechecks held heads in order
-against the live schema, so a local `Migrate` releases waiting bundles
+against the authoritative local schema manifest, so a local `Migrate` releases waiting bundles
 automatically with no DDL transfer and no partial effects. The pre-apply
 gate checks tables, columns, primary keys, per-value type compatibility
-(exact match through SQLite-ish aliases, plus lossless INTEGER into REAL),
-and NULL against NOT NULL columns. Only apply-time infrastructure failures
+(exact match through schema column types, plus lossless integer widening where
+the destination type allows it), and NULL against non-nullable fields. Only apply-time infrastructure failures
 (e.g. a storage error mid-commit) quarantine, preserving the bytes for
 idempotent replay after recovery; an unreadable schema leaves the bundle
 staged for a later drain.
+The gate reads persisted schema manifest definitions rather than database catalog pragmas,
+so its checks also work with native typed schemas. Import row-presence checks
+read cells and tombstones from one authoritative state snapshot rather than
+querying a secondary materializer. Typed collision checks also use RIME row
+lookups. Native typed imports commit imported mutations, ownership-policy
+cells, generated provenance and source receipts atomically through Spool, then
+publish the resulting records through RIME. The live
+`typed-bridge` scenario verifies import and restart reconstruction. Bridge row
+imports require managed typed tables; the legacy SQL transaction fallback has
+been removed.
+Typed remote materialization treats an authoritative tombstone as idempotent:
+if the receiving RIME generation has no row for that key yet, there is nothing
+to remove and the accepted Spool state remains authoritative. This covers
+concurrent delivery where a delete reaches a peer before the corresponding
+insert has been materialized. Application-initiated deletes still report
+missing rows normally.
+Explicit `DB.ReleaseBridgeOwnership` and `DB.ReleaseBridgeRowOwnership`
+operations on typed tables also commit hidden policy/shadow changes to Spool
+and apply their winning rows through the managed RIME adapter; a post-durable
+RIME failure returns an uncertain outcome and fails the database closed.
+The `typed-bridge` live rehearsal verifies High override, blocked Low update,
+explicit release, accepted Low update, and restart reconstruction.
 
-The current schema gate checks object presence, not compatible types or full
-required definitions. Definition-level validation and holds remain pending.
+The schema gate validates objects touched by the bundle; it does not require
+every unmodified column to appear in each bundle. Full descriptor identity
+validation remains pending.
 
 Commit accepted transaction effects, provenance/ownership changes, receipt, and
 contiguous stream progress atomically in authoritative High storage. Materialize

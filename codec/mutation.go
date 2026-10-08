@@ -10,7 +10,7 @@ import (
 )
 
 // CodecVersion versions the mutation/snapshot binary encoding.
-const CodecVersion uint16 = 3
+const CodecVersion uint16 = 4
 
 // MutationFlags qualifies a Mutation.
 type MutationFlags uint32

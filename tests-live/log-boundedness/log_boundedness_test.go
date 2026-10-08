@@ -7,34 +7,24 @@
 // rotate. The ceiling below enforces that property: any per-row log spam
 // (~100 bytes/line with timestamps) exceeds the per-row allowance.
 //
-// The suite uses Schema (replicated registry) tables: tables created only
-// via SchemaSQL DDL are local-only sqlite and are neither durable nor
-// replicated, which would make a load suite vacuous.
+// The suite writes replicated typed records so the load exercises the
+// durable replicated path; node-local writes would make it vacuous.
 package logboundedness_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
-
-func schemaConfig() *db.SchemaConfig {
-	return &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-		Name: "log_rows",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "val", Type: schema.ColText, Nullable: true},
-		},
-	}}}
-}
 
 func loadSeconds() int {
 	if v := harness.GetEnv("MURMUR_LOG_BOUNDEDNESS_SECONDS"); v != "" {
@@ -47,15 +37,16 @@ func loadSeconds() int {
 
 func TestLogBoundednessUnderSustainedLoad(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "log-boundedness",
-		NumNodes:    2,
-		AwaitUnlock: true,
-		Schema:      schemaConfig(),
+		Name:            "log-boundedness",
+		NumNodes:        2,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 
 	duration := time.Duration(loadSeconds()) * time.Second
 	startLog := logSizes(t, cluster)
-	startDisk := pebbleSizes(t, cluster)
+	startDisk := spoolSizes(t, cluster)
 	midLog, midDisk := []int64(nil), []int64(nil)
 
 	// Fixed-window sustained write load, alternating nodes.
@@ -65,14 +56,13 @@ func TestLogBoundednessUnderSustainedLoad(t *testing.T) {
 	sampled := false
 	for time.Now().Before(deadline) {
 		val := fmt.Sprintf("payload-%d-%s", seq, strings.Repeat("abcdefgh", 25))
-		if err := cluster.ExecSQL(seq%2, "INSERT INTO log_rows (id, val) VALUES (?, ?)",
-			fmt.Sprintf("%032x", seq), val); err != nil {
+		if err := cluster.TypedContentionInsert(seq%2, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", seq), Name: val}); err != nil {
 			t.Fatalf("load write %d: %v", seq, err)
 		}
 		acked++
 		seq++
 		if !sampled && time.Until(deadline) < duration/2 {
-			midLog, midDisk = logSizes(t, cluster), pebbleSizes(t, cluster)
+			midLog, midDisk = logSizes(t, cluster), spoolSizes(t, cluster)
 			sampled = true
 		}
 	}
@@ -82,11 +72,11 @@ func TestLogBoundednessUnderSustainedLoad(t *testing.T) {
 	}
 
 	endLog := logSizes(t, cluster)
-	endDisk := pebbleSizes(t, cluster)
+	endDisk := spoolSizes(t, cluster)
 	for i := range cluster.Nodes {
 		t.Logf("node%d log bytes start=%d mid=%d end=%d (growth=%d)",
 			i, startLog[i], midLog[i], endLog[i], endLog[i]-startLog[i])
-		t.Logf("node%d pebble bytes start=%d mid=%d end=%d (growth=%d)",
+		t.Logf("node%d spool bytes start=%d mid=%d end=%d (growth=%d)",
 			i, startDisk[i], midDisk[i], endDisk[i], endDisk[i]-startDisk[i])
 	}
 
@@ -122,13 +112,13 @@ func TestLogBoundednessUnderSustainedLoad(t *testing.T) {
 	for i := range cluster.Nodes {
 		growth := endDisk[i] - startDisk[i]
 		if cap := int64(acked) * 8192; growth > cap {
-			t.Fatalf("node%d pebble growth %d bytes over %d rows exceeds %d (8KiB/row cap)",
+			t.Fatalf("node%d spool growth %d bytes over %d rows exceeds %d (8KiB/row cap)",
 				i, growth, acked, cap)
 		}
 		firstHalf := midDisk[i] - startDisk[i]
 		secondHalf := endDisk[i] - midDisk[i]
 		if secondHalf > 2*firstHalf+1024*1024 {
-			t.Fatalf("node%d pebble growth accelerates: first-half=%d second-half=%d",
+			t.Fatalf("node%d spool growth accelerates: first-half=%d second-half=%d",
 				i, firstHalf, secondHalf)
 		}
 	}
@@ -152,12 +142,12 @@ func logSizes(t *testing.T, c *harness.Cluster) []int64 {
 	return out
 }
 
-func pebbleSizes(t *testing.T, c *harness.Cluster) []int64 {
+func spoolSizes(t *testing.T, c *harness.Cluster) []int64 {
 	t.Helper()
 	out := make([]int64, len(c.Nodes))
 	for i, n := range c.Nodes {
 		var total int64
-		err := filepath.WalkDir(n.PebbleDir, func(_ string, e os.DirEntry, err error) error {
+		err := filepath.WalkDir(n.Dir, func(_ string, e os.DirEntry, err error) error {
 			if err == nil && !e.IsDir() {
 				if fi, err := e.Info(); err == nil {
 					total += fi.Size()
@@ -188,16 +178,22 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "log_rows")
-			if err != nil || n != want {
+			rows, err := c.TypedContentionRows(i)
+			if err != nil || len(rows) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, "log_rows", "val")
-			if err != nil {
-				ok = false
-				break
+			sort.Slice(rows, func(a, b int) bool {
+				if rows[a].Name != rows[b].Name {
+					return rows[a].Name < rows[b].Name
+				}
+				return rows[a].ID < rows[b].ID
+			})
+			h := sha256.New()
+			for _, row := range rows {
+				fmt.Fprintf(h, "%s:%s:%s:%d\n", row.ID, row.Name, row.Phone, row.Score)
 			}
+			d := hex.EncodeToString(h.Sum(nil))
 			if i == 0 {
 				first = d
 			} else if d != first {

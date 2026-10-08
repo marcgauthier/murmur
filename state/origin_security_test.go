@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/internal/testidentity"
@@ -16,7 +15,7 @@ import (
 
 func signedSecurityStore(t *testing.T, node ids.NodeID, dbid ids.DBID) *Store {
 	t.Helper()
-	s, err := Open(t.TempDir(), node, dbid, Options{OriginSigning: testidentity.Config(node), Limits: codec.DefaultLimits()})
+	s, err := Open(t.TempDir(), node, dbid, withTestKey(Options{OriginSigning: testidentity.Config(node), Limits: codec.DefaultLimits()}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +168,7 @@ func TestOriginKeyChangeRefusedAcrossRestart(t *testing.T) {
 	path := t.TempDir()
 	node := ids.NewNodeID()
 	cfg := testidentity.Config(node)
-	s, err := Open(path, node, ids.NewDBID(), Options{OriginSigning: cfg})
+	s, err := Open(path, node, ids.NewDBID(), withTestKey(Options{OriginSigning: cfg}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +178,7 @@ func TestOriginKeyChangeRefusedAcrossRestart(t *testing.T) {
 	registry, _ := origin.NewKeyRegistry(map[ids.NodeID]ed25519.PublicKey{node: pub})
 	cfg.PrivateKey = key
 	cfg.TrustedKeys = registry
-	if s, err = Open(path, node, dbid, Options{OriginSigning: cfg}); err == nil {
+	if s, err = Open(path, node, dbid, withTestKey(Options{OriginSigning: cfg})); err == nil {
 		_ = s.Close()
 		t.Fatal("same NodeID key replacement accepted")
 	}
@@ -188,7 +187,7 @@ func TestOriginKeyChangeRefusedAcrossRestart(t *testing.T) {
 func TestOriginLegacyMigrationPreservesStateAndRecoversPrepare(t *testing.T) {
 	path := t.TempDir()
 	node := ids.NewNodeID()
-	opt := Options{OriginSigning: testidentity.Config(node), Limits: codec.DefaultLimits()}
+	opt := withTestKey(Options{OriginSigning: testidentity.Config(node), Limits: codec.DefaultLimits()})
 	s, err := Open(path, node, ids.NewDBID(), opt)
 	if err != nil {
 		t.Fatal(err)
@@ -203,13 +202,13 @@ func TestOriginLegacyMigrationPreservesStateAndRecoversPrepare(t *testing.T) {
 	raw := codec.EncodeBatch(nil, pending)
 	legacy := append(append([]byte(nil), raw[:94]...), raw[codec.BatchHeaderSize:]...)
 	// Build a legacy fixture with a durable, uncompleted remote prepare.
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	for _, name := range []string{sysFormat, sysMinReader, sysMinWriter} {
-		_ = b.Set(SysKey(name), encodeU64(3), nil)
+		_ = b.Set(SysKey(name), encodeU64(3))
 	}
-	_ = b.Set(SysKey(sysRemotePrepare), legacy, nil)
-	_ = b.Delete(SysKey("origin_signing_key"), nil)
-	if err = b.Commit(pebble.Sync); err != nil {
+	_ = b.Set(SysKey(sysRemotePrepare), legacy)
+	_ = b.Delete(SysKey("origin_signing_key"))
+	if err = s.commitBatch(b, true); err != nil {
 		t.Fatal(err)
 	}
 	_ = b.Close()

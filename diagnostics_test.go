@@ -12,15 +12,19 @@ import (
 // storage gauges land in Status/Metrics.
 func TestStatusWriterMetrics(t *testing.T) {
 	ctx := context.Background()
-	db, err := openSignedFixture(ctx, testConfig(t.TempDir()))
+	cfg := testConfig(t.TempDir())
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	db, err := openSignedFixture(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, name := range []string{"ann", "bob", "cid"} {
-		id := NewRowID()
-		if _, err := db.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], name); err != nil {
+		if err := insertRecord(ctx, db, table, &facadeRecord{ID: NewRowID(), Name: name}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -43,8 +47,8 @@ func TestStatusWriterMetrics(t *testing.T) {
 	if len(st.Peers) != 0 || st.PendingSend != 0 || st.PendingApply != 0 {
 		t.Fatalf("idle status: peers=%d send=%d apply=%d", len(st.Peers), st.PendingSend, st.PendingApply)
 	}
-	if st.PebbleSizeBytes == 0 {
-		t.Fatalf("PebbleSizeBytes = 0")
+	if st.SpoolDiskBytes == 0 {
+		t.Fatalf("SpoolDiskBytes = 0")
 	}
 	if st.Metrics.LocalCommits != 3 {
 		t.Fatalf("Status.Metrics.LocalCommits = %d, want 3", st.Metrics.LocalCommits)
@@ -68,34 +72,45 @@ func TestReplicationDiagnostics(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
-	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	cfgA := replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil)
+	cfgA.Schema.Tables = nil
+	cfgA.Tables = []TableDefinition{recordDefinition(t)}
+	dbA, err := openSignedFixture(ctx, cfgA)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
+	tableA, err := TableOf[facadeRecord](dbA, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	addrA := waitForAddr(t, dbA, 5*time.Second)
 
 	cfgB := replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
+	cfgB.Schema.Tables = nil
+	cfgB.Tables = []TableDefinition{recordDefinition(t)}
 	dbB, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbB.Close()
+	tableB, err := TableOf[facadeRecord](dbB, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	idA := NewRowID()
-	if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
-		idA[:], "ann", "111"); err != nil {
+	if err := insertRecord(ctx, dbA, tableA, &facadeRecord{ID: idA, Name: "111"}); err != nil {
 		t.Fatal(err)
 	}
-	waitForValue(t, dbB, idA, "111", 15*time.Second)
+	waitForRecordName(t, tableB, idA, "111", 15*time.Second)
 
 	idB := NewRowID()
-	if _, err := dbB.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
-		idB[:], "bob", "222"); err != nil {
+	if err := insertRecord(ctx, dbB, tableB, &facadeRecord{ID: idB, Name: "222"}); err != nil {
 		t.Fatal(err)
 	}
-	waitForValue(t, dbA, idB, "222", 15*time.Second)
+	waitForRecordName(t, tableA, idB, "222", 15*time.Second)
 
 	// Acks, pongs, and watermark convergence trail data; poll for them.
 	deadline := time.Now().Add(15 * time.Second)
@@ -175,6 +190,30 @@ func TestReplicationDiagnostics(t *testing.T) {
 	if got := dbA.Metrics().PeersAdded; got != 1 {
 		t.Fatalf("A PeersAdded = %d, want 1", got)
 	}
+}
+
+func insertRecord(ctx context.Context, db *DB, table *RecordTable[facadeRecord], rec *facadeRecord) error {
+	tx, err := db.BeginTx(ctx)
+	if err != nil {
+		return err
+	}
+	if err := table.Insert(tx, rec); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func waitForRecordName(t *testing.T, table *RecordTable[facadeRecord], id RowID, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		got, err := table.Get(id)
+		if err == nil && got.Name == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for name=%q", want)
 }
 
 func lagSum(st Status) uint64 {

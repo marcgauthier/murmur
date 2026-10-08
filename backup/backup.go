@@ -16,14 +16,10 @@ import (
 
 // SourceDB defines the interface that DB/state must satisfy to produce an online backup.
 type SourceDB interface {
-	// Checkpoint snapshots Pebble's live state via hard-links into stagingDataDir.
-	Checkpoint(stagingDataDir string) error
-	// Pin registers the checkpoint directory in KEYREGISTRY to pin needed data keys.
-	Pin(ctx context.Context, path, kind string) error
-	// Unpin removes the pin from KEYREGISTRY when the backup finishes or fails.
-	Unpin(ctx context.Context, path string) error
-	// KeysDir returns the directory containing KEYREGISTRY.
-	KeysDir() string
+	// HoldCommits excludes state commits and returns a release function.
+	HoldCommits() func()
+	// Checkpoint snapshots Spool's live state into stagingDataDir and returns a release func.
+	Checkpoint(ctx context.Context, stagingDataDir string) (release func() error, err error)
 	// ClusterID returns the database cluster identifier.
 	ClusterID() string
 	// LocalNodeID returns the local node identifier.
@@ -38,10 +34,10 @@ type SourceDB interface {
 }
 
 // CreateBackup executes the 4-step online zero-downtime backup pipeline:
-// 1. Instant hard-link checkpoint (<100ms) + key pinning.
+// 1. Instant hard-link Spool checkpoint (<100ms) with state metadata cut.
 // 2. Pure ciphertext streaming tar.gz archive generation (zero heap inflation).
 // 3. Offsite destination transfer (Local, HTTPS/S3, or FTP).
-// 4. Instant cleanup (<10ms) unlinking hard links and unpinning keys.
+// 4. Instant cleanup (<10ms) unlinking hard links and releasing checkpoint handle.
 func CreateBackup(ctx context.Context, src SourceDB, cfg Config) (*Metadata, error) {
 	cfg.withDefaults()
 	log := cfg.Logger
@@ -64,47 +60,30 @@ func CreateBackup(ctx context.Context, src SourceDB, cfg Config) (*Metadata, err
 		_ = os.RemoveAll(stagingDir)
 	}()
 
-	// 2. Pin keys in registry
-	if err := src.Pin(ctx, stagingDir, "checkpoint"); err != nil {
-		return nil, fmt.Errorf("backup: pin registry: %w", err)
-	}
-	defer func() {
-		_ = src.Unpin(context.Background(), stagingDir)
-	}()
-
 	stagingData := filepath.Join(stagingDir, "data")
-	stagingKeys := filepath.Join(stagingDir, "keys")
 
-	// 3. Instant hard-link Pebble checkpoint (<100ms)
+	// 2. Instant hard-link Spool checkpoint under commit exclusion
 	ckStart := time.Now()
-	if err := src.Checkpoint(stagingData); err != nil {
-		return nil, fmt.Errorf("backup: pebble checkpoint: %w", err)
+	releaseCommits := src.HoldCommits()
+	epoch, ver, hash := src.SchemaInfo()
+	clusterID := src.ClusterID()
+	nodeID := src.LocalNodeID()
+	cpRelease, err := src.Checkpoint(ctx, stagingData)
+	releaseCommits()
+	if err != nil {
+		return nil, fmt.Errorf("backup: spool checkpoint: %w", err)
 	}
-	log.Debug("backup: pebble checkpoint created", "elapsed", time.Since(ckStart))
+	if cpRelease != nil {
+		defer func() { _ = cpRelease() }()
+	}
+	log.Debug("backup: spool checkpoint created", "elapsed", time.Since(ckStart))
 
-	// 4. Snapshot KEYREGISTRY (already encrypted with storage key)
-	if err := os.MkdirAll(stagingKeys, 0o700); err != nil {
-		return nil, fmt.Errorf("backup: mkdir staging keys: %w", err)
-	}
-	srcReg := filepath.Join(src.KeysDir(), "KEYREGISTRY")
-	if _, err := os.Stat(srcReg); err == nil {
-		if err := copyRawFile(srcReg, filepath.Join(stagingKeys, "KEYREGISTRY")); err != nil {
-			return nil, fmt.Errorf("backup: copy key registry: %w", err)
-		}
-	}
-	// Copy KEYREGISTRY.bak if present
-	srcRegBak := filepath.Join(src.KeysDir(), "KEYREGISTRY.bak")
-	if _, err := os.Stat(srcRegBak); err == nil {
-		_ = copyRawFile(srcRegBak, filepath.Join(stagingKeys, "KEYREGISTRY.bak"))
-	}
-
-	// 4b. Snapshot file objects when object-inclusive coverage is asked.
-	// File metadata always rides inside the Pebble checkpoint; this step
+	// 3. Snapshot file objects when object-inclusive coverage is asked.
+	// File metadata always rides inside the Spool checkpoint; this step
 	// only adds object bytes plus the key-generation marker.
 	var filesMode string
 	var filesObjects int
 	var filesBytes int64
-	filesStaged := false
 	if cfg.IncludeFiles {
 		filesDir := src.FilesDir()
 		if filesDir == "" {
@@ -116,11 +95,10 @@ func CreateBackup(ctx context.Context, src SourceDB, cfg Config) (*Metadata, err
 			return nil, err
 		}
 		filesMode, filesObjects, filesBytes = FilesModeObjects, count, total
-		filesStaged = true
 		log.Debug("backup: files snapshot staged", "objects", count, "bytes", total)
 	}
 
-	// 5. Gather file metrics and build metadata
+	// 4. Gather file metrics and build metadata
 	var dataFilesCount int
 	var totalBytes int64
 	_ = filepath.Walk(stagingDir, func(path string, info os.FileInfo, err error) error {
@@ -131,19 +109,19 @@ func CreateBackup(ctx context.Context, src SourceDB, cfg Config) (*Metadata, err
 		return nil
 	})
 
-	epoch, ver, hash := src.SchemaInfo()
 	meta := &Metadata{
-		Version:        1,
+		Version:        2,
+		Backend:        "spool",
+		StorageFormat:  5,
 		BackupID:       newBackupID(),
-		DBID:           src.ClusterID(),
-		NodeID:         src.LocalNodeID(),
+		DBID:           clusterID,
+		NodeID:         nodeID,
 		SchemaVersion:  ver,
 		SchemaEpoch:    epoch,
 		SchemaHash:     hash,
 		CreatedAt:      time.Now().UTC(),
 		DataFilesCount: dataFilesCount,
 		TotalBytes:     totalBytes,
-		PebbleFormat:   1,
 		Compression:    cfg.Compression,
 		FilesMode:      filesMode,
 		FilesObjects:   filesObjects,
@@ -205,9 +183,9 @@ func CreateBackup(ctx context.Context, src SourceDB, cfg Config) (*Metadata, err
 			return
 		}
 
-		// B. Write keys/, data/ (and files/ when staged) files
-		subs := []string{"keys", "data"}
-		if filesStaged {
+		// B. Write data/ (and files/ when staged) files
+		subs := []string{"data"}
+		if filesMode != "" {
 			subs = append(subs, "files")
 		}
 		for _, sub := range subs {

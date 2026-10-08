@@ -1,335 +1,95 @@
-# MURMUR-SQL — Architecture and Implementation Plan
+# Murmur — Architecture and Implementation Plan
 
 Coordinated starling flock flight.
 
-**Status:** Architecture and implementation plan  
+**Status:** Implementation and release qualification in progress
 **Target language:** Go  
-**Primary components:** SQLite + Pebble + HashiCorp memberlist + quic-go
-**Replication model:** Masterless, offline-capable, per-column last-writer-wins using HLC  
-**Durable source of truth:** Pebble  
-**Query/search engine:** SQLite materialization (memory by default), rebuilt from Pebble
-**Prepared:** 2026-09-26  
-**Storage revision:** Pebble v2.1.6 with authenticated encrypted VFS; new databases only
-**Membership revision:** 2026-09-27; SWIM discovery and bounded replication, with all inter-node traffic over QUIC
-**Recovery revision:** 2026-09-27; safe snapshot merging/restore identities, range/chunk synchronization, optional Plumtree, and explicit overload control
-
----
+**Primary components:** RIME + encrypted Spool + HashiCorp memberlist + quic-go
+**Replication model:** Masterless, offline-capable, per-field conflict resolution using HLC
+**Durable source of truth:** Spool and its in-memory state index
+**Query engine:** Managed RIME records rebuilt from Spool
+**Build:** Go module builds with CGO disabled; production has no SQLite dependency
 
 [Architecture index](README.md) · [Project README](../README.md)
 
 ## Contents
 
 - [1. Goal](#1-goal)
-- [2. Important Design Decision: Do Not Use CR-SQLite in Version 1](#2-important-design-decision-do-not-use-cr-sqlite-in-version-1)
-- [3. SQLite Role](#3-sqlite-role)
+- [2. Managed Go API](#2-managed-go-api)
+- [3. RIME and Spool Roles](#3-rime-and-spool-roles)
 - [4. Go and CGO Boundary](#4-go-and-cgo-boundary)
-- [88. Final Target Architecture](#88-final-target-architecture)
-
----
+- [88. Current Architecture](#88-current-architecture)
 
 ## 1. Goal
 
-Build a reusable Go package that applications can embed directly. It is not a standalone database server and does not require a separate daemon, HTTP API, or database service.
+Murmur is an embedded Go database for encrypted durable local records and
+masterless replication over QUIC with mutual TLS. Every node remains writable
+offline and converges after communication resumes. Replication is
+asynchronous; it does not provide global serializability.
 
-The package will provide:
+The storage layer owns durable state, transaction receipts, origin logs,
+snapshots, membership metadata, encryption and recovery. Applications provide
+Go record definitions and use Murmur-managed typed table and transaction
+handles.
 
-- SQL queries through an embedded SQLite engine.
-- Very fast local search by keeping the query database in memory and building normal SQL indexes and optional FTS indexes.
-- Durable state in Pebble.
-- Masterless multi-writer replication between nodes.
-- Offline writes on every node.
-- Per-column conflict resolution similar in concept to CR-SQLite.
-- HLC-based deterministic last-writer-wins merge.
-- QUIC replication using `quic-go`.
-- SWIM membership using HashiCorp `memberlist`, carried over authenticated QUIC.
-- Bounded replication fanout, rotating peers, and periodic anti-entropy with a subset of nodes.
-- Optional Plumtree dissemination, resumable transaction chunks, and byte/bandwidth budgets.
-- Snapshot recovery that preserves acknowledged offline writes and explicit backup-restore identity rules.
-- Encrypted Pebble storage.
-- Encryption data-key rotation and package-controlled storage-key rotation.
-- Pebble block caching, bounded encrypted-VFS indexes/buffers, and SQL prepared-statement caching.
-- Fast startup rebuild from compact current state, not from the complete historical change log.
-- Snapshot/bootstrap support for new or very stale nodes.
-- Garbage collection of replication logs after they are no longer required.
-- A small application-facing Go API.
+## 2. Managed Go API
 
-The core architecture is:
+Applications define schemas with `Define[T]`, supply definitions using
+`Config.Tables`, and obtain managed handles using `TableOf[T]`. Writes use
+`WriteTxContext` or explicit `BeginTx` transactions. Murmur stages changes,
+validates them against the durable schema, commits them to Spool, then
+publishes the prepared transaction to RIME. The API does not expose writable
+raw RIME tables or SQL execution.
 
-```text
-Application
-    |
-    | Go API / SQL
-    v
-+----------------------------------------------------+
-|                 Embedded Go Package                |
-|                                                    |
-|  SQL API      Tx Manager      Schema Manager       |
-|  HLC/CRDT     Replicator      Encryption Manager   |
-|  Cache        Snapshot/GC     Diagnostics          |
-+-----------------------+----------------------------+
-                        |
-             +----------+-----------+
-             |                      |
-             v                      v
-     +---------------+       +---------------+
-     |    SQLite     |       |    Pebble     |
-     |               |       |               |
-     | in-memory     |       | durable state |
-     | query tables  |       | mutation log  |
-     | indexes       |       | watermarks    |
-     | FTS           |       | schema/meta   |
-     | disposable    |       | encrypted     |
-     +---------------+       +-------+-------+
-                                     |
-                                     | QUIC + TLS
-                                     v
-                                  Peers
-```
+Schemas use stable table and field identities. Additive evolution is
+manifest-backed and replicated. Rich Go values use the versioned canonical
+record codec; unknown compatible values remain in authoritative state when an
+older binary writes known fields.
 
-The fundamental rule is:
+## 3. RIME and Spool Roles
 
-> Pebble is authoritative. SQLite is a rebuildable materialized query database.
+Spool is authoritative for replicated and persistent node-local values,
+transaction history, receipts, snapshots, schema manifests and recovery
+metadata. Its memory index accelerates state reads and is accounted separately
+from RIME's materializer.
 
-If the in-memory SQLite database disappears, the node recreates it solely from Pebble state.
+RIME provides immutable managed records, MVCC snapshots, indexes, typed
+filters, joins, aggregates and query subscriptions. It is rebuilt from Spool
+on open and after completed snapshot or schema publication. RIME data is never
+a second durable source of truth.
 
----
-
-## 2. Important Design Decision: Do Not Use CR-SQLite in Version 1
-
-Do not embed CR-SQLite into the first implementation.
-
-CR-SQLite solves replication inside SQLite. This design already has a separate replication and durable-state layer. Using CR-SQLite would create two overlapping replication systems:
-
-```text
-SQLite
-   |
-CR-SQLite
-   |
-Custom replication
-   |
-Pebble
-```
-
-Instead, copy the useful CR-SQLite idea:
-
-```text
-(table, row, column) -> value + version metadata
-```
-
-Implement that model directly in the package.
-
-Benefits:
-
-- Replication format is independent of the SQL engine.
-- Pebble remains the authoritative replicated database.
-- The SQLite materialization can be dropped and rebuilt.
-- The query engine can be replaced later without changing the replication protocol.
-- No requirement to make CR-SQLite work with multiple SQLite drivers.
-- No duplicated conflict-resolution metadata.
-- Easier control of tombstones, snapshots, log retention, node watermarks, and encryption.
-
-CR-SQLite can still be studied as a reference for conflict semantics and testing.
-
----
-
-## 3. SQLite Role
-
-SQLite is the embedded SQL engine and holds the query-visible materialization
-in memory by default. Pebble stores the durable current state and replication history.
-SQLite is rebuilt from Pebble during open and can be discarded at any time.
-
-The default build uses `mattn/go-sqlite3` with bundled SQLite. It requires
-`sqlite_preupdate_hook` and `sqlite_fts5` build tags. The optional `modernc`
-build tag selects the pure-Go `modernc.org/sqlite` driver and builds with
-`CGO_ENABLED=0`. Both drivers use a context-aware reader/writer lock: active queries hold a shared
-engine read lock, while writes, rebuilds, migrations, and remote apply take the
-exclusive engine lock. An open result set delays writes until it is closed, exhausted,
-or its query context is canceled. Transaction startup and write admissions respect
-context deadlines, aborting without deadlock if reads remain blocked. Abandoned
-transactions automatically rollback when their context is canceled.
-
-The query materialization is always in-memory with zero disk footprint.
-Pebble remains the authoritative database and is responsible for the
-successful-write durability contract.
-See [SQLite backends](sqlite-backends.md) for build and validation commands.
-
----
+Local writes commit to Spool before RIME publication. Remote transactions are
+authenticated and committed to Spool before the managed materializer publishes
+the accepted winners. Replication does not echo remotely received changes.
 
 ## 4. Go and CGO Boundary
 
-Pebble and quic-go are Go libraries. The default SQLite driver uses CGO; the
-optional modernc driver is pure Go.
+The production module has no SQLite driver, SQL engine or mandatory build
+tags. Murmur builds and tests with `CGO_ENABLED=0`; CGO is needed only when the
+Go race detector or an isolated optional benchmark requires it. The normal
+runtime is implemented in Go and its declared dependencies.
 
-Therefore the package will be embedded in Go, but the complete package will not be pure Go.
+Historical SQLite comparison fixtures, where retained, are isolated in nested
+benchmark modules and do not participate in production builds, CI production
+package tests, or the public API.
 
-Use the default CGO build when the mattn driver is desired. Use `-tags modernc`
-with `CGO_ENABLED=0` on systems without a C toolchain.
-
-Recommended repository layout:
-
-```text
-MURMUR-SQL/
-    db.go
-    config.go
-    errors.go
-    status.go
-
-    sqlengine/
-        engine.go
-        connection.go
-        capture.go
-        preupdate.go
-        triggers.go
-        schema.go
-        rebuild.go
-        apply.go
-        stmtcache.go
-        fts.go
-
-    state/
-        store.go
-        keys.go
-        values.go
-        log.go
-        watermarks.go
-        snapshot.go
-        gc.go
-
-    crdt/
-        hlc.go
-        version.go
-        merge.go
-        tombstone.go
-        delta.go
-
-    replication/
-        membership.go
-        scheduler.go
-        manager.go
-        peer.go
-        session.go
-        handshake.go
-        sender.go
-        receiver.go
-        ack.go
-        snapshot.go
-        protocol.go
-
-    transport/
-        quic.go
-        memberlist.go
-        pool.go
-        tls.go
-        certs.go
-
-    crypto/
-        algorithms.go
-        registry.go
-        rotation.go
-        encryptedfs.go
-        encryptedfile.go
-        format.go
-        provider.go
-        manager.go
-        cache.go
-
-    codec/
-        codec.go
-        mutation.go
-        snapshot.go
-        protocol.go
-
-    internal/
-        ids/
-        binary/
-        retry/
-        testutil/
-
-```
-
-The build tag `modernc` selects the pure-Go driver. The default CGO build uses
-the bundled SQLite in mattn/go-sqlite3 and enables pre-update capture plus FTS5
-with `sqlite_preupdate_hook sqlite_fts5`.
-
----
-
-## 88. Final Target Architecture
+## 88. Current Architecture
 
 ```text
-                         Application
-                              |
-                    Go package SQL API
-                              |
-                              v
-               +-----------------------------+
-               |       Transaction Layer     |
-               |                             |
-               | write serialization         |
-               | TxID                        |
-               | HLC                         |
-               | sequence                    |
-               +-------------+---------------+
-                             |
-                             v
-               +-----------------------------+
-               |            SQLite           |
-               |                             |
-               | in-memory base tables       |
-               | secondary indexes           |
-               | FTS                         |
-               | prepared statements         |
-               | pre-update hook             |
-               +-------------+---------------+
-                             |
-                        TxDelta
-                             |
-                             v
-               +-----------------------------+
-               |          CRDT Layer         |
-               |                             |
-               | per-cell LWW                |
-               | row tombstones              |
-               | deterministic merge         |
-               +-------------+---------------+
-                             |
-                             v
-               +-----------------------------+
-               |           Pebble            |
-               |                             |
-               | current cell state          |
-               | tombstones                  |
-               | per-origin mutation log     |
-               | peer watermarks             |
-               | TxID receipts               |
-               | schema/system metadata      |
-               | encrypted VFS/key registry  |
-               +-------------+---------------+
-                             |
-              +--------------+---------------+
-              |                              |
-              v                              v
-      snapshot / rebuild           bounded QUIC replication
-                                             |
-                              SWIM + TLS 1.3 / mTLS
-                                             |
-                               +-------------+-------------+
-                               |                           |
-                               v                           v
-                       selected Node B             selected Node C
+Application: Go records and typed queries
+                 |
+         Murmur managed facade
+          /              \
+ RIME materializer      Commit coordinator
+          ^                    |
+          |              Encrypted Spool
+          |                    |
+          +------ remote apply +---- signed QUIC/TLS replication
 ```
 
-The design intentionally separates:
-
-```text
-Search/query performance  -> SQLite
-Durability                -> Pebble
-Conflict resolution       -> CRDT/HLC layer
-Replication transport     -> quic-go
-Membership/discovery      -> memberlist SWIM over QUIC
-Dissemination/repair       -> bounded peer scheduler and anti-entropy
-At-rest protection        -> encrypted Pebble VFS/key manager
-```
-
-That separation is the core reason the package can remain embedded, fast, recoverable, and replaceable component-by-component.
-
----
+The migration's remaining release gates are recorded in
+[the migration plan](../MIGRATION_PLAN.md),
+[capability gaps](capability-gaps.md), and
+[release status](release-status.md). They include broader storage-fault,
+delivery-permutation/live soak
+coverage, and reproducible rich-record performance measurements.

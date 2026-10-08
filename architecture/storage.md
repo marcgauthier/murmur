@@ -1,42 +1,52 @@
 # Storage and materialization
 
-Pebble layout, startup/rebuild, caching, compaction, and a log-GC example.
+Spool layout, in-memory radix tree, startup/rebuild, caching, compaction, and a log-GC example.
 
 [Architecture index](README.md) · [Project README](../README.md)
 
 ## Contents
 
-- [13. Pebble as the Durable Source of Truth](#13-pebble-as-the-durable-source-of-truth)
-- [14. Pebble Key Layout](#14-pebble-key-layout)
+- [13. Spool and In-Memory Radix Store as the Durable Source of Truth](#13-spool-and-in-memory-radix-store-as-the-durable-source-of-truth)
+- [14. Storage Key Layout](#14-storage-key-layout)
 - [20. Materialization Generation](#20-materialization-generation)
 - [21. Startup](#21-startup)
-- [22. Fast SQLite Rebuild](#22-fast-sqlite-rebuild)
-- [25. Pebble Caching](#25-pebble-caching)
-- [47. Pebble Compaction and Encrypted-File Reclamation](#47-pebble-compaction-and-encrypted-file-reclamation)
+- [22. Query Materializer Rebuild](#22-query-materializer-rebuild)
+- [25. Memory Management and Caching](#25-memory-management-and-caching)
+- [47. Spool Compaction and Physical Space Reclamation](#47-spool-compaction-and-physical-space-reclamation)
 - [83. Example Log GC](#83-example-log-gc)
 
 ---
 
-## 13. Pebble as the Durable Source of Truth
+## 13. Spool and In-Memory Radix Store as the Durable Source of Truth
 
-Pebble stores four distinct classes of information:
+Authoritative state is held in-memory using an immutable Radix Tree (`github.com/hashicorp/go-immutable-radix`) and persisted to disk via Spool (`spool/`).
+
+The store maintains four distinct classes of information:
 
 1. Current winning state.
 2. Replication log.
 3. Replication/node metadata.
 4. Schema/system metadata.
 
-The current state must be sufficient to rebuild SQLite without replaying historical mutations.
+The current state must be sufficient to rebuild the configured query materializer
+without replaying historical mutations. Managed `Config.Tables` definitions
+rebuild a private RIME database from the current state.
+
+The `state.Reader` contract exposes current rows, cells, and tombstones to a
+materializer without making the durable state package depend on a query engine.
+`state.RowKey` identifies materialization work independently of RIME types.
+Spool and the in-memory state index remain authoritative; RIME is a rebuildable
+query materializer.
 
 ---
 
-## 14. Pebble Key Layout
+## 14. Storage Key Layout
 
-Signed transactions persist their complete origin proof. Fresh stores use format/minimum reader/minimum writer 5; signed format-4 stores require offline merge-policy migration and unsigned legacy stores require trusted-baseline migration. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
+Signed transactions persist their complete origin proof. Fresh stores use format/minimum reader/minimum writer 6; format-5 SQL-era stores fail closed without rewrite and require export with the previous release. See [origin signatures](origin-signatures.md) for the exact format and trust boundaries.
 
-Use binary prefixes.
+Binary key encoding preserves lexicographical sort order.
 
-Suggested layout:
+Key prefixes:
 
 ```text
 0x01 = current cell state
@@ -48,7 +58,25 @@ Suggested layout:
 0x07 = system metadata
 0x08 = transaction receipt / idempotency
 0x09 = snapshot metadata
+0x0a = peer exclusion
+0x0b = membership record
+0x0c = bridge stream progress
+0x0d = transaction-chunk staging
+0x0e = CRDT causal records
+0x10 = node-local typed cell state
+0x11 = node-local transaction receipt
 ```
+
+Node-local typed cells and their receipts use a separate durable namespace.
+They are absent from replicated cell iteration and snapshot export; the
+`state.Store.CommitLocalRecords` primitive supports LWW cells and row
+tombstones without replication. `state.Store.CommitLocalWithRecords` commits
+replicated mutations and node-local LWW cells/tombstones in one Spool batch;
+local cells are excluded from the signed log payload. Both paths share normal
+transaction size limits and receipts. Binding node-local definitions to the
+typed RIME adapter routes persistent writes through these primitives.
+Ephemeral RIME tables have no Spool keys, receipts, or snapshot representation;
+the adapter rejects transactions that mix them with durable tables.
 
 ### Current state
 
@@ -98,45 +126,6 @@ encoded MutationBatch
 04 | originNode:16
 ```
 
-Value:
-
-```text
-highest contiguous sequence stored locally
-```
-
-### Peer acknowledgement
-
-```text
-05 | peerNode:16 | originNode:16
-```
-
-Value:
-
-```text
-highest contiguous sequence peer confirmed
-```
-
-### Schema
-
-```text
-06 | "current_manifest"
-```
-
-Value: binary-encoded `SchemaManifest` containing `Version:u64`, `CreatedOnNode:16`, `TimeCreated:u64`, `Hash:32`, and all serialized `TableSchema` definitions.
-
-### System metadata
-
-Examples:
-
-```text
-07 | local_node_id
-07 | local_sequence
-07 | hlc
-07 | format_version
-07 | schema_epoch
-07 | gc_floor
-```
-
 ### Transaction receipts
 
 ```text
@@ -145,34 +134,26 @@ Examples:
 
 Used for idempotent retry.
 
-### Pebble Comparer & Prefix Bloom Filters
+### In-Memory Radix Tree & Ordered Scans
 
-Pebble uses Block and Table Bloom filters to skip SSTables during lookups. To optimize range scans and point queries on cells:
-- Define a custom `pebble.Comparer` whose `Split(key []byte) int` returns 21 for cell keys:
-  ```go
-  // Prefix: 0x01 (1B) + TableID (4B) + RowID (16B) = 21 bytes
-  func (c *PebbleComparer) Split(k []byte) int {
-      if len(k) >= 21 && k[0] == prefixCell {
-          return 21
-      }
-      return len(k)
-  }
-  ```
-- This configures Pebble's 10-bit Bloom filter at **row granularity**, allowing Pebble iterators and `Get` operations to skip entire SSTables when scanning or rebuilding a row.
+The state store maintains an immutable Radix Tree in memory:
+- Bytewise lexicographical key ordering is preserved.
+- Provides point lookups, bounded prefix and range iteration, and snapshot roots.
+- Pinned immutable roots allow row reconstruction, log serving, snapshot export, and query-materializer rebuild without holding writer locks.
 
 ---
 
 ## 20. Materialization Generation
 
-Maintain a monotonic Pebble generation:
+Maintain a monotonic state generation:
 
 ```text
 state_generation = uint64
 ```
 
-Every committed Pebble mutation batch increments it.
+Every committed mutation batch increments it.
 
-The live DB tracks SQLite query visibility in memory:
+The live DB tracks query visibility in memory:
 
 ```text
 materialized_generation
@@ -184,19 +165,17 @@ After startup rebuild or a successful bulk apply:
 materialized_generation == state_generation
 ```
 
-If the values differ during normal remote receive:
+If the values differ during rebuild or required recovery:
 
 ```text
-SQLite has not yet applied all Pebble state
+RIME has not yet published all durable state
 ```
 
-Queries can see the previous SQLite view until the timed or count-triggered
-bulk apply. The materialized generation is not persisted: on every open,
-SQLite is rebuilt from authoritative Pebble state, then the in-memory marker
-is initialized to the current state generation. A failed bulk apply rebuilds
-SQLite; if rebuild fails, the node rejects reads and writes.
-Existing stores may retain the old `materialized_generation` Pebble key; it is
-ignored and no longer updated.
+Managed queries are unavailable until RIME publishes accepted state and
+advances the materialized generation. The marker is not persisted: on every open, the
+configured materializer is rebuilt from authoritative state, then the marker
+is initialized to the current state generation. Failed materialization rebuilds
+from state; if recovery fails, the node rejects reads and writes.
 
 ---
 
@@ -205,65 +184,48 @@ ignored and no longer updated.
 Startup sequence:
 
 ```text
-1. Load configuration; require schema, Pebble, and encryption settings and validate them, including replication budgets.
-2. Reject legacy Badger directories; resolve wrapping key and recover registry/VFS, snapshot-generation, schema-publication, and restore intents.
-3. Open Pebble with encrypted VFS, WAL enabled, and uniform compression settings.
-4. Validate database format version.
-5. Load NodeID, sequence, HLC and schema metadata; enforce fresh-identity/reseed policy before writable networking.
-6. Validate application schema and compatibility with persisted metadata under Section 6.
-7. Start SQLite.
-8. Create SQL schema.
-9. Bulk rebuild current state from Pebble.
-10. Build non-unique secondary indexes only.
-11. Build FTS structures.
-12. Initialize the in-memory materialized generation from the Pebble generation after rebuilding SQLite.
-13. Start shared QUIC listener and restore persisted peer retirement/GC obligations.
-14. Start SWIM membership, asynchronous bootstrap retry, and bounded peer replication/anti-entropy.
-15. Start GC/maintenance workers.
-16. Mark DB ready.
+1. Load configuration; require typed table definitions, Spool, and encryption settings and validate them, including replication budgets.
+2. Reject legacy Pebble and Badger directories; resolve wrapping key and authenticate keyring/context.
+3. Open Spool with AES-256-GCM encryption and configure background workers.
+4. Validate database format version and physical compatibility.
+5. Load records into in-memory Radix tree root; apply deletion markers.
+6. Enforce fresh-identity/reseed policy before writable networking.
+7. Validate typed record descriptors and compatibility with persisted metadata under Section 6.
+8. Bind typed record descriptors, rebuild a private RIME database and install it atomically.
+9. Build configured secondary indexes in the private RIME materializer.
+10. Initialize the in-memory materialized generation from state after the selected materializer is ready.
+11. Start shared QUIC listener and restore persisted peer retirement/GC obligations.
+12. Start SWIM membership, asynchronous bootstrap retry, and bounded peer replication/anti-entropy.
+13. Start GC/maintenance workers.
+14. Mark DB ready and admit external reads/writes.
 ```
 
-Do not replay the full replication history to rebuild the SQL database.
+Do not replay the full replication history to rebuild RIME.
 
 Only scan current state plus row tombstones.
 
 ---
 
-## 22. Fast SQLite Rebuild
+## 22. Query Materializer Rebuild
 
-Rebuild should operate table-by-table.
+Rebuild operates from a pinned immutable Radix snapshot. Databases load into a
+private RIME generation and switch only after it is complete.
 
 For each replicated table:
 
 ```text
-Pebble prefix scan
+Radix prefix scan
       |
       v
 assemble rows
       |
-      v
-prepared INSERT
-      |
-      v
-large SQLite transaction
+      +----------------------+
+      |                      |
+      v                      v
+RIME private load
 ```
 
-Avoid one SQL transaction per cell.
-
-### Preferred rebuild algorithm
-
-1. Create tables.
-2. Delay nonessential secondary-index creation.
-3. Scan Pebble current-state prefix in key order.
-4. Group consecutive cells by row UUID.
-5. Build one row.
-6. Insert row with a prepared statement.
-7. Commit in large controlled batches if one giant transaction is not practical.
-8. Create non-unique secondary indexes only.
-9. Build FTS index.
-10. Set the in-memory materialized generation.
-
-Benchmark:
+Benchmark RIME rebuild:
 
 - 100K rows.
 - 1M rows.
@@ -278,39 +240,27 @@ rows/sec
 cells/sec
 time to query-ready
 peak RAM
-Pebble read throughput
-SQLite insertion throughput
+Spool reload throughput
 index-build time
-FTS-build time
 ```
 
 ---
 
-## 25. Pebble Caching
+## 25. Memory Management and Caching
 
-Expose `PebbleConfig.CacheBytes` for Pebble's unified block cache; do not retain separate Badger block/index cache settings. Pebble caches decoded blocks above the encrypted VFS, so cache memory contains plaintext.
+The current state and causal history live in the Radix tree. RIME maintains its own query records, indexes, and MVCC history; measure both resident copies.
 
-```go
-type CacheConfig struct {
-    StatementCacheEntries int
-}
-```
-
-Default to a 256 MiB Pebble block cache. Note the SQL dataset also lives in SQLite memory, so size the block cache against the total memory budget: include memtables, encrypted-VFS indexes and buffers, replication queues, and SQL indexes, and benchmark cache sizing on the target dataset before raising it further.
-
-Expose cache usage/hit rate, memtable bytes, encryption buffer/index bytes, replication queues, and statement-cache usage. Close/unref owned Pebble cache resources during shutdown. Statement-cache lookup hits/misses are counted in `DB.Metrics()` (`StmtCacheHits`/`StmtCacheMisses`) and exported as `spedsql_stmt_cache_hits_total` / `spedsql_stmt_cache_misses_total`; use the hit rate to size `Cache.StatementCacheEntries` (default 256 per read/write cache).
+Expose memory usage in `DB.Status().SpoolMemBytes` and `DB.Status().SpoolDiskBytes`. RIME owns its query indexes and MVCC history; Spool owns durable state and replication history.
 
 ---
 
-## 47. Pebble Compaction and Encrypted-File Reclamation
+## 47. Spool Compaction and Physical Space Reclamation
 
-Pebble owns flush, compaction, and obsolete-file reclamation. Do not schedule Badger value-log GC or retain value-log sizing/settings. WAL stays enabled and state writes use synchronized batches.
+Spool manages segment files, write buffers, and background compaction passes. Murmur state commits write records and deletion markers through the state writer coordinator.
 
-Application replication-log GC deletes logical keys through the state writer coordinator; Pebble compaction later reclaims physical space. Deleting a log key is not the same as removing an SSTable or retiring an encryption key.
+Application replication-log GC deletes logical keys through the state writer coordinator; Spool background compaction later reclaims physical segment space. Deleting a log key is not the same as removing an old segment or rotating an encryption key.
 
-Track compaction debt, stalls, live/obsolete bytes, WAL bytes, encrypted-container overhead, and old-key file references. File-removal notifications must reconcile key references with open handles and checkpoints. Use explicit maintenance rewriting for files that normal compaction does not replace, including durable metadata containers.
-
-No remote/object-store bypass of the encrypted VFS is supported in v1.
+Track compaction progress, segment count, disk usage, and pending memory in `DB.Status()`.
 
 ---
 

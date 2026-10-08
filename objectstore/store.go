@@ -381,16 +381,14 @@ func (s *Store) Has(digest Digest) bool {
 // Pin keeps an object's directory entry available for a reader or
 // external export. Close the returned pin when that use ends.
 func (s *Store) Pin(digest Digest) (*Pin, error) {
-	if _, _, _, err := s.resolve(digest); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, &os.PathError{Op: "stat", Path: s.objectPath(digest), Err: os.ErrNotExist}
-		}
-		return nil, err
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.dead {
-		return nil, ErrClosed
+	// Collection uses the same lock: existence and retention must be atomic.
+	if _, _, _, err := s.resolveLocked(digest); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, &os.PathError{Op: "stat", Path: s.objectPathFor(digest, s.current), Err: os.ErrNotExist}
+		}
+		return nil, err
 	}
 	s.pins[digest]++
 	return &Pin{store: s, digest: digest}, nil

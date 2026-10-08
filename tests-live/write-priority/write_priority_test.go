@@ -1,4 +1,4 @@
-// Local-write priority under replication load: two spedsql daemons take
+// Local-write priority under replication load: two daemons take
 // continuous writes on both nodes while serving reads, then the test
 // gates on local progress, the measured remote (replication) share of
 // contended writer service time, and SHA-256-identical convergence.
@@ -11,15 +11,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -40,19 +38,17 @@ func TestLocalWritePriority(t *testing.T) {
 	writeFor := envSeconds(t, "MURMUR_LIVE_WRITE_PRIORITY_SECONDS", 12)
 	syncTimeout := envSeconds(t, "MURMUR_LIVE_WRITE_PRIORITY_SYNC_TIMEOUT_SECONDS", 120)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:     "write-priority",
-		NumNodes: 2,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{Name: "priority_records", Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "val", Type: schema.ColText, Nullable: true},
-		}}}},
+		Name:            "write-priority",
+		NumNodes:        2,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 
 	dualBefore := dualService(t, cluster)
 	deadline := time.Now().Add(writeFor)
 
 	// Sixteen writers per node with disjoint key ranges; the daemon's
-	// single-statement service surface issues one transaction each.
+	// typed service surface issues one transaction each.
 	// Deep queues maximize dual contention (both classes backlogged,
 	// where the 90/10 policy binds) so the policy is actually
 	// exercised, including under `-race` on a loaded box, where each
@@ -73,9 +69,7 @@ func TestLocalWritePriority(t *testing.T) {
 					raw[0], raw[1] = byte(node), byte(worker)
 					binary.BigEndian.PutUint64(raw[8:], uint64(seq))
 					hexID := hex.EncodeToString(raw[:])
-					if err := cluster.ExecSQL(node,
-						`INSERT INTO priority_records (id, val) VALUES (?, ?)`,
-						hexID, fmt.Sprintf("v-n%d-w%d-%d", node, worker, seq)); err != nil {
+					if err := cluster.TypedContentionInsert(node, harness.TypedContentionRow{ID: hexID, Name: fmt.Sprintf("v-n%d-w%d-%d", node, worker, seq)}); err != nil {
 						errCh <- err
 						return
 					}
@@ -90,7 +84,7 @@ func TestLocalWritePriority(t *testing.T) {
 	var reads int
 	for time.Now().Before(deadline) {
 		for node := 0; node < 2; node++ {
-			if _, err := cluster.QuerySQL(node, `SELECT count(*) FROM priority_records`); err != nil {
+			if _, err := cluster.TypedContentionRows(node); err != nil {
 				t.Fatalf("read: %v", err)
 			}
 			reads++
@@ -141,11 +135,12 @@ func TestLocalWritePriority(t *testing.T) {
 
 func stateOf(t *testing.T, cluster *harness.Cluster, idx int) (int, [32]byte) {
 	t.Helper()
-	res, err := cluster.QuerySQL(idx, `SELECT id, val FROM priority_records ORDER BY id`)
+	rows, err := cluster.TypedContentionRows(idx)
 	if err != nil {
 		t.Fatalf("state query: %v", err)
 	}
-	return len(res.Rows), sha256.Sum256([]byte(fmt.Sprintf("%v", res.Rows)))
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	return len(rows), sha256.Sum256([]byte(fmt.Sprintf("%v", rows)))
 }
 
 // dualCounters sums dual-contention service seconds (granted while the
@@ -171,23 +166,19 @@ func dualService(t *testing.T, cluster *harness.Cluster) (out dualCounters) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, line := range strings.Split(string(body), "\n") {
-			if !strings.HasPrefix(line, "spedsql_sched_dual_service_seconds_total{") {
+		samples, ok := harness.MetricSamples(string(body))
+		if !ok {
+			t.Fatal("decode metrics JSON")
+		}
+		for _, sample := range samples {
+			if sample.Name != "spedsql_sched_dual_service_seconds_total" {
 				continue
 			}
-			fields := strings.Fields(line)
-			if len(fields) != 2 {
-				continue
-			}
-			v, err := strconv.ParseFloat(fields[1], 64)
-			if err != nil {
-				continue
-			}
-			switch {
-			case strings.Contains(line, `class="local"`):
-				out.local += v
-			case strings.Contains(line, `class="remote"`):
-				out.remote += v
+			switch sample.Labels["class"] {
+			case "local":
+				out.local += sample.Value
+			case "remote":
+				out.remote += sample.Value
 			}
 		}
 	}

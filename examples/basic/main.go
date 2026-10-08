@@ -1,52 +1,51 @@
-// Command basic opens a single embedded Murmur-SQL node, inserts two rows,
-// and queries them back. No networking, no encryption options beyond the
-// mandatory key: the smallest possible program.
+// Command basic opens a single embedded Murmur node, writes two native Go
+// records, and queries them back through the managed RIME facade.
 //
-// Run it:
+// Run it with:
 //
-//	go run -tags "sqlite_preupdate_hook sqlite_fts5" ./examples/basic
+//	go run ./examples/basic
 package main
 
 import (
 	"context"
 	"fmt"
-	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 
 	"github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
+	"github.com/marcgauthier/murmur/ids"
 )
+
+type contact struct {
+	ID   ids.RowID `rime:"primary"`
+	Name string
+}
 
 func main() {
 	ctx := context.Background()
-
-	// Every node needs a directory for its durable Pebble store.
 	dir, err := os.MkdirTemp("", "murmur-basic-*")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
+	definition, err := murmur.Define[contact]("contacts", 1, murmur.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path:   dir,
 		NodeID: murmur.NewNodeID(),
-		Schema: murmur.SchemaConfig{
-			Version: 1,
-			Tables: []schema.TableSchema{{
-				Name: "contacts",
-				Columns: []schema.ColumnSchema{
-					// Every replicated table needs an explicit BLOB(16)
-					// primary key supplied by the application.
-					{Name: "id", Type: schema.ColBlob},
-					{Name: "name", Type: schema.ColText, Nullable: true},
-				},
-			}},
-		},
-		Pebble: murmur.DefaultPebbleConfig(),
+		Schema: murmur.SchemaConfig{Version: 1},
+		Tables: []murmur.TableDefinition{definition},
+		Spool:  murmur.DefaultSpoolConfig(),
 		Encryption: murmur.EncryptionConfig{
-			// Demo key. Production deployments load key material
-			// from a file, environment, or KMS via a KeyProvider.
+			// Demo key. Production applications load key material from a
+			// file, environment, or KMS through a KeyProvider.
 			Key:   []byte("0123456789abcdef0123456789abcdef"),
 			KeyID: "basic-key",
 		},
@@ -56,29 +55,26 @@ func main() {
 	}
 	defer db.Close()
 
-	for _, name := range []string{"ann", "bob"} {
-		id := murmur.NewRowID()
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO contacts (id, name) VALUES (?, ?)`,
-			id[:], name); err != nil {
-			log.Fatal(err)
-		}
-	}
-
-	rows, err := db.QueryContext(ctx, `SELECT name FROM contacts ORDER BY name`)
+	contacts, err := murmur.TableOf[contact](db, "contacts")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			log.Fatal(err)
+	if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+		for _, name := range []string{"ann", "bob"} {
+			if err := contacts.Insert(tx, &contact{ID: murmur.NewRowID(), Name: name}); err != nil {
+				return err
+			}
 		}
-		fmt.Println(name)
-	}
-	if err := rows.Err(); err != nil {
+		return nil
+	}); err != nil {
 		log.Fatal(err)
+	}
+	rows, err := contacts.Where().OrderByAsc(murmur.FieldOf[contact, string](contacts, "Name")).Find()
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, row := range rows {
+		fmt.Println(row.Name)
 	}
 
 	st := db.Status()

@@ -9,18 +9,17 @@
 package threewayheal_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
-
-const tableName = "twh_rows"
 
 // crossLinks are the four node index pairs spanning the (0,1)|(2,3)
 // split; a heal order is a permutation of these link indexes.
@@ -42,23 +41,17 @@ func TestHealOrderDoesNotAffectFinalDigest(t *testing.T) {
 func runHealOrder(t *testing.T, order []int, tag string) string {
 	t.Helper()
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "three-way-heal-" + tag,
-		NumNodes:    4,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: tableName,
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:            "three-way-heal-" + tag,
+		NumNodes:        4,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 
 	// Baseline converges before the split (honest-path control).
 	// IDs/names are fixed so both heal orders must reach the same digest.
 	for i := 0; i < 10; i++ {
-		id := fmt.Sprintf("%032x", 1000+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)", id, fmt.Sprintf("base-%d", i)); err != nil {
+		if err := insertRow(cluster, 0, 1000+i, fmt.Sprintf("base-%d", i)); err != nil {
 			t.Fatalf("order %v baseline write: %v", order, err)
 		}
 	}
@@ -81,24 +74,20 @@ func runHealOrder(t *testing.T, order []int, tag string) string {
 	// writes strictly after side A in wall time, so the relative HLC
 	// order (and hence the winner) is deterministic across runs.
 	for i := 0; i < 10; i++ {
-		id := fmt.Sprintf("%032x", 2000+i)
-		if err := cluster.ExecSQL(1, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)", id, fmt.Sprintf("sideA-%d", i)); err != nil {
+		if err := insertRow(cluster, 1, 2000+i, fmt.Sprintf("sideA-%d", i)); err != nil {
 			t.Fatalf("order %v sideA write: %v", order, err)
 		}
-		id = fmt.Sprintf("%032x", 3000+i)
-		if err := cluster.ExecSQL(3, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)", id, fmt.Sprintf("sideB-%d", i)); err != nil {
+		if err := insertRow(cluster, 3, 3000+i, fmt.Sprintf("sideB-%d", i)); err != nil {
 			t.Fatalf("order %v sideB write: %v", order, err)
 		}
 	}
 	for i := 0; i < 10; i++ {
-		id := fmt.Sprintf("%032x", 1000+i)
-		if err := cluster.ExecSQL(1, "UPDATE "+tableName+" SET name = ? WHERE id = ?", fmt.Sprintf("conflict-A-%d", i), id); err != nil {
+		if err := cluster.TypedContentionUpdate(1, typedRowID(1000+i), "name", fmt.Sprintf("conflict-A-%d", i)); err != nil {
 			t.Fatalf("order %v sideA conflict write: %v", order, err)
 		}
 	}
 	for i := 0; i < 10; i++ {
-		id := fmt.Sprintf("%032x", 1000+i)
-		if err := cluster.ExecSQL(3, "UPDATE "+tableName+" SET name = ? WHERE id = ?", fmt.Sprintf("conflict-B-%d", i), id); err != nil {
+		if err := cluster.TypedContentionUpdate(3, typedRowID(1000+i), "name", fmt.Sprintf("conflict-B-%d", i)); err != nil {
 			t.Fatalf("order %v sideB conflict write: %v", order, err)
 		}
 	}
@@ -107,14 +96,15 @@ func runHealOrder(t *testing.T, order []int, tag string) string {
 	// prove the split held (otherwise this test would be vacuous).
 	waitConvergedOn(t, cluster, []int{0, 1}, 20, 150*time.Second)
 	waitConvergedOn(t, cluster, []int{2, 3}, 20, 150*time.Second)
-	dA, err := cluster.ComputeTableDigest(0, tableName, "id")
+	rowsA, err := cluster.TypedContentionRows(0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dB, err := cluster.ComputeTableDigest(2, tableName, "id")
+	rowsB, err := cluster.TypedContentionRows(2)
 	if err != nil {
 		t.Fatal(err)
 	}
+	dA, dB := digestRows(rowsA), digestRows(rowsB)
 	if dA == dB {
 		t.Fatalf("order %v: sides unexpectedly agree during split (%s)", order, dA)
 	}
@@ -136,15 +126,18 @@ func runHealOrder(t *testing.T, order []int, tag string) string {
 	}
 
 	waitConverged(t, cluster, 30, 150*time.Second)
-	final, err := cluster.ComputeTableDigest(0, tableName, "id")
+	rows, err := cluster.TypedContentionRows(0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Log the LWW winner on a conflicted row: the digest comparison
 	// across orders is the assertion, this names the value for forensics.
-	res, err := cluster.QuerySQL(0, "SELECT name FROM "+tableName+" WHERE id = ?", fmt.Sprintf("%032x", 1000))
-	if err == nil && len(res.Rows) > 0 && len(res.Rows[0]) > 0 {
-		t.Logf("order %v: conflict winner row 1000 = %v", order, res.Rows[0][0])
+	final := digestRows(rows)
+	for _, row := range rows {
+		if row.ID == typedRowID(1000) {
+			t.Logf("order %v: conflict winner row 1000 = %s", order, row.Name)
+			break
+		}
 	}
 	return final
 }
@@ -155,8 +148,8 @@ func runHealOrder(t *testing.T, order []int, tag string) string {
 // 3) on the sideA endpoint.
 func waitLinkFlowed(t *testing.T, c *harness.Cluster, order []int, link [2]int) {
 	t.Helper()
-	sideA := fmt.Sprintf("%032x", 2000)
-	sideB := fmt.Sprintf("%032x", 3000)
+	sideA := typedRowID(2000)
+	sideB := typedRowID(3000)
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if hasRow(t, c, link[1], sideA) || hasRow(t, c, link[0], sideB) {
@@ -169,13 +162,16 @@ func waitLinkFlowed(t *testing.T, c *harness.Cluster, order []int, link [2]int) 
 
 func hasRow(t *testing.T, c *harness.Cluster, idx int, id string) bool {
 	t.Helper()
-	res, err := c.QuerySQL(idx, "SELECT count(*) FROM "+tableName+" WHERE id = ?", id)
-	if err != nil || len(res.Rows) == 0 || len(res.Rows[0]) == 0 {
+	rows, err := c.TypedContentionRows(idx)
+	if err != nil {
 		return false
 	}
-	var n int
-	_, _ = fmt.Sscanf(fmt.Sprintf("%v", res.Rows[0][0]), "%d", &n)
-	return n == 1
+	for _, row := range rows {
+		if row.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // parseOrder reads a comma-separated permutation of link indexes;
@@ -216,16 +212,12 @@ func waitConvergedOn(t *testing.T, c *harness.Cluster, idxs []int, want int, tim
 		ok := true
 		var first string
 		for k, idx := range idxs {
-			n, err := c.QueryRowCount(idx, tableName)
-			if err != nil || n != want {
+			rows, err := c.TypedContentionRows(idx)
+			if err != nil || len(rows) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(idx, tableName, "id")
-			if err != nil {
-				ok = false
-				break
-			}
+			d := digestRows(rows)
 			if k == 0 {
 				first = d
 			} else if d != first {
@@ -240,17 +232,31 @@ func waitConvergedOn(t *testing.T, c *harness.Cluster, idxs []int, want int, tim
 			lastLog = time.Now()
 			counts := make([]int, len(c.Nodes))
 			for i := range c.Nodes {
-				n, _ := c.QueryRowCount(i, tableName)
-				counts[i] = n
+				rows, _ := c.TypedContentionRows(i)
+				counts[i] = len(rows)
 			}
 			t.Logf("converge progress: counts=%v want=%d", counts, want)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	for _, idx := range idxs {
-		n, _ := c.QueryRowCount(idx, tableName)
-		d, _ := c.ComputeTableDigest(idx, tableName, "id")
-		t.Logf("node %d at timeout: count=%d digest=%s", idx, n, d)
+		rows, _ := c.TypedContentionRows(idx)
+		t.Logf("node %d at timeout: count=%d digest=%s", idx, len(rows), digestRows(rows))
 	}
 	t.Fatalf("nodes %v did not converge on %d rows with equal digests within %v", idxs, want, timeout)
+}
+
+func insertRow(c *harness.Cluster, node, id int, name string) error {
+	return c.TypedContentionInsert(node, harness.TypedContentionRow{ID: typedRowID(id), Name: name})
+}
+
+func typedRowID(id int) string { return fmt.Sprintf("%08x-0000-4000-8000-%012x", id, id) }
+
+func digestRows(rows []harness.TypedContentionRow) string {
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	h := sha256.New()
+	for _, row := range rows {
+		_, _ = fmt.Fprintf(h, "%q\x00%q\x00%q\x00%d\n", row.ID, row.Name, row.Phone, row.Score)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }

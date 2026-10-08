@@ -53,13 +53,26 @@ func TestOriginCredentialsRequiredForOfflineWriters(t *testing.T) {
 func TestOriginLogInspectionPreservesProofAcrossBridgeProjection(t *testing.T) {
 	ctx := context.Background()
 	cfg := testConfig(t.TempDir())
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
 	db, err := Open(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	row := NewRowID()
-	if _, err := db.ExecContext(ctx, "INSERT INTO contacts (id,name) VALUES (?,?)", row[:], "signed"); err != nil {
+	tx, err := db.BeginTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := table.Insert(tx, &facadeRecord{ID: row, Name: "signed"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	var complete, projected *codec.MutationBatch

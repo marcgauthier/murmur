@@ -21,40 +21,29 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
+	"reflect"
 	"testing"
 	"time"
 
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/origin"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
-
-func schemaConfig() *db.SchemaConfig {
-	return &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-		Name: "br_rows",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-		},
-	}}}
-}
 
 func TestBackupRestoreRejoinMesh(t *testing.T) {
 	ctx := context.Background()
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "backup-restore",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		Schema:      schemaConfig(),
+		Name:         "backup-restore",
+		NumNodes:     3,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 	node3 := cluster.Nodes[2]
 
 	for i := 0; i < 20; i++ {
-		id := fmt.Sprintf("%032x", 5000+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO br_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("row-%d", i)); err != nil {
+		if err := cluster.TypedInsert(0, fmt.Sprintf("backup-row-%02d", i)); err != nil {
 			t.Fatalf("seed write: %v", err)
 		}
 	}
@@ -73,15 +62,15 @@ func TestBackupRestoreRejoinMesh(t *testing.T) {
 		t.Fatalf("close offline: %v", err)
 	}
 
-	// Total loss of node3's durable directory, then fresh-identity
+	// Total loss of node3's durable data directory, then fresh-identity
 	// restore into the same location the daemon will reopen.
-	if err := os.RemoveAll(node3.PebbleDir); err != nil {
+	if err := os.RemoveAll(filepath.Join(node3.Dir, "data")); err != nil {
 		t.Fatal(err)
 	}
 	fresh := db.NewNodeID()
 	if _, err := backup.Restore(ctx, backup.RestoreConfig{
 		Source:      mustLocalDest(t, backupDir),
-		TargetPath:  node3.PebbleDir,
+		TargetPath:  node3.Dir,
 		FreshNodeID: fresh.String(),
 		Mode:        backup.RestoreClone,
 		Overwrite:   true,
@@ -105,13 +94,13 @@ func TestBackupRestoreRejoinMesh(t *testing.T) {
 func TestRestoreRejectsStaleIdentity(t *testing.T) {
 	ctx := context.Background()
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "backup-restore-id",
-		NumNodes:    1,
-		AwaitUnlock: true,
-		Schema:      schemaConfig(),
+		Name:         "backup-restore-id",
+		NumNodes:     1,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 	node := cluster.Nodes[0]
-	if err := cluster.ExecSQL(0, "INSERT INTO br_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 9), "solo"); err != nil {
+	if err := cluster.TypedInsert(0, "backup-stale-identity"); err != nil {
 		t.Fatal(err)
 	}
 	cluster.StopNode(0)
@@ -151,6 +140,118 @@ func TestRestoreRejectsStaleIdentity(t *testing.T) {
 	_ = restored.Close()
 }
 
+type liveTypedBackupRecord struct {
+	ID    ids.RowID `rime:"primary"`
+	Name  string
+	Count int64
+	Tags  []string
+	Peak  int64
+	Floor float64
+}
+
+func typedBackupDefinition(t *testing.T) db.TableDefinition {
+	t.Helper()
+	definition, err := db.Define[liveTypedBackupRecord]("live_typed_records", 901, db.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs: map[string]uint32{
+			"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6,
+		},
+		MergePolicies: map[string]db.RecordMergePolicy{
+			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
+			"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return definition
+}
+
+func TestTypedBackupRestoreRoundTripLive(t *testing.T) {
+	cluster := harness.NewCluster(t, harness.ClusterOptions{
+		Name: "typed-backup-restore", NumNodes: 1, AwaitUnlock: true, TypedRecords: true,
+	})
+	if err := cluster.TypedInsert(0, "encrypted-live-backup"); err != nil {
+		t.Fatalf("insert typed backup record: %v", err)
+	}
+	cluster.StopNode(0)
+	node := cluster.Nodes[0]
+	definition := typedBackupDefinition(t)
+	key := keyBytes(t, node.KeyHex)
+	registry, _ := origin.NewKeyRegistry(nil)
+	for _, n := range cluster.Nodes {
+		if err := registry.Add(n.NodeID, n.OriginKey.Public().(ed25519.PublicKey)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	app, err := db.Open(context.Background(), db.Config{
+		Path: node.Dir, NodeID: node.NodeID, DBID: cluster.DBID,
+		OriginSigning: db.OriginSigningConfig{PrivateKey: node.OriginKey, TrustedKeys: registry},
+		Schema:        db.SchemaConfig{Version: 1},
+		Tables:        []db.TableDefinition{definition},
+		Spool:         db.DefaultSpoolConfig(),
+		Encryption:    db.EncryptionConfig{Key: key, KeyID: "remote-unlock-key"},
+	})
+	if err != nil {
+		t.Fatalf("open typed live node: %v", err)
+	}
+	rows, err := db.TableOf[liveTypedBackupRecord](app, "live_typed_records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := rows.Where(db.FieldOf[liveTypedBackupRecord, string](rows, "Name").Eq("encrypted-live-backup")).First()
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupDir := t.TempDir()
+	destination, err := backup.NewLocalDestination(backupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.Backup(context.Background(), backup.Config{Destination: destination}); err != nil {
+		t.Fatalf("backup typed live database: %v", err)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	freshNodeID := db.NewNodeID()
+	target := t.TempDir()
+	if _, err := backup.Restore(context.Background(), backup.RestoreConfig{
+		Source: destination, TargetPath: target, FreshNodeID: freshNodeID.String(),
+		Mode: backup.RestoreClone,
+	}); err != nil {
+		t.Fatalf("restore typed live backup: %v", err)
+	}
+	_, freshKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Add(freshNodeID, freshKey.Public().(ed25519.PublicKey)); err != nil {
+		t.Fatal(err)
+	}
+	clone, err := db.Open(context.Background(), db.Config{
+		Path: target, NodeID: freshNodeID, DBID: cluster.DBID,
+		OriginSigning: db.OriginSigningConfig{PrivateKey: freshKey, TrustedKeys: registry},
+		Schema:        db.SchemaConfig{Version: 1},
+		Tables:        []db.TableDefinition{definition},
+		Spool:         db.DefaultSpoolConfig(),
+		Encryption:    db.EncryptionConfig{Key: key, KeyID: "remote-unlock-key"},
+	})
+	if err != nil {
+		t.Fatalf("open restored typed backup under fresh identity: %v", err)
+	}
+	defer clone.Close()
+	clonedRows, err := db.TableOf[liveTypedBackupRecord](clone, "live_typed_records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := clonedRows.Get(want.ID)
+	if err != nil || got.ID != want.ID || got.Name != want.Name || got.Count != want.Count || len(got.Tags) != len(want.Tags) || got.Peak != want.Peak || got.Floor != want.Floor {
+		t.Fatalf("restored typed record = %+v, %v; want %+v", got, err, want)
+	}
+}
+
 func mustLocalDest(t *testing.T, dir string) *backup.LocalDestination {
 	t.Helper()
 	d, err := backup.NewLocalDestination(dir)
@@ -169,7 +270,7 @@ func keyBytes(t *testing.T, keyHex string) []byte {
 	return raw
 }
 
-func offlineConfig(t *testing.T, pebbleDir string, cluster *harness.Cluster, nodeID string) db.Config {
+func offlineConfig(t *testing.T, dataDir string, cluster *harness.Cluster, nodeID string) db.Config {
 	t.Helper()
 	node, err := db.ParseNodeID(nodeID)
 	if err != nil {
@@ -188,12 +289,13 @@ func offlineConfig(t *testing.T, pebbleDir string, cluster *harness.Cluster, nod
 		_ = registry.Add(node, signingKey.Public().(ed25519.PublicKey))
 	}
 	return db.Config{
-		Path:          pebbleDir,
+		Path:          dataDir,
 		NodeID:        node,
 		DBID:          cluster.DBID,
 		OriginSigning: db.OriginSigningConfig{PrivateKey: signingKey, TrustedKeys: registry},
-		Schema:        *schemaConfig(),
-		Pebble:        db.DefaultPebbleConfig(),
+		Schema:        db.SchemaConfig{Version: 1},
+		Tables:        []db.TableDefinition{typedBackupDefinition(t)},
+		Spool:         db.DefaultSpoolConfig(),
 		// The daemon unlocks with key_id "remote-unlock-key" (see
 		// handleAdminUnlock); the offline open must use the same ID.
 		Encryption: db.EncryptionConfig{Key: keyBytes(t, cluster.Nodes[0].KeyHex), KeyID: "remote-unlock-key"},
@@ -202,7 +304,7 @@ func offlineConfig(t *testing.T, pebbleDir string, cluster *harness.Cluster, nod
 
 func openNodeDir(t *testing.T, ctx context.Context, cluster *harness.Cluster, node *harness.Node) *db.DB {
 	t.Helper()
-	handle, err := db.Open(ctx, offlineConfig(t, node.PebbleDir, cluster, node.NodeID.String()))
+	handle, err := db.Open(ctx, offlineConfig(t, node.Dir, cluster, node.NodeID.String()))
 	if err != nil {
 		t.Fatalf("open node dir: %v", err)
 	}
@@ -275,21 +377,16 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
-		var first string
+		var first []string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "br_rows")
-			if err != nil || n != want {
-				ok = false
-				break
-			}
-			d, err := c.ComputeTableDigest(i, "br_rows", "name")
-			if err != nil {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
 			if i == 0 {
-				first = d
-			} else if d != first {
+				first = names
+			} else if !reflect.DeepEqual(names, first) {
 				ok = false
 				break
 			}
@@ -304,19 +401,15 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 
 func infoLabel(t *testing.T, apiAddr, label string) string {
 	t.Helper()
-	body := scrapeMetrics(t, apiAddr)
-	for _, line := range strings.Split(body, "\n") {
-		if !strings.HasPrefix(line, "spedsql_info{") {
-			continue
-		}
-		key := label + `="`
-		i := strings.Index(line, key)
-		if i < 0 {
-			continue
-		}
-		rest := line[i+len(key):]
-		if j := strings.Index(rest, `"`); j >= 0 {
-			return rest[:j]
+	samples, ok := harness.MetricSamples(scrapeMetrics(t, apiAddr))
+	if !ok {
+		t.Fatal("decode metrics JSON")
+	}
+	for _, sample := range samples {
+		if sample.Name == "spedsql_info" {
+			if value := sample.Labels[label]; value != "" {
+				return value
+			}
 		}
 	}
 	t.Fatalf("label %s not found in spedsql_info", label)

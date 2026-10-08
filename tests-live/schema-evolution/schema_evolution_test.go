@@ -1,10 +1,5 @@
-// Rolling additive schema migration across a live mesh.
-//
-// Three daemons mesh on a two-column table. Node1 migrates first (adds a
-// nullable score column) while node2/node3 stay behind: the mixed-version
-// mesh must keep replicating in both directions without stalling. Then
-// node2 and node3 migrate and the whole mesh converges on the full
-// three-column state with equal digests.
+// Three-node typed schema evolution keeps old application bindings able to
+// update known fields while retaining newly added fields in durable state.
 package schemaevolution_test
 
 import (
@@ -12,145 +7,120 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
-func baseTables() []schema.TableSchema {
-	return []schema.TableSchema{{
-		Name: "evo_rows",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-		},
-	}}
-}
-
-func evolvedTables() []schema.TableSchema {
-	return []schema.TableSchema{{
-		Name: "evo_rows",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-			{Name: "score", Type: schema.ColInteger, Nullable: true},
-		},
-	}}
-}
-
-func TestRollingAdditiveMigration(t *testing.T) {
+func TestRollingTypedSchemaMigration(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "schema-evolution",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		Schema:      &db.SchemaConfig{Version: 1, Tables: baseTables()},
+		Name: "schema-evolution", NumNodes: 3, AwaitUnlock: true, TypedRecords: true,
 	})
-
-	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("%032x", 9000+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO evo_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("n-%d", i)); err != nil {
-			t.Fatalf("seed write: %v", err)
+	const rows = 5
+	for i := 0; i < rows; i++ {
+		name := fmt.Sprintf("typed-row-%d", i)
+		if err := cluster.TypedInsert(0, name); err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+		if err := cluster.TypedCounterAdd(0, name, int64(100+i)); err != nil {
+			t.Fatalf("seed counter %s: %v", name, err)
 		}
 	}
-	waitNamesConverged(t, cluster, 5, 30*time.Second)
+	waitNames(t, cluster, []string{"typed-row-0", "typed-row-1", "typed-row-2", "typed-row-3", "typed-row-4"})
 
-	// Rolling step 1: only node1 migrates, then writes the new column.
-	if err := cluster.Migrate(0, evolvedTables()); err != nil {
-		t.Fatalf("migrate node1: %v", err)
+	// Only node 0 registers the additive Note field. Its peers adopt the
+	// manifest while retaining their older executable record binding.
+	if err := cluster.MigrateTypedRecords(0); err != nil {
+		t.Fatalf("migrate node 0: %v", err)
 	}
-	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("%032x", 9000+i)
-		if err := cluster.ExecSQL(0, "UPDATE evo_rows SET score=? WHERE id=?", int64(100+i), id); err != nil {
-			t.Fatalf("score write: %v", err)
+	waitEpoch(t, cluster, 0, 2, 10*time.Second)
+	waitEpoch(t, cluster, 1, 2, 30*time.Second)
+	waitEpoch(t, cluster, 2, 2, 30*time.Second)
+	if err := cluster.TypedSetNote(0, "typed-row-0", "added-field-survives"); err != nil {
+		t.Fatalf("write added field: %v", err)
+	}
+	// An older binding updates its known Name field after learning the newer
+	// manifest; this must not erase the new Note field.
+	if err := cluster.TypedRename(1, "typed-row-0", "typed-row-renamed"); err != nil {
+		t.Fatalf("old binding write: %v", err)
+	}
+	if err := cluster.TypedInsert(2, "typed-row-late"); err != nil {
+		t.Fatalf("old binding insert after adoption: %v", err)
+	}
+	wantNames := []string{"typed-row-1", "typed-row-2", "typed-row-3", "typed-row-4", "typed-row-late", "typed-row-renamed"}
+	waitNames(t, cluster, wantNames)
+	waitNote(t, cluster, 0, "typed-row-renamed", "added-field-survives", 30*time.Second)
+	for i := 1; i < rows; i++ {
+		name := fmt.Sprintf("typed-row-%d", i)
+		for node := range cluster.Nodes {
+			waitCounter(t, cluster, node, name, int64(100+i), 30*time.Second)
 		}
 	}
-	// Mixed-version mesh still flows both ways: old-schema writes from
-	// node2 must reach migrated node1, and names stay converged.
-	if err := cluster.ExecSQL(1, "INSERT INTO evo_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 9100), "late"); err != nil {
-		t.Fatalf("mixed-version write: %v", err)
-	}
-	waitNamesConverged(t, cluster, 6, 30*time.Second)
-	assertScore(t, cluster, 0, fmt.Sprintf("%032x", 9000), 100)
 
-	// Rolling steps 2-3: the laggards migrate, then full convergence.
-	if err := cluster.Migrate(1, evolvedTables()); err != nil {
-		t.Fatalf("migrate node2: %v", err)
-	}
-	if err := cluster.Migrate(2, evolvedTables()); err != nil {
-		t.Fatalf("migrate node3: %v", err)
-	}
-	waitFullConverged(t, cluster, 30*time.Second)
-	assertScore(t, cluster, 1, fmt.Sprintf("%032x", 9001), 101)
-	assertScore(t, cluster, 2, fmt.Sprintf("%032x", 9002), 102)
+	cluster.StopNode(2)
+	cluster.StartNode(2)
+	cluster.UnlockNode(2, cluster.Nodes[2].KeyHex)
+	cluster.WaitNodeReady(2)
+	waitNames(t, cluster, wantNames)
+	waitCounter(t, cluster, 2, "typed-row-4", 104, 30*time.Second)
 }
 
-// waitNamesConverged polls id/name convergence (tolerates schema skew on
-// the new column during the mixed-version window).
-func waitNamesConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
+func waitNames(t *testing.T, cluster *harness.Cluster, want []string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	var latest []string
+	for time.Now().Before(deadline) {
+		allMatch := true
+		latest = latest[:0]
+		for node := range cluster.Nodes {
+			got, err := cluster.TypedNames(node)
+			latest = append(latest, fmt.Sprintf("node%d names=%v err=%v", node, got, err))
+			if err != nil || fmt.Sprint(got) != fmt.Sprint(want) {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("typed records did not converge to %v: %v", want, latest)
+}
+
+func waitEpoch(t *testing.T, cluster *harness.Cluster, node int, want uint64, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		ok := true
-		counts := map[string]int{}
-		for i := range c.Nodes {
-			res, err := c.QuerySQL(i, "SELECT name FROM evo_rows ORDER BY name")
-			if err != nil || len(res.Rows) != want {
-				ok = false
-				break
-			}
-			key := fmt.Sprintf("%v", res.Rows)
-			counts[key]++
-		}
-		if ok && len(counts) == 1 {
+		if got, err := cluster.TypedSchemaEpoch(node); err == nil && got == want {
 			return
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("nodes did not converge on %d names within %v", want, timeout)
+	got, err := cluster.TypedSchemaEpoch(node)
+	t.Fatalf("node %d schema epoch=%d err=%v, want %d", node, got, err, want)
 }
 
-// waitFullConverged polls full-row digest equality once all peers share
-// the evolved schema.
-func waitFullConverged(t *testing.T, c *harness.Cluster, timeout time.Duration) {
+func waitNote(t *testing.T, cluster *harness.Cluster, node int, name, want string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		ok := true
-		var first string
-		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "evo_rows")
-			if err != nil || n != 6 {
-				ok = false
-				break
-			}
-			d, err := c.ComputeTableDigest(i, "evo_rows", "name")
-			if err != nil {
-				ok = false
-				break
-			}
-			if i == 0 {
-				first = d
-			} else if d != first {
-				ok = false
-				break
-			}
-		}
-		if ok {
+		if got, err := cluster.TypedNote(node, name); err == nil && got == want {
 			return
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("nodes did not fully converge within %v", timeout)
+	got, err := cluster.TypedNote(node, name)
+	t.Fatalf("node %d Note=%q err=%v, want %q", node, got, err, want)
 }
 
-func assertScore(t *testing.T, c *harness.Cluster, idx int, idHex string, want int64) {
+func waitCounter(t *testing.T, cluster *harness.Cluster, node int, name string, want int64, timeout time.Duration) {
 	t.Helper()
-	res, err := c.QuerySQL(idx, "SELECT score FROM evo_rows WHERE id=?", idHex)
-	if err != nil || len(res.Rows) != 1 {
-		t.Fatalf("node %d score read: %+v %v", idx, res, err)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if got, err := cluster.TypedCounterValue(node, name); err == nil && got == want {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	got, _ := res.Rows[0][0].(float64)
-	if int64(got) != want {
-		t.Fatalf("node %d score = %v, want %d", idx, got, want)
-	}
+	got, err := cluster.TypedCounterValue(node, name)
+	t.Fatalf("node %d counter %s=%d err=%v, want %d", node, name, got, err, want)
 }

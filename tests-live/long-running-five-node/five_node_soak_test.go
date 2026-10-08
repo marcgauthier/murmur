@@ -9,14 +9,11 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -39,14 +36,10 @@ func TestFiveNodePersistentCapacityAndMeshSoak(t *testing.T) {
 	interval := envMillis(t, "MURMUR_FIVE_NODE_INTERVAL_MS", 50)
 	settle := envSeconds(t, "MURMUR_FIVE_NODE_SETTLE_SECONDS", 120)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "long-running-five-node",
-		NumNodes:    5,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{Name: "capacity_rows", Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "node", Type: schema.ColText},
-			{Name: "value", Type: schema.ColText},
-		}}}},
+		Name:         "long-running-five-node",
+		NumNodes:     5,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 	for _, node := range cluster.Nodes {
 		t.Logf("%s pid=%d dir=%s repl=%s", node.Label, node.Process.Process.Pid, node.Dir, node.ReplAddr)
@@ -74,9 +67,8 @@ func TestFiveNodePersistentCapacityAndMeshSoak(t *testing.T) {
 					return
 				}
 				seq := writes[node].Load()
-				id := fmt.Sprintf("%032x", int64(node+1)*1_000_000_000_000+int64(seq)+1)
 				value := fmt.Sprintf("node-%d-capacity-%09d", node+1, seq)
-				if err := cluster.ExecSQL(node, "INSERT INTO capacity_rows (id, node, value) VALUES (?, ?, ?)", id, fmt.Sprintf("node-%d", node+1), value); err != nil {
+				if err := cluster.TypedInsert(node, value); err != nil {
 					failures[node].Add(1)
 					continue
 				}
@@ -158,11 +150,11 @@ func TestFiveNodePersistentCapacityAndMeshSoak(t *testing.T) {
 		if metric(metrics, "spedsql_materialized_generation") != metric(metrics, "spedsql_state_generation") {
 			t.Fatalf("%s state has not been fully materialized", node.Label)
 		}
-		if metric(metrics, "spedsql_pebble_size_bytes") > 2<<30 {
+		if metric(metrics, "spedsql_spool_disk_bytes") > 2<<30 {
 			t.Fatalf("%s exceeded 2 GiB persistent capacity limit", node.Label)
 		}
 	}
-	if err := cluster.ExecSQL(4, "INSERT INTO capacity_rows (id, node, value) VALUES (?, ?, ?)", fmt.Sprintf("%032x", 9_999_999_999_999), "node-5", "post-soak-write"); err != nil {
+	if err := cluster.TypedInsert(4, "post-soak-write"); err != nil {
 		t.Fatalf("post-soak application write: %v", err)
 	}
 	postDigest := waitForConvergence(t, cluster, finalCount+1, settle)
@@ -196,7 +188,7 @@ func restartAndCheckPersistence(t *testing.T, cluster *harness.Cluster, node int
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if got, err := rowCount(cluster, node); err == nil && got >= before {
-		t.Logf("%s restarted and rejoined in %s with %d rows (had %d before restart)", cluster.Nodes[node].Label, time.Since(started), got, before)
+			t.Logf("%s restarted and rejoined in %s with %d rows (had %d before restart)", cluster.Nodes[node].Label, time.Since(started), got, before)
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -242,24 +234,17 @@ func connectedPeers(apiAddr string) int {
 }
 
 func rowCount(cluster *harness.Cluster, node int) (int, error) {
-	res, err := cluster.QuerySQL(node, "SELECT count(*) FROM capacity_rows")
-	if err != nil || len(res.Rows) != 1 || len(res.Rows[0]) != 1 {
-		return 0, fmt.Errorf("query count: %v (%v)", res, err)
+	names, err := cluster.TypedNames(node)
+	if err != nil {
+		return 0, fmt.Errorf("read typed rows: %w", err)
 	}
-	return strconv.Atoi(fmt.Sprint(res.Rows[0][0]))
+	return len(names), nil
 }
 
 func tableDigest(cluster *harness.Cluster, node int) (string, error) {
-	res, err := cluster.QuerySQL(node, "SELECT id, node, value FROM capacity_rows")
+	rows, err := cluster.TypedNames(node)
 	if err != nil {
 		return "", err
-	}
-	rows := make([]string, 0, len(res.Rows))
-	for _, row := range res.Rows {
-		if len(row) != 3 {
-			return "", fmt.Errorf("malformed row: %v", row)
-		}
-		rows = append(rows, fmt.Sprintf("%q:%q:%q", fmt.Sprint(row[0]), fmt.Sprint(row[1]), fmt.Sprint(row[2])))
 	}
 	sort.Strings(rows)
 	h := sha256.New()
@@ -309,14 +294,8 @@ func scrapeMetrics(apiAddr string) (string, error) {
 }
 
 func metric(metrics, name string) float64 {
-	for _, line := range strings.Split(metrics, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 2 && (fields[0] == name || strings.HasPrefix(fields[0], name+"{")) {
-			value, err := strconv.ParseFloat(fields[1], 64)
-			if err == nil {
-				return value
-			}
-		}
+	if value, ok := harness.MetricValueFrom(metrics, name); ok {
+		return value
 	}
 	return -1
 }

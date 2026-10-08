@@ -8,7 +8,7 @@
 //
 // Run it:
 //
-//	go run -tags "sqlite_preupdate_hook sqlite_fts5" ./examples/retention-snapshot
+//	go run ./examples/retention-snapshot
 package main
 
 import (
@@ -21,9 +21,14 @@ import (
 	"time"
 
 	"github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/transport"
 )
+
+type note struct {
+	ID   ids.RowID `rime:"primary"`
+	Body string
+}
 
 func freePort() int {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -34,11 +39,10 @@ func freePort() int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-func waitCount(ctx context.Context, db *murmur.DB, want int, timeout time.Duration) {
+func waitCount(table *murmur.RecordTable[note], want int, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		var n int
-		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM notes`).Scan(&n); err == nil && n == want {
+		if n, err := table.Where().Count(); err == nil && n == want {
 			return
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -53,6 +57,12 @@ func main() {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(base)
+	definition, err := murmur.Define[note]("notes", 12, murmur.RecordOptions{
+		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	ca, err := transport.GenerateCA(24 * time.Hour)
 	if err != nil {
@@ -79,17 +89,9 @@ func main() {
 			Path:   dirs[i],
 			NodeID: ids[i],
 			DBID:   dbid,
-			Schema: murmur.SchemaConfig{
-				Version: 1,
-				Tables: []schema.TableSchema{{
-					Name: "notes",
-					Columns: []schema.ColumnSchema{
-						{Name: "id", Type: schema.ColBlob},
-						{Name: "body", Type: schema.ColText, Nullable: true},
-					},
-				}},
-			},
-			Pebble: murmur.DefaultPebbleConfig(),
+			Schema: murmur.SchemaConfig{Version: 1},
+			Tables: []murmur.TableDefinition{definition},
+			Spool:  murmur.DefaultSpoolConfig(),
 			Encryption: murmur.EncryptionConfig{
 				Key:   []byte("0123456789abcdef0123456789abcdef"),
 				KeyID: "snapshot-key",
@@ -116,13 +118,22 @@ func main() {
 	node1 := open(0)
 	node2 := open(1)
 	defer node1.Close()
-
-	id := murmur.NewRowID()
-	if _, err := node1.ExecContext(ctx,
-		`INSERT INTO notes (id, body) VALUES (?, ?)`, id[:], "seed"); err != nil {
+	table1, err := murmur.TableOf[note](node1, "notes")
+	if err != nil {
 		log.Fatal(err)
 	}
-	waitCount(ctx, node2, 1, 30*time.Second)
+	table2, err := murmur.TableOf[note](node2, "notes")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	id := murmur.NewRowID()
+	if err := node1.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+		return table1.Insert(tx, &note{ID: id, Body: "seed"})
+	}); err != nil {
+		log.Fatal(err)
+	}
+	waitCount(table2, 1, 30*time.Second)
 	fmt.Println("seed converged; stopping node 2")
 	if err := node2.Close(); err != nil {
 		log.Fatal(err)
@@ -130,9 +141,9 @@ func main() {
 
 	for r := 0; r < 30; r++ {
 		id := murmur.NewRowID()
-		if _, err := node1.ExecContext(ctx,
-			`INSERT INTO notes (id, body) VALUES (?, ?)`,
-			id[:], fmt.Sprintf("fresh-%d", r)); err != nil {
+		if err := node1.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+			return table1.Insert(tx, &note{ID: id, Body: fmt.Sprintf("fresh-%d", r)})
+		}); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -141,7 +152,11 @@ func main() {
 
 	node2 = open(1)
 	defer node2.Close()
-	waitCount(ctx, node2, 31, 90*time.Second)
+	table2, err = murmur.TableOf[note](node2, "notes")
+	if err != nil {
+		log.Fatal(err)
+	}
+	waitCount(table2, 31, 90*time.Second)
 	got := node2.Metrics().SnapshotAppliesCompleted
 	fmt.Printf("node 2 rejoined with %d rows; snapshot applies completed: %d\n", 31, got)
 	if got < 1 {

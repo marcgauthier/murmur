@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,9 +15,84 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/origin"
 	"github.com/marcgauthier/murmur/schema"
-	"github.com/marcgauthier/murmur/tool/client"
 )
+
+type initBindingRecord struct {
+	ID    murmur.RowID `rime:"primary"`
+	Value string
+}
+
+func bindTypedInitSchema(t *testing.T, dataDir string) {
+	t.Helper()
+	nodeBytes, err := os.ReadFile(filepath.Join(dataDir, "node.id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeID, err := ids.ParseNodeID(strings.TrimSpace(string(nodeBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyBytes, err := os.ReadFile(filepath.Join(dataDir, "origin.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKey := ed25519.PrivateKey(privateKeyBytes)
+	registry, err := origin.NewKeyRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Add(nodeID, privateKey.Public().(ed25519.PublicKey)); err != nil {
+		t.Fatal(err)
+	}
+	definition, err := murmur.Define[initBindingRecord]("items", 1, murmur.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "Value": 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := murmur.Open(context.Background(), murmur.Config{
+		Path:   dataDir,
+		NodeID: nodeID,
+		Schema: murmur.SchemaConfig{Version: 1},
+		Tables: []murmur.TableDefinition{definition},
+		Spool:  murmur.DefaultSpoolConfig(),
+		Encryption: murmur.EncryptionConfig{
+			Key: []byte("0123456789abcdef0123456789abcdef"), KeyID: "cli-key",
+		},
+		OriginSigning: murmur.OriginSigningConfig{PrivateKey: privateKey, TrustedKeys: registry},
+	})
+	if err != nil {
+		t.Fatalf("first typed application open: %v", err)
+	}
+	if _, err := murmur.TableOf[initBindingRecord](db, "items"); err != nil {
+		t.Fatalf("bind typed table: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close typed database: %v", err)
+	}
+	store, err := openOfflineStore(dataDir, GlobalOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	manifest, err := store.LoadSchemaManifest()
+	if err != nil || manifest == nil || len(manifest.Tables) != 1 || manifest.Tables[0].Name != "items" {
+		t.Fatalf("first typed open did not persist the Go schema: manifest=%+v err=%v", manifest, err)
+	}
+}
+
+func TestInitStoreBindsFirstTypedSchema(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "db")
+	if err := (&InitCommand{}).Run(context.Background(), GlobalOptions{}, []string{dataDir}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("initialize Spool: %v", err)
+	}
+	bindTypedInitSchema(t, dataDir)
+}
 
 func TestAllCommandMetadata(t *testing.T) {
 	for name, command := range commandRegistry {
@@ -29,6 +105,19 @@ func TestAllCommandMetadata(t *testing.T) {
 		if command.Usage() == "" {
 			t.Errorf("command %s has empty Usage()", name)
 		}
+	}
+}
+
+func TestLegacyCommandsRemoved(t *testing.T) {
+	for _, name := range []string{"shell", "query", "exec", "import", "export", "dump"} {
+		if command := Lookup(name); command != nil {
+			t.Errorf("legacy command %q is still registered: %T", name, command)
+		}
+	}
+	dir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	if code := Execute([]string{dir}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "unknown command") {
+		t.Fatalf("data-directory shorthand must not dispatch to a shell: code=%d stderr=%s", code, stderr.String())
 	}
 }
 
@@ -152,6 +241,33 @@ func TestInitCommand(t *testing.T) {
 	if !strings.Contains(stdout.String(), `"data_dir":`) {
 		t.Errorf("unexpected JSON init: %s", stdout.String())
 	}
+	if _, err := os.Stat(filepath.Join(target1, "schema.json")); !os.IsNotExist(err) {
+		t.Errorf("native init must not create a legacy schema file (stat err=%v)", err)
+	}
+	initializedStore, err := openOfflineStore(target1, GlobalOptions{})
+	if err != nil {
+		t.Fatalf("open initialized Spool: %v", err)
+	}
+	manifest, err := initializedStore.LoadSchemaManifest()
+	if err != nil {
+		t.Fatalf("load initial schema manifest: %v", err)
+	}
+	if manifest != nil {
+		t.Fatalf("fresh init should leave Go schema binding to the application, got manifest %+v", manifest)
+	}
+	if err := initializedStore.Close(); err != nil {
+		t.Fatalf("close initialized Spool: %v", err)
+	}
+	stdout.Reset()
+	if err := (&VerifyCommand{}).Run(ctx, GlobalOptions{JSON: true}, []string{target1}, &stdout, &stderr); err != nil ||
+		!strings.Contains(stdout.String(), `"valid": true`) || !strings.Contains(stdout.String(), `Schema is not bound yet`) {
+		t.Fatalf("verify should accept a valid unbound Spool and explain schema state: err=%v output=%s", err, stdout.String())
+	}
+	stdout.Reset()
+	if err := (&DoctorCommand{}).Run(ctx, GlobalOptions{JSON: true}, []string{target1}, &stdout, &stderr); err != nil ||
+		!strings.Contains(stdout.String(), `"name": "Schema Registration"`) || !strings.Contains(stdout.String(), `"overall": "DEGRADED"`) {
+		t.Fatalf("doctor should report schema registration pending for a fresh Spool: err=%v output=%s", err, stdout.String())
+	}
 
 	// Init with Passphrase
 	target2 := filepath.Join(tempDir, "db2")
@@ -174,243 +290,6 @@ func TestInitCommand(t *testing.T) {
 	}
 }
 
-func TestDDLHelper_ParsingAndExecution(t *testing.T) {
-	// Column type parsing
-	ddl := `CREATE TABLE test_all_types (
-		id BLOB PRIMARY KEY NOT NULL,
-		name TEXT DEFAULT 'unknown',
-		age INTEGER,
-		salary BIGINT,
-		rate DOUBLE,
-		ratio FLOAT,
-		is_active BOOLEAN,
-		created_at TIMESTAMP
-	);`
-
-	table, err := parseCreateTableDDL(ddl)
-	if err != nil {
-		t.Fatalf("parseCreateTableDDL failed: %v", err)
-	}
-	if table.Name != "test_all_types" || len(table.Columns) != 8 {
-		t.Fatalf("unexpected parsed table: %+v", table)
-	}
-	if table.Columns[0].Type != schema.ColBlob || table.Columns[0].Nullable {
-		t.Errorf("col 0 mismatch: %+v", table.Columns[0])
-	}
-	if table.Columns[1].Type != schema.ColText || !table.Columns[1].Nullable {
-		t.Errorf("col 1 mismatch: %+v", table.Columns[1])
-	}
-	if table.Columns[2].Type != schema.ColInteger {
-		t.Errorf("col 2 mismatch: %+v", table.Columns[2])
-	}
-
-	// Invalid syntax statements
-	_, err = parseCreateTableDDL("CREATE TABLE invalid_no_paren;")
-	if err == nil {
-		t.Errorf("expected error for invalid CREATE TABLE syntax, got nil")
-	}
-
-	// Split statements
-	sqlScript := `
-		-- This is a comment
-		CREATE TABLE a (id BLOB PRIMARY KEY);
-		/* Multiline comment */
-		INSERT INTO a (id) VALUES (x'0102030405060708090a0b0c0d0e0f10');
-		SELECT * FROM a WHERE name = 'semi;colon';
-	`
-	stmts := splitStatements(sqlScript)
-	if len(stmts) != 3 {
-		t.Errorf("expected 3 statements, got %d: %v", len(stmts), stmts)
-	}
-}
-
-func TestQueryCommand_LocalAndRemote(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "murmur_query_test_*")
-	if err != nil {
-		t.Fatalf("temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	dataDir := filepath.Join(tempDir, "db")
-	initCmd := &InitCommand{}
-	var stdout, stderr bytes.Buffer
-	_ = initCmd.Run(context.Background(), GlobalOptions{}, []string{dataDir}, &stdout, &stderr)
-
-	ctx := context.Background()
-	queryCmd := &QueryCommand{}
-
-	// Missing args
-	err = queryCmd.Run(ctx, GlobalOptions{}, nil, &stdout, &stderr)
-	if err == nil {
-		t.Errorf("expected error for missing query args")
-	}
-
-	// Create table and insert
-	stdout.Reset()
-	err = queryCmd.Run(ctx, GlobalOptions{}, []string{dataDir, "CREATE TABLE users (id BLOB PRIMARY KEY, name TEXT);"}, &stdout, &stderr)
-	if err != nil {
-		t.Fatalf("create table query failed: %v", err)
-	}
-
-	stdout.Reset()
-	err = queryCmd.Run(ctx, GlobalOptions{}, []string{dataDir, "INSERT INTO users (id, name) VALUES (x'0102030405060708090a0b0c0d0e0f10', 'Alice');"}, &stdout, &stderr)
-	if err != nil {
-		t.Fatalf("insert query failed: %v", err)
-	}
-
-	// Query with Table output
-	stdout.Reset()
-	err = queryCmd.Run(ctx, GlobalOptions{}, []string{dataDir, "SELECT name FROM users;"}, &stdout, &stderr)
-	if err != nil || !strings.Contains(stdout.String(), "Alice") {
-		t.Errorf("select query table output mismatch: %s", stdout.String())
-	}
-
-	// Query with Markdown output
-	stdout.Reset()
-	err = queryCmd.Run(ctx, GlobalOptions{Markdown: true}, []string{dataDir, "SELECT name FROM users;"}, &stdout, &stderr)
-	if err != nil || !strings.Contains(stdout.String(), "| Alice |") {
-		t.Errorf("select query markdown output mismatch: %s", stdout.String())
-	}
-
-	// Query with JSON output
-	stdout.Reset()
-	err = queryCmd.Run(ctx, GlobalOptions{JSON: true}, []string{dataDir, "SELECT name FROM users;"}, &stdout, &stderr)
-	if err != nil || !strings.Contains(stdout.String(), `"name": "Alice"`) {
-		t.Errorf("select query JSON output mismatch: %s", stdout.String())
-	}
-
-	// Query with --file
-	sqlFile := filepath.Join(tempDir, "query.sql")
-	_ = os.WriteFile(sqlFile, []byte("SELECT count(*) AS total FROM users;"), 0o600)
-	stdout.Reset()
-	err = queryCmd.Run(ctx, GlobalOptions{JSON: true}, []string{dataDir, "--file=" + sqlFile}, &stdout, &stderr)
-	if err != nil || !strings.Contains(stdout.String(), `"total":`) {
-		t.Errorf("query with file failed: %v, out: %s", err, stdout.String())
-	}
-
-	// Remote query mock
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/query", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"columns": []string{"msg"},
-			"rows":    [][]string{{"remote hello"}},
-		})
-	})
-	mux.HandleFunc("/v1/exec", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"rows_affected": 1,
-		})
-	})
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-
-	stdout.Reset()
-	err = queryCmd.Run(ctx, GlobalOptions{JSON: true}, []string{ts.URL, "SELECT msg"}, &stdout, &stderr)
-	if err != nil || !strings.Contains(stdout.String(), "remote hello") {
-		t.Errorf("remote query failed: %v, out: %s", err, stdout.String())
-	}
-}
-
-func TestImportAndExportCommands(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "murmur_io_test_*")
-	if err != nil {
-		t.Fatalf("temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	dataDir := filepath.Join(tempDir, "db")
-	_ = (&InitCommand{}).Run(context.Background(), GlobalOptions{}, []string{dataDir}, io.Discard, io.Discard)
-	_ = (&QueryCommand{}).Run(context.Background(), GlobalOptions{}, []string{dataDir, "CREATE TABLE logs (id BLOB PRIMARY KEY, level TEXT, msg TEXT);"}, io.Discard, io.Discard)
-
-	ctx := context.Background()
-	importCmd := &ImportCommand{}
-	exportCmd := &ExportCommand{}
-
-	// Missing args
-	var stdout, stderr bytes.Buffer
-	if err := importCmd.Run(ctx, GlobalOptions{}, nil, &stdout, &stderr); err == nil {
-		t.Errorf("expected import error on missing args")
-	}
-	if err := exportCmd.Run(ctx, GlobalOptions{}, nil, &stdout, &stderr); err == nil {
-		t.Errorf("expected export error on missing args")
-	}
-
-	// Import CSV with custom delimiter and batching
-	csvFile := filepath.Join(tempDir, "data.csv")
-	csvContent := "id;level;msg\n01010101010101010101010101010101;INFO;started\n02020202020202020202020202020202;WARN;check\n"
-	_ = os.WriteFile(csvFile, []byte(csvContent), 0o600)
-
-	stdout.Reset()
-	err = importCmd.Run(ctx, GlobalOptions{JSON: true}, []string{
-		dataDir,
-		"--table=logs",
-		"--delimiter=;",
-		"--batch=1",
-		csvFile,
-	}, &stdout, &stderr)
-	if err != nil {
-		t.Fatalf("import failed: %v", err)
-	}
-	if !strings.Contains(stdout.String(), `"imported": 2`) {
-		t.Errorf("unexpected import JSON: %s", stdout.String())
-	}
-
-	// Export JSON
-	stdout.Reset()
-	err = exportCmd.Run(ctx, GlobalOptions{}, []string{dataDir, "--table=logs", "--format=json"}, &stdout, &stderr)
-	if err != nil || !strings.Contains(stdout.String(), "started") {
-		t.Errorf("export JSON failed: %v, out: %s", err, stdout.String())
-	}
-
-	// Export SQL
-	stdout.Reset()
-	err = exportCmd.Run(ctx, GlobalOptions{}, []string{dataDir, "--table=logs", "--format=sql"}, &stdout, &stderr)
-	if err != nil || !strings.Contains(stdout.String(), "INSERT INTO logs") {
-		t.Errorf("export SQL failed: %v, out: %s", err, stdout.String())
-	}
-
-	// Export to file
-	outFile := filepath.Join(tempDir, "out.csv")
-	err = exportCmd.Run(ctx, GlobalOptions{}, []string{dataDir, "--table=logs", "--format=csv", "--output=" + outFile}, &stdout, &stderr)
-	if err != nil {
-		t.Fatalf("export to file failed: %v", err)
-	}
-	outData, _ := os.ReadFile(outFile)
-	if !strings.Contains(string(outData), "started") {
-		t.Errorf("exported file missing rows: %s", string(outData))
-	}
-
-	// Remote import mock
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/exec", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"rows_affected": 1})
-	})
-	mux.HandleFunc("/v1/query", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"columns": []string{"id", "level"},
-			"rows":    [][]string{{"0101", "INFO"}},
-		})
-	})
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-
-	stdout.Reset()
-	err = importCmd.Run(ctx, GlobalOptions{JSON: true}, []string{ts.URL, "--table=logs", "--delimiter=;", csvFile}, &stdout, &stderr)
-	if err != nil {
-		t.Fatalf("remote import failed: %v", err)
-	}
-
-	stdout.Reset()
-	err = exportCmd.Run(ctx, GlobalOptions{JSON: true}, []string{ts.URL, "--table=logs", "--format=json"}, &stdout, &stderr)
-	if err != nil || !strings.Contains(stdout.String(), "INFO") {
-		t.Errorf("remote export failed: %v, out: %s", err, stdout.String())
-	}
-}
-
 func TestInspectVerifyRepairDoctor(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "murmur_diag_test_*")
 	if err != nil {
@@ -420,7 +299,7 @@ func TestInspectVerifyRepairDoctor(t *testing.T) {
 
 	dataDir := filepath.Join(tempDir, "db")
 	_ = (&InitCommand{}).Run(context.Background(), GlobalOptions{}, []string{dataDir}, io.Discard, io.Discard)
-	_ = (&QueryCommand{}).Run(context.Background(), GlobalOptions{}, []string{dataDir, "CREATE TABLE items (id BLOB PRIMARY KEY, title TEXT);"}, io.Discard, io.Discard)
+	bindTypedInitSchema(t, dataDir)
 
 	ctx := context.Background()
 	var stdout, stderr bytes.Buffer
@@ -451,7 +330,7 @@ func TestInspectVerifyRepairDoctor(t *testing.T) {
 		t.Errorf("unexpected verify JSON: %s", stdout.String())
 	}
 
-	// 3. Repair (check only and force)
+	// 3. Repair validates Spool directly and refuses to claim a CLI rebuild.
 	repairCmd := &RepairCommand{}
 	if err := repairCmd.Run(ctx, GlobalOptions{}, nil, &stdout, &stderr); err == nil {
 		t.Errorf("expected error for missing repair args")
@@ -461,11 +340,14 @@ func TestInspectVerifyRepairDoctor(t *testing.T) {
 		t.Fatalf("repair check failed: %v", err)
 	}
 	stdout.Reset()
-	if err := repairCmd.Run(ctx, GlobalOptions{JSON: true}, []string{dataDir, "--force"}, &stdout, &stderr); err != nil {
-		t.Fatalf("repair force failed: %v", err)
+	if err := repairCmd.Run(ctx, GlobalOptions{JSON: true}, []string{dataDir}, &stdout, &stderr); err != nil {
+		t.Fatalf("repair durable-state check failed: %v", err)
 	}
-	if !strings.Contains(stdout.String(), `"sqlite_rebuilt": true`) {
+	if !strings.Contains(stdout.String(), `"durable_state_checked": true`) || strings.Contains(stdout.String(), `"materializer_rebuilt": true`) {
 		t.Errorf("unexpected repair JSON: %s", stdout.String())
+	}
+	if err := repairCmd.Run(ctx, GlobalOptions{}, []string{dataDir, "--rebuild-materializer"}, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "Go table definitions") {
+		t.Errorf("repair must not claim a CLI materializer rebuild, got %v", err)
 	}
 
 	// 4. Schema
@@ -515,12 +397,16 @@ func TestBenchAndClusterCommands(t *testing.T) {
 	// 1. Bench
 	benchCmd := &BenchCommand{}
 	stdout.Reset()
-	err := benchCmd.Run(ctx, GlobalOptions{JSON: true}, []string{"--operations=50"}, &stdout, &stderr)
+	err := benchCmd.Run(ctx, GlobalOptions{JSON: true}, []string{"--duration=1ms"}, &stdout, &stderr)
 	if err != nil {
 		t.Fatalf("bench failed: %v", err)
 	}
-	if !strings.Contains(stdout.String(), `"sql_inserts_per_sec":`) {
-		t.Errorf("bench JSON missing fields: %s", stdout.String())
+	var benchMetrics map[string]float64
+	if err := json.Unmarshal(stdout.Bytes(), &benchMetrics); err != nil {
+		t.Fatalf("decode bench JSON: %v; output: %s", err, stdout.String())
+	}
+	if benchMetrics["rime_record_writes_per_sec"] <= 0 || benchMetrics["rime_record_reads_per_sec"] <= 0 {
+		t.Errorf("bench did not measure typed RIME operations: %#v", benchMetrics)
 	}
 
 	// 2. Remote Cluster, Lag, GC with table output
@@ -545,11 +431,8 @@ func TestBenchAndClusterCommands(t *testing.T) {
 			{"node_id": "node-02", "addr": "127.0.0.1:8081", "status": "alive"},
 		})
 	})
-	mux.HandleFunc("/v1/exec", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"rows_affected": 1,
-		})
+	mux.HandleFunc("/v1/admin/gc", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
 	})
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
@@ -582,33 +465,6 @@ func TestBenchAndClusterCommands(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "triggered successfully") {
 		t.Errorf("gc trigger output unexpected: %s", stdout.String())
-	}
-}
-
-func TestShell_ScriptFileExecution(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "murmur_shell_script_*")
-	if err != nil {
-		t.Fatalf("temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	dataDir := filepath.Join(tempDir, "db")
-	_ = (&InitCommand{}).Run(context.Background(), GlobalOptions{}, []string{dataDir}, io.Discard, io.Discard)
-
-	scriptFile := filepath.Join(tempDir, "commands.sql")
-	scriptContent := "CREATE TABLE test_script (id BLOB PRIMARY KEY, val TEXT);\nINSERT INTO test_script VALUES (x'0102030405060708090a0b0c0d0e0f10', 'from_script');\n"
-	_ = os.WriteFile(scriptFile, []byte(scriptContent), 0o600)
-
-	input := fmt.Sprintf(".read %s\nSELECT val FROM test_script;\n.quit\n", scriptFile)
-	shellCmd := &ShellCommand{In: strings.NewReader(input)}
-
-	var stdout, stderr bytes.Buffer
-	err = shellCmd.Run(context.Background(), GlobalOptions{}, []string{dataDir}, &stdout, &stderr)
-	if err != nil {
-		t.Fatalf("shell .read failed: %v", err)
-	}
-	if !strings.Contains(stdout.String(), "from_script") {
-		t.Errorf("shell missing .read output: %s", stdout.String())
 	}
 }
 
@@ -679,7 +535,7 @@ func TestDoctor_ComprehensiveBranches(t *testing.T) {
 	}
 }
 
-func TestInit_SeedAndErrors(t *testing.T) {
+func TestInit_RejectsLegacySeed(t *testing.T) {
 	tempDir, _ := os.MkdirTemp("", "init_seed_*")
 	defer os.RemoveAll(tempDir)
 
@@ -687,22 +543,18 @@ func TestInit_SeedAndErrors(t *testing.T) {
 	initCmd := &InitCommand{}
 	var stdout, stderr bytes.Buffer
 
-	// Seed with valid SQL
+	// Legacy schema-file seeding is removed; applications define schemas in Go.
 	seedFile := filepath.Join(tempDir, "seed.sql")
 	_ = os.WriteFile(seedFile, []byte("CREATE TABLE seed_tbl (id BLOB PRIMARY KEY, v TEXT);"), 0o600)
 
 	dbDir := filepath.Join(tempDir, "seeded_db")
 	stdout.Reset()
 	err := initCmd.Run(ctx, GlobalOptions{JSON: true}, []string{dbDir, "--seed=" + seedFile}, &stdout, &stderr)
-	if err != nil || !strings.Contains(stdout.String(), `"seed_loaded": true`) {
-		t.Errorf("init with valid seed failed: %v, out: %s", err, stdout.String())
+	if err == nil || !strings.Contains(err.Error(), "SQL seed files are no longer supported") {
+		t.Errorf("expected seed rejection, got err=%v out=%s", err, stdout.String())
 	}
-
-	// Seed with invalid path
-	stdout.Reset()
-	err = initCmd.Run(ctx, GlobalOptions{}, []string{filepath.Join(tempDir, "bad_db"), "--seed=/nonexistent/seed.sql"}, &stdout, &stderr)
-	if err == nil {
-		t.Errorf("expected error for nonexistent seed file, got nil")
+	if _, statErr := os.Stat(dbDir); !os.IsNotExist(statErr) {
+		t.Errorf("rejected seed should not create a database directory (stat err=%v)", statErr)
 	}
 }
 
@@ -713,22 +565,15 @@ func TestSchema_RemoteAndFiltered(t *testing.T) {
 
 	// Remote schema mock
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/query", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/schema", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		var req map[string]string
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		q := req["query"]
-		if strings.Contains(q, "PRAGMA table_info") {
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"columns": []string{"cid", "name", "type", "notnull", "dflt_value", "pk"},
-				"rows":    [][]string{{"0", "id", "BLOB", "1", "", "1"}, {"1", "name", "TEXT", "0", "", "0"}},
-			})
-		} else {
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"columns": []string{"name", "sql"},
-				"rows":    [][]string{{"remote_users", "CREATE TABLE remote_users (id BLOB PRIMARY KEY, name TEXT)"}},
-			})
-		}
+		_ = json.NewEncoder(w).Encode([]schema.TableSchema{{
+			ID: 17, Name: "remote_users", PK: 1,
+			Columns: []schema.ColumnSchema{
+				{ID: 1, Name: "id", Type: schema.ColBlob},
+				{ID: 2, Name: "name", Type: schema.ColText, Nullable: true},
+			},
+		}})
 	})
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
@@ -744,11 +589,11 @@ func TestSchema_RemoteAndFiltered(t *testing.T) {
 	tempDir, _ := os.MkdirTemp("", "schema_filter_*")
 	defer os.RemoveAll(tempDir)
 	_ = (&InitCommand{}).Run(ctx, GlobalOptions{}, []string{tempDir}, io.Discard, io.Discard)
-	_ = (&QueryCommand{}).Run(ctx, GlobalOptions{}, []string{tempDir, "CREATE TABLE custom_tbl (id BLOB PRIMARY KEY, title TEXT);"}, io.Discard, io.Discard)
+	bindTypedInitSchema(t, tempDir)
 
 	stdout.Reset()
-	err = schemaCmd.Run(ctx, GlobalOptions{}, []string{tempDir, "--table=custom_tbl"}, &stdout, &stderr)
-	if err != nil || !strings.Contains(stdout.String(), "custom_tbl") {
+	err = schemaCmd.Run(ctx, GlobalOptions{}, []string{tempDir, "--table=items"}, &stdout, &stderr)
+	if err != nil || !strings.Contains(stdout.String(), "items") {
 		t.Errorf("local schema filtered output failed: %v, out: %s", err, stdout.String())
 	}
 }
@@ -900,16 +745,15 @@ func TestGCCommand_Comprehensive(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/exec", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"rows_affected": 0})
+	mux.HandleFunc("/v1/admin/gc", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/v1/admin/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"gc_watermark": 1000,
+			"gc_watermark":    1000,
 			"retention_epoch": 5,
-			"other_stat": "abc",
+			"other_stat":      "abc",
 		})
 	})
 	ts := httptest.NewServer(mux)
@@ -953,8 +797,8 @@ func TestGCCommand_Comprehensive(t *testing.T) {
 
 	// 5. Server error on trigger
 	muxErr := http.NewServeMux()
-	muxErr.HandleFunc("/v1/exec", func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "exec failed", http.StatusBadRequest)
+	muxErr.HandleFunc("/v1/admin/gc", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "gc failed", http.StatusBadRequest)
 	})
 	tsErr := httptest.NewServer(muxErr)
 	defer tsErr.Close()
@@ -993,107 +837,14 @@ func TestRepairCommand_Comprehensive(t *testing.T) {
 		t.Errorf("RESTORE_INTENT should not be deleted during dry-run")
 	}
 
-	// 2. Real repair with --clear-intent and --rebuild-sqlite in table mode
+	// 2. Clear intent after validating direct Spool access.
 	stdout.Reset()
-	err = repairCmd.Run(ctx, GlobalOptions{}, []string{dbDir, "--clear-intent", "--rebuild-sqlite"}, &stdout, &stderr)
+	err = repairCmd.Run(ctx, GlobalOptions{}, []string{dbDir, "--clear-intent"}, &stdout, &stderr)
 	if err != nil || !strings.Contains(stdout.String(), "REPAIRED") {
 		t.Errorf("repair failed: %v, out: %s", err, stdout.String())
 	}
 	if _, err := os.Stat(filepath.Join(dbDir, "RESTORE_INTENT")); !os.IsNotExist(err) {
 		t.Errorf("RESTORE_INTENT should have been removed")
-	}
-}
-
-func TestShellCommand_InteractiveAndRemote(t *testing.T) {
-	ctx := context.Background()
-	var stdout, stderr bytes.Buffer
-
-	// Missing args
-	shellCmd := &ShellCommand{}
-	if err := shellCmd.Run(ctx, GlobalOptions{}, nil, &stdout, &stderr); err == nil {
-		t.Errorf("expected error on shell missing args")
-	}
-
-	// 1. Remote Shell
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"node_id": "remote-node-1"})
-	})
-	mux.HandleFunc("/v1/query", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		var req map[string]string
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		q := req["query"]
-		if strings.Contains(q, "sqlite_master") && strings.Contains(q, "table") {
-			_ = json.NewEncoder(w).Encode(client.QueryResult{Columns: []string{"name"}, Rows: [][]string{{"items"}}})
-		} else if strings.Contains(q, "sqlite_master") {
-			_ = json.NewEncoder(w).Encode(client.QueryResult{Columns: []string{"sql"}, Rows: [][]string{{"CREATE TABLE items (id INT);"}}})
-		} else {
-			_ = json.NewEncoder(w).Encode(client.QueryResult{Columns: []string{"col1"}, Rows: [][]string{{"val1"}}})
-		}
-	})
-	mux.HandleFunc("/v1/exec", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(client.ExecResult{RowsAffected: 2})
-	})
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-
-	remoteScript := strings.Join([]string{
-		".help",
-		".mode markdown",
-		".headers off",
-		".timer on",
-		"SELECT 1;",
-		"INSERT INTO t VALUES (1);",
-		".tables",
-		".tables item",
-		".schema",
-		".schema items",
-		".status",
-		".mode csv",
-		"SELECT 1;",
-		".mode json",
-		"SELECT 1;",
-		".mode table",
-		".headers on",
-		".headers",
-		".timer",
-		".mode",
-		".mode invalid_mode",
-		".unknown_cmd",
-		".read",
-		".read /nonexistent/file.sql",
-		".dump items",
-		".exit",
-	}, "\n") + "\n"
-
-	remoteShell := &ShellCommand{In: strings.NewReader(remoteScript)}
-	stdout.Reset()
-	stderr.Reset()
-	err := remoteShell.Run(ctx, GlobalOptions{}, []string{ts.URL}, &stdout, &stderr)
-	if err != nil {
-		t.Fatalf("remote shell run failed: %v", err)
-	}
-
-	// 2. Local shorthand execution via Execute
-	tempDir, _ := os.MkdirTemp("", "shell_exec_*")
-	defer os.RemoveAll(tempDir)
-	_ = (&InitCommand{}).Run(ctx, GlobalOptions{}, []string{tempDir}, io.Discard, io.Discard)
-
-	// Test Execute with dataDir arg invoking shell (with immediate .quit)
-	origStdin := os.Stdin
-	rPipe, wPipe, _ := os.Pipe()
-	os.Stdin = rPipe
-	_, _ = wPipe.WriteString(".quit\n")
-	_ = wPipe.Close()
-
-	stdout.Reset()
-	code := Execute([]string{tempDir}, &stdout, io.Discard)
-	os.Stdin = origStdin
-	if code != 0 {
-		t.Errorf("Execute shorthand failed with code %d", code)
 	}
 }
 
@@ -1136,39 +887,3 @@ func TestBackup_InfoAndErrors(t *testing.T) {
 		t.Errorf("backup info table mode failed: %v, out: %s", err, stdout.String())
 	}
 }
-
-func TestQuery_TimingAndFormats(t *testing.T) {
-	ctx := context.Background()
-	var stdout, stderr bytes.Buffer
-	queryCmd := &QueryCommand{}
-
-	tempDir, _ := os.MkdirTemp("", "query_formats_*")
-	defer os.RemoveAll(tempDir)
-	dbDir := filepath.Join(tempDir, "db")
-	_ = (&InitCommand{}).Run(ctx, GlobalOptions{}, []string{dbDir}, io.Discard, io.Discard)
-
-	// Create table
-	_ = queryCmd.Run(ctx, GlobalOptions{}, []string{dbDir, "CREATE TABLE items (id BLOB PRIMARY KEY, title TEXT);"}, io.Discard, io.Discard)
-
-	// Insert with timing
-	stdout.Reset()
-	err := queryCmd.Run(ctx, GlobalOptions{}, []string{dbDir, "INSERT INTO items (id, title) VALUES (x'0102030405060708090a0b0c0d0e0f12', 'Gadget');", "--timing"}, &stdout, &stderr)
-	if err != nil || !strings.Contains(stdout.String(), "Query OK") {
-		t.Errorf("query insert with timing failed: %v, out: %s", err, stdout.String())
-	}
-
-	// Select with CSV format
-	stdout.Reset()
-	err = queryCmd.Run(ctx, GlobalOptions{}, []string{dbDir, "SELECT title FROM items;", "--format=csv"}, &stdout, &stderr)
-	if err != nil || !strings.Contains(stdout.String(), "Gadget") {
-		t.Errorf("query select csv failed: %v, out: %s", err, stdout.String())
-	}
-
-	// Update mutation
-	stdout.Reset()
-	err = queryCmd.Run(ctx, GlobalOptions{}, []string{dbDir, "UPDATE items SET title = 'SuperGadget' WHERE title = 'Gadget';", "--timing"}, &stdout, &stderr)
-	if err != nil || !strings.Contains(stdout.String(), "Query OK") {
-		t.Errorf("query update failed: %v, out: %s", err, stdout.String())
-	}
-}
-

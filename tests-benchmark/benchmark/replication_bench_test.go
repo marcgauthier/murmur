@@ -51,10 +51,8 @@ func (m *benchMesh) config(b *testing.B, path string, node murmur.NodeID, listen
 		Path:   path,
 		NodeID: node,
 		DBID:   m.dbid,
-		Schema: murmur.SchemaConfig{
-			Version: 1, Tables: benchSchema(), LocalDDL: benchLocalDDL(),
-		},
-		Pebble: murmur.DefaultPebbleConfig(),
+		Tables: mustBenchTables(),
+		Spool:  murmur.DefaultSpoolConfig(),
 		Encryption: murmur.EncryptionConfig{
 			Key: bytes.Clone(benchKey), KeyID: "bench",
 		},
@@ -107,15 +105,26 @@ func BenchmarkReplicationThroughput(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer dbB.Close()
+	contactsA, err := murmur.TableOf[benchContact](dbA, "contacts")
+	if err != nil {
+		b.Fatal(err)
+	}
 	waitConnected(b, dbB, 10)
 	before := dbB.Status().Replication
 	b.ResetTimer()
 	start := time.Now()
 	for i := 0; i < n; i++ {
-		id := murmur.NewRowID()
-		if _, err := dbA.ExecContext(ctx,
-			`INSERT INTO contacts (id, name, phone, score) VALUES (?, ?, ?, ?)`,
-			id[:], fmt.Sprintf("t %d", i), fmt.Sprintf("555-%04d", i), i%1000); err != nil {
+		tx, err := dbA.BeginTx(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := contactsA.Insert(tx, &benchContact{
+			ID: murmur.NewRowID(), Name: fmt.Sprintf("t %d", i),
+			Phone: fmt.Sprintf("555-%04d", i), Score: int64(i % 1000),
+		}); err != nil {
+			b.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
 			b.Fatal(err)
 		}
 	}

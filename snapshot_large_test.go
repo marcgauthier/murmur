@@ -11,25 +11,38 @@ import (
 
 // TestSnapshotLargeChunkedMergeEndToEnd imports a real multi-chunk
 // snapshot above the default atomic threshold and proves crash-safe
-// publication with a gated SQL rebuild: rows stay invisible until the
+// publication with a gated typed rebuild: rows stay invisible until the
 // final chunk publishes, then the materializer rebuilds once from the
 // committed state with watermarks and generation advanced together.
 func TestSnapshotLargeChunkedMergeEndToEnd(t *testing.T) {
 	ctx := context.Background()
-	dbA, err := openSignedFixture(ctx, testConfig(t.TempDir()))
+	cfgA := testConfig(t.TempDir())
+	cfgA.Schema.Tables = nil
+	cfgA.Tables = []TableDefinition{recordDefinition(t)}
+	dbA, err := openSignedFixture(ctx, cfgA)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
+	tableA, err := TableOf[facadeRecord](dbA, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Fat values keep the row count (and setup time) small while the
-	// encoded snapshot clears the 8 MiB atomic threshold.
+	// encoded snapshot clears the 8 MiB atomic threshold. One row per
+	// transaction preserves the original per-row sequence numbering.
 	fat := strings.Repeat("v", 64<<10)
 	const rows = 200
 	for i := 0; i < rows; i++ {
-		id := NewRowID()
-		if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
-			id[:], fmt.Sprintf("n%04d", i), fat); err != nil {
+		tx, err := dbA.BeginTx(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tableA.Insert(tx, &facadeRecord{ID: NewRowID(), Name: fmt.Sprintf("n%04d", i) + fat}); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -53,14 +66,28 @@ func TestSnapshotLargeChunkedMergeEndToEnd(t *testing.T) {
 
 	cfgB := testConfig(t.TempDir())
 	cfgB.DBID = dbA.DBID()
+	cfgB.Schema.Tables = nil
+	cfgB.Tables = []TableDefinition{recordDefinition(t)}
 	dbB, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbB.Close()
+	tableB, err := TableOf[facadeRecord](dbB, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	typedCount := func() int {
+		t.Helper()
+		got, err := tableB.Where().Count()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
 
-	// Before the final chunk, nothing is published and SQL stays gated
-	// on the pre-snapshot (empty) materialization.
+	// Before the final chunk, nothing is published and typed reads stay
+	// gated on the pre-snapshot (empty) materialization.
 	for i := uint64(0); i+1 < manifest.ChunkCount; i++ {
 		complete, err := dbB.ApplySnapshotChunk(ctx, manifest, i, chunks[i], false)
 		if err != nil {
@@ -69,15 +96,16 @@ func TestSnapshotLargeChunkedMergeEndToEnd(t *testing.T) {
 		if complete {
 			t.Fatalf("chunk %d reported complete early", i)
 		}
-		if got := queryAll(t, dbB, `SELECT id FROM contacts`); len(got) != 0 {
-			t.Fatalf("chunk %d exposed %d rows before publication", i, len(got))
+		if got := typedCount(); got != 0 {
+			t.Fatalf("chunk %d exposed %d rows before publication", i, got)
 		}
 		if wm, _ := dbB.store.ReceiveWatermark(dbA.cfg.NodeID); wm != 0 {
 			t.Fatalf("chunk %d advanced watermark: %d", i, wm)
 		}
 	}
 
-	// The final chunk merges, publishes, and rebuilds SQL once.
+	// The final chunk merges, publishes, and rebuilds the typed
+	// materializer once.
 	last := manifest.ChunkCount - 1
 	complete, err := dbB.ApplySnapshotChunk(ctx, manifest, last, chunks[last], true)
 	if err != nil {
@@ -86,8 +114,8 @@ func TestSnapshotLargeChunkedMergeEndToEnd(t *testing.T) {
 	if !complete {
 		t.Fatal("final chunk did not complete")
 	}
-	if got := queryAll(t, dbB, `SELECT id FROM contacts`); len(got) != rows {
-		t.Fatalf("published rows = %d, want %d", len(got), rows)
+	if got := typedCount(); got != rows {
+		t.Fatalf("published rows = %d, want %d", got, rows)
 	}
 	if wm, _ := dbB.store.ReceiveWatermark(dbA.cfg.NodeID); wm != rows {
 		t.Fatalf("watermark = %d, want %d", wm, rows)

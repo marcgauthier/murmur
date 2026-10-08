@@ -17,7 +17,7 @@ import (
 )
 
 func TestDaemonAPIRequiresMTLSExceptHealth(t *testing.T) {
-	cluster := harness.NewCluster(t, harness.ClusterOptions{Name: "api-mtls", NumNodes: 1})
+	cluster := harness.NewCluster(t, harness.ClusterOptions{Name: "api-mtls", NumNodes: 1, TypedRecords: true})
 	node := cluster.Nodes[0]
 	cluster.WaitNodeReady(0)
 	baseURL := "https://" + node.APIAddr

@@ -2,8 +2,8 @@ package murmur
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"sort"
 	"testing"
 	"time"
 
@@ -57,53 +57,11 @@ func waitForAddr(t testing.TB, db *DB, timeout time.Duration) string {
 	return ""
 }
 
-func waitForRows(t testing.TB, db *DB, want int, timeout time.Duration) [][]any {
+func replTypedConfig(t *testing.T, cfg Config) Config {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		rows, err := db.QueryContext(context.Background(), `SELECT name, phone FROM contacts ORDER BY name`)
-		if err != nil {
-			if errors.Is(err, ErrMaterializerDirty) {
-				time.Sleep(20 * time.Millisecond)
-				continue
-			}
-			t.Fatal(err)
-		}
-		var got [][]any
-		cols := rows.Columns()
-		for rows.Next() {
-			dest := make([]any, len(cols))
-			ptrs := make([]any, len(cols))
-			for i := range dest {
-				ptrs[i] = &dest[i]
-			}
-			if err := rows.Scan(ptrs...); err != nil {
-				rows.Close()
-				t.Fatal(err)
-			}
-			got = append(got, dest)
-		}
-		rows.Close()
-		if len(got) == want {
-			return got
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %d rows", want)
-	return nil
-}
-
-func waitForValue(t *testing.T, db *DB, id RowID, want string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		got := queryAll(t, db, `SELECT phone FROM contacts WHERE id = ?`, id[:])
-		if len(got) == 1 && fmt.Sprintf("%v", got[0][0]) == want {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for phone=%q", want)
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	return cfg
 }
 
 func TestTwoNodeReplication(t *testing.T) {
@@ -112,43 +70,49 @@ func TestTwoNodeReplication(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
-	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replTypedConfig(t, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
+	tableA, err := TableOf[facadeRecord](dbA, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	addrA := waitForAddr(t, dbA, 5*time.Second)
 
 	cfgB := replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
-	dbB, err := openSignedFixture(ctx, cfgB)
+	dbB, err := openSignedFixture(ctx, replTypedConfig(t, cfgB))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbB.Close()
+	tableB, err := TableOf[facadeRecord](dbB, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	id := NewRowID()
-	if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
-		id[:], "ann", "111"); err != nil {
+	if err := insertRecord(ctx, dbA, tableA, &facadeRecord{ID: id, Name: "111"}); err != nil {
 		t.Fatal(err)
 	}
 	// B converges without any manual sync.
-	waitForValue(t, dbB, id, "111", 15*time.Second)
+	waitForRecordName(t, tableB, id, "111", 15*time.Second)
 
 	// Reverse direction.
 	id2 := NewRowID()
-	if _, err := dbB.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
-		id2[:], "bob", "222"); err != nil {
+	if err := insertRecord(ctx, dbB, tableB, &facadeRecord{ID: id2, Name: "222"}); err != nil {
 		t.Fatal(err)
 	}
-	waitForValue(t, dbA, id2, "222", 15*time.Second)
+	waitForRecordName(t, tableA, id2, "222", 15*time.Second)
 
 	// Both hold both rows.
-	if n := len(queryAll(t, dbA, `SELECT id FROM contacts`)); n != 2 {
-		t.Fatalf("A has %d rows", n)
+	if n, err := tableA.Where().Count(); err != nil || n != 2 {
+		t.Fatalf("A has %d rows, %v", n, err)
 	}
-	if n := len(queryAll(t, dbB, `SELECT id FROM contacts`)); n != 2 {
-		t.Fatalf("B has %d rows", n)
+	if n, err := tableB.Where().Count(); err != nil || n != 2 {
+		t.Fatalf("B has %d rows, %v", n, err)
 	}
 	st := dbA.Status()
 	if st.ConnectedPeers < 1 {
@@ -164,25 +128,31 @@ func TestOfflineConflictConverges(t *testing.T) {
 
 	// Same row created on both while disconnected (offline writes).
 	id := NewRowID()
-	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replTypedConfig(t, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
+	tableA, err := TableOf[facadeRecord](dbA, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	addrA := waitForAddr(t, dbA, 5*time.Second)
 
-	dbB, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeB, dbid, creds[nodeB], nil))
+	dbB, err := openSignedFixture(ctx, replTypedConfig(t, replConfig(t.TempDir(), nodeB, dbid, creds[nodeB], nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbB.Close()
-
-	if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
-		id[:], "ann", "from-A"); err != nil {
+	tableB, err := TableOf[facadeRecord](dbB, "records")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dbB.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
-		id[:], "ann", "from-B"); err != nil {
+
+	if err := insertRecord(ctx, dbA, tableA, &facadeRecord{ID: id, Name: "from-A"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := insertRecord(ctx, dbB, tableB, &facadeRecord{ID: id, Name: "from-B"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -194,20 +164,20 @@ func TestOfflineConflictConverges(t *testing.T) {
 	}
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		a := queryAll(t, dbA, `SELECT phone FROM contacts WHERE id = ?`, id[:])
-		b := queryAll(t, dbB, `SELECT phone FROM contacts WHERE id = ?`, id[:])
-		if len(a) == 1 && len(b) == 1 && fmt.Sprintf("%v", a[0][0]) == fmt.Sprintf("%v", b[0][0]) {
-			t.Logf("both converged to phone=%v", a[0][0])
+		a, aErr := tableA.Get(id)
+		b, bErr := tableB.Get(id)
+		if aErr == nil && bErr == nil && a.Name == b.Name {
+			t.Logf("both converged to name=%v", a.Name)
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("no convergence: A=%v B=%v", a, b)
+			t.Fatalf("no convergence: A=%v,%v B=%v,%v", a, aErr, b, bErr)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	// Row count is 1 on both (same UUID, not duplicated).
-	if n := len(queryAll(t, dbA, `SELECT id FROM contacts`)); n != 1 {
-		t.Fatalf("A has %d rows", n)
+	if n, err := tableA.Where().Count(); err != nil || n != 1 {
+		t.Fatalf("A has %d rows, %v", n, err)
 	}
 	if err := dbB.ForceSync(ctx, nodeA); err != nil {
 		t.Fatal(err)
@@ -225,19 +195,23 @@ func TestReplicationSchemaMismatchRejected(t *testing.T) {
 
 	// Strict policy on both nodes: sessions refuse without sync.
 	strict := false
-	cfgA := replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil)
+	cfgA := replTypedConfig(t, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
 	cfgA.Schema.AcceptRemoteSchema = &strict
 	dbA, err := openSignedFixture(ctx, cfgA)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
+	tableA, err := TableOf[facadeRecord](dbA, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	addrA := waitForAddr(t, dbA, 5*time.Second)
 
 	// B runs a different schema epoch: the session must be refused and both
 	// nodes must stay healthy.
-	cfgB := replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
-		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
+	cfgB := replTypedConfig(t, replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
+		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}}))
 	cfgB.Schema.Version = 2
 	cfgB.Schema.AcceptRemoteSchema = &strict
 	dbB, err := openSignedFixture(ctx, cfgB)
@@ -245,6 +219,10 @@ func TestReplicationSchemaMismatchRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbB.Close()
+	tableB, err := TableOf[facadeRecord](dbB, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	time.Sleep(time.Second) // allow several dial/handshake attempts
 	if got := dbB.Status().ConnectedPeers; got != 0 {
@@ -254,11 +232,10 @@ func TestReplicationSchemaMismatchRejected(t *testing.T) {
 		t.Fatalf("A connected despite schema mismatch: %d", got)
 	}
 	// Both still serve local writes.
-	idA, idB := NewRowID(), NewRowID()
-	if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id) VALUES (?)`, idA[:]); err != nil {
+	if err := insertRecord(ctx, dbA, tableA, &facadeRecord{ID: NewRowID()}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dbB.ExecContext(ctx, `INSERT INTO contacts (id) VALUES (?)`, idB[:]); err != nil {
+	if err := insertRecord(ctx, dbB, tableB, &facadeRecord{ID: NewRowID()}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -269,17 +246,19 @@ func TestSnapshotJoinAfterLogGC(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeC)
 
-	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replTypedConfig(t, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
+	tableA, err := TableOf[facadeRecord](dbA, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	addrA := waitForAddr(t, dbA, 5*time.Second)
 
 	for i := 0; i < 10; i++ {
-		id := NewRowID()
-		if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
-			id[:], fmt.Sprintf("n%02d", i), fmt.Sprintf("p%02d", i)); err != nil {
+		if err := insertRecord(ctx, dbA, tableA, &facadeRecord{ID: NewRowID(), Name: fmt.Sprintf("n%02d", i)}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -291,14 +270,18 @@ func TestSnapshotJoinAfterLogGC(t *testing.T) {
 
 	cfgC := replConfig(t.TempDir(), nodeC, dbid, creds[nodeC],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
-	dbC, err := openSignedFixture(ctx, cfgC)
+	dbC, err := openSignedFixture(ctx, replTypedConfig(t, cfgC))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbC.Close()
+	tableC, err := TableOf[facadeRecord](dbC, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	got := waitForRows(t, dbC, 10, 20*time.Second)
-	if fmt.Sprintf("%v", got[0][0]) != "n00" {
+	got := waitForRecordNames(t, tableC, 10, 20*time.Second)
+	if got[0] != "n00" {
 		t.Fatalf("first row = %v", got[0])
 	}
 	// C adopted A's watermarks from the snapshot manifest.
@@ -307,10 +290,31 @@ func TestSnapshotJoinAfterLogGC(t *testing.T) {
 	}
 	// And C can now replicate normally: write on C, read on A.
 	id := NewRowID()
-	if _, err := dbC.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "new"); err != nil {
+	if err := insertRecord(ctx, dbC, tableC, &facadeRecord{ID: id, Name: "new"}); err != nil {
 		t.Fatal(err)
 	}
-	waitForRows(t, dbA, 11, 15*time.Second)
+	waitForRecordName(t, tableA, id, "new", 15*time.Second)
+}
+
+// waitForRecordNames waits for want typed rows and returns their names
+// sorted ascending, mirroring waitForRows' ORDER BY name.
+func waitForRecordNames(t *testing.T, table *RecordTable[facadeRecord], want int, timeout time.Duration) []string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		rows, err := table.Where().Find()
+		if err == nil && len(rows) == want {
+			names := make([]string, 0, len(rows))
+			for _, row := range rows {
+				names = append(names, row.Name)
+			}
+			sort.Strings(names)
+			return names
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d rows", want)
+	return nil
 }
 
 func TestSnapshotTailRepairConcurrentWritesAndGC(t *testing.T) {
@@ -319,17 +323,24 @@ func TestSnapshotTailRepairConcurrentWritesAndGC(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeC)
 
-	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	definition := recordDefinition(t)
+	cfgA := replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil)
+	cfgA.Schema.Tables = nil
+	cfgA.Tables = []TableDefinition{definition}
+	dbA, err := openSignedFixture(ctx, cfgA)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
 	addrA := waitForAddr(t, dbA, 5*time.Second)
+	tableA, err := TableOf[facadeRecord](dbA, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for i := 0; i < 10; i++ {
-		id := NewRowID()
-		if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
-			id[:], fmt.Sprintf("n%02d", i), fmt.Sprintf("p%02d", i)); err != nil {
+		value := &facadeRecord{ID: NewRowID(), Name: fmt.Sprintf("n%02d", i)}
+		if err := dbA.WriteTxContext(ctx, func(tx *Tx) error { return tableA.Insert(tx, value) }); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -340,7 +351,15 @@ func TestSnapshotTailRepairConcurrentWritesAndGC(t *testing.T) {
 
 	// Concurrently write new rows on A and trigger GC aggressively while C connects and syncs.
 	stopWriter := make(chan struct{})
+	writerStopped := false
+	stopSourceWriter := func() {
+		if !writerStopped {
+			close(stopWriter)
+			writerStopped = true
+		}
+	}
 	writerDone := make(chan struct{})
+	writerErr := make(chan error, 1)
 	go func() {
 		defer close(writerDone)
 		count := 10
@@ -352,9 +371,11 @@ func TestSnapshotTailRepairConcurrentWritesAndGC(t *testing.T) {
 				return
 			case <-ticker.C:
 				if count < 20 {
-					id := NewRowID()
-					_, _ = dbA.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
-						id[:], fmt.Sprintf("n%02d", count), fmt.Sprintf("p%02d", count))
+					value := &facadeRecord{ID: NewRowID(), Name: fmt.Sprintf("n%02d", count)}
+					if err := dbA.WriteTxContext(ctx, func(tx *Tx) error { return tableA.Insert(tx, value) }); err != nil {
+						writerErr <- err
+						return
+					}
 					count++
 				}
 				// Aggressive GC attempting to wipe all logs up to infinity.
@@ -363,9 +384,15 @@ func TestSnapshotTailRepairConcurrentWritesAndGC(t *testing.T) {
 			}
 		}
 	}()
+	defer func() {
+		stopSourceWriter()
+		<-writerDone
+	}()
 
 	cfgC := replConfig(t.TempDir(), nodeC, dbid, creds[nodeC],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
+	cfgC.Schema.Tables = nil
+	cfgC.Tables = []TableDefinition{definition}
 	dbC, err := openSignedFixture(ctx, cfgC)
 	if err != nil {
 		t.Fatal(err)
@@ -373,16 +400,33 @@ func TestSnapshotTailRepairConcurrentWritesAndGC(t *testing.T) {
 	defer dbC.Close()
 
 	// Wait for C to catch up all 20 rows (snapshot + tail repair).
-	waitForRows(t, dbC, 20, 20*time.Second)
-
-	close(stopWriter)
+	tableC, err := TableOf[facadeRecord](dbC, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := waitForRecordNames(t, tableC, 20, 20*time.Second); len(got) != 20 {
+		t.Fatalf("receiver rows=%d, want 20", len(got))
+	}
+	stopSourceWriter()
 	<-writerDone
+	select {
+	case err := <-writerErr:
+		t.Fatalf("typed source write during snapshot failed: %v", err)
+	default:
+	}
 
 	// Verify both nodes have 20 rows and can exchange further mutations.
-	rowsA := waitForRows(t, dbA, 20, 10*time.Second)
-	rowsC := waitForRows(t, dbC, 20, 10*time.Second)
+	rowsA := waitForRecordNames(t, tableA, 20, 10*time.Second)
+	rowsC := waitForRecordNames(t, tableC, 20, 10*time.Second)
 	if len(rowsA) != 20 || len(rowsC) != 20 {
 		t.Fatalf("row count mismatch: A=%d C=%d", len(rowsA), len(rowsC))
+	}
+	value := &facadeRecord{ID: NewRowID(), Name: "post-catchup"}
+	if err := dbC.WriteTxContext(ctx, func(tx *Tx) error { return tableC.Insert(tx, value) }); err != nil {
+		t.Fatal(err)
+	}
+	if got := waitForRecordNames(t, tableA, 21, 10*time.Second); len(got) != 21 {
+		t.Fatalf("source rows after reverse write=%d, want 21", len(got))
 	}
 }
 
@@ -397,27 +441,33 @@ func TestBidirectionalBulkConverges(t *testing.T) {
 	dbid := NewDBID()
 	_, creds := testClusterCA(t, nodeA, nodeB)
 
-	dbA, err := openSignedFixture(ctx, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil))
+	dbA, err := openSignedFixture(ctx, replTypedConfig(t, replConfig(t.TempDir(), nodeA, dbid, creds[nodeA], nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
+	tableA, err := TableOf[facadeRecord](dbA, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	addrA := waitForAddr(t, dbA, 5*time.Second)
 	cfgB := replConfig(t.TempDir(), nodeB, dbid, creds[nodeB],
 		[]Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
-	dbB, err := openSignedFixture(ctx, cfgB)
+	dbB, err := openSignedFixture(ctx, replTypedConfig(t, cfgB))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbB.Close()
+	tableB, err := TableOf[facadeRecord](dbB, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	const n = 250
 	errCh := make(chan error, 2)
 	go func() {
 		for i := 0; i < n; i++ {
-			id := NewRowID()
-			if _, err := dbB.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`,
-				id[:], "b"); err != nil {
+			if err := insertRecord(ctx, dbB, tableB, &facadeRecord{ID: NewRowID(), Name: "b"}); err != nil {
 				errCh <- err
 				return
 			}
@@ -425,9 +475,7 @@ func TestBidirectionalBulkConverges(t *testing.T) {
 		errCh <- nil
 	}()
 	for i := 0; i < n; i++ {
-		id := NewRowID()
-		if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name) VALUES (?, ?)`,
-			id[:], "a"); err != nil {
+		if err := insertRecord(ctx, dbA, tableA, &facadeRecord{ID: NewRowID(), Name: "a"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -435,6 +483,6 @@ func TestBidirectionalBulkConverges(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitForRows(t, dbA, 2*n, 60*time.Second)
-	waitForRows(t, dbB, 2*n, 60*time.Second)
+	waitForRecordCount(t, tableA, 2*n, 60*time.Second)
+	waitForRecordCount(t, tableB, 2*n, 60*time.Second)
 }

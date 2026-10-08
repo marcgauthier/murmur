@@ -5,7 +5,7 @@
 //
 // Run it:
 //
-//	go run -tags "sqlite_preupdate_hook sqlite_fts5" ./examples/plumtree
+//	go run ./examples/plumtree
 package main
 
 import (
@@ -19,9 +19,14 @@ import (
 	"time"
 
 	"github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/transport"
 )
+
+type note struct {
+	ID   ids.RowID `rime:"primary"`
+	Body string
+}
 
 func freePort() int {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -32,13 +37,13 @@ func freePort() int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-func waitCounts(ctx context.Context, dbs []*murmur.DB, want int, timeout time.Duration) {
+func waitCounts(tables []*murmur.RecordTable[note], want int, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
-		for _, db := range dbs {
-			var n int
-			if err := db.QueryRowContext(ctx, `SELECT count(*) FROM notes`).Scan(&n); err != nil || n != want {
+		for _, table := range tables {
+			n, err := table.Where().Count()
+			if err != nil || n != want {
 				ok = false
 				break
 			}
@@ -66,9 +71,16 @@ func main() {
 	dbid := murmur.NewDBID()
 
 	const nodes = 3
+	definition, err := murmur.Define[note]("notes", 11, murmur.RecordOptions{
+		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	ids := make([]murmur.NodeID, nodes)
 	addrs := make([]string, nodes)
 	dbs := make([]*murmur.DB, nodes)
+	tables := make([]*murmur.RecordTable[note], nodes)
 	for i := range ids {
 		ids[i] = murmur.NewNodeID()
 		addrs[i] = fmt.Sprintf("127.0.0.1:%d", freePort())
@@ -92,17 +104,9 @@ func main() {
 			Path:   dir,
 			NodeID: ids[i],
 			DBID:   dbid,
-			Schema: murmur.SchemaConfig{
-				Version: 1,
-				Tables: []schema.TableSchema{{
-					Name: "notes",
-					Columns: []schema.ColumnSchema{
-						{Name: "id", Type: schema.ColBlob},
-						{Name: "body", Type: schema.ColText, Nullable: true},
-					},
-				}},
-			},
-			Pebble: murmur.DefaultPebbleConfig(),
+			Schema: murmur.SchemaConfig{Version: 1},
+			Tables: []murmur.TableDefinition{definition},
+			Spool:  murmur.DefaultSpoolConfig(),
 			Encryption: murmur.EncryptionConfig{
 				Key:   []byte("0123456789abcdef0123456789abcdef"),
 				KeyID: "plumtree-key",
@@ -120,24 +124,30 @@ func main() {
 			log.Fatal(err)
 		}
 		defer dbs[i].Close()
+		tables[i], err = murmur.TableOf[note](dbs[i], "notes")
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	var wg sync.WaitGroup
 	for i, db := range dbs {
+		table := tables[i]
 		wg.Add(1)
-		go func(i int, db *murmur.DB) {
+		go func(i int, db *murmur.DB, table *murmur.RecordTable[note]) {
 			defer wg.Done()
-			for r := 0; r < 5; r++ {
-				id := murmur.NewRowID()
-				if _, err := db.ExecContext(ctx,
-					`INSERT INTO notes (id, body) VALUES (?, ?)`,
-					id[:], fmt.Sprintf("node%d-note%d", i+1, r)); err != nil {
-					log.Fatal(err)
+			if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+				batch := make([]*note, 5)
+				for r := range batch {
+					batch[r] = &note{ID: murmur.NewRowID(), Body: fmt.Sprintf("node%d-note%d", i+1, r)}
 				}
+				return table.InsertMany(tx, batch)
+			}); err != nil {
+				log.Fatal(err)
 			}
-		}(i, db)
+		}(i, db, table)
 	}
 	wg.Wait()
-	waitCounts(ctx, dbs, 15, 90*time.Second)
+	waitCounts(tables, 15, 90*time.Second)
 	fmt.Println("15 rows converged on all 3 Plumtree nodes")
 }

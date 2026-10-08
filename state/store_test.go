@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2"
-
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/ids"
 )
@@ -785,8 +783,8 @@ func TestFormatVersionTamperFailsOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Tamper the format version directly in Pebble.
-	if err := s.db.Set(SysKey(sysFormat), encodeU64(999), pebble.Sync); err != nil {
+	// Tamper the format version directly in storage.
+	if err := s.dbSet(SysKey(sysFormat), encodeU64(999), true); err != nil {
 		t.Fatal(err)
 	}
 	_ = s.Close()
@@ -795,8 +793,8 @@ func TestFormatVersionTamperFailsOpen(t *testing.T) {
 	}
 }
 
-// TestMaintenanceCloseReopen cycles Pebble underneath the same Store handle:
-// operations block across the window and data is intact afterwards.
+// TestMaintenanceCloseReopen holds a maintenance window on the same Store
+// handle: operations block across the window and data is intact afterwards.
 func TestMaintenanceCloseReopen(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t, ids.NewNodeID())
@@ -892,10 +890,6 @@ func TestAsyncDurabilityMode(t *testing.T) {
 	if !s.AsyncDurability() {
 		t.Fatal("expected AsyncDurability to be true")
 	}
-	if s.DurabilityWriteOptions() != pebble.NoSync {
-		t.Fatalf("expected writeOpts to be pebble.NoSync, got %v", s.DurabilityWriteOptions())
-	}
-
 	row := ids.NewRowID()
 	res, err := s.CommitLocal(ctx, localBatch(s, s.ClockNow(),
 		codec.Mutation{TableID: 10, RowID: row, ColumnID: 1, Value: codec.Text("async_val")}))
@@ -912,12 +906,14 @@ func TestAsyncDurabilityMode(t *testing.T) {
 	}
 
 	// Test explicit sync.
-	walBytesBefore := s.db.Metrics().WAL.BytesWritten
+	if n := s.UnsyncedBytes(); n == 0 {
+		t.Fatal("UnsyncedBytes = 0 before Sync, want > 0")
+	}
 	if err := s.Sync(); err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}
-	if walBytesAfter := s.db.Metrics().WAL.BytesWritten; walBytesAfter <= walBytesBefore {
-		t.Fatalf("Sync wrote no WAL barrier: before=%d after=%d", walBytesBefore, walBytesAfter)
+	if n := s.UnsyncedBytes(); n != 0 {
+		t.Fatalf("UnsyncedBytes = %d after Sync, want 0", n)
 	}
 
 	if err := s.Close(); err != nil {

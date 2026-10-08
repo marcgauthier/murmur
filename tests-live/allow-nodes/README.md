@@ -1,13 +1,10 @@
 # Node identity allow-list multi-process scenario
 
-Run from the repository root with:
-
-```sh
-go test -count=1 ./tests-live/allow-nodes
-```
+Run with `bash tests-live/run.sh allow-nodes`. The fixture uses typed records
+and runs with CGO disabled.
 
 Three standalone Murmur-SQL processes use separate node directories, encrypted
-Pebble stores, and certificates issued by one cluster CA. Node1 and node3 accept
+Spool stores, and certificates issued by one cluster CA. Node1 and node3 accept
 all identities; node2 allows only node1. All nodes produce application writes
 concurrently for three minutes by default. The test requires the unauthorized
 node3-to-node2 session to remain absent while traffic is active, then checks

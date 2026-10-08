@@ -36,8 +36,9 @@ func TestTwoLowTwoHighFileBridgeLive(t *testing.T) {
 	}
 
 	low := harness.NewCluster(t, harness.ClusterOptions{
-		Name:     "files-bridge-low",
-		NumNodes: 2,
+		Name:         "files-bridge-low",
+		NumNodes:     2,
+		TypedRecords: true,
 		// Negative fetch interval disables the background worker so each
 		// fetch below is an explicit, deterministic step.
 		Files: &harness.FilesOptions{ObjectKeyHex: lowObjectKey, MaxFileBytes: 4 << 20, FetchIntervalMs: -1},
@@ -48,9 +49,10 @@ func TestTwoLowTwoHighFileBridgeLive(t *testing.T) {
 		},
 	})
 	high := harness.NewCluster(t, harness.ClusterOptions{
-		Name:     "files-bridge-high",
-		NumNodes: 2,
-		Files:    &harness.FilesOptions{ObjectKeyHex: highObjectKey, MaxFileBytes: 4 << 20, FetchIntervalMs: -1},
+		Name:         "files-bridge-high",
+		NumNodes:     2,
+		TypedRecords: true,
+		Files:        &harness.FilesOptions{ObjectKeyHex: highObjectKey, MaxFileBytes: 4 << 20, FetchIntervalMs: -1},
 		Bridge: &harness.BridgeOptions{
 			Role: "high-importer", Stream: bridgeStream, NodeIndex: 0,
 			StagingDir:       staging,
@@ -104,7 +106,7 @@ func TestTwoLowTwoHighFileBridgeLive(t *testing.T) {
 		t.Fatalf("High-1 import: %v", err)
 	}
 	assertNodeDigest(t, high, 0, data)
-	assertReencrypted(t, low.Nodes[0].PebbleDir, high.Nodes[0].PebbleDir)
+	assertReencrypted(t, low.Nodes[0].Dir, high.Nodes[0].Dir)
 
 	// High mesh carries metadata to High-2, which fetches bytes from High-1.
 	if err := high.WaitFileAvailable(1, bridgeFileName, false, 30*time.Second); err != nil {
@@ -195,10 +197,10 @@ func assertNoPlaintext(t *testing.T, staged []string, data []byte) {
 
 // assertReencrypted verifies High at-rest bytes differ from Low at-rest
 // bytes for the same verified content (separate domain object keys).
-func assertReencrypted(t *testing.T, lowPebble, highPebble string) {
+func assertReencrypted(t *testing.T, lowDir, highDir string) {
 	t.Helper()
-	lowObj := firstObjectFile(t, lowPebble)
-	highObj := firstObjectFile(t, highPebble)
+	lowObj := firstObjectFile(t, lowDir)
+	highObj := firstObjectFile(t, highDir)
 	lowRaw, err := os.ReadFile(lowObj)
 	if err != nil {
 		t.Fatal(err)
@@ -212,17 +214,17 @@ func assertReencrypted(t *testing.T, lowPebble, highPebble string) {
 	}
 }
 
-func firstObjectFile(t *testing.T, pebbleDir string) string {
+func firstObjectFile(t *testing.T, dataDir string) string {
 	t.Helper()
 	var found string
-	_ = filepath.Walk(filepath.Join(pebbleDir, "files"), func(path string, info os.FileInfo, err error) error {
+	_ = filepath.Walk(filepath.Join(dataDir, "files"), func(path string, info os.FileInfo, err error) error {
 		if err == nil && !info.IsDir() && strings.HasSuffix(info.Name(), ".spfo") && found == "" {
 			found = path
 		}
 		return nil
 	})
 	if found == "" {
-		t.Fatalf("no object file under %s", pebbleDir)
+		t.Fatalf("no object file under %s", dataDir)
 	}
 	return found
 }

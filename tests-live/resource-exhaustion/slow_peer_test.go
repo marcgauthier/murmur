@@ -49,11 +49,12 @@ func TestSlowPeerConvergesWithoutWedge(t *testing.T) {
 	bound := harness.EnvSeconds("MURMUR_RX_SLOW_BOUND_SECONDS", 300)
 
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "resource-slow",
-		NumNodes:    2,
-		AwaitUnlock: true,
-		ManualPeers: true,
-		Schema:      rxSchema(),
+		Name:            "resource-slow",
+		NumNodes:        2,
+		AwaitUnlock:     true,
+		ManualPeers:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 
 	// Both directions cross a throttle: replication data follows the
@@ -78,8 +79,7 @@ func TestSlowPeerConvergesWithoutWedge(t *testing.T) {
 
 	// Baseline through the throttle proves the proxied path works before
 	// the timed leg starts.
-	if err := cluster.ExecSQL(0, "INSERT INTO rx_rows (id, name) VALUES (?, ?)",
-		fmt.Sprintf("%032x", 1), "baseline"); err != nil {
+	if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 1), Name: "baseline"}); err != nil {
 		t.Fatalf("baseline insert: %v", err)
 	}
 	waitCounts(t, cluster, []int{1}, 1, 2*time.Minute)
@@ -91,8 +91,7 @@ func TestSlowPeerConvergesWithoutWedge(t *testing.T) {
 	// the throttle would never bind.
 	vals := uniqueRandomValues(rows, valBytes)
 	for i := 0; i < rows; i++ {
-		if err := cluster.ExecSQL(0, "INSERT INTO rx_rows (id, name) VALUES (?, ?)",
-			fmt.Sprintf("%032x", i+2), vals[i]); err != nil {
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", i+2), Name: vals[i]}); err != nil {
 			t.Fatalf("churn insert %d: %v", i, err)
 		}
 	}
@@ -102,7 +101,7 @@ func TestSlowPeerConvergesWithoutWedge(t *testing.T) {
 	last, lastIncrease := 0, time.Now()
 	stalled := false
 	for {
-		n, err := cluster.QueryRowCount(1, tableName)
+		n, err := rxCount(cluster, 1)
 		if err != nil {
 			t.Fatalf("slow node unreadable: %v", err)
 		}
@@ -160,8 +159,7 @@ func TestSlowPeerConvergesWithoutWedge(t *testing.T) {
 		t.Fatalf("re-peer 1->0 direct: %v", err)
 	}
 	for i := 0; i < 10; i++ {
-		if err := cluster.ExecSQL(0, "INSERT INTO rx_rows (id, name) VALUES (?, ?)",
-			fmt.Sprintf("%032x", total+i+1), "healed"); err != nil {
+		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", total+i+1), Name: "healed"}); err != nil {
 			t.Fatalf("post-heal insert %d: %v", i, err)
 		}
 	}

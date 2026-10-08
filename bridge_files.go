@@ -299,7 +299,7 @@ func (db *DB) BridgeApplyFileMetadata(ctx context.Context, source ids.DBID, stre
 		mutations = append(mutations, codec.Mutation{TableID: fs.ids.table, RowID: row, ColumnID: codec.ColumnTombstone, Flags: codec.FlagTombstone})
 	}
 	info := &bridgeImportInfo{SourceDomain: source, Stream: stream, BundleID: bundle, FirstSeq: first, LastSeq: last, AllowHighDelete: allowHighDelete}
-	policyMutations, err := policyMutationsForTx(db, &Tx{txID: txID, bridgeImport: info}, mutations)
+	policyMutations, err := policyMutationsForTx(db, &policyTx{db: db, txID: txID, bridgeImport: info}, mutations)
 	if err != nil {
 		return fmt.Errorf("murmur: bridge policy: %w", err)
 	}
@@ -337,9 +337,7 @@ func (db *DB) BridgeApplyFileMetadata(ctx context.Context, source ids.DBID, stre
 	if err != nil {
 		return err
 	}
-	if len(db.remoteRows) == 0 {
-		db.materializedGeneration.Store(result.Generation)
-	}
+	db.materializedGeneration.Store(result.Generation)
 	if manager := db.replManager(); manager != nil {
 		manager.NotifyLocal()
 	}

@@ -25,8 +25,6 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -40,13 +38,7 @@ func TestSeedOnlyDiscoveryFormsFullMesh(t *testing.T) {
 		AwaitUnlock:    true,
 		ManualPeers:    true,
 		BootstrapSeeds: []int{0},
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: tableName,
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		TypedRecords:   true,
 	})
 	assertNoStaticPeers(t, cluster)
 
@@ -59,9 +51,7 @@ func TestSeedOnlyDiscoveryFormsFullMesh(t *testing.T) {
 	rowsPerNode := 10
 	for i := range cluster.Nodes {
 		for r := 0; r < rowsPerNode; r++ {
-			id := fmt.Sprintf("%032x", (i+1)*1000+r)
-			if err := cluster.ExecSQL(i, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)",
-				id, fmt.Sprintf("n%d-r%d", i, r)); err != nil {
+			if err := cluster.TypedInsert(i, fmt.Sprintf("n%d-r%d", i, r)); err != nil {
 				t.Fatalf("node %d write: %v", i, err)
 			}
 		}
@@ -80,13 +70,7 @@ func TestSeedKillAndRediscovery(t *testing.T) {
 		AwaitUnlock:    true,
 		ManualPeers:    true,
 		BootstrapSeeds: []int{0},
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: tableName,
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		TypedRecords:   true,
 	})
 	assertNoStaticPeers(t, cluster)
 	waitMembership(t, cluster, 4, time.Duration(deadline)*time.Second)
@@ -94,8 +78,7 @@ func TestSeedKillAndRediscovery(t *testing.T) {
 
 	// Baseline writes converge before the kill (honest-path control).
 	for i := 0; i < 8; i++ {
-		id := fmt.Sprintf("%032x", 5000+i)
-		if err := cluster.ExecSQL(2, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)", id, fmt.Sprintf("base-%d", i)); err != nil {
+		if err := cluster.TypedInsert(2, fmt.Sprintf("base-%d", i)); err != nil {
 			t.Fatalf("baseline write: %v", err)
 		}
 	}
@@ -115,8 +98,7 @@ func TestSeedKillAndRediscovery(t *testing.T) {
 
 	// Survivors keep writing while the seed is down.
 	for i := 0; i < 12; i++ {
-		id := fmt.Sprintf("%032x", 6000+i)
-		if err := cluster.ExecSQL(1+i%3, "INSERT INTO "+tableName+" (id, name) VALUES (?, ?)", id, fmt.Sprintf("down-%d", i)); err != nil {
+		if err := cluster.TypedInsert(1+i%3, fmt.Sprintf("down-%d", i)); err != nil {
 			t.Fatalf("survivor write %d: %v", i, err)
 		}
 	}
@@ -252,15 +234,8 @@ func sessionMeshComplete(t *testing.T, c *harness.Cluster) bool {
 			if i == j {
 				continue
 			}
-			want := fmt.Sprintf("spedsql_peer_connected{peer=%q} 1", to.NodeID.String())
-			found := false
-			for _, line := range strings.Split(body, "\n") {
-				if strings.TrimSpace(line) == want {
-					found = true
-					break
-				}
-			}
-			if !found {
+			connected, found := harness.MetricValueWithLabels(body, "spedsql_peer_connected", map[string]string{"peer": to.NodeID.String()})
+			if !found || connected != 1 {
 				return false
 			}
 		}
@@ -282,21 +257,16 @@ func waitConvergedOn(t *testing.T, c *harness.Cluster, idxs []int, want int, tim
 	stallDumps := 0
 	for time.Now().Before(deadline) {
 		ok := true
-		var first string
+		var first []string
 		for k, idx := range idxs {
-			n, err := c.QueryRowCount(idx, tableName)
-			if err != nil || n != want {
-				ok = false
-				break
-			}
-			d, err := c.ComputeTableDigest(idx, tableName, "id")
-			if err != nil {
+			names, err := c.TypedNames(idx)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
 			if k == 0 {
-				first = d
-			} else if d != first {
+				first = names
+			} else if !sameNames(names, first) {
 				ok = false
 				break
 			}
@@ -308,8 +278,8 @@ func waitConvergedOn(t *testing.T, c *harness.Cluster, idxs []int, want int, tim
 			lastLog = time.Now()
 			counts := make([]int, len(c.Nodes))
 			for i := range c.Nodes {
-				n, _ := c.QueryRowCount(i, tableName)
-				counts[i] = n
+				names, _ := c.TypedNames(i)
+				counts[i] = len(names)
 			}
 			t.Logf("converge progress: counts=%v want=%d", counts, want)
 			key := fmt.Sprintf("%v", counts)
@@ -325,12 +295,23 @@ func waitConvergedOn(t *testing.T, c *harness.Cluster, idxs []int, want int, tim
 		time.Sleep(200 * time.Millisecond)
 	}
 	for _, idx := range idxs {
-		n, _ := c.QueryRowCount(idx, tableName)
-		d, _ := c.ComputeTableDigest(idx, tableName, "id")
-		t.Logf("node %d at timeout: count=%d digest=%s", idx, n, d)
+		names, _ := c.TypedNames(idx)
+		t.Logf("node %d at timeout: count=%d", idx, len(names))
 	}
 	dumpTopoForensics(t, c)
-	t.Fatalf("nodes %v did not converge on %d rows with equal digests within %v", idxs, want, timeout)
+	t.Fatalf("nodes %v did not converge on %d typed records with equal contents within %v", idxs, want, timeout)
+}
+
+func sameNames(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // dumpTopoForensics logs membership, session, and per-peer state for
@@ -344,14 +325,11 @@ func dumpTopoForensics(t *testing.T, c *harness.Cluster) {
 			continue
 		}
 		var peers []string
-		for _, line := range strings.Split(body, "\n") {
-			trim := strings.TrimSpace(line)
-			if strings.HasPrefix(trim, "spedsql_peer_connected") ||
-				strings.HasPrefix(trim, "spedsql_peer_selected") ||
-				strings.HasPrefix(trim, "spedsql_peer_excluded") ||
-				strings.HasPrefix(trim, "spedsql_peer_retired") ||
-				strings.HasPrefix(trim, "spedsql_peer_schema_agreed") {
-				peers = append(peers, trim)
+		if samples, ok := harness.MetricSamples(body); ok {
+			for _, sample := range samples {
+				if strings.HasPrefix(sample.Name, "spedsql_peer_") {
+					peers = append(peers, fmt.Sprintf("%s labels=%v value=%g", sample.Name, sample.Labels, sample.Value))
+				}
 			}
 		}
 		t.Logf("node %d topo: membership=%v alive=%v applyFail=%v invalid=%v deferred=%v peers=[%s]",
@@ -474,10 +452,11 @@ func dumpStallForensics(t *testing.T, c *harness.Cluster) {
 	wedged := -1
 	behind, best := -1, -1
 	for idx, node := range c.Nodes {
-		n, err := c.QueryRowCount(idx, tableName)
+		names, err := c.TypedNames(idx)
 		if err != nil {
 			continue
 		}
+		n := len(names)
 		if behind == -1 || n < best {
 			behind, best = idx, n
 		}
@@ -583,22 +562,7 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 // metricValueFrom parses one gauge/counter; ok=false reports absence
 // without failing so forensics can cover nodes in odd states.
 func metricValueFrom(body, name string) (float64, bool) {
-	for _, line := range strings.Split(body, "\n") {
-		if line == "" || line[0] == '#' {
-			continue
-		}
-		if !strings.HasPrefix(line, name) {
-			continue
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(line, name))
-		if i := strings.LastIndex(rest, " "); i >= 0 {
-			rest = rest[i+1:]
-		}
-		if v, err := strconv.ParseFloat(rest, 64); err == nil {
-			return v, true
-		}
-	}
-	return 0, false
+	return harness.MetricValueFrom(body, name)
 }
 
 func mustMetric(body, name string) float64 {

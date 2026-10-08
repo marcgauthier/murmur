@@ -89,7 +89,7 @@ filesystem because its behavior depends on the volume and mount configuration.
 
 For each release candidate, restore a representative production-sized backup
 in an isolated environment and measure backup retrieval, decryption/open,
-Pebble recovery, SQL materialization rebuild, and replication catch-up
+Spool recovery, RIME materializer rebuild, and replication catch-up
 separately. Include a node restart after a simulated abrupt stop. Verify
 acknowledged writes and compare the resulting digest with the recovery oracle.
 Record p50/p95 across repeated runs when practical; fail the operational target

@@ -93,7 +93,7 @@ type Status struct {
 
 	StateGeneration uint64
 	// MaterializedGeneration is the in-memory SQL view's progress. It is
-	// initialized after rebuilding from Pebble on every open.
+	// initialized after rebuilding from Spool on every open.
 	MaterializedGeneration uint64
 
 	HLC          uint64
@@ -109,7 +109,7 @@ type Status struct {
 	QUICConnections int
 	PendingDials    int
 
-	// PendingApply is the current in-flight remote Pebble-apply count.
+	// PendingApply is the current in-flight remote Spool-apply count.
 	// PendingSend is queued outbound control/need/schema frames.
 	PendingApply int
 	PendingSend  int
@@ -125,10 +125,14 @@ type Status struct {
 	// Metrics holds node-local writer, apply, GC, and schema counters.
 	Metrics MetricsSnapshot
 
-	PebbleSizeBytes     uint64
-	PebbleCacheHits     int64
-	PebbleCacheMisses   int64
-	PebbleMemTableBytes uint64
+	SpoolDiskBytes      uint64
+	SpoolKeys           uint64
+	SpoolPendingBytes   uint64
+	SpoolPendingRecords uint64
+	SpoolBlocksWritten  uint64
+	SpoolBytesWritten   uint64
+	SpoolCompactions    uint64
+	SpoolStorageFailure bool
 
 	Uptime time.Duration
 	// OpenProgress is the latest startup snapshot, or nil when reporting was

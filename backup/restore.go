@@ -141,6 +141,12 @@ func Restore(ctx context.Context, cfg RestoreConfig) (*Metadata, error) {
 			if err := json.NewDecoder(tr).Decode(meta); err != nil {
 				return nil, fmt.Errorf("%w: decode metadata: %v", ErrInvalidMetadata, err)
 			}
+			if meta.Backend != "" && meta.Backend != "spool" {
+				return nil, fmt.Errorf("%w: backup backend %q is not supported (Spool required)", ErrCorruptBackup, meta.Backend)
+			}
+			if meta.PebbleFormat != 0 || (meta.Version < 2 && meta.Backend == "") {
+				return nil, fmt.Errorf("%w: legacy Pebble backup archive is not supported (Spool required)", ErrCorruptBackup)
+			}
 			if cfg.ExpectedDBID != "" && meta.DBID != cfg.ExpectedDBID {
 				return nil, fmt.Errorf("%w: got %s, want %s", ErrDBIDMismatch, meta.DBID, cfg.ExpectedDBID)
 			}

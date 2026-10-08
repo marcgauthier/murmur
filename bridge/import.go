@@ -3,9 +3,9 @@ package bridge
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"errors"
 	"fmt"
+	"math/big"
 	"sort"
 	"strings"
 	"sync"
@@ -16,21 +16,22 @@ import (
 	"github.com/marcgauthier/murmur/schema"
 )
 
-// Importer applies opened bundles to a High database as ordinary
-// transactions, so accepted imports redistribute among High mesh peers as
-// regular replicated writes. One bundle maps to exactly one transaction:
-// imports are atomic per bundle.
-//
-// Imported puts apply as UPDATE-then-INSERT by primary key (partial rows
-// fill missing columns with NULL), so replaying an applied bundle converges
-// to the same state instead of duplicating effects. Two High receivers
-// importing the same bundle likewise converge through mesh LWW on identical
-// values. Deletes remove by primary key.
+// Importer applies opened bundles as ordinary database transactions, so
+// accepted imports redistribute among High mesh peers as regular replicated
+// writes. Typed row mutations, ownership policy, provenance and receipts commit
+// atomically through Spool; file metadata commits separately. Completion
+// receipts and progress commit together after all effects succeed, so
+// interrupted imports remain retryable.
 type Importer struct {
 	db *db.DB
 
 	mu  sync.Mutex
 	pks map[string]string
+
+	// Tests inject storage faults after effects commit, before completion.
+	beforeCompletion      func()
+	beforeCompletionError func() error
+	beforeFileApply       func()
 }
 
 var ErrIdentityCollision = errors.New("bridge: imported row identity collides with High-owned data")
@@ -56,12 +57,11 @@ func NewImporter(database *db.DB) (*Importer, error) {
 	return &Importer{db: database, pks: make(map[string]string)}, nil
 }
 
-// ApplyBundle imports one bundle atomically while preserving source transaction
-// boundaries and recording stable source-transaction receipts in authoritative storage.
-// The entire bundle is applied in a single atomic database transaction so that partial
-// failures roll back completely without leaving partial source effects.
-// Batches and bundles whose receipts are already present in authoritative storage
-// are skipped to ensure deduplication across replays and concurrent receivers.
+// ApplyBundle imports row effects atomically and file metadata separately,
+// recording durable completion only after both succeed. Row source receipts
+// commit with row effects; completion receipts and stream progress share a
+// second atomic batch. Replays repair interrupted completion without repeating
+// completed row-only imports; mixed bundles retry both effects to convergence.
 func (im *Importer) ApplyBundle(ctx context.Context, b *Bundle) error {
 	return im.applyBundleResolved(ctx, b, "")
 }
@@ -81,9 +81,7 @@ func (im *Importer) ResolvePolicyHold(ctx context.Context, inbox *Inbox, stream 
 }
 
 func (im *Importer) applyBundleResolved(ctx context.Context, b *Bundle, resolution string) error {
-	// Resolve primary keys before opening the write transaction: PK
-	// discovery queries the shared materialization, which the write lock
-	// would deadlock against.
+	// Resolve primary keys from the manifest before preparing rows.
 	tables := make(map[string]bool)
 	for _, batch := range b.Batches {
 		for _, rec := range batch.Records {
@@ -99,8 +97,20 @@ func (im *Importer) applyBundleResolved(ctx context.Context, b *Bundle, resoluti
 		}
 	}
 
-	// Check if all batches in the bundle are already recorded.
+	// Row source receipts commit with row effects. For a bundle containing
+	// files they cannot prove file completion; require its terminal receipt.
+	hasFiles := bundleHasFileRecords(b)
 	allRecorded := len(b.Batches) > 0
+	if hasFiles {
+		allRecorded = false
+		if !b.Manifest.BundleID.IsZero() {
+			var err error
+			allRecorded, err = im.db.HasTransactionReceipt(b.Manifest.BundleID)
+			if err != nil {
+				return err
+			}
+		}
+	}
 	for _, batch := range b.Batches {
 		if batch.TxID.IsZero() {
 			allRecorded = false
@@ -116,18 +126,16 @@ func (im *Importer) applyBundleResolved(ctx context.Context, b *Bundle, resoluti
 		}
 	}
 	if allRecorded {
-		return im.db.SetBridgeStreamProgress(b.Manifest.Stream, b.Manifest.SeqLast)
+		return im.completeBundle(b)
 	}
 	prepared, err := im.prepareBundle(ctx, b, resolution)
 	if err != nil {
 		return err
 	}
 
-	// File records split from row records: rows import through one SQL
-	// transaction, files through one metadata commit. Homogeneous bundles
-	// (the only kind capture produces) stay atomic; a mixed bundle applies
-	// as two idempotent commits (rows first, preserving poison ordering),
-	// and quarantine retry replays both to convergence.
+	// File records split from row records: typed rows and files use their
+	// respective managed Spool commits. Quarantine retry replays both to
+	// convergence.
 	var rowBatches []Batch
 	var filePuts []db.BridgeFilePut
 	var fileDeletes []ids.RowID
@@ -167,58 +175,234 @@ func (im *Importer) applyBundleResolved(ctx context.Context, b *Bundle, resoluti
 		// Deduplication still keys on source identity: the skip check and
 		// the receipts recorded below use the source batch/Bundle IDs.
 		txID := ids.NewTxID()
-
-		tx, err := im.db.BeginBridgeImportTx(ctx, txID, b.Manifest.SourceDomain, b.Manifest.Stream, b.Manifest.BundleID, b.Manifest.SeqFirst, b.Manifest.SeqLast, resolution == "accept-low-delete", &db.TxOptions{})
+		_, typed, err := im.db.BridgeTypedRowExists(rowBatches[0].Records[0].Table, rowBatches[0].Records[0].Row)
 		if err != nil {
 			return err
 		}
-		committed := false
-		defer func() {
-			if !committed {
-				_ = tx.Rollback()
-			}
-		}()
-
-		for _, batch := range rowBatches {
-			for _, rec := range batch.Records {
-				if err := im.applyRecord(ctx, tx, rec); err != nil {
-					return err
-				}
-			}
+		if !typed {
+			return fmt.Errorf("bridge: import requires managed typed RIME tables")
 		}
-
-		for _, batch := range rowBatches {
-			if err := tx.RecordBridgeSourceReceipt(sourceReceiptID(b, batch), batch.Origin, batch.Sequence); err != nil {
-				return err
-			}
-		}
-		if err := tx.Commit(); err != nil {
+		mutations, err := im.typedImportMutations(ctx, b, rowBatches)
+		if err != nil {
 			return err
 		}
-		committed = true
+		receipts := make([]db.BridgeSourceReceipt, 0, len(rowBatches))
+		for _, batch := range rowBatches {
+			receipts = append(receipts, db.BridgeSourceReceipt{
+				TxID: sourceReceiptID(b, batch), Origin: batch.Origin, Sequence: batch.Sequence,
+			})
+		}
+		if err := im.db.CommitTypedBridgeImport(ctx, txID, b.Manifest.SourceDomain, b.Manifest.Stream, b.Manifest.BundleID, b.Manifest.SeqFirst, b.Manifest.SeqLast, resolution == "accept-low-delete", receipts, mutations); err != nil {
+			return err
+		}
 	}
 
 	if len(filePuts) > 0 || len(fileDeletes) > 0 {
+		if im.beforeFileApply != nil {
+			im.beforeFileApply()
+		}
 		if err := im.db.BridgeApplyFileMetadata(ctx, b.Manifest.SourceDomain, b.Manifest.Stream, b.Manifest.BundleID, b.Manifest.SeqFirst, b.Manifest.SeqLast, resolution == "accept-low-delete", filePuts, fileDeletes); err != nil {
 			return err
 		}
 	}
 
-	// Record receipts for all constituent batches in authoritative storage.
+	return im.completeBundle(b)
+}
+
+func (im *Importer) typedImportMutations(ctx context.Context, b *Bundle, batches []Batch) ([]codec.Mutation, error) {
+	tables, err := im.db.SchemaTables()
+	if err != nil {
+		return nil, err
+	}
+	tableByName := make(map[string]schema.TableSchema, len(tables))
+	for _, table := range tables {
+		tableByName[strings.ToLower(table.Name)] = table
+	}
+	type rowKey struct {
+		table uint32
+		row   ids.RowID
+	}
+	type rowState struct {
+		table        schema.TableSchema
+		deleted      bool
+		needsPrimary bool
+		columns      map[uint32]codec.Mutation
+	}
+	rows := make(map[rowKey]*rowState)
+	var order []rowKey
+	for _, batch := range batches {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		for _, rec := range batch.Records {
+			table, ok := tableByName[strings.ToLower(rec.Table)]
+			if !ok {
+				return nil, fmt.Errorf("bridge: import: typed table %q is absent from the schema manifest", rec.Table)
+			}
+			key := rowKey{table: table.ID, row: rec.Row}
+			row := rows[key]
+			if row == nil {
+				row = &rowState{table: table, columns: make(map[uint32]codec.Mutation)}
+				row.needsPrimary, _, err = im.db.BridgeTypedRowExists(rec.Table, rec.Row)
+				if err != nil {
+					return nil, err
+				}
+				row.needsPrimary = !row.needsPrimary
+				rows[key] = row
+				order = append(order, key)
+			}
+			switch rec.Op {
+			case RecordDelete:
+				row.deleted = true
+				row.needsPrimary = true
+				clear(row.columns)
+			case RecordPut:
+				if row.deleted {
+					clear(row.columns)
+					row.needsPrimary = true
+					row.deleted = false
+				}
+				for _, column := range rec.Columns {
+					var declared *schema.ColumnSchema
+					for i := range table.Columns {
+						if strings.EqualFold(table.Columns[i].Name, column.Column) {
+							declared = &table.Columns[i]
+							break
+						}
+					}
+					if declared == nil || declared.MergePolicy != column.Policy {
+						return nil, fmt.Errorf("bridge: import: typed field %s.%s does not match the schema manifest", rec.Table, column.Column)
+					}
+					if declared.ID == table.PK {
+						row.needsPrimary = false
+					}
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+					if column.Policy == schema.LWW {
+						typed, err := im.db.ValidateBridgeTypedField(table.Name, declared.ID, rec.Row, column.Value)
+						if err != nil {
+							return nil, err
+						}
+						if !typed {
+							return nil, fmt.Errorf("bridge: typed field validation lost typed schema mode")
+						}
+					}
+					mutation := codec.Mutation{
+						TableID: table.ID, RowID: rec.Row, ColumnID: declared.ID,
+						Policy: column.Policy, Value: column.Value, Records: column.Records,
+					}
+					if column.Policy == schema.PN_COUNTER || column.Policy == schema.OR_SET {
+						mutation.Flags = codec.FlagCRDTImport
+					}
+					if column.Policy == schema.PN_COUNTER || column.Policy == schema.OR_SET {
+						previous, exists := row.columns[declared.ID]
+						if exists {
+							mutation.Records = append(append([]codec.CRDTRecord(nil), previous.Records...), mutation.Records...)
+						}
+					} else if column.Policy == schema.MAX || column.Policy == schema.MIN {
+						previous, exists := row.columns[declared.ID]
+						if exists {
+							cmp, err := compareBridgeExtrema(previous.Value, mutation.Value)
+							if err != nil {
+								return nil, err
+							}
+							if column.Policy == schema.MAX && cmp > 0 || column.Policy == schema.MIN && cmp < 0 {
+								mutation.Value = previous.Value
+							}
+						}
+					}
+					row.columns[declared.ID] = mutation
+				}
+			default:
+				return nil, fmt.Errorf("bridge: import: unknown record op %d", rec.Op)
+			}
+		}
+	}
+	var out []codec.Mutation
+	for _, key := range order {
+		row := rows[key]
+		if row.deleted {
+			out = append(out, codec.Mutation{TableID: key.table, RowID: key.row, ColumnID: codec.ColumnTombstone, Flags: codec.FlagTombstone})
+			continue
+		}
+		if row.needsPrimary {
+			return nil, fmt.Errorf("bridge: typed insert for %s row %s lacks its primary field", row.table.Name, key.row)
+		}
+		columnIDs := make([]uint32, 0, len(row.columns))
+		for id := range row.columns {
+			columnIDs = append(columnIDs, id)
+		}
+		sort.Slice(columnIDs, func(i, j int) bool { return columnIDs[i] < columnIDs[j] })
+		for _, id := range columnIDs {
+			out = append(out, row.columns[id])
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("bridge: typed row import has no effects")
+	}
+	return out, nil
+}
+
+func compareBridgeExtrema(a, b codec.Value) (int, error) {
+	toRat := func(value codec.Value) (*big.Rat, error) {
+		switch value.Type {
+		case codec.TypeInteger:
+			return new(big.Rat).SetInt64(value.I), nil
+		case codec.TypeReal:
+			rat := new(big.Rat).SetFloat64(value.F)
+			if rat == nil {
+				return nil, fmt.Errorf("bridge: non-finite extrema value")
+			}
+			return rat, nil
+		default:
+			return nil, fmt.Errorf("bridge: extrema value has type %s", valueTypeName(value.Type))
+		}
+	}
+	ra, err := toRat(a)
+	if err != nil {
+		return 0, err
+	}
+	rb, err := toRat(b)
+	if err != nil {
+		return 0, err
+	}
+	return ra.Cmp(rb), nil
+}
+
+func bundleHasFileRecords(b *Bundle) bool {
+	for _, batch := range b.Batches {
+		for _, rec := range batch.Records {
+			if rec.Table == db.BridgeFileTableName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (im *Importer) completeBundle(b *Bundle) error {
+	if im.beforeCompletion != nil {
+		im.beforeCompletion()
+	}
+	if im.beforeCompletionError != nil {
+		if err := im.beforeCompletionError(); err != nil {
+			return err
+		}
+	}
+	// Publish all completion receipts together with progress. Neither the
+	// success path nor replay recovery may acknowledge a partial completion.
+	receipts := make([]ids.TxID, 0, len(b.Batches)+1)
 	if !b.Manifest.BundleID.IsZero() {
-		_ = im.db.RecordTransactionReceipt(b.Manifest.BundleID)
+		receipts = append(receipts, b.Manifest.BundleID)
 	}
 	for _, batch := range b.Batches {
 		if !batch.TxID.IsZero() {
-			_ = im.db.RecordTransactionReceipt(sourceReceiptID(b, batch))
+			receipts = append(receipts, sourceReceiptID(b, batch))
 		}
 	}
 
-	// Update contiguous stream progress in authoritative storage.
-	if err := im.db.SetBridgeStreamProgress(b.Manifest.Stream, b.Manifest.SeqLast); err != nil {
-		return err
-	}
-	return nil
+	return im.db.CompleteBridgeImport(b.Manifest.Stream, b.Manifest.SeqLast, receipts)
 }
 
 // prepareBundle rejects unrelated High-row collisions, prevents Low values
@@ -290,8 +474,18 @@ func (im *Importer) prepareBundle(ctx context.Context, b *Bundle, resolution str
 					if err != nil {
 						return nil, err
 					}
+					// Typed rows keep accepting the Low stream's underlying LWW
+					// value while a High shadow controls what readers see. This
+					// preserves the newest Low value for an ownership release.
+					// Legacy SQL rows retain their historical filtering behavior.
 					if ok && policy.Owner == db.BridgeOwnerHigh && column.Policy == schema.LWW {
-						continue
+						typed, _, err := im.db.BridgeTypedRowExists(rec.Table, rec.Row)
+						if err != nil {
+							return nil, err
+						}
+						if !typed {
+							continue
+						}
 					}
 					filtered.Columns = append(filtered.Columns, column)
 				}
@@ -405,27 +599,10 @@ func validateFilePutColumns(rec Record) error {
 }
 
 func (im *Importer) rowExists(ctx context.Context, tableName string, row ids.RowID) (bool, error) {
-	table, err := quoteIdent(tableName)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	pk, err := im.pkColumn(ctx, tableName)
-	if err != nil {
-		return false, err
-	}
-	pk, err = quoteIdent(pk)
-	if err != nil {
-		return false, err
-	}
-	var found int
-	err = im.db.QueryRowContext(ctx, fmt.Sprintf("SELECT 1 FROM %s WHERE %s = ?", table, pk), row[:]).Scan(&found)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	return im.db.BridgeStoredRowExists(tableName, row)
 }
 
 // Drain imports contiguous staged bundles until a gap, hold, or failure.
@@ -439,8 +616,14 @@ func (im *Importer) rowExists(ctx context.Context, tableName string, row ids.Row
 // issued: each domain applies its own migrations.
 func (im *Importer) Drain(ctx context.Context, in *Inbox) (int, error) {
 	for _, stream := range in.Streams() {
-		if applied, ok, err := im.db.BridgeStreamProgress(stream); err == nil && ok {
-			_ = in.SyncAuthoritativeProgress(stream, applied)
+		applied, ok, err := im.db.BridgeStreamProgress(stream)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			if err := in.SyncAuthoritativeProgress(stream, applied); err != nil {
+				return 0, err
+			}
 		}
 	}
 	if _, err := in.RecheckHolds(func(bundle *Bundle) error {
@@ -505,7 +688,7 @@ func (im *Importer) Drain(ctx context.Context, in *Inbox) (int, error) {
 }
 
 // checkSchema verifies the bundle's tables, columns, primary keys, and
-// value-type compatibility against the live local schema without writing
+// value-type compatibility against the authoritative local manifest without writing
 // anything. A satisfied schema returns nil; missing or incompatible
 // definitions return a *HoldError naming them; a schema that cannot be
 // read returns the underlying error.
@@ -553,8 +736,8 @@ func (im *Importer) checkSchema(ctx context.Context, b *Bundle) error {
 	sort.Strings(tables)
 	for _, table := range tables {
 		if table == db.BridgeFileTableName {
-			// File metadata bypasses the SQL schema: it needs the file
-			// subsystem, not a SQL table. Shape validation happens at
+			// File metadata belongs to the dedicated file subsystem, not a
+			// user-defined typed table. Shape validation happens at
 			// prepare time (poison quarantines); a disabled subsystem
 			// holds until the operator enables files and reopens.
 			if !im.db.BridgeFilesEnabled() {
@@ -616,97 +799,8 @@ func holdMissing(held *HoldError, what string) *HoldError {
 	return held
 }
 
-func (im *Importer) applyRecord(ctx context.Context, tx *db.Tx, rec Record) error {
-	table, err := quoteIdent(rec.Table)
-	if err != nil {
-		return err
-	}
-	pk, err := im.pkColumn(ctx, rec.Table)
-	if err != nil {
-		return err
-	}
-	pkQ, err := quoteIdent(pk)
-	if err != nil {
-		return err
-	}
-	switch rec.Op {
-	case RecordDelete:
-		_, err := tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE %s = ?", table, pkQ), rec.Row[:])
-		return err
-	case RecordPut:
-		originalColumns := rec.Columns
-		rec.Columns = append([]ColumnValue(nil), rec.Columns...)
-		for i := range rec.Columns {
-			if rec.Columns[i].Policy == schema.PN_COUNTER {
-				rec.Columns[i].Value = codec.Text("0")
-			} else if rec.Columns[i].Policy == schema.OR_SET {
-				rec.Columns[i].Value = codec.Text("[]")
-			}
-		}
-		deferApply := func() error {
-			for _, column := range originalColumns {
-				if column.Policy != schema.LWW {
-					if err := tx.ImportMergeColumn(ctx, rec.Table, column.Column, rec.Row, column.Policy, column.Value, column.Records); err != nil {
-						return err
-					}
-				}
-			}
-			return nil
-		}
-		if len(rec.Columns) == 0 {
-			return fmt.Errorf("bridge: import: upsert of %s has no columns", rec.Table)
-		}
-		set := make([]string, len(rec.Columns))
-		args := make([]any, 0, 2*len(rec.Columns)+2)
-		for i, c := range rec.Columns {
-			cq, err := quoteIdent(c.Column)
-			if err != nil {
-				return err
-			}
-			set[i] = cq + " = ?"
-			v, err := valueArg(c.Value)
-			if err != nil {
-				return err
-			}
-			args = append(args, v)
-		}
-		args = append(args, rec.Row[:])
-		res, err := tx.ExecContext(ctx, fmt.Sprintf("UPDATE %s SET %s WHERE %s = ?", table, strings.Join(set, ", "), pkQ), args...)
-		if err != nil {
-			return err
-		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			return deferApply()
-		}
-		cols := make([]string, len(rec.Columns)+1)
-		holders := make([]string, len(rec.Columns)+1)
-		insArgs := make([]any, 0, len(rec.Columns)+1)
-		cols[0], holders[0], insArgs = pkQ, "?", append(insArgs, rec.Row[:])
-		for i, c := range rec.Columns {
-			cq, err := quoteIdent(c.Column)
-			if err != nil {
-				return err
-			}
-			cols[i+1] = cq
-			holders[i+1] = "?"
-			v, err := valueArg(c.Value)
-			if err != nil {
-				return err
-			}
-			insArgs = append(insArgs, v)
-		}
-		_, err = tx.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(cols, ", "), strings.Join(holders, ", ")), insArgs...)
-		if err != nil {
-			return err
-		}
-		return deferApply()
-	default:
-		return fmt.Errorf("bridge: import: unknown record op %d", int(rec.Op))
-	}
-}
-
-// pkColumn resolves (and caches) a table's single-column primary key via the
-// live High schema.
+// pkColumn resolves (and caches) a table's single-column primary key from the
+// authoritative High schema manifest.
 func (im *Importer) pkColumn(ctx context.Context, table string) (string, error) {
 	im.mu.Lock()
 	if pk, ok := im.pks[table]; ok {
@@ -741,39 +835,31 @@ type tableDesc struct {
 	pk   string
 }
 
-// describeTable reads a table's live definition. A missing table returns
-// a nil descriptor without an error; the schema gate must always see
-// post-migration truth, so results are never cached here (pkColumn keeps
-// its own PK cache).
+// describeTable reads the authoritative persisted table definition. A missing
+// table returns a nil descriptor without an error; results are not cached so
+// the schema gate sees the current manifest after a migration.
 func (im *Importer) describeTable(ctx context.Context, table string) (*tableDesc, error) {
-	tq, err := quoteIdent(table)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	rows, err := im.db.QueryContext(ctx, fmt.Sprintf("SELECT name, type, \"notnull\", pk FROM pragma_table_info(%s)", tq))
+	tables, err := im.db.SchemaTables()
 	if err != nil {
-		return nil, fmt.Errorf("bridge: import: describe %s: %w", table, err)
+		return nil, fmt.Errorf("bridge: import: read schema for %s: %w", table, err)
 	}
-	defer rows.Close()
-	desc := &tableDesc{cols: make(map[string]columnDesc)}
-	for rows.Next() {
-		var name, typ string
-		var notnull, pk int64
-		if err := rows.Scan(&name, &typ, &notnull, &pk); err != nil {
-			return nil, err
+	for _, schemaTable := range tables {
+		if !strings.EqualFold(schemaTable.Name, table) {
+			continue
 		}
-		desc.cols[name] = columnDesc{typ: typ, notNull: notnull != 0}
-		if pk != 0 {
-			desc.pk = name
+		desc := &tableDesc{cols: make(map[string]columnDesc, len(schemaTable.Columns))}
+		for _, column := range schemaTable.Columns {
+			desc.cols[column.Name] = columnDesc{typ: column.Type.String(), notNull: !column.Nullable}
+			if column.ID == schemaTable.PK {
+				desc.pk = column.Name
+			}
 		}
+		return desc, nil
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if len(desc.cols) == 0 {
-		return nil, nil
-	}
-	return desc, nil
+	return nil, nil
 }
 
 // typeCompatible reports whether a logical value may land in a column of
@@ -818,30 +904,6 @@ func valueTypeName(vt codec.ValueType) string {
 		return "BLOB"
 	default:
 		return fmt.Sprintf("value type %d", int(vt))
-	}
-}
-
-func quoteIdent(name string) (string, error) {
-	if name == "" || strings.ContainsRune(name, 0) {
-		return "", fmt.Errorf("bridge: import: invalid identifier")
-	}
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`, nil
-}
-
-func valueArg(v codec.Value) (any, error) {
-	switch v.Type {
-	case codec.TypeNull:
-		return nil, nil
-	case codec.TypeInteger:
-		return v.I, nil
-	case codec.TypeReal:
-		return v.F, nil
-	case codec.TypeText:
-		return v.S, nil
-	case codec.TypeBlob:
-		return append([]byte(nil), v.B...), nil
-	default:
-		return nil, fmt.Errorf("bridge: import: unsupported value type %d", int(v.Type))
 	}
 }
 

@@ -3,19 +3,22 @@ package murmur
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/state"
 )
 
 func TestOpenProgressEmptyAndDisabled(t *testing.T) {
 	for _, enabled := range []bool{false, true} {
 		cfg := testConfig(t.TempDir())
+		cfg.Schema.Tables = nil
+		cfg.Tables = []TableDefinition{recordDefinition(t)}
 		var events []OpenProgress
 		if enabled {
 			cfg.OnOpenProgress = func(p OpenProgress) { events = append(events, p) }
@@ -35,7 +38,7 @@ func TestOpenProgressEmptyAndDisabled(t *testing.T) {
 		if p == nil || p.Phase != OpenReady || p.TotalItemsKnown || p.TotalItems != 0 || p.PercentComplete != 0 || p.EstimateKnown {
 			t.Fatalf("empty terminal snapshot: %+v", p)
 		}
-		want := []OpenPhase{OpenOpening, OpenRebuilding, OpenIndexing, OpenFinalizing, OpenReady}
+		want := []OpenPhase{OpenOpening, OpenRebuilding, OpenFinalizing, OpenReady}
 		var phases []OpenPhase
 		for _, p := range events {
 			if len(phases) == 0 || phases[len(phases)-1] != p.Phase {
@@ -60,6 +63,8 @@ func TestOpenProgressEmptyAndDisabled(t *testing.T) {
 
 func TestOpenProgressStorageFailure(t *testing.T) {
 	cfg := testConfig(t.TempDir())
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
 	if err := os.WriteFile(filepath.Join(cfg.Path, "data"), []byte("blocked store directory"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -82,36 +87,34 @@ func TestOpenProgressStorageFailure(t *testing.T) {
 	}
 }
 
-func TestOpenProgressDeletedAndIncompleteRows(t *testing.T) {
+func TestOpenProgressDeletedTypedRowsAreNotMaterialized(t *testing.T) {
 	cfg := testConfig(t.TempDir())
-	cfg.Schema.Tables[0].Columns[1].Nullable = false
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
 	live, err := openSignedFixture(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 3; i++ {
-		id := NewRowID()
-		if _, err := live.ExecContext(context.Background(), "INSERT INTO contacts(id,name) VALUES(?,?)", id[:], "same"); err != nil {
-			live.Close()
-			t.Fatal(err)
-		}
-	}
-	if _, err := live.ExecContext(context.Background(), "DELETE FROM contacts WHERE rowid=(SELECT max(rowid) FROM contacts)"); err != nil {
-		live.Close()
-		t.Fatal(err)
-	}
-	table := live.reg.Tables[0]
-	id := NewRowID()
-	_, err = live.store.CommitLocal(context.Background(), &codec.MutationBatch{
-		ProtocolVersion: 1, TxID: NewTxID(), OriginNode: cfg.NodeID, HLC: live.store.ClockMax() + 1, SchemaEpoch: 1,
-		Mutations: []codec.Mutation{{TableID: table.ID, RowID: id, ColumnID: table.Columns[0].ID, Value: codec.Blob(id[:])}},
-	})
+	table, err := TableOf[facadeRecord](live, "records")
 	if err != nil {
 		live.Close()
 		t.Fatal(err)
 	}
+	ids := []ids.RowID{NewRowID(), NewRowID(), NewRowID()}
+	if err := live.WriteTxContext(context.Background(), func(tx *Tx) error {
+		for i, id := range ids {
+			if err := table.Insert(tx, &facadeRecord{ID: id, Name: fmt.Sprintf("row-%d", i)}); err != nil {
+				return err
+			}
+		}
+		return table.Delete(tx, ids[2])
+	}); err != nil {
+		live.Close()
+		t.Fatal(err)
+	}
+	schemaTable := live.reg.Tables[0]
 	var expected uint64
-	if err := live.store.IterateTable(table.ID, func(r *state.Row) error { expected += uint64(len(r.Cells)); return nil }); err != nil {
+	if err := live.store.IterateTable(schemaTable.ID, func(r *state.Row) error { expected += uint64(len(r.Cells)); return nil }); err != nil {
 		live.Close()
 		t.Fatal(err)
 	}
@@ -125,7 +128,7 @@ func TestOpenProgressDeletedAndIncompleteRows(t *testing.T) {
 	}
 	defer live.Close()
 	p := live.Status().OpenProgress
-	if p.TotalItemsKnown || p.TotalItems != 0 || p.ProcessedItems != expected || p.RowsInserted != 2 || p.RowsSkipped != 2 {
+	if p.TotalItemsKnown || p.TotalItems != 0 || p.ProcessedItems != expected || p.RowsInserted != 2 || p.RowsSkipped != 0 {
 		t.Fatalf("progress=%+v expected cells=%d", p, expected)
 	}
 }
@@ -139,6 +142,7 @@ func TestOpenProgressTerminalFailures(t *testing.T) {
 			ctx, cancel = context.WithCancel(ctx)
 			cancel()
 		} else {
+			cfg.Tables = nil
 			cfg.Schema.Tables = nil
 		}
 		var events []OpenProgress

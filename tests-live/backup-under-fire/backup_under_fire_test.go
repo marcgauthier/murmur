@@ -16,7 +16,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -26,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,28 +34,30 @@ import (
 
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/backup"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
-func schemaConfig() *db.SchemaConfig {
-	return &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-		Name: "buf_rows",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-		},
-	}}}
+type backupFireRecord struct {
+	ID    ids.RowID `rime:"primary"`
+	Name  string
+	Count int64
+	Tags  []string
+	Peak  int64
+	Floor float64
 }
 
-func agentTags() string {
-	if tags := harness.GetEnv("MURMUR_TAGS"); tags != "" {
-		return tags
+func typedDefinition(t *testing.T) db.TableDefinition {
+	t.Helper()
+	definition, err := db.Define[backupFireRecord]("live_typed_records", 901, db.RecordOptions{
+		PrimaryField:  "ID",
+		FieldIDs:      map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
+		MergePolicies: map[string]db.RecordMergePolicy{"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if os.Getenv("CGO_ENABLED") == "0" {
-		return "modernc"
-	}
-	return "sqlite_preupdate_hook sqlite_fts5"
+	return definition
 }
 
 func repoRoot(t *testing.T) string {
@@ -76,13 +78,11 @@ func repoRoot(t *testing.T) string {
 	}
 }
 
-// buildAgent compiles the suite-local backup agent with the same tags as
-// the daemon under test (MURMUR_TAGS-aware, so the modernc config builds
-// a matching agent).
+// buildAgent compiles the native typed backup agent without SQLite tags.
 func buildAgent(t *testing.T) string {
 	t.Helper()
 	out := filepath.Join(t.TempDir(), "backupagent")
-	cmd := exec.Command("go", "build", "-tags", agentTags(), "-o", out, "./tests-live/backup-under-fire/backupagent")
+	cmd := exec.Command("go", "build", "-o", out, "./tests-live/backup-under-fire/backupagent")
 	cmd.Dir = repoRoot(t)
 	if raw, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build backupagent: %v: %s", err, raw)
@@ -111,8 +111,8 @@ func startAgent(t *testing.T, bin string, cluster *harness.Cluster, replAddr str
 	t.Helper()
 	id := db.NewNodeID()
 	root := t.TempDir()
-	pebbleDir := filepath.Join(root, "pebble")
-	if err := os.MkdirAll(pebbleDir, 0755); err != nil {
+	dataDir := filepath.Join(root, "data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 	certPEM, keyPEM, err := cluster.CA.IssueNode(id, time.Hour)
@@ -153,14 +153,6 @@ func startAgent(t *testing.T, bin string, cluster *harness.Cluster, replAddr str
 	if err := os.WriteFile(keyFile, keyPEM, 0600); err != nil {
 		t.Fatal(err)
 	}
-	schemaRaw, err := json.Marshal(schemaConfig())
-	if err != nil {
-		t.Fatal(err)
-	}
-	schemaFile := filepath.Join(root, "schema.json")
-	if err := os.WriteFile(schemaFile, schemaRaw, 0644); err != nil {
-		t.Fatal(err)
-	}
 	var peers []string
 	for _, n := range cluster.Nodes {
 		peers = append(peers, n.NodeID.String()+"="+n.ReplAddr)
@@ -172,12 +164,11 @@ func startAgent(t *testing.T, bin string, cluster *harness.Cluster, replAddr str
 	}
 	t.Cleanup(func() { _ = stderr.Close() })
 	cmd := exec.Command(bin,
-		"--pebble-dir", pebbleDir,
+		"--data-dir", dataDir,
 		"--node-id", id.String(),
 		"--db-id", cluster.DBID.String(),
 		"--key-hex", cluster.Nodes[0].KeyHex,
 		"--key-id", "remote-unlock-key",
-		"--schema", schemaFile,
 		"--repl-addr", replAddr,
 		"--peers", strings.Join(peers, ","),
 		"--ca", caFile,
@@ -185,7 +176,6 @@ func startAgent(t *testing.T, bin string, cluster *harness.Cluster, replAddr str
 		"--key", keyFile,
 		"--origin-key", originKeyFile,
 		"--origin-public-keys", originKeysFile,
-		"--table", "buf_rows",
 	)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -314,10 +304,7 @@ func TestBackupUnderFire(t *testing.T) {
 	ctx := context.Background()
 	agentBin := buildAgent(t)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "backup-under-fire",
-		NumNodes:    2,
-		AwaitUnlock: true,
-		Schema:      schemaConfig(),
+		Name: "backup-under-fire", NumNodes: 2, AwaitUnlock: true, TypedRecords: true,
 	})
 	writeDur := writeSeconds(t)
 
@@ -337,9 +324,8 @@ func TestBackupUnderFire(t *testing.T) {
 				case <-stopWriters:
 					return
 				case <-ticker.C:
-					id := fmt.Sprintf("%02x%030x", w, seq)
 					seq++
-					if err := cluster.ExecSQL(w, "INSERT INTO buf_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("w%d-%d", w, seq)); err != nil {
+					if err := cluster.TypedInsert(w, fmt.Sprintf("w%d-%d", w, seq)); err != nil {
 						failedWrites.Add(1)
 					} else {
 						okWrites.Add(1)
@@ -353,10 +339,11 @@ func TestBackupUnderFire(t *testing.T) {
 	// Agent run A: join mid-load, take two fast online backups, then a
 	// throttled backup that dies to SIGKILL mid-stream.
 	agentA := startAgent(t, agentBin, cluster, fmt.Sprintf("127.0.0.1:%d", freePort(t)))
-	snap, err := cluster.QueryRowCount(0, "buf_rows")
+	snapNames, err := cluster.TypedNames(0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	snap := len(snapNames)
 	target := snap
 	if target < 100 {
 		target = 100
@@ -401,10 +388,11 @@ func TestBackupUnderFire(t *testing.T) {
 	}
 	t.Logf("load phase: %d writes, zero failures", total)
 	waitConverged(t, cluster, total, 90*time.Second)
-	survivorDigest, err := cluster.ComputeTableDigest(0, "buf_rows", "id")
+	survivorNames, err := cluster.TypedNames(0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	survivorDigest := namesDigest(survivorNames)
 
 	// Agent run B: rejoin fresh, converge on the quiesced total, take the
 	// final online backup, and exit cleanly.
@@ -425,14 +413,17 @@ func TestBackupUnderFire(t *testing.T) {
 	// Restore every completed backup: intermediate snapshots must be
 	// non-empty, non-decreasing, and subsets of the final data; the
 	// final backup must match the survivors exactly (zero lost rows).
-	finalIDs := daemonIDSet(t, cluster)
+	finalNames := make(map[string]bool, len(survivorNames))
+	for _, name := range survivorNames {
+		finalNames[name] = true
+	}
 	c1 := restoreAndCount(ctx, t, cluster, b1, b1Name)
 	c2 := restoreAndCount(ctx, t, cluster, b2, b2Name)
 	if c1 <= 0 || c2 < c1 {
 		t.Fatalf("intermediate backup counts %d/%d not positive non-decreasing", c1, c2)
 	}
-	assertSubset(t, cluster, b1, b1Name, finalIDs)
-	assertSubset(t, cluster, b2, b2Name, finalIDs)
+	assertSubset(t, cluster, b1, b1Name, finalNames)
+	assertSubset(t, cluster, b2, b2Name, finalNames)
 	c4, d4 := restoreCountDigest(ctx, t, cluster, b4, b4Name)
 	if c4 != total {
 		t.Fatalf("final backup count = %d, want %d (lost rows)", c4, total)
@@ -552,16 +543,12 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 		ready := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "buf_rows")
-			if err != nil || n != want {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ready = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, "buf_rows", "id")
-			if err != nil {
-				ready = false
-				break
-			}
+			d := namesDigest(names)
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -575,6 +562,16 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("mesh did not converge on %d rows within %v", want, timeout)
+}
+
+func namesDigest(names []string) string {
+	copyNames := append([]string(nil), names...)
+	sort.Strings(copyNames)
+	h := sha256.New()
+	for _, name := range copyNames {
+		fmt.Fprintf(h, "%s\n", name)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func mustLocalDest(t *testing.T, dir string) *backup.LocalDestination {
@@ -595,7 +592,7 @@ func keyBytes(t *testing.T, keyHex string) []byte {
 	return raw
 }
 
-func offlineOpen(t *testing.T, ctx context.Context, cluster *harness.Cluster, pebbleDir, nodeID string) *db.DB {
+func offlineOpen(t *testing.T, ctx context.Context, cluster *harness.Cluster, dataDir, nodeID string) *db.DB {
 	t.Helper()
 	node, err := db.ParseNodeID(nodeID)
 	if err != nil {
@@ -603,11 +600,12 @@ func offlineOpen(t *testing.T, ctx context.Context, cluster *harness.Cluster, pe
 	}
 	handle, err := db.Open(ctx, db.Config{
 		OriginSigning: cluster.OriginSigning(node),
-		Path:          pebbleDir,
+		Path:          dataDir,
 		NodeID:        node,
 		DBID:          cluster.DBID,
-		Schema:        *schemaConfig(),
-		Pebble:        db.DefaultPebbleConfig(),
+		Schema:        db.SchemaConfig{Version: 1},
+		Tables:        []db.TableDefinition{typedDefinition(t)},
+		Spool:         db.DefaultSpoolConfig(),
 		// The agent stores use the same key ID the daemon unlock path
 		// uses, by suite construction.
 		Encryption: db.EncryptionConfig{Key: keyBytes(t, cluster.Nodes[0].KeyHex), KeyID: "remote-unlock-key"},
@@ -639,16 +637,12 @@ func restoreAndCount(ctx context.Context, t *testing.T, cluster *harness.Cluster
 	target, fresh := restoreTo(t, ctx, srcDir, name)
 	handle := offlineOpen(t, ctx, cluster, target, fresh)
 	defer handle.Close()
-	rows, err := handle.QueryContext(ctx, "SELECT count(*) FROM buf_rows")
+	rows, err := db.TableOf[backupFireRecord](handle, "live_typed_records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
-	if !rows.Next() {
-		t.Fatal("no count row")
-	}
-	var n int
-	if err := rows.Scan(&n); err != nil {
+	n, err := rows.Where().Count()
+	if err != nil {
 		t.Fatal(err)
 	}
 	return n
@@ -659,75 +653,45 @@ func restoreCountDigest(ctx context.Context, t *testing.T, cluster *harness.Clus
 	target, fresh := restoreTo(t, ctx, srcDir, name)
 	handle := offlineOpen(t, ctx, cluster, target, fresh)
 	defer handle.Close()
-	rows, err := handle.QueryContext(ctx, "SELECT count(*) FROM buf_rows")
+	rows, err := db.TableOf[backupFireRecord](handle, "live_typed_records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var n int
-	if rows.Next() {
-		if err := rows.Scan(&n); err != nil {
-			t.Fatal(err)
-		}
+	n, err := rows.Where().Count()
+	if err != nil {
+		t.Fatal(err)
 	}
-	_ = rows.Close()
 	return n, offlineDigest(ctx, t, handle)
 }
 
-// offlineDigest mirrors harness.ComputeTableDigest exactly, including its
-// JSON value rendering (see tampered-backup for the rationale).
+// offlineDigest uses the same canonical unique-name digest as TypedNames.
 func offlineDigest(ctx context.Context, t *testing.T, handle *db.DB) string {
 	t.Helper()
-	rows, err := handle.QueryContext(ctx, "SELECT * FROM buf_rows ORDER BY id")
+	rows, err := db.TableOf[backupFireRecord](handle, "live_typed_records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
-	cols := rows.Columns()
-	h := sha256.New()
-	for rows.Next() {
-		dest := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range dest {
-			ptrs[i] = &dest[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			t.Fatal(err)
-		}
-		for _, cell := range dest {
-			raw, err := json.Marshal(cell)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var v any
-			if err := json.Unmarshal(raw, &v); err != nil {
-				t.Fatal(err)
-			}
-			h.Write([]byte(fmt.Sprintf("%v:", v)))
-		}
-		h.Write([]byte("\n"))
-	}
-	if err := rows.Err(); err != nil {
+	records, err := rows.Where().Find()
+	if err != nil {
 		t.Fatal(err)
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	names := make([]string, 0, len(records))
+	for _, row := range records {
+		names = append(names, row.Name)
+	}
+	return namesDigest(names)
 }
 
-// daemonIDSet returns the hex row IDs visible on node 0 (HTTP values
-// render blobs as base64).
+// daemonIDSet returns unique marker names visible on node 0.
 func daemonIDSet(t *testing.T, cluster *harness.Cluster) map[string]bool {
 	t.Helper()
-	res, err := cluster.QuerySQL(0, "SELECT id FROM buf_rows ORDER BY id")
+	names, err := cluster.TypedNames(0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := make(map[string]bool, len(res.Rows))
-	for _, row := range res.Rows {
-		s, _ := row[0].(string)
-		raw, err := base64.StdEncoding.DecodeString(s)
-		if err != nil {
-			t.Fatalf("decode id %q: %v", s, err)
-		}
-		out[hex.EncodeToString(raw)] = true
+	out := make(map[string]bool, len(names))
+	for _, name := range names {
+		out[name] = true
 	}
 	return out
 }
@@ -740,33 +704,20 @@ func assertSubset(t *testing.T, cluster *harness.Cluster, srcDir, name string, f
 	target, fresh := restoreTo(t, ctx, srcDir, name)
 	handle := offlineOpen(t, ctx, cluster, target, fresh)
 	defer handle.Close()
-	rows, err := handle.QueryContext(ctx, "SELECT id FROM buf_rows ORDER BY id")
+	rows, err := db.TableOf[backupFireRecord](handle, "live_typed_records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	records, err := rows.Where().Find()
+	if err != nil {
+		t.Fatal(err)
+	}
 	checked := 0
-	for rows.Next() {
-		var cell any
-		if err := rows.Scan(&cell); err != nil {
-			t.Fatal(err)
-		}
-		var hx string
-		switch v := cell.(type) {
-		case []byte:
-			hx = hex.EncodeToString(v)
-		case string:
-			hx = hex.EncodeToString([]byte(v))
-		default:
-			t.Fatalf("id cell type %T", cell)
-		}
-		if !final[hx] {
-			t.Fatalf("backup %s restores phantom row %s", name, hx)
+	for _, row := range records {
+		if !final[row.Name] {
+			t.Fatalf("backup %s restores phantom row %s", name, row.Name)
 		}
 		checked++
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
 	}
 	t.Logf("backup %s: %d rows all present in final set", name, checked)
 }

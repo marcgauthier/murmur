@@ -5,7 +5,7 @@ Three encrypted Murmur-SQL daemon processes run in separate node directories
 and accept continuous independent SQL writes through the HTTP service. They
 must converge to an identical logical-state SHA-256 digest. The test reports
 write p95 and maximum latency, and checks service readiness, materialized
-generation, replication queue depth, and Pebble disk usage from Prometheus.
+generation, replication queue depth, and Spool disk usage from Prometheus.
 
 Configure a longer acceptance run with:
 

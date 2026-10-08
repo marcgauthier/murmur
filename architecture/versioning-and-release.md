@@ -18,7 +18,7 @@ Version separately:
 
 ```text
 package API version
-persistent Pebble format version
+persistent Spool storage format version
 replication protocol version
 membership metadata/envelope version
 mutation codec version
@@ -27,7 +27,7 @@ schema epoch
 
 Do not assume they always change together.
 
-Pebble metadata:
+Spool metadata:
 
 ```text
 format_version
@@ -49,11 +49,16 @@ Require a new replication transport protocol version for shared membership/repli
 
 Version the new range/chunk and Plumtree message formats, schema ancestry, snapshot manifest/generation publication, and restore identity metadata. Negotiate required capabilities before starting transfers; an old peer must not interpret observed heads or staging receipts as applied watermarks. Preserve transaction identities across chunking and existing HLC/LWW semantics. Range/chunk transfer, Plumtree, snapshot publication, and restore metadata have implementations; their evidence and acceptance limits are recorded in [release status](release-status.md#1-verified-feature-matrix).
 
-Implementation status: protocol/minimum version 5 require `CapOriginSignatures` and `CapMergePolicies`, mutation codec 3 and transaction chunks 2 carry origin proofs, and unsigned runtime fallback is disabled. Signed format-4 stores require explicit offline `MigrateMergePolicies`; unsigned legacy stores require baseline migration; see [origin signatures](origin-signatures.md).
+The RIME cutover uses store format/minimum reader/minimum writer 6, replication protocol/minimum protocol 6, mutation codec 4, schema manifest encoding 3, and snapshot manifest format 3. Protocol 6 requires origin signatures and merge-policy capabilities. Format-5 SQL-era stores fail closed without rewrite; applications start from a fresh directory. See [origin signatures](origin-signatures.md) and the [migration plan](../MIGRATION_PLAN.md).
 
-Fresh Pebble stores record `format_version`,
-`minimum_reader_version`, and `minimum_writer_version` (all 5); open fails
-closed when a store demands a newer reader or writer, and signed format 4 requires explicit merge-policy migration and legacy format 2/3 stores require explicit baseline migration. The QUIC handshake
+The breaking API and format changes are summarized in the project
+[release notes](../RELEASE_NOTES.md). They describe typed-table adoption,
+previous-release export requirements, and the current qualification status.
+
+Fresh Spool stores record `format_version`,
+`minimum_reader_version`, and `minimum_writer_version` (all 6); open fails
+closed when a store demands a newer reader or writer. Format-5 SQL-era and
+legacy Pebble directories are rejected without migration. The QUIC handshake
 negotiates capabilities (`NegotiateCapabilities`): unknown optional bits are
 ignored, unknown required bits (marked with `CapRequiredMask`) refuse the
 session before any peer state exists, and sessions pin the negotiated usable
@@ -87,30 +92,17 @@ for the following checks. These are not observed results for the latest revision
 
 | Platform / Architecture | Build Mode / Driver | Compiler & Toolchain | CI Checks |
 |---|---|---|---|
-| **Linux amd64** | Default bundled SQLite CGO (`mattn/go-sqlite3`) | Go 1.26.x (`CGO_ENABLED=1`, gcc; `sqlite_preupdate_hook sqlite_fts5` tags) | `go vet`, race detector (`go test -race ./...`), smoke tests |
-| **Linux amd64** | Optional Pure Go (`modernc.org/sqlite`) | Go 1.26.x (`-tags "modernc"`, `CGO_ENABLED=0`) | `go vet`, unit/integration test suite |
-| **Linux arm64** | Pure Go (`modernc.org/sqlite`) | Go 1.26.x (`GOARCH=arm64`, `-tags "modernc"`, `CGO_ENABLED=0`) | Cross-compilation build verification |
-| **Windows amd64** | Pure Go (`modernc.org/sqlite`) | Go 1.26.x (`GOOS=windows`, `-tags "modernc"`, `CGO_ENABLED=0`) | Windows native test suite & cross-build |
+| **Linux amd64** | RIME + encrypted Spool; no SQLite dependency | Go 1.26.x; production build supports `CGO_ENABLED=0` | CI `go vet`, race detector, benchmark modules, and live gate |
 
-### Build Tags and Driver Selection
+Other targets (for example Windows or Linux arm64) are not covered in CI and
+need separate validation before being claimed as supported.
 
-The default backend is bundled SQLite through `mattn/go-sqlite3`; the SQL
-materialization is in-memory and uses SQLite reader/writer locking.
+### Build and test contract
 
-When building with specialized tags or zero-CGO fallbacks:
-- **Default (`!modernc`)**: mattn CGO driver (`mattn/go-sqlite3`) with bundled SQLite.
-- **`modernc`**: Switches SQL engine to pure Go (`modernc.org/sqlite`), enabling zero-CGO compilation.
-- **`sqlite_preupdate_hook`**: Enables native SQLite pre-update hook capture via `mattn/go-sqlite3`.
-- **`sqlite_fts5`**: Enables SQLite FTS5 full-text search module in bundled SQLite builds.
-
-### Build-tag contract
-
-The default CGO configuration requires tags
-(`sqlengine/capture_mattn.go` needs the pre-update-hook API). Every build,
-vet, and test invocation must pass `-tags "sqlite_preupdate_hook sqlite_fts5"`
-or `-tags modernc`; `tests-live/run.sh` applies `MURMUR_TAGS` (defaulting to
-the CGO set) to both the internal test-node build and the test run. The
-separately built test node is not race-instrumented by `go test -race` alone.
+The production module builds and its normal tests run with CGO disabled. No
+SQLite build tags or driver selection are required. Live fixtures are separate
+processes; `MURMUR_RACE=1` is required to race-instrument the child node as well
+as the test process.
 
 ### Release status and release commit
 
@@ -127,57 +119,32 @@ The codebase maintains explicit pins in `go.mod`:
 | Component | Pinned Version / Source | Rationale / Capability |
 |---|---|---|
 | **Go Toolchain** | `1.26.0` (`go.mod` directive) | Primary runtime, compiler, and standard library |
-| **mattn SQLite** | `github.com/mattn/go-sqlite3 v1.14.32` | Default CGO SQLite driver with pre-update hook and FTS5 build features |
-| **Pebble** | `github.com/cockroachdb/pebble/v2 v2.1.6` | Authoritative LSM KV, Zstd level 3, VFS encryption, reader/writer version checks |
+| **Immutable Radix** | `github.com/hashicorp/go-immutable-radix v1.3.1` | In-memory authoritative state store and snapshots |
 | **Memberlist** | `github.com/hashicorp/memberlist v0.7.0` | SWIM cluster membership and gossip |
 | **quic-go** | `github.com/quic-go/quic-go v0.63.0` | QUIC transport, mTLS connection multiplexing, DATAGRAM capabilities |
-| **Compress** | `github.com/klauspost/compress v1.19.1` | Zstandard payload and snapshot wire compression |
-| **Aegis** | `github.com/ericlagergren/aegis v0.0.0-20250325060835-cd0defd64358` | High-performance AEGIS AEAD authenticated ciphers |
-| **Modernc SQLite** | `modernc.org/sqlite v1.44.3` | Optional pure Go embedded SQLite engine (`-tags modernc`) |
 | **Google UUID** | `github.com/google/uuid v1.6.0` | 128-bit identity serialization for nodes, transactions, and snapshots |
-| **Prometheus Client**| `github.com/prometheus/client_golang v1.24.1` | Standard metrics exposition types for runtime observability |
 
 ### Licensing and Redistribution Review
 
 Before publishing release binaries, container images, or vendored amalgamations, maintain compliance with constituent open-source licenses:
 
-1. **Apache License 2.0**:
-   - `github.com/cockroachdb/pebble/v2` (CockroachDB LSM KV store)
-   - `github.com/ericlagergren/aegis` (AEGIS AEAD cipher implementation)
-   - `crypto/key_registry.go` (adapted key-registry mechanics based on Badger concepts)
-   - *Requirement*: Include original copyright notices and Apache 2.0 license text in binary distributions and third-party notices.
-2. **Mozilla Public License 2.0 (MPL-2.0)**:
+1. **Mozilla Public License 2.0 (MPL-2.0)**:
+   - `github.com/hashicorp/go-immutable-radix` (HashiCorp immutable radix tree library)
    - `github.com/hashicorp/memberlist` (HashiCorp SWIM membership library)
-   - *Requirement*: Distribute MPL-2.0 notice. If memberlist source files are modified, modifications must remain available under MPL-2.0.
-3. **MIT License**:
+   - *Requirement*: Distribute MPL-2.0 notice. If source files are modified, modifications must remain available under MPL-2.0.
+2. **MIT License**:
    - `github.com/quic-go/quic-go` (QUIC implementation)
    - `github.com/google/uuid` (UUID library)
    - *Requirement*: Preserve copyright and permission notice in binary distributions.
-4. **BSD 3-Clause License**:
+3. **BSD 3-Clause License**:
    - Go standard library and `golang.org/x/*` packages (`x/crypto`, `x/sys`, `x/net`)
-   - `github.com/klauspost/compress` (BSD 3-Clause)
    - *Requirement*: Retain copyright notice, conditions list, and disclaimer.
-5. **Public Domain / MIT (SQLite drivers)**:
-   - SQLite source code is dedicated to the public domain.
 
 ---
 
 ## 90. References Used for This Plan
 
-Architecture references; the Pebble storage/compression design is pinned to v2.1.6, and cipher/VFS conformance must be validated during implementation.
-
-- SQLite pre-update hook:
-  https://sqlite.org/c3ref/preupdate_blobwrite.html
-
-- Pebble repository and versioned storage/cache/compression options:
-  https://github.com/cockroachdb/pebble
-  https://github.com/cockroachdb/pebble/blob/v2.1.6/options.go
-
-- Pebble VFS:
-  https://github.com/cockroachdb/pebble/blob/v2.1.6/vfs/vfs.go
-
-- Pebble Zstd level 3 compression profile:
-  https://github.com/cockroachdb/pebble/blob/v2.1.6/sstable/block/compression.go
+Architecture references:
 
 - Badger key-registry reference (concepts/adapted code only, Apache-2.0):
   https://github.com/dgraph-io/badger/blob/v4.9.1/key_registry.go
@@ -185,7 +152,6 @@ Architecture references; the Pebble storage/compression design is pinned to v2.1
 - Go authenticated cipher implementations:
   https://pkg.go.dev/crypto/cipher
   https://pkg.go.dev/golang.org/x/crypto/chacha20poly1305
-  https://github.com/ericlagergren/aegis
 
 - quic-go repository and stream documentation:
   https://github.com/quic-go/quic-go

@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # Benchmark suite runner: runs ONLY the suites under tests-benchmark/
-# (in-process Go benchmarks, live replication benchmark, SQLite driver
-# comparison). Each test folder has its own runner; live correctness
-# scenarios live under tests-live/run.sh.
+# (in-process Go benchmarks, live replication benchmark, isolated historical
+# baselines). Each test folder has its own runner; live
+# correctness scenarios live under tests-live/run.sh.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 scenario=${1:-all}
 binary=${MURMUR_BIN:-"$root/tests-benchmark/bin/testnode"}
-tags=${MURMUR_TAGS:-"sqlite_preupdate_hook sqlite_fts5"}
+tags=${MURMUR_TAGS:-""}
+# The in-process benchmark module drives the typed backend and needs no
+# build tags; keep the MURMUR_TAGS override honored when explicitly set.
+bench_tags=${MURMUR_TAGS:-}
 race_args=()
 if [[ ${MURMUR_RACE:-0} == 1 ]]; then
   race_args=(-race)
@@ -21,7 +24,7 @@ export MURMUR_LIVE_FAILURES="$failures_dir"
 started_at=$SECONDS
 
 echo "======================================================================"
-echo "  MURMUR-SQL BENCHMARK SUITE RUNNER"
+echo "  MURMUR BENCHMARK SUITE RUNNER"
 echo "======================================================================"
 
 # Reap leftover daemons rooted at OUR runtime dir on the way out, scoped by
@@ -44,11 +47,13 @@ sweep_runtime_daemons() {
 }
 trap sweep_runtime_daemons EXIT INT TERM
 
-# Compile testnode fixture binary (used by the replication suite) to ensure
-# it matches current sources & tags.
-echo "Compiling testnode fixture binary at $binary with tags: '$tags'..."
-mkdir -p "$(dirname "$binary")"
-(cd "$root" && go build "${race_args[@]}" -tags "$tags" -o "$binary" ./tests-live/harness/testnode)
+# Compile the testnode fixture only for suites that can use it. The isolated
+# engine benchmarks do not start the replication daemon.
+if [[ "$scenario" != "rime-sqlite" && "$scenario" != "sqlite-bench" ]]; then
+  echo "Compiling testnode fixture binary at $binary with tags: '$tags'..."
+  mkdir -p "$(dirname "$binary")"
+  (cd "$root" && go build "${race_args[@]}" -tags "$tags" -o "$binary" ./tests-live/harness/testnode)
+fi
 
 scenario_timeout() {
   case "$1" in
@@ -62,7 +67,15 @@ run_go_suite() {
   local scn=$1
   echo ""
   echo ">>> RUNNING BENCHMARK SUITE: $scn"
-  (cd "$root" && go test "${race_args[@]}" -tags "$tags" -v -count=1 -timeout="$(scenario_timeout "$scn")" "./tests-benchmark/$scn")
+  if [[ "$scn" == "rime-sqlite" || "$scn" == "sqlite-bench" ]]; then
+    (cd "$root/tests-benchmark/$scn" && go test "${race_args[@]}" -v -count=1 -timeout="$(scenario_timeout "$scn")" .)
+  elif [[ "$scn" == "replication" ]]; then
+    (cd "$root/tests-benchmark/replication" && go test "${race_args[@]}" -tags "$tags" -v -count=1 -timeout="$(scenario_timeout "$scn")" .)
+  elif [[ "$scn" == "benchmark" ]]; then
+    (cd "$root/tests-benchmark/benchmark" && go test "${race_args[@]}" -tags "$tags" -v -count=1 -timeout="$(scenario_timeout "$scn")" .)
+  else
+    (cd "$root" && go test "${race_args[@]}" -tags "$tags" -v -count=1 -timeout="$(scenario_timeout "$scn")" "./tests-benchmark/$scn")
+  fi
   echo ">>> SUITE COMPLETED: $scn"
 }
 
@@ -72,10 +85,10 @@ run_benchmark_pkg() {
   local benchtime=${MURMUR_BENCH_BENCHTIME:-1s}
   echo ""
   echo ">>> RUNNING BENCHMARK SUITE: benchmark (throughput tests)"
-  (cd "$root" && go test "${race_args[@]}" -tags "$tags" -v -count=1 -timeout="$(scenario_timeout benchmark)" "./tests-benchmark/benchmark")
+  (cd "$root/tests-benchmark/benchmark" && go test "${race_args[@]}" ${bench_tags:+-tags "$bench_tags"} -v -count=1 -timeout="$(scenario_timeout benchmark)" .)
   echo ""
   echo ">>> RUNNING BENCHMARK SUITE: benchmark (micro-benchmarks, -short, benchtime=$benchtime)"
-  (cd "$root" && go test "${race_args[@]}" -tags "$tags" -count=1 -timeout="$(scenario_timeout benchmark)" -run '^$' -bench . -short -benchtime "$benchtime" "./tests-benchmark/benchmark")
+  (cd "$root/tests-benchmark/benchmark" && go test "${race_args[@]}" ${bench_tags:+-tags "$bench_tags"} -count=1 -timeout="$(scenario_timeout benchmark)" -run '^$' -bench . -short -benchtime "$benchtime" .)
   echo ">>> SUITE COMPLETED: benchmark"
 }
 
@@ -85,11 +98,11 @@ run_perf_matrix() {
   local tier=${MURMUR_PERF_TIER:-standard}
   echo ""
   echo ">>> RUNNING PERF MATRIX (tier=$tier)"
-  (cd "$root" && go test "${race_args[@]}" -tags "$tags" -v -count=1 -timeout="$(scenario_timeout perf-matrix)" -run '^TestPerfMatrix$' "./tests-benchmark/benchmark")
+  (cd "$root/tests-benchmark/benchmark" && go test "${race_args[@]}" ${bench_tags:+-tags "$bench_tags"} -v -count=1 -timeout="$(scenario_timeout perf-matrix)" -run '^TestPerfMatrix$' .)
   echo ">>> SUITE COMPLETED: perf-matrix"
 }
 
-ALL_SUITES="replication sqlite-bench benchmark"
+ALL_SUITES="replication sqlite-bench rime-sqlite benchmark"
 
 case "$scenario" in
   all)

@@ -1,12 +1,10 @@
 package replication
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math/rand"
 	"sort"
@@ -16,10 +14,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
 	"github.com/quic-go/quic-go"
 
 	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/compression"
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/overload"
 	"github.com/marcgauthier/murmur/plumtree"
@@ -58,7 +56,7 @@ type Logger interface {
 
 // Applier durably applies received data and materializes winners into the
 // query engine. Implementations must send no acknowledgement before the
-// Pebble commit; acknowledgements are handled by the Manager.
+// Spool commit; acknowledgements are handled by the Manager.
 type Applier interface {
 	ApplyRemote(ctx context.Context, batch *codec.MutationBatch) error
 	ApplySnapshotChunk(ctx context.Context, manifest *codec.SnapshotManifest, index uint64, cells []codec.SnapshotCell, last bool) (bool, error)
@@ -167,7 +165,13 @@ type ManagerConfig struct {
 	// Default 30s.
 	SendTimeout time.Duration
 
-	SnapshotChunkCells      int
+	SnapshotChunkCells int
+	// Codec compresses outgoing snapshot chunks. Nil selects the
+	// built-in deflate. A custom codec must be registered (via
+	// Codecs) on every peer that receives from this node.
+	Codec compression.Codec
+	// Codecs registers custom codecs for decoding incoming frames.
+	Codecs                  []compression.Codec
 	MaxSnapshotBytes        uint64
 	SnapshotTransferTimeout time.Duration
 	// SnapshotRequestTimeout bounds how long a receiver waits for
@@ -625,6 +629,9 @@ type Manager struct {
 	cfg ManagerConfig
 	log Logger
 
+	codecs    *compression.Registry // decode registry
+	sendCodec compression.Codec     // outgoing snapshot codec
+
 	st stats // diagnostics counters; Manager is always used by pointer
 
 	ln         *transport.Listener
@@ -680,6 +687,17 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if local != cfg.Local {
 		return nil, fmt.Errorf("replication: certificate node %s != configured %s", local, cfg.Local)
 	}
+	userCodecs := cfg.Codecs
+	sendCodec := cfg.Codec
+	if sendCodec == nil {
+		sendCodec = compression.Deflate
+	} else {
+		userCodecs = append([]compression.Codec{sendCodec}, userCodecs...)
+	}
+	codecs, err := compression.NewRegistry(userCodecs...)
+	if err != nil {
+		return nil, fmt.Errorf("replication: %w", err)
+	}
 	pool := cfg.Pool
 	if pool == nil {
 		p, err := transport.NewPool(transport.PoolOptions{
@@ -705,6 +723,8 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	}
 	m := &Manager{
 		cfg:             cfg,
+		codecs:          codecs,
+		sendCodec:       sendCodec,
 		pool:            pool,
 		peers:           make(map[ids.NodeID]*peerState),
 		selected:        make(map[ids.NodeID]bool),
@@ -1543,7 +1563,7 @@ func (m *Manager) ourHello() (*Hello, error) {
 		wms = wms[:ProgressPageEntries]
 	}
 	id := m.currentSchema()
-	caps := CapMergePolicies | CapZstd | CapProgressPages | CapTransactionChunks | CapOriginSignatures
+	caps := CapMergePolicies | CapCompression | CapProgressPages | CapTransactionChunks | CapOriginSignatures
 	if m.cfg.EnablePlumtree {
 		caps |= CapPlumtree | CapRequiredMask
 	}
@@ -3525,15 +3545,8 @@ func (m *Manager) sendSnapshot(p *peerState, ps *peerSession) {
 	defer snapStream.Close()
 
 	p.mu.Lock()
-	useZstd := p.caps&CapZstd != 0
+	useCompression := p.caps&CapCompression != 0
 	p.mu.Unlock()
-	var enc *zstd.Encoder
-	if useZstd {
-		enc, _ = zstd.NewWriter(nil)
-		if enc != nil {
-			defer enc.Close()
-		}
-	}
 	sentManifest := false
 	chunkIndex := uint64(0)
 	err = m.cfg.Store.ExportSnapshotContext(ctx, m.cfg.SnapshotChunkCells,
@@ -3549,10 +3562,10 @@ func (m *Manager) sendSnapshot(p *peerState, ps *peerSession) {
 			}
 			raw := EncodeSnapshotChunk(nil, &SnapshotChunk{Index: chunkIndex, Last: last, Cells: chunk})
 			flags := uint16(0)
-			if enc != nil && len(raw) > 4096 {
-				if c := enc.EncodeAll(raw, nil); len(c) < len(raw) {
+			if useCompression && len(raw) > 4096 {
+				if c, cerr := m.sendCodec.Compress(nil, raw); cerr == nil && len(c) < len(raw) {
 					raw = c
-					flags = FlagZstd
+					flags = CompressedFlags(m.sendCodec.ID())
 				}
 			}
 			if err := m.waitTransferContext(ctx, p, len(raw)); err != nil {
@@ -3617,7 +3630,7 @@ func (m *Manager) onSnapshotManifest(p *peerState, _ *peerSession, payload []byt
 		return err
 	}
 	m.st.snapshotManifestsReceived.Add(1)
-	if len(rest) != 0 || manifest.FormatVersion != 2 || manifest.ChunkCount == 0 || manifest.ChunkCount > 65_536 || manifest.EncodedBytes > m.cfg.MaxSnapshotBytes {
+	if len(rest) != 0 || manifest.FormatVersion != 3 || manifest.ChunkCount == 0 || manifest.ChunkCount > 65_536 || manifest.EncodedBytes > m.cfg.MaxSnapshotBytes {
 		m.st.snapshotManifestsRejected.Add(1)
 		return fmt.Errorf("invalid snapshot manifest bounds or format")
 	}
@@ -3653,14 +3666,13 @@ func (m *Manager) onSnapshotChunk(p *peerState, _ *peerSession, f *Frame) error 
 		return nil
 	}
 	payload := f.Payload
-	if f.Flags&FlagZstd != 0 {
-		dec, err := zstd.NewReader(bytes.NewReader(payload))
+	if f.Flags&FlagCompressed != 0 {
+		cd, err := m.codecs.Get(FlagCodecID(f.Flags))
 		if err != nil {
-			return err
+			return fmt.Errorf("snapshot chunk codec: %w", err)
 		}
-		defer dec.Close()
 		// Bound decompressed size (chunks carry <= SnapshotChunkCells cells).
-		raw, err := io.ReadAll(io.LimitReader(dec, 256<<20))
+		raw, err := cd.Decompress(nil, payload, 256<<20)
 		if err != nil {
 			return err
 		}

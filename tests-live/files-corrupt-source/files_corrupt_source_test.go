@@ -37,8 +37,9 @@ const errInvalidObject = "objectstore: invalid encrypted object"
 func TestCorruptSourceFetchFailsVerification(t *testing.T) {
 	victimSize := envInt("MURMUR_FILES_CORRUPT_VICTIM_KB", 256) << 10
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:     "files-corrupt-source",
-		NumNodes: 2,
+		Name:         "files-corrupt-source",
+		NumNodes:     2,
+		TypedRecords: true,
 		Files: &harness.FilesOptions{
 			ObjectKeyHex: objectKey, MaxFileBytes: 4 << 20, FetchIntervalMs: -1,
 		},

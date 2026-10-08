@@ -11,8 +11,10 @@ import (
 
 type VerifyCommand struct{}
 
-func (c *VerifyCommand) Name() string        { return "verify" }
-func (c *VerifyCommand) Description() string { return "Verify integrity of offline storage, WAL, and schema DAG" }
+func (c *VerifyCommand) Name() string { return "verify" }
+func (c *VerifyCommand) Description() string {
+	return "Verify integrity of offline storage, WAL, and schema DAG"
+}
 func (c *VerifyCommand) Usage() string {
 	return "murmur verify <data-dir> [--deep] [--json]"
 }
@@ -22,12 +24,14 @@ func init() {
 }
 
 type verifyResult struct {
-	DataDir        string   `json:"data_dir"`
-	Valid          bool     `json:"valid"`
-	TablesChecked  int      `json:"tables_checked"`
-	RowsChecked    int64    `json:"rows_checked"`
-	Errors         []string `json:"errors,omitempty"`
-	Warnings       []string `json:"warnings,omitempty"`
+	DataDir             string   `json:"data_dir"`
+	Valid               bool     `json:"valid"`
+	TablesChecked       int      `json:"tables_checked"`
+	StateGeneration     uint64   `json:"state_generation"`
+	MaterializerChecked bool     `json:"materializer_checked"`
+	Deep                bool     `json:"deep"`
+	Errors              []string `json:"errors,omitempty"`
+	Warnings            []string `json:"warnings,omitempty"`
 }
 
 func (c *VerifyCommand) Run(ctx context.Context, globalOpts GlobalOptions, args []string, stdout, stderr io.Writer) error {
@@ -36,7 +40,7 @@ func (c *VerifyCommand) Run(ctx context.Context, globalOpts GlobalOptions, args 
 
 	for _, arg := range args {
 		switch {
-		case arg == "--deep":
+		case arg == "--deep" || arg == "--full":
 			deep = true
 		case !strings.HasPrefix(arg, "-") && dataDir == "":
 			dataDir = arg
@@ -50,56 +54,40 @@ func (c *VerifyCommand) Run(ctx context.Context, globalOpts GlobalOptions, args 
 	res := verifyResult{
 		DataDir: dataDir,
 		Valid:   true,
+		Deep:    deep,
 	}
 
-	db, err := openLocalDB(ctx, dataDir, globalOpts, true)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	store, err := openOfflineStore(dataDir, globalOpts)
 	if err != nil {
 		res.Valid = false
-		res.Errors = append(res.Errors, fmt.Sprintf("Failed to open database: %v", err))
+		res.Errors = append(res.Errors, fmt.Sprintf("Failed to open durable state: %v", err))
 		if globalOpts.JSON {
 			return format.RenderJSON(stdout, res, true)
 		}
 		fmt.Fprintf(stderr, "FAIL: %v\n", err)
 		return nil
 	}
-	defer db.Close()
+	defer store.Close()
 
-	// 1. Run SQLite PRAGMA quick_check or integrity_check
-	checkSQL := "PRAGMA quick_check;"
-	if deep {
-		checkSQL = "PRAGMA integrity_check;"
-	}
-
-	rows, err := db.QueryContext(ctx, checkSQL)
+	// Opening Spool replays and authenticates its durable records. Read the
+	// manifest from the same authoritative state; the CLI has no application
+	// Go types with which to reconstruct a RIME materializer.
+	manifest, err := store.LoadSchemaManifest()
 	if err != nil {
 		res.Valid = false
-		res.Errors = append(res.Errors, fmt.Sprintf("Integrity check query failed: %v", err))
+		res.Errors = append(res.Errors, fmt.Sprintf("Schema manifest verification failed: %v", err))
+	} else if manifest == nil {
+		res.Warnings = append(res.Warnings, "Schema is not bound yet; the first application Open will persist its Go table definitions")
 	} else {
-		for rows.Next() {
-			var msg string
-			if err := rows.Scan(&msg); err == nil {
-				if msg != "ok" {
-					res.Valid = false
-					res.Errors = append(res.Errors, msg)
-				}
-			}
-		}
-		rows.Close()
+		res.TablesChecked = len(manifest.Tables)
 	}
-
-	// 2. Query table counts
-	tRows, err := db.QueryContext(ctx, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-	if err == nil {
-		for tRows.Next() {
-			var tbl string
-			if err := tRows.Scan(&tbl); err == nil {
-				res.TablesChecked++
-				var count int64
-				_ = db.QueryRowContext(ctx, fmt.Sprintf("SELECT count(*) FROM %s;", tbl)).Scan(&count)
-				res.RowsChecked += count
-			}
-		}
-		tRows.Close()
+	res.StateGeneration, err = store.StateGeneration()
+	if err != nil {
+		res.Valid = false
+		res.Errors = append(res.Errors, fmt.Sprintf("State generation read failed: %v", err))
 	}
 
 	if globalOpts.JSON {
@@ -107,12 +95,21 @@ func (c *VerifyCommand) Run(ctx context.Context, globalOpts GlobalOptions, args 
 	}
 
 	if res.Valid {
-		fmt.Fprintf(stdout, "PASS: Storage and SQLite materialization verified for %s\n", dataDir)
+		fmt.Fprintf(stdout, "PASS: Durable Spool state verified for %s\n", dataDir)
+		integrityStatus := "HEALTHY"
+		if len(res.Warnings) > 0 {
+			integrityStatus = "DEGRADED"
+		}
 		format.RenderKV(stdout, [][2]string{
 			{"Tables Checked", fmt.Sprintf("%d", res.TablesChecked)},
-			{"Total Rows Verified", fmt.Sprintf("%d", res.RowsChecked)},
-			{"Integrity Status", "HEALTHY"},
+			{"State Generation", fmt.Sprintf("%d", res.StateGeneration)},
+			{"Schema Status", map[bool]string{true: "bound", false: "not yet bound"}[res.Warnings == nil]},
+			{"Materializer Check", "not run (application schema unavailable)"},
+			{"Integrity Status", integrityStatus},
 		})
+		for _, warning := range res.Warnings {
+			fmt.Fprintf(stderr, "WARN: %s\n", warning)
+		}
 	} else {
 		fmt.Fprintf(stderr, "FAIL: Integrity verification found %d error(s) in %s:\n", len(res.Errors), dataDir)
 		for _, e := range res.Errors {

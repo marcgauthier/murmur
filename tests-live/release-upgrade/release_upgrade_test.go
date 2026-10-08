@@ -1,17 +1,16 @@
-// Release and upgrade acceptance: previous-release binaries must
-// interoperate with the current build.
+// Release and upgrade acceptance: the current build must reject
+// incompatible on-disk formats from the previous release.
 //
 // The suite checks out the pinned previous release (MURMUR_PREV_REF)
-// into a scratch worktree, builds its daemon, and proves three
-// upgrade paths against the current binary: a rolling upgrade with
-// continuous writes, a current-binary open of a previous-release
-// store, and a fresh-identity restore (by the current library) of a
-// backup taken by the previous release's writer.
+// into a scratch worktree, builds its daemon, and verifies that the
+// current binary rejects its incompatible store and backup formats.
 package releaseupgrade_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -23,12 +22,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/origin"
 	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
@@ -49,10 +49,11 @@ func prevTags() string {
 	if tags := harness.GetEnv("MURMUR_TAGS"); tags != "" {
 		return tags
 	}
-	if os.Getenv("CGO_ENABLED") == "0" {
-		return "modernc"
-	}
-	return "sqlite_preupdate_hook sqlite_fts5"
+	// The pinned previous release uses mattn/go-sqlite3 and requires this
+	// tag for its replication capture hook. This tag is isolated to the
+	// historical fixture build; current typed binaries use the runner's
+	// CGO-disabled configuration.
+	return "sqlite_preupdate_hook"
 }
 
 // The previous release is checked out and built once per package run;
@@ -185,7 +186,7 @@ func prevDaemon(t *testing.T) string {
 
 // prevBackupBin returns a helper built against the previous release
 // that takes an offline backup of a stopped node directory:
-// prev-backup <pebbleDir> <nodeID> <dbid> <keyHex> <schemaJSON> <destDir>.
+// prev-backup <dataDir> <nodeID> <dbid> <keyHex> <schemaJSON> <destDir>.
 func prevBackupBin(t *testing.T) string {
 	t.Helper()
 	ensurePrevBuild(t)
@@ -220,9 +221,9 @@ func fail(format string, args ...any) {
 
 func main() {
 	if len(os.Args) != 7 {
-		fail("usage: prev-backup <pebbleDir> <nodeID> <dbid> <keyHex> <schemaJSON> <destDir>")
+		fail("usage: prev-backup <dataDir> <nodeID> <dbid> <keyHex> <schemaJSON> <destDir>")
 	}
-	pebbleDir, nodeIDS, dbidS, keyHex, schemaFile, destDir := os.Args[1], os.Args[2], os.Args[3], os.Args[4], os.Args[5], os.Args[6]
+	dataDir, nodeIDS, dbidS, keyHex, schemaFile, destDir := os.Args[1], os.Args[2], os.Args[3], os.Args[4], os.Args[5], os.Args[6]
 	nodeID, err := db.ParseNodeID(nodeIDS)
 	if err != nil {
 		fail("parse node id: %v", err)
@@ -249,11 +250,10 @@ func main() {
 	}
 	ctx := context.Background()
 	handle, err := db.Open(ctx, db.Config{
-		Path:       pebbleDir,
+		Path:       dataDir,
 		NodeID:     nodeID,
 		DBID:       dbid,
 		Schema:     schemaCfg,
-		Pebble:     db.DefaultPebbleConfig(),
 		Encryption: db.EncryptionConfig{Key: key, KeyID: "remote-unlock-key"},
 	})
 	if err != nil {
@@ -288,62 +288,9 @@ func schemaConfig() *db.SchemaConfig {
 	}}}
 }
 
-// Signed replication requires a coordinated offline cutover. Every legacy
-// node converges first, then all writers stop before baseline migration.
-func TestCoordinatedSignedCutoverLosesNoWrites(t *testing.T) {
-	oldBin := prevDaemon(t)
-	cluster := harness.NewCluster(t, harness.ClusterOptions{Name: "release-upgrade", NumNodes: 3, AwaitUnlock: true, Schema: schemaConfig(), BinaryByNode: map[int]string{0: oldBin, 1: oldBin, 2: oldBin}})
-	for node := range cluster.Nodes {
-		for i := 0; i < 5; i++ {
-			if err := cluster.ExecSQL(node, "INSERT INTO ru_rows (id,name) VALUES (?,?)", fmt.Sprintf("%032x", node*100+i), fmt.Sprintf("old-%d-%d", node, i)); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	waitCounts(t, cluster, 15, 60*time.Second)
-	before, err := cluster.ComputeTableDigest(0, "ru_rows", "id")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := range cluster.Nodes {
-		cluster.StopNode(i)
-	}
-	for i := range cluster.Nodes {
-		migrateNodeBaseline(t, cluster, i)
-		cluster.SetNodeBinary(i, cluster.BinaryPath)
-	}
-	for i := range cluster.Nodes {
-		cluster.StartNode(i)
-		cluster.UnlockNode(i, cluster.Nodes[i].KeyHex)
-		cluster.WaitNodeReady(i)
-	}
-	waitCounts(t, cluster, 15, 30*time.Second)
-	for i := range cluster.Nodes {
-		got, err := cluster.ComputeTableDigest(i, "ru_rows", "id")
-		if err != nil || got != before {
-			t.Fatalf("baseline changed: %s %v", got, err)
-		}
-	}
-	for i := range cluster.Nodes {
-		if err := cluster.ExecSQL(i, "INSERT INTO ru_rows (id,name) VALUES (?,?)", fmt.Sprintf("%032x", 1000+i), "signed"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	waitCounts(t, cluster, 18, 30*time.Second)
-	waitConvergedCounts(t, cluster, 30*time.Second)
-}
-
-func migrateNodeBaseline(t *testing.T, c *harness.Cluster, idx int) {
-	t.Helper()
-	cmd := exec.Command(c.BinaryPath, "migrate-origin-baseline", "--config", c.Nodes[idx].ConfigFile)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("offline origin baseline migration: %v: %s", err, out)
-	}
-}
-
-// The current binary opens a store written by the previous release:
-// same identity, same directory, data byte-identical.
-func TestNewBinaryOpensOldStore(t *testing.T) {
+// The current binary rejects opening a legacy Pebble store:
+// fails closed with a clear error without modifying the directory.
+func TestNewBinaryRejectsOldPebbleStore(t *testing.T) {
 	oldBin := prevDaemon(t)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
 		Name:         "release-upgrade-open",
@@ -354,36 +301,38 @@ func TestNewBinaryOpensOldStore(t *testing.T) {
 	})
 	for i := 0; i < 10; i++ {
 		id := fmt.Sprintf("%032x", 100+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO ru_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("old-%d", i)); err != nil {
+		if err := execPreviousReleaseSQL(cluster, 0, "INSERT INTO ru_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("old-%d", i)); err != nil {
 			t.Fatalf("seed write: %v", err)
 		}
 	}
-	waitCounts(t, cluster, 10, 60*time.Second)
-	want, err := cluster.ComputeTableDigest(0, "ru_rows", "id")
-	if err != nil {
-		t.Fatal(err)
-	}
 	cluster.StopNode(0)
 
-	migrateNodeBaseline(t, cluster, 0)
-	cluster.SetNodeBinary(0, cluster.BinaryPath)
-	cluster.StartNode(0)
-	cluster.UnlockNode(0, cluster.Nodes[0].KeyHex)
-	cluster.WaitNodeReady(0)
-	waitCounts(t, cluster, 10, 30*time.Second)
-	got, err := cluster.ComputeTableDigest(0, "ru_rows", "id")
-	if err != nil {
-		t.Fatal(err)
+	node := cluster.Nodes[0]
+	entries1, _ := os.ReadDir(node.Dir)
+	var names1 []string
+	for _, e := range entries1 {
+		names1 = append(names1, e.Name())
 	}
-	if got != want {
-		t.Fatalf("current binary read digest %s, old writer wrote %s", got, want)
+	t.Logf("node.Dir entries: %v", names1)
+	entries2, _ := os.ReadDir(node.DataDir)
+	var names2 []string
+	for _, e := range entries2 {
+		names2 = append(names2, e.Name())
+	}
+	t.Logf("node.DataDir entries: %v", names2)
+	cfg := offlineConfig(t, node.Dir, cluster, node.NodeID.String())
+	if _, err := db.Open(context.Background(), cfg); err == nil {
+		t.Fatalf("expected db.Open to reject legacy Pebble directory, got nil")
+	} else if !strings.Contains(err.Error(), "legacy Pebble database") {
+		t.Fatalf("expected legacy Pebble rejection error, got: %v", err)
+	} else {
+		t.Logf("legacy Pebble store properly rejected: %v", err)
 	}
 }
 
-// A backup taken by the previous release's writer restores under the
-// current library with a fresh identity, and the current binary serves
-// the restored data with no lost rows.
-func TestOldBackupRestoresOnNewBinary(t *testing.T) {
+// A backup taken by a legacy Pebble writer is explicitly rejected by the
+// current Spool-only restore engine.
+func TestOldBackupRejectedOnNewBinary(t *testing.T) {
 	ctx := context.Background()
 	oldBin := prevDaemon(t)
 	helper := prevBackupBin(t)
@@ -397,14 +346,9 @@ func TestOldBackupRestoresOnNewBinary(t *testing.T) {
 	node := cluster.Nodes[0]
 	for i := 0; i < 20; i++ {
 		id := fmt.Sprintf("%032x", 7000+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO ru_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("row-%d", i)); err != nil {
+		if err := execPreviousReleaseSQL(cluster, 0, "INSERT INTO ru_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("row-%d", i)); err != nil {
 			t.Fatalf("seed write: %v", err)
 		}
-	}
-	waitCounts(t, cluster, 20, 60*time.Second)
-	want, err := cluster.ComputeTableDigest(0, "ru_rows", "id")
-	if err != nil {
-		t.Fatal(err)
 	}
 	cluster.StopNode(0)
 
@@ -417,205 +361,51 @@ func TestOldBackupRestoresOnNewBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	backupDir := t.TempDir()
-	cmd := exec.Command(helper, node.PebbleDir, node.NodeID.String(), cluster.DBID.String(), node.KeyHex, schemaFile, backupDir)
+	cmd := exec.Command(helper, node.DataDir, node.NodeID.String(), cluster.DBID.String(), node.KeyHex, schemaFile, backupDir)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("previous-release backup: %v: %s", err, out)
 	} else {
 		t.Logf("previous writer: %s", strings.TrimSpace(string(out)))
 	}
 
-	if err := os.RemoveAll(node.PebbleDir); err != nil {
+	if err := os.RemoveAll(node.DataDir); err != nil {
 		t.Fatal(err)
 	}
 	fresh := db.NewNodeID()
 	if _, err := backup.Restore(ctx, backup.RestoreConfig{
 		Source:      mustLocalDest(t, backupDir),
-		TargetPath:  node.PebbleDir,
+		TargetPath:  node.DataDir,
 		FreshNodeID: fresh.String(),
 		Mode:        backup.RestoreClone,
 		Overwrite:   true,
-	}); err != nil {
-		t.Fatalf("current restore of previous-release backup: %v", err)
+	}); err == nil {
+		t.Fatalf("expected restore to reject legacy Pebble backup, got nil")
+	} else if !strings.Contains(err.Error(), "legacy Pebble backup") {
+		t.Fatalf("expected legacy Pebble backup error, got: %v", err)
+	} else {
+		t.Logf("legacy Pebble backup properly rejected: %v", err)
 	}
-	rewriteNodeConfig(t, node, fresh.String())
-	reissueNodeCert(t, cluster, node, fresh.String())
+}
 
-	migrateNodeBaseline(t, cluster, 0)
-	cluster.SetNodeBinary(0, cluster.BinaryPath)
-	cluster.StartNode(0)
-	cluster.UnlockNode(0, node.KeyHex)
-	cluster.WaitNodeReady(0)
-	waitCounts(t, cluster, 20, 90*time.Second)
-	got, err := cluster.ComputeTableDigest(0, "ru_rows", "id")
+// execPreviousReleaseSQL seeds fixtures only through the pinned historical
+// binary. Current Murmur nodes have no SQL client or materializer.
+func execPreviousReleaseSQL(c *harness.Cluster, idx int, query string, args ...any) error {
+	node := c.Nodes[idx]
+	payload, err := json.Marshal(map[string]any{"query": query, "args": args})
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
-	if got != want {
-		t.Fatalf("restored digest %s != pre-backup %s", got, want)
+	url := "https://" + node.APIAddr + "/v1/exec"
+	resp, err := c.APIClient().Post(url, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("previous daemon SQL seed request: %w", err)
 	}
-	if id := infoLabel(t, node.APIAddr, "node_id"); id != fresh.String() {
-		t.Fatalf("node identity = %s, want fresh %s", id, fresh.String())
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("previous daemon SQL seed failed (%d): %s", resp.StatusCode, body)
 	}
-}
-
-// waitCounts waits until every node reports the exact row count.
-func waitCounts(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		ok := true
-		for idx := range c.Nodes {
-			n, err := c.QueryRowCount(idx, "ru_rows")
-			if err != nil || n != want {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("row counts did not reach %d within %v", want, timeout)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-// waitRowOnNode waits until one node serves a row written elsewhere
-// (mixed-version replication proof).
-func waitRowOnNode(t *testing.T, c *harness.Cluster, idx int, id string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		res, err := c.QuerySQL(idx, "SELECT count(*) FROM ru_rows WHERE id = ?", id)
-		if err == nil && len(res.Rows) > 0 && len(res.Rows[0]) > 0 && fmt.Sprintf("%v", res.Rows[0][0]) == "1" {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("node%d did not replicate row %s within %v (last err %v)", idx+1, id, timeout, err)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-// quiesce pauses all writers, waits for exact digest agreement, then
-// resumes. Callers must hold no pause themselves.
-func quiesce(t *testing.T, c *harness.Cluster, paused *[3]atomic.Bool, timeout time.Duration) {
-	t.Helper()
-	for i := range paused {
-		paused[i].Store(true)
-	}
-	time.Sleep(300 * time.Millisecond)
-	deadline := time.Now().Add(timeout)
-	for {
-		want, err := c.ComputeTableDigest(0, "ru_rows", "id")
-		if err == nil {
-			match := true
-			for idx := 1; idx < len(c.Nodes); idx++ {
-				d, err := c.ComputeTableDigest(idx, "ru_rows", "id")
-				if err != nil || d != want {
-					match = false
-					break
-				}
-			}
-			if match {
-				for i := range paused {
-					paused[i].Store(false)
-				}
-				return
-			}
-		}
-		if time.Now().After(deadline) {
-			dumpIDDiff(t, c)
-			t.Fatalf("digests did not agree within %v", timeout)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-}
-
-// waitConvergedCounts waits until all nodes agree on the same row count
-// (the absolute value floats while writers run).
-func waitConvergedCounts(t *testing.T, c *harness.Cluster, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		first, err := c.QueryRowCount(0, "ru_rows")
-		if err != nil {
-			if time.Now().After(deadline) {
-				t.Fatalf("node1 count query: %v", err)
-			}
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-		agree := true
-		for idx := 1; idx < len(c.Nodes); idx++ {
-			n, err := c.QueryRowCount(idx, "ru_rows")
-			if err != nil || n != first {
-				agree = false
-				break
-			}
-		}
-		if agree {
-			time.Sleep(500 * time.Millisecond)
-			still := true
-			for idx := range c.Nodes {
-				n, err := c.QueryRowCount(idx, "ru_rows")
-				if err != nil || n != first {
-					still = false
-					break
-				}
-			}
-			if still {
-				return
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("row counts did not converge within %v", timeout)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-// dumpIDDiff logs the symmetric row-id difference between nodes 1 and
-// 2 plus the first ordered row difference (failure diagnostics).
-func dumpIDDiff(t *testing.T, c *harness.Cluster) {
-	t.Helper()
-	ids := func(idx int) map[string]bool {
-		m := map[string]bool{}
-		res, err := c.QuerySQL(idx, "SELECT id FROM ru_rows")
-		if err != nil {
-			t.Logf("divergence: node%d ids query: %v", idx+1, err)
-			return m
-		}
-		for _, row := range res.Rows {
-			if len(row) > 0 {
-				m[fmt.Sprintf("%v", row[0])] = true
-			}
-		}
-		return m
-	}
-	a, b := ids(0), ids(1)
-	var onlyA, onlyB int
-	for id := range a {
-		if !b[id] {
-			onlyA++
-		}
-	}
-	for id := range b {
-		if !a[id] {
-			onlyB++
-		}
-	}
-	t.Logf("divergence: only-node1=%d only-node2=%d", onlyA, onlyB)
-	r0, _ := c.QuerySQL(0, "SELECT * FROM ru_rows ORDER BY id")
-	r1, _ := c.QuerySQL(1, "SELECT * FROM ru_rows ORDER BY id")
-	for i := 0; i < len(r0.Rows) && i < len(r1.Rows); i++ {
-		a, b := fmt.Sprintf("%v", r0.Rows[i]), fmt.Sprintf("%v", r1.Rows[i])
-		if a != b {
-			t.Logf("divergence: first diff at row %d:\n  node1=%q\n  node2=%q", i, a, b)
-			break
-		}
-	}
+	return nil
 }
 
 func mustLocalDest(t *testing.T, dir string) *backup.LocalDestination {
@@ -686,18 +476,15 @@ func reissueNodeCert(t *testing.T, cluster *harness.Cluster, node *harness.Node,
 
 func infoLabel(t *testing.T, apiAddr, label string) string {
 	t.Helper()
-	for _, line := range strings.Split(scrapeMetrics(t, apiAddr), "\n") {
-		if !strings.HasPrefix(line, "spedsql_info{") {
-			continue
-		}
-		key := label + `="`
-		i := strings.Index(line, key)
-		if i < 0 {
-			continue
-		}
-		rest := line[i+len(key):]
-		if j := strings.Index(rest, `"`); j >= 0 {
-			return rest[:j]
+	samples, ok := harness.MetricSamples(scrapeMetrics(t, apiAddr))
+	if !ok {
+		t.Fatal("decode metrics JSON")
+	}
+	for _, sample := range samples {
+		if sample.Name == "spedsql_info" {
+			if value := sample.Labels[label]; value != "" {
+				return value
+			}
 		}
 	}
 	t.Fatalf("label %s not found in spedsql_info", label)
@@ -716,4 +503,51 @@ func scrapeMetrics(t *testing.T, apiAddr string) string {
 		t.Fatal(err)
 	}
 	return string(raw)
+}
+
+func offlineConfig(t *testing.T, dataDir string, cluster *harness.Cluster, nodeID string) db.Config {
+	t.Helper()
+	typed, err := db.Define[struct {
+		ID ids.RowID `rime:"primary"`
+	}]("ru_rows", 1, db.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := db.ParseNodeID(nodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var signingKey ed25519.PrivateKey
+	registry, _ := origin.NewKeyRegistry(nil)
+	for _, n := range cluster.Nodes {
+		_ = registry.Add(n.NodeID, n.OriginKey.Public().(ed25519.PublicKey))
+		if n.NodeID == node {
+			signingKey = n.OriginKey
+		}
+	}
+	if len(signingKey) == 0 {
+		_, signingKey, _ = ed25519.GenerateKey(rand.Reader)
+		_ = registry.Add(node, signingKey.Public().(ed25519.PublicKey))
+	}
+	return db.Config{
+		Path:          dataDir,
+		NodeID:        node,
+		DBID:          cluster.DBID,
+		Tables:        []db.TableDefinition{typed},
+		OriginSigning: db.OriginSigningConfig{PrivateKey: signingKey, TrustedKeys: registry},
+		Spool:         db.DefaultSpoolConfig(),
+		Encryption:    db.EncryptionConfig{Key: keyBytes(t, cluster.Nodes[0].KeyHex), KeyID: "remote-unlock-key"},
+	}
+}
+
+func keyBytes(t *testing.T, keyHex string) []byte {
+	t.Helper()
+	raw, err := hex.DecodeString(keyHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }

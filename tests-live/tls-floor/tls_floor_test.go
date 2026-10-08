@@ -7,7 +7,7 @@
 //     server-side rejection ("remote error"), not a local config error.
 //     TLS 1.0 is probed the same way.
 //  2. API positive: the identical client shape at TLS 1.2 succeeds and
-//     runs a real query; the negotiated version is asserted to be 1.2.
+//     reaches the live status endpoint; the negotiated version is asserted to be 1.2.
 //  3. Mesh positive control: a 2-node cluster converges a marker over
 //     QUIC (TLS 1.3), proving the floor does not break replication.
 //
@@ -29,41 +29,32 @@ package tlsfloor_test
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
-	"fmt"
-	"io"
 	"net/http"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 	"github.com/marcgauthier/murmur/transport"
 )
 
 func TestAPIFloorRejectsBelowTLS12(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "tls-floor",
-		NumNodes:    2,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "markers",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "val", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:         "tls-floor",
+		NumNodes:     2,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 	node := cluster.Nodes[0]
 
 	// Mesh positive control: marker converges over QUIC (TLS 1.3).
-	if err := cluster.ExecSQL(0, "INSERT INTO markers (id, val) VALUES (?, ?)", fmt.Sprintf("%032x", 7), "v"); err != nil {
+	if err := cluster.TypedInsert(0, "tls-version-floor-marker"); err != nil {
 		t.Fatalf("marker insert: %v", err)
 	}
-	waitConverged(t, cluster, "markers", 1, 60*time.Second)
+	waitConverged(t, cluster, 1, 60*time.Second)
 
 	roots := x509.NewCertPool()
 	if !roots.AppendCertsFromPEM(cluster.CA.CertPEM) {
@@ -102,7 +93,7 @@ func TestAPIFloorRejectsBelowTLS12(t *testing.T) {
 		}
 	}
 
-	// API positive: the same client at TLS 1.2 succeeds and runs a query.
+	// API positive: the same client at TLS 1.2 reaches a live typed node.
 	conn, err := tls.Dial("tcp", node.APIAddr, &tls.Config{
 		RootCAs: roots, Certificates: []tls.Certificate{clientCert},
 		MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS12,
@@ -131,11 +122,15 @@ func TestAPIFloorRejectsBelowTLS12(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("TLS 1.2 status=%d, want 200", resp.StatusCode)
 	}
-	rows := queryVia(t, tls12Client, baseURL, "SELECT count(*) FROM markers")
-	if len(rows) != 1 || fmt.Sprint(rows[0][0]) != "1" {
-		t.Fatalf("TLS 1.2 query returned %v, want [[1]]", rows)
+	resp, err = tls12Client.Get(baseURL + "/v1/status")
+	if err != nil {
+		t.Fatalf("TLS 1.2 status: %v", err)
 	}
-	t.Logf("TLS 1.2 client ran a live query successfully")
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("TLS 1.2 status=%d, want 200", resp.StatusCode)
+	}
+	t.Logf("TLS 1.2 client reached the typed API successfully")
 }
 
 // TestQUICFloorPinsTLS13 guards the replication floor at the product's
@@ -174,45 +169,21 @@ func isRemoteRejection(err error) bool {
 		strings.Contains(msg, "handshake failure")
 }
 
-func queryVia(t *testing.T, client *http.Client, baseURL, query string) [][]any {
-	t.Helper()
-	payload, _ := json.Marshal(map[string]any{"query": query})
-	resp, err := client.Post(baseURL+"/v1/query", "application/json", strings.NewReader(string(payload)))
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		t.Fatalf("query status=%d: %s", resp.StatusCode, raw)
-	}
-	var res harness.QueryResult
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		t.Fatalf("decode query: %v", err)
-	}
-	return res.Rows
-}
-
-func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, timeout time.Duration) {
+func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
-		var first string
+		var first []string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, table)
-			if err != nil || n != want {
-				ok = false
-				break
-			}
-			d, err := c.ComputeTableDigest(i, table, "id")
-			if err != nil {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
 			if i == 0 {
-				first = d
-			} else if d != first {
+				first = names
+			} else if !reflect.DeepEqual(names, first) {
 				ok = false
 				break
 			}
@@ -222,5 +193,5 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("nodes did not converge on %d %s rows with equal digests within %v", want, table, timeout)
+	t.Fatalf("nodes did not converge on %d typed records within %v", want, timeout)
 }

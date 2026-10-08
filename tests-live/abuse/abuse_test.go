@@ -6,18 +6,17 @@
 package abuse_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
-
-const tableName = "abuse_rows"
 
 // TestAbuseMesh answers "can I make Murmur fail under realistic abuse?"
 // Scale and length are environment-driven so the same test covers a quick
@@ -40,16 +39,11 @@ func TestAbuseMesh(t *testing.T) {
 	statusInterval := harness.EnvSeconds("MURMUR_ABUSE_STATUS_SECONDS", 15)
 
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "abuse",
-		NumNodes:    nodes,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: tableName,
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:            "abuse",
+		NumNodes:        nodes,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 
 	rep := newReporter(t)
@@ -57,8 +51,7 @@ func TestAbuseMesh(t *testing.T) {
 		nodes, duration, settle, writeInterval, seed, statusInterval)
 
 	// Baseline: one row on node 0, present everywhere before abuse starts.
-	if err := cluster.ExecSQL(0, "INSERT INTO abuse_rows (id, name) VALUES (?, ?)",
-		fmt.Sprintf("%032x", 0), "baseline"); err != nil {
+	if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: fmt.Sprintf("%032x", 0), Name: "baseline"}); err != nil {
 		t.Fatalf("baseline insert: %v", err)
 	}
 	if err := waitAllCount(cluster, nodes, 1, 2*time.Minute); err != nil {
@@ -118,11 +111,11 @@ func TestAbuseMesh(t *testing.T) {
 				}
 				seq++
 				// 32 lowercase hex chars: unique per writer/attempt, and
-				// accepted by the API's blob-id decoding (opaque text
+				// accepted by the typed API's UUID decoding (opaque text
 				// ids are rejected).
 				id := fmt.Sprintf("%08x%024x", w, seq)
-				err := cluster.ExecSQL(target,
-					"INSERT INTO abuse_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("writer-%d", w))
+				err := cluster.TypedContentionInsert(target,
+					harness.TypedContentionRow{ID: id, Name: fmt.Sprintf("writer-%d", w)})
 				rep.countAttempt(err == nil)
 				if err != nil {
 					rep.sampleErr(err)
@@ -297,13 +290,28 @@ func restartBehindBarrier(cluster *harness.Cluster, idx []int, setAlive func(int
 	wg.Wait()
 }
 
+// abuseNodeState returns the row count and PK-ordered digest of the typed
+// contention table on one node.
+func abuseNodeState(cluster *harness.Cluster, idx int) (int, string, error) {
+	rows, err := cluster.TypedContentionRows(idx)
+	if err != nil {
+		return 0, "", err
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	h := sha256.New()
+	for _, row := range rows {
+		fmt.Fprintf(h, "%s:%s:%s:%d\n", row.ID, row.Name, row.Phone, row.Score)
+	}
+	return len(rows), hex.EncodeToString(h.Sum(nil)), nil
+}
+
 // waitAllCount polls until every node reports want rows or timeout.
 func waitAllCount(cluster *harness.Cluster, nodes, want int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
 		for i := 0; i < nodes; i++ {
-			n, err := cluster.QueryRowCount(i, tableName)
+			n, _, err := abuseNodeState(cluster, i)
 			if err != nil || n != want {
 				ok = false
 				break
@@ -327,9 +335,8 @@ func waitConverged(cluster *harness.Cluster, nodes int, timeout time.Duration) (
 		digests = make([]string, nodes)
 		ok := true
 		for i := 0; i < nodes; i++ {
-			n, qerr := cluster.QueryRowCount(i, tableName)
-			d, derr := cluster.ComputeTableDigest(i, tableName, "id")
-			if qerr != nil || derr != nil {
+			n, d, serr := abuseNodeState(cluster, i)
+			if serr != nil {
 				ok = false
 				break
 			}
@@ -347,13 +354,10 @@ func waitConverged(cluster *harness.Cluster, nodes int, timeout time.Duration) (
 	counts = make([]int, nodes)
 	digests = make([]string, nodes)
 	for i := 0; i < nodes; i++ {
-		n, qerr := cluster.QueryRowCount(i, tableName)
-		d, derr := cluster.ComputeTableDigest(i, tableName, "id")
-		if qerr != nil {
+		n, d, serr := abuseNodeState(cluster, i)
+		if serr != nil {
 			n = -1
-		}
-		if derr != nil {
-			d = "unreachable:" + derr.Error()
+			d = "unreachable:" + serr.Error()
 		}
 		counts[i], digests[i] = n, d
 	}

@@ -29,8 +29,25 @@ import (
 
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/origin"
 )
+
+type backupAgentRecord struct {
+	ID    ids.RowID `rime:"primary"`
+	Name  string
+	Count int64
+	Tags  []string
+	Peak  int64
+	Floor float64
+}
+
+func recordDefinition() (db.TableDefinition, error) {
+	return db.Define[backupAgentRecord]("live_typed_records", 901, db.RecordOptions{
+		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
+		MergePolicies: map[string]db.RecordMergePolicy{"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin},
+	})
+}
 
 var out = bufio.NewWriter(os.Stdout)
 
@@ -45,12 +62,11 @@ func fail(format string, args ...any) {
 }
 
 func main() {
-	pebbleDir := flag.String("pebble-dir", "", "agent data directory")
+	dataDir := flag.String("data-dir", "", "agent data directory")
 	nodeIDS := flag.String("node-id", "", "agent node ID (UUID text)")
 	dbIDS := flag.String("db-id", "", "cluster DBID (UUID text)")
 	keyHex := flag.String("key-hex", "", "hex-encoded 32-byte storage key")
 	keyID := flag.String("key-id", "", "storage key ID")
-	schemaFile := flag.String("schema", "", "db.SchemaConfig JSON file")
 	replAddr := flag.String("repl-addr", "", "QUIC replication listen addr")
 	peersFlag := flag.String("peers", "", "comma-separated nodeID=addr peers")
 	caFile := flag.String("ca", "", "cluster CA PEM file")
@@ -58,7 +74,6 @@ func main() {
 	keyFile := flag.String("key", "", "agent node key PEM file")
 	originKeyFile := flag.String("origin-key", "", "Ed25519 private key file")
 	originKeysFile := flag.String("origin-public-keys", "", "explicit NodeID/public key JSON registry")
-	table := flag.String("table", "", "table for WAIT/COUNT readiness")
 	flag.Parse()
 
 	nodeID, err := db.ParseNodeID(*nodeIDS)
@@ -72,14 +87,6 @@ func main() {
 	key, err := hex.DecodeString(*keyHex)
 	if err != nil {
 		fail("decode key: %v", err)
-	}
-	schemaRaw, err := os.ReadFile(*schemaFile)
-	if err != nil {
-		fail("read schema: %v", err)
-	}
-	var schemaCfg db.SchemaConfig
-	if err := json.Unmarshal(schemaRaw, &schemaCfg); err != nil {
-		fail("parse schema: %v", err)
 	}
 	caPEM, err := os.ReadFile(*caFile)
 	if err != nil {
@@ -142,14 +149,21 @@ func main() {
 		snapshotSources = append(snapshotSources, peer.NodeID)
 	}
 
+	agentDir := *dataDir
+	definition, err := recordDefinition()
+	if err != nil {
+		fail("define record schema: %v", err)
+	}
+
 	ctx := context.Background()
 	handle, err := db.Open(ctx, db.Config{
 		OriginSigning: db.OriginSigningConfig{PrivateKey: originKey, TrustedKeys: registry},
-		Path:          *pebbleDir,
+		Path:          agentDir,
 		NodeID:        nodeID,
 		DBID:          dbID,
-		Schema:        schemaCfg,
-		Pebble:        db.DefaultPebbleConfig(),
+		Schema:        db.SchemaConfig{Version: 1},
+		Tables:        []db.TableDefinition{definition},
+		Spool:         db.DefaultSpoolConfig(),
 		Encryption: db.EncryptionConfig{
 			Key:   key,
 			KeyID: *keyID,
@@ -193,14 +207,14 @@ func main() {
 				emit("WAIT_ERR bad args %q", arg)
 				continue
 			}
-			got := waitRows(ctx, handle, *table, want, time.Duration(timeoutS)*time.Second)
+			got := waitRows(ctx, handle, want, time.Duration(timeoutS)*time.Second)
 			if got >= want {
 				emit("WAIT_OK %d", got)
 			} else {
 				emit("WAIT_TIMEOUT %d", got)
 			}
 		case "COUNT":
-			emit("COUNT %d", countRows(ctx, handle, *table))
+			emit("COUNT %d", countRows(ctx, handle))
 		case "BACKUP":
 			var subdir string
 			var chunk, sleepMs int
@@ -234,27 +248,24 @@ func oneLine(s string) string {
 	return s
 }
 
-func countRows(ctx context.Context, handle *db.DB, table string) int {
-	rows, err := handle.QueryContext(ctx, fmt.Sprintf("SELECT count(*) FROM %s", table))
+func countRows(ctx context.Context, handle *db.DB) int {
+	_ = ctx
+	rows, err := db.TableOf[backupAgentRecord](handle, "live_typed_records")
 	if err != nil {
 		return -1
 	}
-	defer rows.Close()
-	if !rows.Next() {
-		return -1
-	}
-	var n int
-	if err := rows.Scan(&n); err != nil {
+	n, err := rows.Where().Count()
+	if err != nil {
 		return -1
 	}
 	return n
 }
 
-func waitRows(ctx context.Context, handle *db.DB, table string, want int, timeout time.Duration) int {
+func waitRows(ctx context.Context, handle *db.DB, want int, timeout time.Duration) int {
 	deadline := time.Now().Add(timeout)
 	got := 0
 	for time.Now().Before(deadline) {
-		if n := countRows(ctx, handle, table); n > got {
+		if n := countRows(ctx, handle); n > got {
 			got = n
 		}
 		if got >= want {

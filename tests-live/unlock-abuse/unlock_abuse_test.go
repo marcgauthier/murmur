@@ -2,49 +2,43 @@ package unlockabuse_test
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
-// NOTE: abuse_rows must be a replicated manifest table (structured Schema),
-// not SchemaSQL. SchemaSQL files are executed as local-only SQLite DDL on
-// each node (testnode applies them via ExecContext after open), so writes
-// to them never enter the replication log and cross-node convergence
-// assertions would be vacuous (and fail).
+// NOTE: the suite writes the replicated typed contention fixture table so
+// cross-node convergence assertions exercise the replication log;
+// node-local writes would make them vacuous (and fail).
 
 const wrongKeyHex = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0"
 
 func TestUnlockAbuse(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "unlock-abuse",
-		NumNodes:    2,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "abuse_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		Name:            "unlock-abuse",
+		NumNodes:        2,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 	})
 
 	// Positive control: honest path works before any abuse.
 	baseID := fmt.Sprintf("%032x", 1)
-	if err := cluster.ExecSQL(0, "INSERT INTO abuse_rows (id, name) VALUES (?, ?)", baseID, "baseline"); err != nil {
+	if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: baseID, Name: "baseline"}); err != nil {
 		t.Fatalf("baseline insert: %v", err)
 	}
-	waitAllCount(t, cluster, "abuse_rows", 1, 10*time.Second)
-	assertEqualDigests(t, cluster, "abuse_rows", "id")
+	waitAllCount(t, cluster, 1, 10*time.Second)
+	assertEqualDigests(t, cluster)
 
 	// Lock node0: restart without unlock. Truncate its log so the audit
 	// entry asserted below must come from the upcoming unlock.
@@ -125,19 +119,19 @@ func TestUnlockAbuse(t *testing.T) {
 	}
 	waitLogContains(t, node.LogFile, "Database unlocked and online", 10*time.Second)
 
-	count, err := cluster.QueryRowCount(0, "abuse_rows")
+	rows, err := cluster.TypedContentionRows(0)
 	if err != nil {
 		t.Fatalf("post-unlock count: %v", err)
 	}
-	if count != 1 {
-		t.Fatalf("post-unlock count=%d, want 1 (data intact)", count)
+	if len(rows) != 1 {
+		t.Fatalf("post-unlock count=%d, want 1 (data intact)", len(rows))
 	}
 	postID := fmt.Sprintf("%032x", 2)
-	if err := cluster.ExecSQL(0, "INSERT INTO abuse_rows (id, name) VALUES (?, ?)", postID, "post-unlock"); err != nil {
+	if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: postID, Name: "post-unlock"}); err != nil {
 		t.Fatalf("post-unlock insert: %v", err)
 	}
-	waitAllCount(t, cluster, "abuse_rows", 2, 10*time.Second)
-	assertEqualDigests(t, cluster, "abuse_rows", "id")
+	waitAllCount(t, cluster, 2, 10*time.Second)
+	assertEqualDigests(t, cluster)
 }
 
 type unlockResult struct {
@@ -195,14 +189,14 @@ func assertNoOracle(t *testing.T, name string, r unlockResult, node *harness.Nod
 	}
 }
 
-func waitAllCount(t *testing.T, cluster *harness.Cluster, table string, expected int, timeout time.Duration) {
+func waitAllCount(t *testing.T, cluster *harness.Cluster, expected int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		allMatch := true
 		for i := range cluster.Nodes {
-			c, err := cluster.QueryRowCount(i, table)
-			if err != nil || c != expected {
+			rows, err := cluster.TypedContentionRows(i)
+			if err != nil || len(rows) != expected {
 				allMatch = false
 				break
 			}
@@ -212,18 +206,23 @@ func waitAllCount(t *testing.T, cluster *harness.Cluster, table string, expected
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("cluster failed to converge to %d rows in %s within %v", expected, table, timeout)
+	t.Fatalf("cluster failed to converge to %d rows within %v", expected, timeout)
 }
 
-func assertEqualDigests(t *testing.T, cluster *harness.Cluster, table, orderBy string) {
+func assertEqualDigests(t *testing.T, cluster *harness.Cluster) {
 	t.Helper()
 	var digests []string
 	for i := range cluster.Nodes {
-		d, err := cluster.ComputeTableDigest(i, table, orderBy)
+		rows, err := cluster.TypedContentionRows(i)
 		if err != nil {
 			t.Fatalf("node %d digest: %v", i, err)
 		}
-		digests = append(digests, d)
+		sort.Slice(rows, func(a, b int) bool { return rows[a].ID < rows[b].ID })
+		h := sha256.New()
+		for _, row := range rows {
+			fmt.Fprintf(h, "%s:%s:%s:%d\n", row.ID, row.Name, row.Phone, row.Score)
+		}
+		digests = append(digests, hex.EncodeToString(h.Sum(nil)))
 	}
 	for i := 1; i < len(digests); i++ {
 		if digests[i] != digests[0] {

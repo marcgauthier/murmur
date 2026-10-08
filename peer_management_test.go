@@ -79,27 +79,38 @@ func TestPeerExclusionAndRetirement(t *testing.T) {
 	dirA := t.TempDir()
 	dirB := t.TempDir()
 
-	dbA, err := openSignedFixture(ctx, replConfig(dirA, nodeA, dbid, creds[nodeA], nil))
+	cfgA := replConfig(dirA, nodeA, dbid, creds[nodeA], nil)
+	cfgA.Schema.Tables = nil
+	cfgA.Tables = []TableDefinition{recordDefinition(t)}
+	dbA, err := openSignedFixture(ctx, cfgA)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
+	tableA, err := TableOf[facadeRecord](dbA, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 	addrA := waitForAddr(t, dbA, 5*time.Second)
 
 	cfgB := replConfig(dirB, nodeB, dbid, creds[nodeB], []Peer{{NodeID: nodeA, Addrs: []string{addrA}}})
+	cfgB.Schema.Tables = nil
+	cfgB.Tables = []TableDefinition{recordDefinition(t)}
 	dbB, err := openSignedFixture(ctx, cfgB)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dbB.Close()
-
-	// 1. Initial write on A replicates to B
-	row1 := NewRowID()
-	if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
-		row1[:], "Alice", "111-1111"); err != nil {
+	tableB, err := TableOf[facadeRecord](dbB, "records")
+	if err != nil {
 		t.Fatal(err)
 	}
-	waitForRows(t, dbB, 1, 5*time.Second)
+
+	// 1. Initial write on A replicates to B
+	if err := insertRecord(ctx, dbA, tableA, &facadeRecord{ID: NewRowID(), Name: "Alice"}); err != nil {
+		t.Fatal(err)
+	}
+	waitForRecordCount(t, tableB, 1, 5*time.Second)
 
 	// Check PeerStatus on B
 	peers := dbB.Peers()
@@ -126,16 +137,17 @@ func TestPeerExclusionAndRetirement(t *testing.T) {
 	}
 
 	// 3. Write another row on A; B must NOT receive it while excluded
-	row2 := NewRowID()
-	if _, err := dbA.ExecContext(ctx, `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
-		row2[:], "Bob", "222-2222"); err != nil {
+	if err := insertRecord(ctx, dbA, tableA, &facadeRecord{ID: NewRowID(), Name: "Bob"}); err != nil {
 		t.Fatal(err)
 	}
 	// Give replication loop time to attempt delivery
 	time.Sleep(300 * time.Millisecond)
-	got := queryAll(t, dbB, `SELECT name FROM contacts`)
-	if len(got) != 1 {
-		t.Fatalf("expected 1 row on dbB while nodeA is excluded, got %d rows", len(got))
+	got, err := tableB.Where().Count()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 1 {
+		t.Fatalf("expected 1 row on dbB while nodeA is excluded, got %d rows", got)
 	}
 
 	// 4. Restart Node B and verify persistent exclusion survives restart
@@ -149,15 +161,22 @@ func TestPeerExclusionAndRetirement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbB2.Close()
+	tableB2, err := TableOf[facadeRecord](dbB2, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if !dbB2.IsPeerExcluded(nodeA) {
 		t.Fatalf("expected persistent exclusion to survive restart on dbB2")
 	}
 
 	time.Sleep(300 * time.Millisecond)
-	got2 := queryAll(t, dbB2, `SELECT name FROM contacts`)
-	if len(got2) != 1 {
-		t.Fatalf("expected 1 row on dbB2 after restart, got %d rows", len(got2))
+	got2, err := tableB2.Where().Count()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got2 != 1 {
+		t.Fatalf("expected 1 row on dbB2 after restart, got %d rows", got2)
 	}
 
 	// 5. AddPeer clears exclusion and restores replication
@@ -169,7 +188,20 @@ func TestPeerExclusionAndRetirement(t *testing.T) {
 	}
 
 	// Now B should converge and have both rows
-	waitForRows(t, dbB2, 2, 5*time.Second)
+	waitForRecordCount(t, tableB2, 2, 5*time.Second)
+}
+
+func waitForRecordCount(t *testing.T, table *RecordTable[facadeRecord], want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		got, err := table.Where().Count()
+		if err == nil && got == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d rows", want)
 }
 
 func TestPeerManagementValidation(t *testing.T) {

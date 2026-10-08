@@ -2,30 +2,25 @@ package benchmark_test
 
 import (
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
-// TestWriterThroughput measures application-visible, acknowledged SQL inserts
-// against one encrypted daemon. Each insert is its own transaction.
+// TestWriterThroughput measures application-visible, acknowledged typed
+// inserts against one encrypted daemon. Each insert is its own transaction.
 func TestWriterThroughput(t *testing.T) {
 	writeFor := envSeconds(t, "MURMUR_LIVE_WRITER_BENCH_SECONDS", 10)
 	for _, writers := range []int{1, 4} {
 		t.Run(fmt.Sprintf("%d_writers", writers), func(t *testing.T) {
 			cluster := harness.NewCluster(t, harness.ClusterOptions{
-				Name:     fmt.Sprintf("writer-throughput-%d", writers),
-				NumNodes: 1,
-				Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{Name: "writer_bench", Columns: []schema.ColumnSchema{
-					{Name: "id", Type: schema.ColBlob},
-					{Name: "val", Type: schema.ColText},
-				}}}},
+				Name:         fmt.Sprintf("writer-throughput-%d", writers),
+				NumNodes:     1,
+				TypedRecords: true,
 			})
 
 			type result struct {
@@ -46,8 +41,7 @@ func TestWriterThroughput(t *testing.T) {
 						var id [16]byte
 						binary.BigEndian.PutUint64(id[:8], uint64(worker+1))
 						binary.BigEndian.PutUint64(id[8:], uint64(writes+1))
-						if err := cluster.ExecSQL(0, `INSERT INTO writer_bench (id, val) VALUES (?, ?)`,
-							hex.EncodeToString(id[:]), "writer-throughput"); err != nil {
+						if err := cluster.TypedInsertWithID(0, db.RowID(id), "writer-throughput"); err != nil {
 							results <- result{writes: writes, err: fmt.Errorf("writer %d: %w", worker+1, err)}
 							return
 						}
@@ -78,16 +72,12 @@ func TestWriterThroughput(t *testing.T) {
 				t.Fatal(writeErr)
 			}
 
-			rows, err := cluster.QuerySQL(0, `SELECT COUNT(*) FROM writer_bench`)
+			count, err := cluster.TypedCount(0, "writer-throughput")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(rows.Rows) != 1 || len(rows.Rows[0]) != 1 {
-				t.Fatalf("unexpected count result: %+v", rows.Rows)
-			}
-			count, ok := rows.Rows[0][0].(float64)
-			if !ok || count != float64(total) {
-				t.Fatalf("queryable rows = %v; acknowledged inserts = %d", rows.Rows[0][0], total)
+			if count != total {
+				t.Fatalf("queryable rows = %d; acknowledged inserts = %d", count, total)
 			}
 			t.Logf("writers=%d acknowledged_inserts=%d elapsed=%s writes_per_second=%.1f",
 				writers, total, elapsed, float64(total)/elapsed.Seconds())

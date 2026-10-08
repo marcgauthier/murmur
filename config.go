@@ -4,23 +4,14 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/compression"
 	"github.com/marcgauthier/murmur/origin"
 	"github.com/marcgauthier/murmur/replication"
 	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/spool"
 	"github.com/marcgauthier/murmur/transport"
 )
-
-// QueryStoreConfig configures the SQL materialization.
-type QueryStoreConfig struct {
-	// RemoteApplyInterval batches durable remote changes into one SQLite
-	// transaction. Zero selects one second. A negative value is invalid.
-	RemoteApplyInterval time.Duration
-	// RemoteApplyMaxTransactions flushes when this many received transactions
-	// are queued, even before RemoteApplyInterval. Zero selects 1,000.
-	RemoteApplyMaxTransactions int
-}
 
 // DurabilityMode selects the acknowledgement contract for local writes.
 type DurabilityMode int
@@ -34,10 +25,8 @@ const (
 	DurabilityAsync
 )
 
-// GroupCommitConfig configures synchronous group commit for local writes.
-// Concurrent transactions briefly queue after their SQL commit and share one
-// Pebble batch with one fsync; each transaction is still acknowledged only
-// after that shared fsync, so the DurabilitySynchronous contract is unchanged.
+// GroupCommitConfig configures synchronous group commit for managed typed
+// writes.
 type GroupCommitConfig struct {
 	// MaxDelay bounds how long a group leader waits for concurrent
 	// transactions before committing. Zero selects the one-millisecond
@@ -66,9 +55,9 @@ type DurabilityConfig struct {
 	// reached first triggers the sync, bounding the loss window under
 	// bursty load that a pure time interval would leave wide open.
 	MaxUnsyncedBytes int64
-	// GroupCommit configures synchronous group commit. It is ignored in
-	// DurabilityAsync mode, which already acknowledges without waiting
-	// for fsync.
+	// GroupCommit configures synchronous group commit for managed typed writes.
+	// The setting is ignored in DurabilityAsync mode, which already
+	// acknowledges without waiting for fsync.
 	GroupCommit GroupCommitConfig
 }
 
@@ -161,67 +150,81 @@ type SubscriptionConfig struct {
 	MaxRetainedEvents int
 }
 
-// CacheConfig sizes the caches.
-type CacheConfig struct {
-	StatementCacheEntries int
-	// BlockCacheBytes sizes Pebble's unified block cache (alias for Pebble.CacheBytes).
-	// Default 256 MiB.
-	BlockCacheBytes int64
-}
-
-// CompressionAlgorithm selects Pebble block compression.
+// CompressionAlgorithm selects Spool block compression.
 type CompressionAlgorithm string
 
 const (
-	CompressionZstd   CompressionAlgorithm = "zstd"
-	CompressionSnappy CompressionAlgorithm = "snappy"
-	CompressionNone   CompressionAlgorithm = "none"
+	CompressionNone CompressionAlgorithm = "none"
+	// CompressionDeflate is the default: standard-library deflate at
+	// its fastest level (no external dependency). Custom codecs are
+	// selected through SpoolConfig.Codec.
+	CompressionDeflate CompressionAlgorithm = "deflate"
 )
 
-// CompressionConfig configures Pebble block compression.
-type CompressionConfig struct {
-	// Algorithm selects the codec. Default zstd.
-	Algorithm CompressionAlgorithm
-	// ZstdLevel selects the Zstd level. Default 3; supported levels are
-	// 3 (default), 9, and 12.
-	ZstdLevel int
+// SpoolConfig configures the durable Spool store. It is required; use
+// DefaultSpoolConfig for standard settings.
+type SpoolConfig struct {
+	// WriteShards sets the number of concurrent put buffers (power of two).
+	// Default 128.
+	WriteShards int
+	// IndexShards sets the number of index shards (power of two).
+	// Default 256.
+	IndexShards int
+	// TargetBlockBytes seals a block around this size. Default 4 MiB.
+	TargetBlockBytes int
+	// MaxBlockBytes is the hard cap for one block. Default 64 MiB.
+	MaxBlockBytes int
+	// MaxRecordsPerBlock caps records in one block. Default 10,000.
+	MaxRecordsPerBlock int
+	// MaxAtomicBatchBytes bounds one Commit group's plaintext bodies. Default 256 MiB.
+	MaxAtomicBatchBytes int64
+	// MaxSegmentSize rolls to a new segment past this size. Default 256 MiB.
+	MaxSegmentSize int64
+	// MaxPendingBytes caps buffered plus in-flight write bytes. Default 512 MiB.
+	MaxPendingBytes int64
+	// Workers bounds parallel block compression/encryption.
+	// Default runtime.NumCPU clamped to [2,32].
+	Workers int
+	// CompactionThreshold in (0,1] marks sealed segments with live/total
+	// records at or below it eligible for compaction. Default 0.20.
+	CompactionThreshold float64
+	// CompactionMinFreeBytes refuses rewrite passes while the store's
+	// filesystem reports less free space. Default 0 (disabled).
+	CompactionMinFreeBytes int64
+	// TombProofThreshold gates deletion-marker garbage collection.
+	// Default 1024.
+	TombProofThreshold int
+	// ReclaimInterval ticks background tombstone cleanup, dead-file
+	// deletion and compaction. Default 30s. Negative disables the worker.
+	ReclaimInterval time.Duration
+	// Flush bounds the buffered flush thresholds.
+	Flush spool.FlushPolicy
+	// Compression selects the block-level codec. Default CompressionDeflate.
+	Compression CompressionAlgorithm
+	// Codec, when non-nil, is a custom compression codec (wire id
+	// 128-255) used for Spool blocks and outgoing replication snapshot
+	// chunks. It overrides Compression. Every node that must read
+	// this node's data or snapshots has to register the same codec.
+	Codec compression.Codec
+	// Faults injects storage failures for testing.
+	Faults *spool.FaultHooks
 }
 
-// PebbleConfig configures the durable Pebble store. It is required; use
-// DefaultPebbleConfig for standard settings. A missing/invalid storage
-// budget is an error rather than silently allocating an unbounded cache.
-type PebbleConfig struct {
-	// CacheBytes sizes Pebble's unified block cache. Required, positive.
-	CacheBytes int64
-	// MemTableBytes caps one memtable. Default 4MiB.
-	MemTableBytes uint64
-	// MemTableCount caps live memtables. Default 2.
-	MemTableCount int
-	// MaxOpenFiles caps open file handles. Default 1000.
-	MaxOpenFiles int
-	// MaxConcurrentCompactions caps background compactions. Default 1.
-	MaxConcurrentCompactions int
-	// DisableAutomaticCompactions stops automatic compactions (flushes
-	// still run). Default false; used to simulate stalled compaction.
-	DisableAutomaticCompactions bool
-	// Compression selects block compression. Default zstd level 3.
-	Compression CompressionConfig
-	// BaseFS is the filesystem under the encrypted VFS. Nil means
-	// vfs.Default. Tests use it for fault injection (for example,
-	// simulated disk-full failures).
-	BaseFS vfs.FS
-}
-
-// DefaultPebbleConfig returns standard Pebble settings (256MiB cache, 4MiB
-// memtables x2, 1000 open files, 1 concurrent compaction, Zstd level 3).
-func DefaultPebbleConfig() PebbleConfig {
-	return PebbleConfig{
-		CacheBytes:               256 << 20,
-		MemTableBytes:            4 << 20,
-		MemTableCount:            2,
-		MaxOpenFiles:             1000,
-		MaxConcurrentCompactions: 1,
-		Compression:              CompressionConfig{Algorithm: CompressionZstd, ZstdLevel: 3},
+// DefaultSpoolConfig returns standard Spool settings.
+func DefaultSpoolConfig() SpoolConfig {
+	return SpoolConfig{
+		WriteShards:         128,
+		IndexShards:         256,
+		TargetBlockBytes:    4 << 20,
+		MaxBlockBytes:       64 << 20,
+		MaxRecordsPerBlock:  10000,
+		MaxAtomicBatchBytes: 256 << 20,
+		MaxSegmentSize:      256 << 20,
+		MaxPendingBytes:     512 << 20,
+		CompactionThreshold: 0.20,
+		TombProofThreshold:  1024,
+		ReclaimInterval:     30 * time.Second,
+		Compression:         CompressionDeflate,
 	}
 }
 
@@ -231,15 +234,6 @@ type SchemaConfig struct {
 	Version uint64
 	// Tables are the replicated tables. IDs may be zero for deterministic derivation.
 	Tables []schema.TableSchema
-	// DDL, when provided, is executed verbatim to create tables instead of
-	// generated DDL. Table/column names must still match Tables.
-	DDL []string
-	// LocalDDL holds local-only objects (indexes, views, FTS) applied after
-	// replicated tables on every open/rebuild. Never replicated.
-	// Statements must be idempotent (IF NOT EXISTS): they re-run
-	// whenever the materializer rebuilds, and local objects (which may
-	// hold app data) are never dropped for them.
-	LocalDDL []string
 	// AcceptRemoteSchema controls schema synchronization from peers during
 	// replication (architecture/schema.md section 50). Nil (the default)
 	// adopts compatible remote schemas and merges concurrent additive
@@ -378,22 +372,28 @@ type Config struct {
 	OriginSigning           OriginSigningConfig
 	originBaselineMigration bool
 	mergePolicyMigration    bool
-	// Path is the Pebble data directory (content files plus key registry).
+	// Path is the database directory (data/ contains Spool persistence).
 	Path string
 	// NodeID is this node's identity. Required.
 	NodeID NodeID
 	// DBID identifies the cluster. Zero means "load or create".
 	DBID DBID
 
-	QueryStore  QueryStoreConfig
-	Pebble      PebbleConfig
+	// Codecs registers additional custom compression codecs (ids
+	// 128-255) for reading Spool blocks and replication frames written
+	// under them. Spool.Codec is registered automatically.
+	Codecs []compression.Codec
+
+	Spool       SpoolConfig
 	Encryption  EncryptionConfig
 	Replication ReplicationConfig
-	Cache       CacheConfig
 	Schema      SchemaConfig
-	Durability  DurabilityConfig
-	Backup      BackupScheduleConfig
-	Files       FilesConfig
+	// Tables defines native Go record tables. It is mutually exclusive with
+	// Schema.Tables is the stable descriptor metadata derived from Config.Tables.
+	Tables     []TableDefinition
+	Durability DurabilityConfig
+	Backup     BackupScheduleConfig
+	Files      FilesConfig
 	// Scheduling configures local/replication writer-time shares.
 	// Zero resolves to the 90/10 defaults.
 	Scheduling   WriterSchedulingConfig
@@ -419,41 +419,42 @@ type Config struct {
 }
 
 func (c *Config) withDefaults() {
-	if c.QueryStore.RemoteApplyInterval == 0 {
-		c.QueryStore.RemoteApplyInterval = time.Second
+	s := &c.Spool
+	if s.WriteShards == 0 {
+		s.WriteShards = 128
 	}
-	if c.QueryStore.RemoteApplyMaxTransactions == 0 {
-		c.QueryStore.RemoteApplyMaxTransactions = 1_000
+	if s.IndexShards == 0 {
+		s.IndexShards = 256
 	}
-	if c.Cache.StatementCacheEntries == 0 {
-		c.Cache.StatementCacheEntries = 256
+	if s.TargetBlockBytes == 0 {
+		s.TargetBlockBytes = 4 << 20
 	}
-	p := &c.Pebble
-	if c.Cache.BlockCacheBytes > 0 {
-		p.CacheBytes = c.Cache.BlockCacheBytes
-	} else if p.CacheBytes == 0 {
-		p.CacheBytes = 256 << 20
+	if s.MaxBlockBytes == 0 {
+		s.MaxBlockBytes = 64 << 20
 	}
-	if c.Cache.BlockCacheBytes == 0 {
-		c.Cache.BlockCacheBytes = p.CacheBytes
+	if s.MaxRecordsPerBlock == 0 {
+		s.MaxRecordsPerBlock = 10000
 	}
-	if p.MemTableBytes == 0 {
-		p.MemTableBytes = 4 << 20
+	if s.MaxAtomicBatchBytes == 0 {
+		s.MaxAtomicBatchBytes = 256 << 20
 	}
-	if p.MemTableCount == 0 {
-		p.MemTableCount = 2
+	if s.MaxSegmentSize == 0 {
+		s.MaxSegmentSize = 256 << 20
 	}
-	if p.MaxOpenFiles == 0 {
-		p.MaxOpenFiles = 1000
+	if s.MaxPendingBytes == 0 {
+		s.MaxPendingBytes = 512 << 20
 	}
-	if p.MaxConcurrentCompactions == 0 {
-		p.MaxConcurrentCompactions = 1
+	if s.CompactionThreshold == 0 {
+		s.CompactionThreshold = 0.20
 	}
-	if p.Compression.Algorithm == "" {
-		p.Compression.Algorithm = CompressionZstd
+	if s.TombProofThreshold == 0 {
+		s.TombProofThreshold = 1024
 	}
-	if p.Compression.ZstdLevel == 0 {
-		p.Compression.ZstdLevel = 3
+	if s.ReclaimInterval == 0 {
+		s.ReclaimInterval = 30 * time.Second
+	}
+	if s.Compression == "" {
+		s.Compression = CompressionDeflate
 	}
 	if c.MaxReplicatedValueBytes == 0 {
 		c.MaxReplicatedValueBytes = 16 << 20
@@ -610,19 +611,13 @@ func (c *Config) validate() error {
 	if c.Subscription.MaxSubscribers < 0 || c.Subscription.EventBufferSize < 0 || c.Subscription.MaxRetainedEvents < 0 {
 		return fmt.Errorf("murmur: subscription limits must be non-negative: %w", ErrUnsupportedSchema)
 	}
-	if c.QueryStore.RemoteApplyInterval <= 0 {
-		return fmt.Errorf("murmur: query-store RemoteApplyInterval must be positive: %w", ErrUnsupportedSchema)
-	}
-	if c.QueryStore.RemoteApplyMaxTransactions <= 0 {
-		return fmt.Errorf("murmur: query-store RemoteApplyMaxTransactions must be positive: %w", ErrUnsupportedSchema)
-	}
-	if len(c.Schema.Tables) == 0 {
+	if len(c.Schema.Tables) == 0 && len(c.Tables) == 0 {
 		return fmt.Errorf("murmur: at least one replicated table is required: %w", ErrUnsupportedSchema)
 	}
 	if _, err := schema.BuildRegistry(c.Schema.Version, c.Schema.Tables); err != nil {
 		return err
 	}
-	if err := c.Pebble.validate(); err != nil {
+	if err := c.Spool.validate(); err != nil {
 		return err
 	}
 	if err := c.Encryption.validate(); err != nil {
@@ -695,33 +690,41 @@ func (c *Config) validate() error {
 	return nil
 }
 
-func (p PebbleConfig) validate() error {
-	if p.CacheBytes <= 0 {
-		return fmt.Errorf("murmur: Pebble.CacheBytes is required and must be positive (use DefaultPebbleConfig)")
+func (s SpoolConfig) validate() error {
+	if s.WriteShards <= 0 || (s.WriteShards&(s.WriteShards-1)) != 0 {
+		return fmt.Errorf("murmur: Spool.WriteShards must be a positive power of two")
 	}
-	if p.MemTableBytes == 0 {
-		return fmt.Errorf("murmur: Pebble.MemTableBytes must be positive")
+	if s.IndexShards <= 0 || (s.IndexShards&(s.IndexShards-1)) != 0 {
+		return fmt.Errorf("murmur: Spool.IndexShards must be a positive power of two")
 	}
-	if p.MemTableCount <= 0 {
-		return fmt.Errorf("murmur: Pebble.MemTableCount must be positive")
+	if s.TargetBlockBytes <= 0 {
+		return fmt.Errorf("murmur: Spool.TargetBlockBytes must be positive")
 	}
-	if p.MaxOpenFiles <= 0 {
-		return fmt.Errorf("murmur: Pebble.MaxOpenFiles must be positive")
+	if s.MaxBlockBytes <= 0 || s.MaxBlockBytes < s.TargetBlockBytes {
+		return fmt.Errorf("murmur: Spool.MaxBlockBytes must be positive and at least TargetBlockBytes")
 	}
-	if p.MaxConcurrentCompactions <= 0 {
-		return fmt.Errorf("murmur: Pebble.MaxConcurrentCompactions must be positive")
+	if s.MaxRecordsPerBlock <= 0 {
+		return fmt.Errorf("murmur: Spool.MaxRecordsPerBlock must be positive")
 	}
-	switch p.Compression.Algorithm {
-	case CompressionZstd, CompressionSnappy, CompressionNone:
+	if s.MaxAtomicBatchBytes <= 0 {
+		return fmt.Errorf("murmur: Spool.MaxAtomicBatchBytes must be positive")
+	}
+	if s.MaxSegmentSize <= 0 {
+		return fmt.Errorf("murmur: Spool.MaxSegmentSize must be positive")
+	}
+	if s.MaxPendingBytes <= 0 {
+		return fmt.Errorf("murmur: Spool.MaxPendingBytes must be positive")
+	}
+	if s.CompactionThreshold <= 0 || s.CompactionThreshold > 1 {
+		return fmt.Errorf("murmur: Spool.CompactionThreshold must be within (0, 1]")
+	}
+	if s.TombProofThreshold <= 0 {
+		return fmt.Errorf("murmur: Spool.TombProofThreshold must be positive")
+	}
+	switch s.Compression {
+	case CompressionNone, CompressionDeflate:
 	default:
-		return fmt.Errorf("murmur: unknown Pebble compression %q", p.Compression.Algorithm)
-	}
-	if p.Compression.Algorithm == CompressionZstd {
-		switch p.Compression.ZstdLevel {
-		case 3, 9, 12:
-		default:
-			return fmt.Errorf("murmur: Pebble Zstd supports only levels 3, 9, and 12 (got %d)", p.Compression.ZstdLevel)
-		}
+		return fmt.Errorf("murmur: unsupported Spool compression %q", s.Compression)
 	}
 	return nil
 }

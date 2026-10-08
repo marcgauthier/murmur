@@ -9,7 +9,16 @@ import (
 	"github.com/marcgauthier/murmur/schema"
 )
 
-func (tx *Tx) ownershipEpoch(table uint32, row ids.RowID, col uint32) (crdt.Version, bool, error) {
+// policyTx carries the operation identity and bridge provenance needed while
+// routing durable mutations. It is independent of both SQL and RIME write
+// transaction implementations.
+type policyTx struct {
+	db           *DB
+	txID         ids.TxID
+	bridgeImport *bridgeImportInfo
+}
+
+func (tx *policyTx) ownershipEpoch(table uint32, row ids.RowID, col uint32) (crdt.Version, bool, error) {
 	cells, err := tx.db.store.GetRow(table, row)
 	if err != nil {
 		return crdt.Version{}, false, err
@@ -55,7 +64,7 @@ func (tx *Tx) ownershipEpoch(table uint32, row ids.RowID, col uint32) (crdt.Vers
 // High operations join a branch whose stable epoch is the last release marker.
 // Source components copied at takeover retain identity, so two receivers cannot
 // count the baseline twice. New Low payloads keep joining the underlying field.
-func (tx *Tx) routeMergeOwnership(mutations []codec.Mutation) ([]codec.Mutation, error) {
+func (tx *policyTx) routeMergeOwnership(mutations []codec.Mutation) ([]codec.Mutation, error) {
 	if tx.bridgeImport != nil {
 		return mutations, nil
 	}
@@ -143,7 +152,7 @@ func (tx *Tx) routeMergeOwnership(mutations []codec.Mutation) ([]codec.Mutation,
 	}
 	return out, nil
 }
-func (tx *Tx) effectiveMergeRecords(table uint32, row ids.RowID, col uint32) (uint32, crdt.Version, bool, error) {
+func (tx *policyTx) effectiveMergeRecords(table uint32, row ids.RowID, col uint32) (uint32, crdt.Version, bool, error) {
 	epoch, active, err := tx.ownershipEpoch(table, row, col)
 	if err != nil {
 		return 0, epoch, false, err

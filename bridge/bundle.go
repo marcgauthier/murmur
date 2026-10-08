@@ -12,12 +12,12 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/klauspost/compress/zstd"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 
 	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/compression"
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/schema"
 )
@@ -29,8 +29,8 @@ const (
 	// BundleMagic prefixes every bundle.
 	BundleMagic = "SPB1"
 	// SuiteV1 is Ed25519 signatures, X25519+HKDF recipient wrap of a fresh
-	// XChaCha20-Poly1305 content key, XChaCha20-Poly1305 payload, and zstd
-	// compression over the canonical encoding below.
+	// XChaCha20-Poly1305 content key, XChaCha20-Poly1305 payload, and codec-id-prefixed
+	// compression (compression.Codec; default deflate) over the canonical encoding below.
 	SuiteV1 = 1
 	SuiteV2 = 2
 )
@@ -264,7 +264,7 @@ func SealBatches(signer *SignerKey, recipient [keyIDSize]byte, manifest Manifest
 	if err != nil {
 		return nil, err
 	}
-	compressed, err := zstdEncode(payload)
+	compressed, err := compressPayload(payload, limits)
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +317,7 @@ func OpenBundle(data []byte, trust *TrustStore, limits Limits) (*Bundle, error) 
 	if err != nil {
 		return nil, err
 	}
-	payload, err := zstdDecodeBounded(compressed, limits.MaxPayloadBytes)
+	payload, err := decompressPayload(compressed, limits)
 	if err != nil {
 		return nil, err
 	}
@@ -543,27 +543,43 @@ func bridgeKEK(shared []byte, ephPub, recipient [keyIDSize]byte) []byte {
 	return kek
 }
 
-func zstdEncode(raw []byte) ([]byte, error) {
-	enc, err := zstd.NewWriter(nil)
-	if err != nil {
-		return nil, err
+// compressPayload prefixes the compressed bytes with the one-byte codec
+// id. The result is sealed and signed by the envelope, so the id is
+// authenticated and cannot be swapped.
+func compressPayload(raw []byte, limits Limits) ([]byte, error) {
+	cd := limits.Codec
+	if cd == nil {
+		cd = compression.Deflate
 	}
-	defer enc.Close()
-	return enc.EncodeAll(raw, nil), nil
+	out, err := cd.Compress([]byte{cd.ID()}, raw)
+	if err != nil {
+		return nil, fmt.Errorf("bridge: compress: %w", err)
+	}
+	return out, nil
 }
 
-func zstdDecodeBounded(compressed []byte, max int) ([]byte, error) {
-	dec, err := zstd.NewReader(bytes.NewReader(compressed))
-	if err != nil {
-		return nil, fmt.Errorf("bridge: decompress init: %w", err)
+func decompressPayload(compressed []byte, limits Limits) ([]byte, error) {
+	if len(compressed) == 0 {
+		return nil, fmt.Errorf("bridge: empty compressed payload")
 	}
-	defer dec.Close()
-	out, err := io.ReadAll(io.LimitReader(dec, int64(max)+1))
+	user := limits.Codecs
+	if limits.Codec != nil {
+		user = append([]compression.Codec{limits.Codec}, user...)
+	}
+	reg, err := compression.NewRegistry(user...)
+	if err != nil {
+		return nil, fmt.Errorf("bridge: %w", err)
+	}
+	cd, err := reg.Get(compressed[0])
+	if err != nil {
+		return nil, fmt.Errorf("bridge: payload codec: %w", err)
+	}
+	out, err := cd.Decompress(nil, compressed[1:], limits.MaxPayloadBytes)
 	if err != nil {
 		return nil, fmt.Errorf("bridge: decompress: %w", err)
 	}
-	if len(out) > max {
-		return nil, fmt.Errorf("bridge: decompressed %d bytes exceed limit %d", len(out), max)
+	if len(out) > limits.MaxPayloadBytes {
+		return nil, fmt.Errorf("bridge: decompressed %d bytes exceed limit %d", len(out), limits.MaxPayloadBytes)
 	}
 	return out, nil
 }

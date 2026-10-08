@@ -6,8 +6,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/marcgauthier/murmur/sqlengine"
 )
 
 // OpenPhase identifies startup work. Only OpenReady means queries are available.
@@ -49,7 +47,7 @@ type OpenProgress struct {
 	Error              error
 }
 
-// openProgressReporter keeps user callbacks away from storage/SQL locks. Only
+// openProgressReporter keeps user callbacks away from storage/materializer locks. Only
 // phase transitions are queued; routine updates coalesce into the latest state.
 type openProgressReporter struct {
 	mu           sync.Mutex
@@ -122,15 +120,15 @@ func (r *openProgressReporter) phase(phase OpenPhase) {
 	r.notify()
 }
 
-func (r *openProgressReporter) engineProgress(p sqlengine.RebuildProgress) {
-	r.mu.Lock()
-	r.progress.CurrentTable = p.CurrentTable
-	r.progress.RowsInserted = p.RowsInserted
-	r.progress.RowsSkipped = p.RowsSkipped
-	r.mu.Unlock()
-	if p.Indexing {
-		r.phase(OpenIndexing)
+func (r *openProgressReporter) materializerProgress(currentTable string, rowsInserted, rowsSkipped uint64) {
+	if r == nil {
+		return
 	}
+	r.mu.Lock()
+	r.progress.CurrentTable = currentTable
+	r.progress.RowsInserted = rowsInserted
+	r.progress.RowsSkipped = rowsSkipped
+	r.mu.Unlock()
 }
 
 func (r *openProgressReporter) deliver(latest bool) {
@@ -183,21 +181,4 @@ func (r *openProgressReporter) finish(err error) {
 	r.mu.Unlock()
 	close(r.stop)
 	<-r.done // No callbacks remain when Open returns.
-}
-
-func (db *DB) rebuildOnOpen(ctx context.Context) error {
-	r := db.openProgress
-	if r == nil {
-		return db.engine.RebuildContext(ctx, db.store, nil)
-	}
-	r.phase(OpenRebuilding)
-	view, err := db.store.NewRebuildSnapshot(ctx, func(delta uint64) { r.processed.Add(delta) })
-	if err != nil {
-		return err
-	}
-	defer view.Close()
-	if err := db.engine.RebuildContext(ctx, view, r.engineProgress); err != nil {
-		return err
-	}
-	return view.Close()
 }

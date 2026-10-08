@@ -33,8 +33,7 @@ func TestHighLowOwnershipReorderAcrossPeersLive(t *testing.T) {
 	}
 	low := newLowCluster(t, "highlow-own-low", staging, keys, liveContactsSchema())
 	high := harness.NewCluster(t, harness.ClusterOptions{
-		Name: "highlow-own-high", NumNodes: 2, ManualPeers: true,
-		Schema: liveSchemaConfig(liveContactsSchema()),
+		Name: "highlow-own-high", NumNodes: 2, ManualPeers: true, TypedRecords: true,
 		Bridge: &harness.BridgeOptions{
 			Role: "high-importer", Stream: liveStream, NodeIndices: []int{0, 1},
 			StagingDir:       staging,
@@ -53,10 +52,12 @@ func TestHighLowOwnershipReorderAcrossPeersLive(t *testing.T) {
 	if _, imported := importOnce(t, high, 0); imported < 1 {
 		t.Fatalf("A round 1 imported %d, want >= 1", imported)
 	}
-	if err := high.ExecSQL(0, `UPDATE contacts SET name=? WHERE id=?`, "high", rowHex); err != nil {
+	if err := high.TypedRename(0, "low-1", "high"); err != nil {
 		t.Fatalf("A override: %v", err)
 	}
-	updateContact(t, low, 0, row, "low-2", 2)
+	if err := low.TypedRename(0, "low-1", "low-2"); err != nil {
+		t.Fatalf("Low update: %v", err)
+	}
 	if _, published := exportOnce(t, low, 0); published < 1 {
 		t.Fatalf("round 2 published %d, want >= 1", published)
 	}
@@ -86,7 +87,7 @@ func TestHighLowOwnershipReorderAcrossPeersLive(t *testing.T) {
 	assertContactsEqual(t, contacts(t, high, 0), contacts(t, high, 1))
 
 	// Explicit release on A converges both peers back to the Low value.
-	if err := high.ReleaseOwnership(0, "contacts", rowHex, "name"); err != nil {
+	if err := high.ReleaseOwnership(0, "live_typed_records", rowHex, "Name"); err != nil {
 		t.Fatalf("release: %v", err)
 	}
 	waitForOwnership(t, high, rowHex, "low-2", "low", 30*time.Second)
@@ -95,15 +96,15 @@ func TestHighLowOwnershipReorderAcrossPeersLive(t *testing.T) {
 
 func contactName(t *testing.T, c *harness.Cluster, idx int, rowHex string) string {
 	t.Helper()
-	res, err := c.QuerySQL(idx, `SELECT name FROM contacts WHERE id=?`, rowHex)
+	_ = rowHex // This fixture has exactly one row; provenance below checks its stable ID.
+	names, err := c.TypedNames(idx)
 	if err != nil {
 		t.Fatalf("contact name: %v", err)
 	}
-	if len(res.Rows) != 1 {
-		t.Fatalf("contact rows = %+v, want one", res.Rows)
+	if len(names) != 1 {
+		t.Fatalf("contact rows = %+v, want one", names)
 	}
-	name, _ := res.Rows[0][0].(string)
-	return name
+	return names[0]
 }
 
 func waitForOwnership(t *testing.T, c *harness.Cluster, rowHex, wantName, wantOwner string, timeout time.Duration) {
@@ -112,16 +113,16 @@ func waitForOwnership(t *testing.T, c *harness.Cluster, rowHex, wantName, wantOw
 	for time.Now().Before(deadline) {
 		ready := true
 		for i := 0; i < 2; i++ {
-			res, err := c.QuerySQL(i, `SELECT name FROM contacts WHERE id=?`, rowHex)
-			if err != nil || len(res.Rows) != 1 {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != 1 {
 				ready = false
 				break
 			}
-			if name, _ := res.Rows[0][0].(string); name != wantName {
+			if names[0] != wantName {
 				ready = false
 				break
 			}
-			present, owner, err := c.Provenance(i, "contacts", rowHex, "name")
+			present, owner, err := c.Provenance(i, "live_typed_records", rowHex, "Name")
 			if err != nil || !present || owner != wantOwner {
 				ready = false
 				break

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crdt"
 	"github.com/marcgauthier/murmur/ids"
@@ -15,7 +14,7 @@ import (
 // Use it sequentially and Close it before closing its Store.
 type RebuildSnapshot struct {
 	s           *Store
-	snap        *pebble.Snapshot
+	snap        *snapshot
 	ctx         context.Context
 	onProcessed func(uint64)
 	once        sync.Once
@@ -34,7 +33,7 @@ func (s *Store) NewRebuildSnapshot(ctx context.Context, onProcessed func(uint64)
 		s.gate.RUnlock()
 		return nil, err
 	}
-	return &RebuildSnapshot{s: s, snap: s.db.NewSnapshot(), ctx: ctx, onProcessed: onProcessed}, nil
+	return &RebuildSnapshot{s: s, snap: s.mem.newSnapshot(), ctx: ctx, onProcessed: onProcessed}, nil
 }
 
 // Close releases the pinned snapshot and store read lease. It is idempotent.

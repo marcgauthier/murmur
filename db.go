@@ -2,7 +2,6 @@ package murmur
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -15,16 +14,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2/sstable"
-	"github.com/cockroachdb/pebble/v2/sstable/block"
-	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/marcgauthier/murmur/backup"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crypto"
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/internal/recordcodec"
+	"github.com/marcgauthier/murmur/internal/rimeadapter"
 	"github.com/marcgauthier/murmur/replication"
+	"github.com/marcgauthier/murmur/rime"
 	"github.com/marcgauthier/murmur/schema"
-	"github.com/marcgauthier/murmur/sqlengine"
+	"github.com/marcgauthier/murmur/spool"
 	"github.com/marcgauthier/murmur/state"
 	"github.com/marcgauthier/murmur/transport"
 )
@@ -38,14 +37,18 @@ type DB struct {
 	log            Logger
 	reg            *schema.Registry
 
-	store  *state.Store
-	engine *sqlengine.Engine
-	repl   *replication.Manager
-	subMgr *subscriptionManager
-	files  *fileStore // nil unless Files.Enabled
-
-	keyReg *crypto.Registry
-	encMgr *crypto.Manager
+	store *state.Store
+	// recordDB and recordAdapter are the private native-record materializer.
+	recordMu          sync.RWMutex
+	recordGeneration  uint64
+	recordDB          *rime.DB
+	recordAdapter     *rimeadapter.Adapter
+	recordTables      map[string]any
+	recordDefinitions []TableDefinition // guarded by recordMu; runtime Go bindings for the durable typed schema
+	retiredRecordDBs  []*rime.DB
+	repl              *replication.Manager
+	subMgr            *subscriptionManager
+	files             *fileStore // nil unless Files.Enabled
 
 	backupWorker *backup.Worker
 	backupMu     sync.Mutex
@@ -73,14 +76,18 @@ type DB struct {
 	lastStatus   Status
 	lastStatusOK bool
 
-	writeMu                sync.Mutex                    // serialized local write coordinator
-	applyMu                sync.Mutex                    // serializes all durable commits + materialization
-	grouper                *groupCommitter               // synchronous group commit queue; nil when disabled
-	groupWG                sync.WaitGroup                // phase-2 (post-writeMu) group commits in flight
-	remoteRows             map[sqlengine.RowKey]struct{} // durable remote rows awaiting SQLite
-	remoteTxnCount         int                           // received transactions since the last SQLite flush
-	remoteFlushWake        chan struct{}                 // transaction-count threshold wakes the bulk flush worker
-	materializedGeneration atomic.Uint64                 // query-visible generation; rebuilt on every open
+	writeMu                sync.Mutex // serialized local write coordinator
+	applyMu                sync.Mutex // serializes all durable commits + materialization
+	recordPrepMu           sync.Mutex // tracks typed callbacks staged before writer admission
+	recordPrepCond         *sync.Cond
+	recordPreparers        int
+	recordPrepDrain        chan struct{}
+	recordPrepGate         chan struct{}
+	recordBarrierMu        sync.Mutex      // serializes snapshot publication barriers
+	gcRunMu                sync.Mutex      // serializes periodic and operator-triggered GC passes
+	grouper                *groupCommitter // synchronous group commit queue; nil when disabled
+	groupWG                sync.WaitGroup  // phase-2 (post-writeMu) group commits in flight
+	materializedGeneration atomic.Uint64   // query-visible generation; rebuilt on every open
 
 	sched *writerScheduler // fair writer admission (see scheduler.go)
 
@@ -94,23 +101,6 @@ type DB struct {
 	openProgress *openProgressReporter
 
 	crash *crashHooks // failure injection; nil in production
-}
-
-// zstdProfileForLevel returns the Pebble block compression profile for a
-// validated Zstd level. Level 3 uses Pebble's built-in profile; other
-// supported levels copy it and override the per-block level. The shared
-// built-in profile is never mutated.
-func zstdProfileForLevel(level int) *sstable.CompressionProfile {
-	base := block.CompressionProfileByName("zstd")
-	if level == 3 {
-		return base
-	}
-	prof := *base
-	prof.Name = fmt.Sprintf("zstd-%d", level)
-	prof.DataBlocks.Level = uint8(level)
-	prof.ValueBlocks.Level = uint8(level)
-	prof.OtherBlocks.Level = uint8(level)
-	return &prof
 }
 
 // Open opens or creates the database, rebuilds the in-memory query database
@@ -129,25 +119,29 @@ func Open(ctx context.Context, cfg Config) (result *DB, openErr error) {
 		return nil, err
 	}
 	cfg.withDefaults()
+	if err := cfg.applyTableDefinitions(); err != nil {
+		return nil, err
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
+	}
+	if len(cfg.Tables) == 0 {
+		return nil, fmt.Errorf("murmur: SQL schemas are no longer supported; define managed tables with Config.Tables: %w", ErrUnsupportedSchema)
 	}
 	reg, err := schema.BuildRegistry(cfg.Schema.Version, cfg.Schema.Tables)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrUnsupportedSchema, err)
 	}
-	db := &DB{cfg: cfg, log: cfg.Logger, reg: reg, dbState: StateOpening, openedAt: time.Now(), sched: newWriterScheduler(cfg.Scheduling), remoteFlushWake: make(chan struct{}, 1)}
+	db := &DB{cfg: cfg, log: cfg.Logger, reg: reg, dbState: StateOpening, openedAt: time.Now(), sched: newWriterScheduler(cfg.Scheduling)}
+	db.recordPrepCond = sync.NewCond(&db.recordPrepMu)
+	db.recordDefinitions = append([]TableDefinition(nil), cfg.Tables...)
 	if cfg.Durability.Mode == DurabilitySynchronous && cfg.Durability.GroupCommit.MaxDelay > 0 {
-		db.grouper = newGroupCommitter(cfg.Durability.GroupCommit, db.commitLocalGroup)
+		db.grouper = newGroupCommitter(cfg.Durability.GroupCommit, db.commitRecordGroup)
 	}
 	db.openProgress = progress
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
-	if err := db.recoverRotationLeftovers(); err != nil {
-		return nil, err
-	}
-	// Mandatory at-rest encryption: storage key, registry, encrypted VFS,
-	// and rotation/rewrite manager. Encryption is not optional.
+	// Mandatory at-rest encryption: storage key from provider or direct material.
 	storageProvider := cfg.Encryption.storageProvider()
 	mat, err := storageProvider.Current(ctx)
 	if err != nil {
@@ -157,122 +151,71 @@ func Open(ctx context.Context, cfg Config) (result *DB, openErr error) {
 		crypto.Zero(mat.Key)
 		return nil, fmt.Errorf("%w: %w", ErrEncryptionKey, verr)
 	}
-	crypto.Zero(mat.Key)
+	defer crypto.Zero(mat.Key)
 
-	regDir := filepath.Join(cfg.Path, "keys")
 	dataPath := filepath.Join(cfg.Path, "data")
-	// Coordinated reseed: the restored ciphertext is bound to the source
-	// DBID, so rebind it to the new DBID before anything opens it under
-	// the new identity. The rebind is idempotent and crash-safe, and the
-	// restore intent persists until post-rebuild cleanup, so a crash at
-	// any point retries to convergence on the next Open.
-	if err := maybeRebindReseedStore(ctx, cfg, storageProvider, regDir, dataPath); err != nil {
-		return nil, err
-	}
-	var dID [16]byte
-	copy(dID[:], cfg.DBID[:])
-	_, statErr := os.Stat(filepath.Join(regDir, crypto.RegistryFileName))
-	registryExisted := statErr == nil
-	keyReg, err := crypto.OpenRegistry(regDir, storageProvider, dID)
-	if err != nil {
-		return nil, fmt.Errorf("%w: open key registry: %w", ErrEncryptionKey, err)
-	}
-	// The persisted write algorithm is authoritative: a fresh registry
-	// adopts the configured algorithm, a reopen must agree with it.
-	writeAlg := cfg.Encryption.writeAlgorithm()
-	if !registryExisted {
-		if err := keyReg.SetDefaultAlgorithm(ctx, writeAlg); err != nil {
-			keyReg.Close()
-			return nil, fmt.Errorf("%w: set write algorithm: %w", ErrEncryptionKey, err)
-		}
-	} else if got := keyReg.DefaultAlgorithm(); got != writeAlg {
-		keyReg.Close()
-		return nil, fmt.Errorf("%w: configured algorithm %s disagrees with persisted %s",
-			ErrEncryptionKey, writeAlg, got)
-	}
-	db.keyReg = keyReg
-	db.encPhase = crypto.PhaseIdle
-
-	baseFS := cfg.Pebble.BaseFS
-	if baseFS == nil {
-		baseFS = vfs.Default
-	}
-	efs, err := crypto.NewEncryptedFS(crypto.FSOptions{
-		Base:     baseFS,
-		Registry: keyReg,
-		DBID:     dID,
-		Logger:   cfg.Logger,
-	})
-	if err != nil {
-		db.closeStore()
-		return nil, fmt.Errorf("crypto: new encrypted fs: %w", err)
-	}
-	encMgr, err := crypto.NewManager(crypto.ManagerOptions{
-		FS:             efs,
-		Roots:          []string{dataPath},
-		MaxKeyLifetime: cfg.Encryption.DataKeyRotation,
-	})
-	if err != nil {
-		db.closeStore()
-		return nil, fmt.Errorf("crypto: new encryption manager: %w", err)
-	}
-	db.encMgr = encMgr
-	efs.SetRotationCheck(encMgr.MaybeRotateOnExpiry)
-	// Resume an interrupted file rewrite before Pebble opens: the journal
-	// requires a closed store, which holds this early in Open.
-	if encMgr.HasJournal() {
-		db.encPhase = crypto.PhaseRecovering
-		if err := encMgr.ResumeRewrite(ctx); err != nil {
-			db.closeStore()
-			return nil, fmt.Errorf("%w: resume rewrite: %w", ErrEncryptionKey, err)
-		}
-		db.encPhase = crypto.PhaseIdle
-	}
-	var compProfile *sstable.CompressionProfile
-	switch cfg.Pebble.Compression.Algorithm {
+	var spoolComp spool.Compression
+	switch cfg.Spool.Compression {
 	case CompressionNone:
-		compProfile = block.NoCompression
-	case CompressionSnappy:
-		compProfile = block.CompressionProfileByName("snappy")
-	case CompressionZstd:
-		compProfile = zstdProfileForLevel(cfg.Pebble.Compression.ZstdLevel)
+		spoolComp = spool.CompressionNone
+	default:
+		spoolComp = spool.CompressionDeflate
 	}
 
-	pebbleFS := vfs.FS(efs)
+	spoolDur := spool.DurabilitySync
+	if cfg.Durability.Mode == DurabilityAsync {
+		spoolDur = spool.DurabilityAsync
+	}
+
+	spoolOpt := spool.Options{
+		Path:                   dataPath,
+		MasterKey:              append([]byte(nil), mat.Key...),
+		WrappingKeyID:          mat.ID,
+		Encryption:             spool.EncryptionAES256GCM,
+		Compression:            spoolComp,
+		CompressionSet:         true,
+		Codec:                  cfg.Spool.Codec,
+		Codecs:                 cfg.Codecs,
+		Durability:             spoolDur,
+		WriteShards:            cfg.Spool.WriteShards,
+		IndexShards:            cfg.Spool.IndexShards,
+		TargetBlockBytes:       cfg.Spool.TargetBlockBytes,
+		MaxBlockBytes:          cfg.Spool.MaxBlockBytes,
+		MaxRecordsPerBlock:     cfg.Spool.MaxRecordsPerBlock,
+		MaxAtomicBatchBytes:    cfg.Spool.MaxAtomicBatchBytes,
+		MaxSegmentSize:         cfg.Spool.MaxSegmentSize,
+		MaxPendingBytes:        cfg.Spool.MaxPendingBytes,
+		Workers:                cfg.Spool.Workers,
+		CompactionThreshold:    cfg.Spool.CompactionThreshold,
+		CompactionMinFreeBytes: cfg.Spool.CompactionMinFreeBytes,
+		TombProofThreshold:     cfg.Spool.TombProofThreshold,
+		ReclaimInterval:        cfg.Spool.ReclaimInterval,
+		DataKeyMaxAge:          cfg.Encryption.DataKeyRotation,
+		Flush:                  cfg.Spool.Flush,
+		Faults:                 cfg.Spool.Faults,
+	}
+
 	// Restore intent: restored data must be opened with its fresh writer
 	// identity (same-identity rollback is rejected here and again during
 	// adoption). The adoption swaps the stored identity atomically with a
 	// durable restore marker.
 	restoreAdoption, intentPath, err := restoreAdoptionFor(cfg)
 	if err != nil {
-		if db.keyReg != nil {
-			db.keyReg.Close()
-		}
 		db.cancel()
 		return nil, err
 	}
 	store, err := state.Open(dataPath, cfg.NodeID, cfg.DBID, state.Options{
-		OriginSigning:               cfg.OriginSigning,
-		SnapshotAtomicMergeBytes:    cfg.Replication.SnapshotAtomicMergeBytes,
-		MigrateUnsignedBaseline:     cfg.originBaselineMigration,
-		MigrateMergePolicies:        cfg.mergePolicyMigration,
-		FS:                          pebbleFS,
-		CacheBytes:                  cfg.Pebble.CacheBytes,
-		MemTableSize:                cfg.Pebble.MemTableBytes,
-		MemTableStopWritesThreshold: cfg.Pebble.MemTableCount,
-		MaxOpenFiles:                cfg.Pebble.MaxOpenFiles,
-		CompactionConcurrency:       cfg.Pebble.MaxConcurrentCompactions,
-		DisableAutomaticCompactions: cfg.Pebble.DisableAutomaticCompactions,
-		Compression:                 compProfile,
-		Limits:                      codec.Limits{MaxValueBytes: cfg.MaxReplicatedValueBytes, MaxMutations: cfg.MaxBatchMutations, MaxTransactionBytes: cfg.MaxTransactionBytes},
-		Logger:                      cfg.Logger,
-		AsyncDurability:             cfg.Durability.Mode == DurabilityAsync,
-		Restore:                     restoreAdoption,
+		OriginSigning:            cfg.OriginSigning,
+		SnapshotAtomicMergeBytes: cfg.Replication.SnapshotAtomicMergeBytes,
+		MigrateUnsignedBaseline:  cfg.originBaselineMigration,
+		MigrateMergePolicies:     cfg.mergePolicyMigration,
+		Spool:                    spoolOpt,
+		Limits:                   codec.Limits{MaxValueBytes: cfg.MaxReplicatedValueBytes, MaxMutations: cfg.MaxBatchMutations, MaxTransactionBytes: cfg.MaxTransactionBytes},
+		Logger:                   cfg.Logger,
+		AsyncDurability:          cfg.Durability.Mode == DurabilityAsync,
+		Restore:                  restoreAdoption,
 	})
 	if err != nil {
-		if db.keyReg != nil {
-			db.keyReg.Close()
-		}
 		db.cancel()
 		return nil, err
 	}
@@ -295,30 +238,62 @@ func Open(ctx context.Context, cfg Config) (result *DB, openErr error) {
 		Author:      manifest.CreatedOnNode,
 		TimeCreated: manifest.TimeCreated,
 	}
-	var engine *sqlengine.Engine
-	engine, err = sqlengine.Open(reg, cfg.Schema.DDL, cfg.Schema.LocalDDL, cfg.Cache.StatementCacheEntries)
-	if err != nil {
-		db.closeStore()
-		db.cancel()
-		return nil, err
+	if len(cfg.Tables) > 0 {
+		db.recordDB = rime.New()
+		db.recordGeneration = 1
+		db.recordAdapter, err = rimeadapter.New(store, db.recordDB, manifest, recordcodec.NewCodecRegistry(), recordcodec.Limits{
+			MaxBytes: uint64(cfg.MaxReplicatedValueBytes),
+		})
+		if err != nil {
+			db.recordDB.Close()
+			db.recordDB = nil
+			db.closeStore()
+			db.cancel()
+			return nil, err
+		}
+		if err := db.configureRecordAdapter(db.recordAdapter); err != nil {
+			db.recordDB.Close()
+			db.recordDB = nil
+			db.closeStore()
+			db.cancel()
+			return nil, err
+		}
+		db.recordTables = make(map[string]any, len(cfg.Tables))
+		for _, definition := range cfg.Tables {
+			table, regErr := definition.register(db.recordAdapter)
+			if regErr != nil {
+				db.recordDB.Close()
+				db.recordDB = nil
+				db.closeStore()
+				db.cancel()
+				return nil, regErr
+			}
+			db.recordTables[strings.ToLower(definition.name)] = table
+		}
 	}
-	db.engine = engine
-
 	db.setState(StateRebuilding)
 	db.applyMu.Lock()
-	if err := db.rebuildOnOpen(ctx); err != nil {
+	progress.phase(OpenRebuilding)
+	var observeRebuild func(rimeadapter.RebuildProgress)
+	if progress != nil {
+		observeRebuild = func(p rimeadapter.RebuildProgress) {
+			progress.processed.Store(p.ProcessedItems)
+			progress.materializerProgress(p.CurrentTable, p.RowsInserted, p.RowsSkipped)
+		}
+	}
+	if rebuildErr := db.recordAdapter.Rebuild(ctx, 1024, observeRebuild); rebuildErr != nil {
 		db.applyMu.Unlock()
 		db.setState(StateFailed)
-		_ = engine.Close()
+		db.closeRecordDB()
 		db.closeStore()
 		db.cancel()
-		return nil, fmt.Errorf("murmur: rebuild: %w", err)
+		return nil, fmt.Errorf("murmur: rebuild: %w", rebuildErr)
 	}
 	progress.phase(OpenFinalizing)
 	if gen, err := store.StateGeneration(); err != nil {
 		db.applyMu.Unlock()
 		db.setState(StateFailed)
-		_ = engine.Close()
+		db.closeRecordDB()
 		db.closeStore()
 		db.cancel()
 		return nil, err
@@ -346,20 +321,13 @@ func Open(ctx context.Context, cfg Config) (result *DB, openErr error) {
 		db.repl = mgr
 	}
 
-	// Rotate on open when the active data key already expired; a failure
-	// is non-fatal (availability first, the expiry worker retries).
-	if err := db.encMgr.MaybeRotateOnExpiry(); err != nil {
-		db.log.Warn("murmur: data-key rotation on open failed", "err", err.Error())
-	}
-
-	db.subMgr = newSubscriptionManager(db, cfg.Subscription)
-	db.subMgr.start()
+	db.subMgr = newSubscriptionManager(db.ctx, cfg.Subscription)
 
 	if cfg.Files.Enabled {
 		files, err := openFileStore(db)
 		if err != nil {
 			db.setState(StateFailed)
-			_ = engine.Close()
+			db.closeRecordDB()
 			db.closeStore()
 			db.cancel()
 			return nil, err
@@ -372,8 +340,6 @@ func Open(ctx context.Context, cfg Config) (result *DB, openErr error) {
 		return nil, err
 	}
 	db.setState(StateReady)
-	db.wg.Add(1)
-	go db.remoteMaterializationLoop()
 	if db.repl != nil {
 		db.startReplication(db.repl)
 	}
@@ -389,11 +355,6 @@ func Open(ctx context.Context, cfg Config) (result *DB, openErr error) {
 		db.wg.Add(1)
 		go db.fetchLoop()
 	}
-	db.wg.Add(1)
-	go func() {
-		defer db.wg.Done()
-		db.encMgr.RunExpiryWorker(db.ctx)
-	}()
 
 	if cfg.Backup.Enabled && cfg.Backup.Destination != nil {
 		db.backupWorker = backup.NewWorker(backup.ScheduleConfig{
@@ -419,11 +380,19 @@ func (db *DB) closeStore() {
 		_ = db.store.Close()
 		db.store = nil
 	}
-	if db.keyReg != nil {
-		db.keyReg.Close()
-		db.keyReg = nil
+}
+
+func (db *DB) closeRecordDB() {
+	if db.recordDB != nil {
+		db.recordDB.Close()
+		db.recordDB = nil
+		db.recordAdapter = nil
+		db.recordTables = nil
 	}
 }
+
+// groupCommitEnabled reports whether synchronous group commit is active.
+func (db *DB) groupCommitEnabled() bool { return db.grouper != nil }
 
 // restoreAdoptionFor loads a pending restore intent for cfg.Path. It returns
 // the adoption for state.Open plus the intent path to clear after a
@@ -478,35 +447,6 @@ func restoreAdoptionFor(cfg Config) (*state.RestoreAdoption, string, error) {
 		adoption.NewDBID = newDB
 	}
 	return adoption, filepath.Join(cfg.Path, backup.RestoreIntentFileName), nil
-}
-
-// maybeRebindReseedStore runs the crash-safe ciphertext rebind when a
-// reseed intent moves the store to a new DBID. Ordinary opens, fresh
-// databases, and same-DBID clones are no-ops.
-func maybeRebindReseedStore(ctx context.Context, cfg Config, provider crypto.KeyProvider, regDir, dataPath string) error {
-	adoption, _, err := restoreAdoptionFor(cfg)
-	if err != nil {
-		return err
-	}
-	if adoption == nil || adoption.NewDBID.IsZero() || adoption.NewDBID == adoption.SourceDBID {
-		return nil
-	}
-	base := cfg.Pebble.BaseFS
-	if base == nil {
-		base = vfs.Default
-	}
-	var source, target [16]byte
-	copy(source[:], adoption.SourceDBID[:])
-	copy(target[:], adoption.NewDBID[:])
-	return crypto.RebindStore(ctx, crypto.RebindOptions{
-		RegDir:     regDir,
-		Roots:      []string{dataPath},
-		Provider:   provider,
-		SourceDBID: source,
-		NewDBID:    target,
-		Base:       base,
-		Logger:     cfg.Logger,
-	})
 }
 
 // --- state ---
@@ -573,167 +513,6 @@ func (db *DB) requireRead() error {
 	}
 }
 
-// --- writes ---
-
-// ExecContext executes a statement. Writes run as an implicit transaction:
-// SQL COMMIT, then one atomic Pebble commit; success is acknowledged only
-// after Pebble durability. Read-only statements are executed directly.
-func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	// PRAGMA never runs through Exec: reads belong on the Query path
-	// (Exec discards rows) and assignments are rejected everywhere.
-	// Without this the read-only branch below would accept PRAGMA
-	// reads that return nothing to the caller.
-	if firstSQLKeyword(query) == "PRAGMA" {
-		return nil, fmt.Errorf("%w: PRAGMA is not allowed through Exec (use Query for read-only introspection)", sqlengine.ErrStatementNotAllowed)
-	}
-	if isReadOnlyStatement(query) {
-		if err := db.requireRead(); err != nil {
-			return nil, err
-		}
-		rows, err := db.engine.Query(ctx, query, args...)
-		if err != nil {
-			return nil, err
-		}
-		_ = rows.Close()
-		return sqlengine.EmptyResult{}, nil
-	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	res, err := tx.ExecContext(ctx, query, args...)
-	if err != nil {
-		_ = tx.Rollback()
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return res, nil
-}
-
-// QueryContext runs a read. Rows must be closed promptly; an open Rows
-// stalls writers.
-func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
-	if err := db.requireRead(); err != nil {
-		return nil, err
-	}
-	rows, err := db.engine.Query(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	return &Rows{rows: rows}, nil
-}
-
-// QueryRowContext runs a single-row read.
-func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *Row {
-	return &Row{db: db, ctx: ctx, query: query, args: args}
-}
-
-// Subscribe opens a reactive query subscription for a read-only query.
-// It delivers an initial query result followed by updates on committed changes.
-func (db *DB) Subscribe(ctx context.Context, query string, args ...any) (*Subscription, error) {
-	return db.SubscribeWithOptions(ctx, query, SubscriptionOptions{}, args...)
-}
-
-// SubscribeWithOptions opens a reactive query subscription with custom options.
-func (db *DB) SubscribeWithOptions(ctx context.Context, query string, opts SubscriptionOptions, args ...any) (*Subscription, error) {
-	if err := db.requireRead(); err != nil {
-		return nil, err
-	}
-	if !isReadOnlyStatement(query) {
-		return nil, ErrReadOnlyRequired
-	}
-	if db.subMgr == nil {
-		return nil, ErrNotReady
-	}
-	return db.subMgr.subscribe(ctx, query, opts, args...)
-}
-
-// PrepareContext returns a statement handle. Statements execute through the
-// normal implicit-transaction paths; Close is a no-op (the engine owns a
-// shared prepared-statement cache).
-func (db *DB) PrepareContext(_ context.Context, query string) (*Stmt, error) {
-	if err := db.requireRead(); err != nil {
-		return nil, err
-	}
-	return &Stmt{db: db, query: query}, nil
-}
-
-// BeginTx starts an explicit local transaction. The serialized write
-// coordinator is held until Commit or Rollback.
-func (db *DB) BeginTx(ctx context.Context, opts *TxOptions) (*Tx, error) {
-	return db.BeginTxWithID(ctx, ids.NewTxID(), opts)
-}
-
-// BeginTxWithID starts an explicit local transaction with a designated TxID.
-// This is used by importers to preserve stable source transaction identities
-// and enable deduplication across replays and concurrent receivers.
-func (db *DB) BeginTxWithID(ctx context.Context, txID ids.TxID, _ *TxOptions) (*Tx, error) {
-	if err := db.requireWrite(); err != nil {
-		return nil, err
-	}
-	if txID.IsZero() {
-		txID = ids.NewTxID()
-	}
-	// Scheduler admission precedes the write lock; the ticket covers the
-	// SQL phase and releases on Commit, Rollback, or (grouped path) the
-	// group enqueue, whose shared fsync runs ticketless.
-	ticket, err := db.sched.Admit(ctx, WriterLocal)
-	if err != nil {
-		return nil, fmt.Errorf("murmur: writer admission: %w", err)
-	}
-	waitStart := time.Now()
-	db.writeMu.Lock()
-	db.metrics.writeAcquisitions.Add(1)
-	db.metrics.writeQueueWaitNanos.Add(uint64(time.Since(waitStart)))
-	if err := db.requireWrite(); err != nil {
-		db.writeMu.Unlock()
-		ticket.Release()
-		return nil, err
-	}
-	db.applyMu.Lock()
-	flushErr := db.flushRemoteLocked()
-	db.applyMu.Unlock()
-	if flushErr != nil {
-		db.writeMu.Unlock()
-		ticket.Release()
-		return nil, flushErr
-	}
-	stx, err := db.engine.Begin(ctx)
-	if err != nil {
-		db.writeMu.Unlock()
-		ticket.Release()
-		return nil, err
-	}
-	tx := &Tx{db: db, stx: stx, txID: txID, ticket: ticket}
-	var stopUser, stopDB func() bool
-	if ctx.Done() != nil {
-		stopUser = context.AfterFunc(ctx, func() {
-			_ = tx.Rollback()
-		})
-	}
-	if db.ctx.Done() != nil {
-		stopDB = context.AfterFunc(db.ctx, func() {
-			_ = tx.Rollback()
-		})
-	}
-	if stopUser != nil || stopDB != nil {
-		tx.stopHook = func() bool {
-			ok1 := true
-			if stopUser != nil {
-				ok1 = stopUser()
-			}
-			ok2 := true
-			if stopDB != nil {
-				ok2 = stopDB()
-			}
-			return ok1 && ok2
-		}
-	}
-	return tx, nil
-}
-
 // HasTransactionReceipt reports whether a transaction ID already has a durable
 // receipt in authoritative storage.
 func (db *DB) HasTransactionReceipt(txID ids.TxID) (bool, error) {
@@ -767,14 +546,14 @@ func (db *DB) BridgeStreamProgress(stream string) (uint64, bool, error) {
 	return db.store.BridgeStreamProgress(stream)
 }
 
-// crashHooks injects failures at commit boundaries. It is nil in production;
+// crashHooks injects failures at data and schema durability boundaries. It is nil in production;
 // white-box crash tests set it to prove every boundary converges to durable state
 // authoritative state.
 type crashHooks struct {
-	beforeSQLCommit   func() error
-	afterSQLCommit    func() error
 	beforeDurable     func() error
 	afterDurable      func() error
+	beforeSchemaStore func() error
+	afterSchemaStore  func() error
 	remoteMaterialize func() error
 }
 
@@ -789,479 +568,10 @@ func (db *DB) fireCrash(sel func(*crashHooks) func() error) error {
 	return nil
 }
 
-// commitTx implements SQL COMMIT -> Pebble COMMIT ordering for explicit and
-// implicit transactions. writeMu is held by the caller (Tx.Commit); commitTx
-// releases it exactly once on every path: at return for the direct path, or
-// right after the group enqueue for the grouped path so the next
-// transaction's SQL overlaps this fsync.
-func (db *DB) commitTx(tx *Tx) error {
-	if db.groupCommitEnabled() {
-		return db.commitTxGrouped(tx)
-	}
-	defer db.writeMu.Unlock()
-	return db.commitTxDirect(tx)
-}
-
-// groupCommitEnabled reports whether synchronous group commit is active.
-func (db *DB) groupCommitEnabled() bool {
-	return db.grouper != nil
-}
-
-// preparedLocalTx is a SQL-committed transaction awaiting durability.
-type preparedLocalTx struct {
-	mutations []codec.Mutation
-	// batch is nil when the transaction has no net change (nothing to replicate).
-	batch *codec.MutationBatch
-	// genBefore/seqBefore are the state generation and local sequence
-	// observed before SQL commit, for interleaving probes below.
-	genBefore uint64
-	seqBefore uint64
-}
-
-// prepareLocalCommit validates the captured delta, commits SQL, and builds
-// the durable batch. writeMu is held throughout so SQL order, HLC order,
-// and (for the grouped path) group order agree. On success SQL is committed
-// and the caller owns durability. On error SQL is rolled back (or the
-// materializer rebuilt when SQL committed but the hook failed) and the
-// caller must NOT durably replicate.
-func (db *DB) prepareLocalCommit(tx *Tx) (*preparedLocalTx, error) {
-	prep := &preparedLocalTx{}
-	// Validate/coalesce before SQL COMMIT so oversize transactions roll back
-	// cleanly instead of dirtying the materializer.
-	if err := tx.validateMergeCapture(tx.stx.Pending()); err != nil {
-		_ = tx.stx.Rollback()
-		return nil, err
-	}
-	delta := sqlengine.NewDelta()
-	for _, ev := range tx.stx.Pending() {
-		if err := delta.Add(ev); err != nil {
-			_ = tx.stx.Rollback()
-			return nil, err
-		}
-	}
-	mutations, err := delta.Build(db.cfg.MaxReplicatedValueBytes)
-	if err != nil {
-		_ = tx.stx.Rollback()
-		return nil, fmt.Errorf("%w: %w", ErrValueTooLarge, err)
-	}
-	mutations = tx.attachMergeMutations(mutations)
-	mutations, err = tx.routeMergeOwnership(mutations)
-	if err != nil {
-		_ = tx.stx.Rollback()
-		return nil, err
-	}
-	policyMutations, err := policyMutationsForTx(db, tx, mutations)
-	if err != nil {
-		_ = tx.stx.Rollback()
-		return nil, fmt.Errorf("murmur: bridge policy: %w", err)
-	}
-	mutations = append(mutations, policyMutations...)
-	if len(mutations) > db.cfg.MaxBatchMutations {
-		_ = tx.stx.Rollback()
-		return nil, fmt.Errorf("%w: %d mutations", ErrBatchTooLarge, len(mutations))
-	}
-	if encodedSize := int64(codec.EncodedMutationsSize(mutations)); encodedSize > db.cfg.MaxTransactionBytes {
-		_ = tx.stx.Rollback()
-		return nil, fmt.Errorf("%w: transaction encoded size %d bytes exceeds MaxTransactionBytes %d: %w", ErrTransactionTooLarge, encodedSize, db.cfg.MaxTransactionBytes, ErrBatchTooLarge)
-	}
-	if err := db.fireCrash(func(h *crashHooks) func() error { return h.beforeSQLCommit }); err != nil {
-		_ = tx.stx.Rollback()
-		return nil, err
-	}
-	// Generation probe: remote commits between here and our Pebble commit
-	// may have touched the same SQL rows (delete/resurrect races), in which
-	// case the touched rows are repaired below. The local-sequence probe
-	// beside it lets the grouped path tell interleaved local commits
-	// (lower HLCs, no repair needed) from remote ones.
-	prep.genBefore, _ = db.store.StateGeneration()
-	prep.seqBefore, _ = db.store.LocalSeq()
-	if _, err := tx.stx.Commit(); err != nil {
-		return nil, err // SQL rejected; nothing durable (capture discarded)
-	}
-	if err := db.fireCrash(func(h *crashHooks) func() error { return h.afterSQLCommit }); err != nil {
-		// SQL committed but durability did not: recover via rebuild.
-		db.applyMu.Lock()
-		defer db.applyMu.Unlock()
-		if rerr := db.rebuildLocked(); rerr != nil {
-			db.log.Error("rebuild after failed commit failed", "err", rerr.Error())
-		}
-		return nil, err
-	}
-	prep.mutations = mutations
-	if len(mutations) == 0 {
-		return prep, nil // no net change; nothing to replicate
-	}
-	schemaId := db.schemaIdentity()
-	prep.batch = &codec.MutationBatch{
-		ProtocolVersion: replication.ProtocolVersion,
-		TxID:            tx.txID,
-		OriginNode:      db.cfg.NodeID,
-		HLC:             db.store.ClockNow(),
-		SchemaEpoch:     schemaId.Epoch,
-		SchemaHash:      schemaId.Hash,
-		Mutations:       mutations,
-	}
-	return prep, nil
-}
-
-// commitTxDirect commits one transaction alone, holding writeMu throughout.
-// It is the non-group path (group commit disabled or asynchronous mode).
-func (db *DB) commitTxDirect(tx *Tx) error {
-	start := time.Now()
-	noteCommit := func(mutations int) {
-		db.metrics.localCommits.Add(1)
-		db.metrics.localCommitMutations.Add(uint64(mutations))
-		db.metrics.localCommitLatencyNanos.Add(uint64(time.Since(start)))
-	}
-	prep, err := db.prepareLocalCommit(tx)
-	if err != nil {
-		return err
-	}
-	if prep.batch == nil {
-		db.applyMu.Lock()
-		ferr := db.flushRemoteLocked()
-		db.applyMu.Unlock()
-		if ferr != nil {
-			return ferr
-		}
-		noteCommit(0)
-		return nil // no net change; nothing to replicate
-	}
-	mutations := prep.mutations
-	batch := prep.batch
-	genBefore := prep.genBefore
-	db.applyMu.Lock()
-	defer db.applyMu.Unlock()
-	if err := db.fireCrash(func(h *crashHooks) func() error { return h.beforeDurable }); err != nil {
-		if rerr := db.rebuildLocked(); rerr != nil {
-			db.log.Error("rebuild after failed commit failed", "err", rerr.Error())
-		}
-		return err
-	}
-	res, err := db.store.CommitLocal(context.Background(), batch)
-	if err != nil {
-		// SQL is ahead of durable state: mark dirty, rebuild, report.
-		if rerr := db.rebuildLocked(); rerr != nil {
-			db.log.Error("rebuild after failed commit failed", "err", rerr.Error())
-		}
-		if errors.Is(err, state.ErrTooBig) {
-			return fmt.Errorf("%w: %w", ErrBatchTooLarge, err)
-		}
-		return err
-	}
-	materializedByFlush := len(db.remoteRows) > 0
-	if err := db.flushRemoteLocked(); err != nil {
-		return err
-	}
-	gen, err := db.store.StateGeneration()
-	if err != nil {
-		return err
-	}
-	_ = res
-	if gen != genBefore+1 || mutationsHaveMergePolicies(mutations) {
-		// Concurrent durable commits interleaved with our SQL commit and
-		// may have deleted/resurrected our rows in SQL: reconcile the
-		// touched rows with durable visibility before acknowledging.
-		db.metrics.repairs.Add(1)
-		seen := make(map[sqlengine.RowKey]bool, len(mutations))
-		var touched []sqlengine.RowKey
-		for i := range mutations {
-			k := sqlengine.RowKey{TableID: mutations[i].TableID, RowID: mutations[i].RowID}
-			if !seen[k] {
-				seen[k] = true
-				touched = append(touched, k)
-			}
-		}
-		repair := db.engine.RepairRows
-		if mutationsHaveMergePolicies(mutations) {
-			repair = db.engine.ApplyRows
-		}
-		if err := repair(db.shadowReader(), touched); err != nil {
-			db.log.Warn("local repair failed; rebuilding materializer", "err", err.Error())
-			if rerr := db.rebuildLocked(); rerr != nil {
-				return rerr
-			}
-			if gen, err = db.store.StateGeneration(); err != nil {
-				return err
-			}
-		}
-	}
-	if !materializedByFlush {
-		db.materializedGeneration.Store(gen)
-	}
-	if err := db.fireCrash(func(h *crashHooks) func() error { return h.afterDurable }); err != nil {
-		// Ambiguous commit: durable and materialized, acknowledgement lost.
-		noteCommit(len(mutations))
-		if repl := db.replManager(); repl != nil {
-			repl.NotifyLocal()
-		}
-		return fmt.Errorf("%w: %w", ErrAmbiguousCommit, err)
-	}
-	if db.subMgr != nil {
-		db.subMgr.notifyChange(false)
-	}
-	if repl := db.replManager(); repl != nil {
-		repl.NotifyLocal()
-	}
-	noteCommit(len(mutations))
-	return nil
-}
-
-// commitTxGrouped commits through the group committer: SQL commits under
-// writeMu, then the transaction enqueues (still under writeMu, preserving
-// SQL order) and releases its ticket and writeMu so the next transaction's
-// SQL overlaps this fsync. The leader durably commits the whole group with
-// one Pebble batch; every member is acknowledged only after that shared
-// fsync.
-func (db *DB) commitTxGrouped(tx *Tx) error {
-	start := time.Now()
-	writeHeld := true
-	defer func() {
-		if writeHeld {
-			db.writeMu.Unlock()
-		}
-	}()
-	prep, err := db.prepareLocalCommit(tx)
-	if err != nil {
-		return err
-	}
-	if prep.batch == nil {
-		db.applyMu.Lock()
-		ferr := db.flushRemoteLocked()
-		db.applyMu.Unlock()
-		if ferr != nil {
-			return ferr
-		}
-		db.metrics.localCommits.Add(1)
-		db.metrics.localCommitLatencyNanos.Add(uint64(time.Since(start)))
-		return nil // no net change; nothing to replicate
-	}
-	m := &groupMember{
-		batch:     prep.batch,
-		mutations: prep.mutations,
-		genBefore: prep.genBefore,
-		seqBefore: prep.seqBefore,
-		start:     start,
-		resCh:     make(chan groupMemberResult, 1),
-	}
-	// groupWG tracks phase-2 (post-writeMu) commits so Close cannot pass
-	// its writeMu drain while a group is in flight. Add under writeMu:
-	// after Close holds writeMu no new Add can occur.
-	db.mergePendingMu.Lock()
-	if db.mergePending == nil {
-		db.mergePending = make(map[*codec.MutationBatch]pendingMergeBatch)
-	}
-	db.mergePending[m.batch] = pendingMergeBatch{version: m.batch.Version(), mutations: copyMergeMutations(m.batch.Mutations)}
-	db.mergePendingMu.Unlock()
-	db.groupWG.Add(1)
-	ticket := db.grouper.enqueue(m)
-	// The SQL phase is done: release the admission ticket (exclusive, one
-	// active writer node-wide) so the next transaction's SQL overlaps this
-	// fsync instead of queueing behind the group window. The shared
-	// durable phase runs ticketless under applyMu; every member was
-	// admitted for its SQL phase, so the group is bounded by admitted
-	// work. Tx.Commit's deferred Release is a no-op after this.
-	tx.ticket.Release()
-	writeHeld = false
-	db.writeMu.Unlock()
-	return db.grouper.await(ticket).err
-}
-
-// commitLocalGroup durably commits members as one group under applyMu and
-// returns one result per member, aligned with the input. It mirrors the
-// commitTxDirect durable tail: beforeDurable hook, one Pebble commit, one
-// remote flush, per-member repair probing, generation bookkeeping,
-// afterDurable hook, then notify. Runs ticketless in the leader's
-// goroutine (members released their tickets at enqueue); followers block
-// until their result is delivered.
-func (db *DB) commitLocalGroup(members []*groupMember) []groupMemberResult {
-	defer func() {
-		db.mergePendingMu.Lock()
-		for _, m := range members {
-			delete(db.mergePending, m.batch)
-		}
-		db.mergePendingMu.Unlock()
-	}()
-	results := make([]groupMemberResult, len(members))
-	noteMember := func(m *groupMember) {
-		db.metrics.localCommits.Add(1)
-		db.metrics.localCommitMutations.Add(uint64(len(m.mutations)))
-		db.metrics.localCommitLatencyNanos.Add(uint64(time.Since(m.start)))
-	}
-	failAll := func(err error) []groupMemberResult {
-		for i := range members {
-			results[i] = groupMemberResult{err: err}
-			db.groupWG.Done()
-		}
-		return results
-	}
-	db.applyMu.Lock()
-	defer db.applyMu.Unlock()
-	if err := db.fireCrash(func(h *crashHooks) func() error { return h.beforeDurable }); err != nil {
-		if rerr := db.rebuildLocked(); rerr != nil {
-			db.log.Error("rebuild after failed commit failed", "err", rerr.Error())
-		}
-		return failAll(err)
-	}
-	// Paired pre-group probes (applyMu serializes all durable commits, so
-	// no commit lands between these reads and the group commit below).
-	seqAtStart, _ := db.store.LocalSeq()
-	batches := make([]*codec.MutationBatch, len(members))
-	for i, m := range members {
-		batches[i] = m.batch
-	}
-	res, err := db.store.CommitLocalGroup(context.Background(), batches)
-	if err != nil {
-		// SQL is ahead of durable state: mark dirty, rebuild, report.
-		if rerr := db.rebuildLocked(); rerr != nil {
-			db.log.Error("rebuild after failed commit failed", "err", rerr.Error())
-		}
-		if errors.Is(err, state.ErrTooBig) {
-			return failAll(fmt.Errorf("%w: %w", ErrBatchTooLarge, err))
-		}
-		return failAll(err)
-	}
-	db.metrics.groupCommits.Add(1)
-	db.metrics.groupCommitMembers.Add(uint64(len(members)))
-	materializedByFlush := len(db.remoteRows) > 0
-	if err := db.flushRemoteLocked(); err != nil {
-		return failAll(err)
-	}
-	gen := res.Generation
-	needsRepair := false
-	seen := make(map[sqlengine.RowKey]bool)
-	var touched []sqlengine.RowKey
-	for _, m := range members {
-		if !groupMemberNeedsRepair(m.genBefore, res.GenerationBefore, m.seqBefore, seqAtStart) && !mutationsHaveMergePolicies(m.mutations) {
-			continue
-		}
-		needsRepair = true
-		for i := range m.mutations {
-			k := sqlengine.RowKey{TableID: m.mutations[i].TableID, RowID: m.mutations[i].RowID}
-			if !seen[k] {
-				seen[k] = true
-				touched = append(touched, k)
-			}
-		}
-	}
-	if needsRepair {
-		// Non-local commits interleaved with our SQL commits and may have
-		// deleted/resurrected our rows in SQL: reconcile the touched rows
-		// with durable visibility before acknowledging.
-		db.metrics.repairs.Add(1)
-		repair := db.engine.RepairRows
-		for _, m := range members {
-			if mutationsHaveMergePolicies(m.mutations) {
-				repair = db.engine.ApplyRows
-				break
-			}
-		}
-		if err := repair(db.shadowReader(), touched); err != nil {
-			db.log.Warn("local repair failed; rebuilding materializer", "err", err.Error())
-			if rerr := db.rebuildLocked(); rerr != nil {
-				return failAll(rerr)
-			}
-			if gen2, err := db.store.StateGeneration(); err != nil {
-				return failAll(err)
-			} else {
-				gen = gen2
-			}
-		}
-	}
-	if !materializedByFlush {
-		db.materializedGeneration.Store(gen)
-	}
-	if err := db.fireCrash(func(h *crashHooks) func() error { return h.afterDurable }); err != nil {
-		// Ambiguous commit: durable and materialized, acknowledgement lost.
-		for i, m := range members {
-			noteMember(m)
-			results[i] = groupMemberResult{applied: res.Members[i].Applied, gen: res.Members[i].Generation, err: fmt.Errorf("%w: %w", ErrAmbiguousCommit, err)}
-			db.groupWG.Done()
-		}
-		if repl := db.replManager(); repl != nil {
-			repl.NotifyLocal()
-		}
-		return results
-	}
-	if db.subMgr != nil {
-		db.subMgr.notifyChange(false)
-	}
-	if repl := db.replManager(); repl != nil {
-		repl.NotifyLocal()
-	}
-	for i, m := range members {
-		noteMember(m)
-		results[i] = groupMemberResult{applied: res.Members[i].Applied, gen: res.Members[i].Generation}
-		db.groupWG.Done()
-	}
-	return results
-}
-
-// groupMemberNeedsRepair reports whether non-local (remote/snapshot)
-// commits landed between the member's SQL commit and its group commit.
-// The generation advances once per applied commit of any origin (plus
-// once per materializer rebuild, which drops inline applies) while the
-// local sequence advances once per applied local commit, so equal deltas
-// mean only lower-HLC local commits interleaved — those can never overturn
-// the member's materialized rows. A mismatch (or a non-monotonic probe,
-// defensively) requires reconciling the member's touched rows.
-func groupMemberNeedsRepair(genBefore, genAtStart, seqBefore, seqAtStart uint64) bool {
-	if genAtStart < genBefore || seqAtStart < seqBefore {
-		return true
-	}
-	return genAtStart-genBefore != seqAtStart-seqBefore
-}
-
-// rebuildLocked rebuilds the query database from durable state. applyMu held.
-//
-// On success the node returns to Ready. On failure the node fails closed:
-// the materializer cannot be trusted, so reads and writes stay rejected
-// until the operator restarts (Open rebuilds from Pebble-authoritative
-// state). Callers must not overwrite the Failed state.
-func (db *DB) rebuildLocked() error {
-	start := time.Now()
-	db.setState(StateMaterializerDirty)
-	ok := false
-	defer func() {
-		db.metrics.rebuilds.Add(1)
-		db.metrics.rebuildNanos.Add(uint64(time.Since(start)))
-		if ok {
-			db.setState(StateReady)
-		} else {
-			db.setState(StateFailed)
-		}
-	}()
-	// Invalidate in-flight group members before discarding SQLite: the
-	// rebuild drops their inline applies, and only a generation change
-	// makes the phase-2 repair probe re-materialize them (schema
-	// publishes bump no data counters of their own).
-	if err := db.store.BumpGeneration(); err != nil {
-		db.log.Error("rebuild failed; node failed closed", "err", err.Error())
-		return err
-	}
-	if err := db.engine.Rebuild(db.shadowReader()); err != nil {
-		db.log.Error("rebuild failed; node failed closed", "err", err.Error())
-		return err
-	}
-	gen, err := db.store.StateGeneration()
-	if err != nil {
-		db.log.Error("rebuild failed; node failed closed", "err", err.Error())
-		return err
-	}
-	db.materializedGeneration.Store(gen)
-	db.remoteRows = nil
-	db.remoteTxnCount = 0
-	if db.subMgr != nil {
-		db.subMgr.notifyChange(true)
-	}
-	ok = true
-	return nil
-}
-
 // --- replication applier ---
 
-// ApplyRemote durably merges a received batch and queues its winning rows for
-// bulk SQLite materialization.
+// ApplyRemote durably merges a received batch and publishes its winning rows
+// through the managed RIME adapter.
 // It satisfies replication.Applier. Acknowledgements are sent by the
 // replication manager only after this returns nil.
 func (db *DB) ApplyRemote(ctx context.Context, batch *codec.MutationBatch) error {
@@ -1299,13 +609,20 @@ func (db *DB) ApplyRemote(ctx context.Context, batch *codec.MutationBatch) error
 	if err := db.fireCrash(func(h *crashHooks) func() error { return h.remoteMaterialize }); err != nil {
 		// Simulated materialization failure: durable state is correct, rebuild.
 		db.log.Warn("remote apply failed; rebuilding materializer", "err", err.Error())
-		if rerr := db.rebuildLocked(); rerr != nil {
+		var rerr error
+		rerr = db.rebuildRecordMaterializer(ctx)
+		if rerr != nil {
 			db.log.Error("rebuild failed", "err", rerr.Error())
+			db.setState(StateFailed)
+			return rerr
 		}
 		failed = false
 		return nil
 	}
-	if err := db.queueRemoteLocked(res.Winners, res.Generation, 1); err != nil {
+	err = db.applyRemoteRecords(ctx, res)
+	if err != nil {
+		db.log.Error("typed remote apply failed; database failed closed", "err", err.Error())
+		db.setState(StateFailed)
 		if state.IsStorageFailure(err) {
 			db.log.Error("remote apply failed; storage failed closed", "err", err.Error())
 			db.setState(StateFailed)
@@ -1326,9 +643,9 @@ func (db *DB) ApplyRemote(ctx context.Context, batch *codec.MutationBatch) error
 }
 
 // ApplyRemoteGroup commits an ordered group of remote transactions with one
-// writer admission and one Pebble sync. Transaction IDs, receipts, and origin
-// sequence positions remain independent. Query visibility follows the next
-// bulk SQLite flush; acknowledgement follows the durable Pebble commit.
+// writer admission and one Spool sync. Transaction IDs, receipts, and origin
+// sequence positions remain independent. RIME publication completes before
+// acknowledgement, after the durable Spool commit.
 func (db *DB) ApplyRemoteGroup(ctx context.Context, batches []*codec.MutationBatch) error {
 	if len(batches) == 0 {
 		return nil
@@ -1373,13 +690,18 @@ func (db *DB) ApplyRemoteGroup(ctx context.Context, batches []*codec.MutationBat
 	}
 	if err := db.fireCrash(func(h *crashHooks) func() error { return h.remoteMaterialize }); err != nil {
 		db.log.Warn("remote group apply failed; rebuilding materializer", "err", err.Error())
-		if rerr := db.rebuildLocked(); rerr != nil {
+		rerr := db.rebuildRecordMaterializer(ctx)
+		if rerr != nil {
 			db.log.Error("rebuild failed", "err", rerr.Error())
+			db.setState(StateFailed)
+			return rerr
 		}
 		failed = false
 		return nil
 	}
-	if err := db.queueRemoteLocked(res.Winners, res.Generation, len(batches)); err != nil {
+	err = db.applyRemoteRecords(ctx, res)
+	if err != nil {
+		db.setState(StateFailed)
 		if state.IsStorageFailure(err) {
 			db.log.Error("remote group apply failed; storage failed closed", "err", err.Error())
 			db.setState(StateFailed)
@@ -1395,6 +717,16 @@ func (db *DB) ApplySnapshotChunk(ctx context.Context, manifest *codec.SnapshotMa
 	if st := db.getState(); st == StateClosed || st == StateClosing || st == StateFailed {
 		return false, fmt.Errorf("murmur: snapshot apply in state %s", st)
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if last {
+		release, err := db.quiesceRecordPreparation(ctx)
+		if err != nil {
+			return false, err
+		}
+		defer release()
+	}
 	db.metrics.applyInflight.Add(1)
 	defer db.metrics.applyInflight.Add(-1)
 	ticket, err := db.sched.Admit(ctx, WriterRemote)
@@ -1404,6 +736,7 @@ func (db *DB) ApplySnapshotChunk(ctx context.Context, manifest *codec.SnapshotMa
 	defer ticket.Release()
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
+	db.drainGroupCommitsLocked()
 	db.applyMu.Lock()
 	defer db.applyMu.Unlock()
 	res, complete, err := db.store.ImportSnapshotChunk(ctx, manifest, index, cells, last, uint64(db.cfg.Replication.MaxSnapshotBytes))
@@ -1417,9 +750,10 @@ func (db *DB) ApplySnapshotChunk(ctx context.Context, manifest *codec.SnapshotMa
 	}
 	db.metrics.snapshotChunksApplied.Add(1)
 	if complete && res.Applied {
-		if err := db.rebuildLocked(); err != nil {
+		if err := db.rebuildRecordMaterializer(ctx); err != nil {
 			db.metrics.snapshotApplyFailures.Add(1)
-			return false, err
+			db.setState(StateFailed)
+			return false, fmt.Errorf("murmur: rebuild typed records after snapshot: %w", err)
 		}
 		db.metrics.snapshotAppliesComplete.Add(1)
 	}
@@ -1611,10 +945,14 @@ func (db *DB) statusLive() Status {
 		st.FormatFormat = format
 	}
 	pm := db.store.Metrics()
-	st.PebbleSizeBytes = pm.DiskBytes
-	st.PebbleCacheHits = pm.CacheHits
-	st.PebbleCacheMisses = pm.CacheMisses
-	st.PebbleMemTableBytes = pm.MemTableBytes
+	st.SpoolDiskBytes = pm.DiskBytes
+	st.SpoolKeys = pm.Keys
+	st.SpoolPendingBytes = pm.PendingBytes
+	st.SpoolPendingRecords = pm.PendingRecords
+	st.SpoolBlocksWritten = pm.BlocksWritten
+	st.SpoolBytesWritten = pm.BytesWritten
+	st.SpoolCompactions = pm.Compactions
+	st.SpoolStorageFailure = pm.StorageFailure
 	if repl := db.replManager(); repl != nil {
 		rs := repl.Stats()
 		st.Replication = rs
@@ -1821,13 +1159,35 @@ func (db *DB) admitLegacyAckPeers(now int64) {
 }
 
 func (db *DB) gcOnce(withReceipts bool) {
+	_ = db.gcContext(db.ctx, withReceipts)
+}
+
+// GC runs one operator-triggered log and receipt collection pass. It removes
+// only history permitted by persisted peer acknowledgements and retention
+// limits; callers should use a deadline for large backlogs.
+func (db *DB) GC(ctx context.Context) error {
+	return db.gcContext(ctx, true)
+}
+
+func (db *DB) gcContext(ctx context.Context, withReceipts bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := db.requireWrite(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	db.gcRunMu.Lock()
+	defer db.gcRunMu.Unlock()
 	if db.getState() != StateReady {
-		return
+		return ErrNotReady
 	}
 	origins, err := db.store.KnownOrigins()
 	if err != nil {
 		db.metrics.gcFailures.Add(1)
-		return
+		return err
 	}
 	start := time.Now()
 	defer func() {
@@ -1839,8 +1199,8 @@ func (db *DB) gcOnce(withReceipts bool) {
 	// subset. Members whose obligation expired (or never existed) do not
 	// pin history; their return path is snapshot resync.
 	now := time.Now().UnixMilli()
-	if ticket, err := db.sched.Admit(db.ctx, WriterMaintenance); err != nil {
-		return
+	if ticket, err := db.sched.Admit(ctx, WriterMaintenance); err != nil {
+		return err
 	} else {
 		db.admitLegacyAckPeers(now)
 		ticket.Release()
@@ -1876,16 +1236,16 @@ func (db *DB) gcOnce(withReceipts bool) {
 		// 30s pass caps collection at ~137 batches/s, which any
 		// sustained workload outruns (unbounded retained growth).
 		for unit := 0; ; unit++ {
-			ticket, err := db.sched.Admit(db.ctx, WriterMaintenance)
+			ticket, err := db.sched.Admit(ctx, WriterMaintenance)
 			if err != nil {
-				return
+				return err
 			}
 			n, cerr := db.store.CollectLog(origin, floor, cutoff, db.cfg.Replication.MinRetainedBatches)
 			ticket.Release()
 			if cerr != nil {
 				db.metrics.gcFailures.Add(1)
 				db.log.Debug("log GC failed", "origin", origin.String(), "err", cerr.Error())
-				break
+				return cerr
 			}
 			db.metrics.gcLogCollected.Add(uint64(n))
 			if n < state.CollectUnitCap {
@@ -1896,16 +1256,16 @@ func (db *DB) gcOnce(withReceipts bool) {
 	}
 	if withReceipts {
 		for {
-			ticket, err := db.sched.Admit(db.ctx, WriterMaintenance)
+			ticket, err := db.sched.Admit(ctx, WriterMaintenance)
 			if err != nil {
-				return
+				return err
 			}
 			n, cerr := db.store.CollectReceipts(floors)
 			ticket.Release()
 			if cerr != nil {
 				db.metrics.gcFailures.Add(1)
 				db.log.Debug("receipt GC failed", "err", cerr.Error())
-				break
+				return cerr
 			}
 			db.metrics.gcReceiptsCollected.Add(uint64(n))
 			if n < state.CollectUnitCap {
@@ -1913,11 +1273,12 @@ func (db *DB) gcOnce(withReceipts bool) {
 			}
 		}
 	}
+	return ctx.Err()
 }
 
 func (db *DB) valueGCloop() {
 	defer db.wg.Done()
-	// Pebble automatically compacts SSTables in background; valueGCloop is kept for loop draining.
+	// Spool manages segments in background; valueGCloop is kept for loop draining.
 	<-db.ctx.Done()
 }
 
@@ -1975,6 +1336,8 @@ func (db *DB) newReplicationManager(extraPeers []replication.PeerInfo) (*replica
 	}
 	schemaId := db.schemaIdentity()
 	mgr, err := replication.NewManager(replication.ManagerConfig{
+		Codec:                       db.cfg.Spool.Codec,
+		Codecs:                      db.cfg.Codecs,
 		TrustedSnapshotSources:      append([]ids.NodeID(nil), db.cfg.Replication.TrustedSnapshotSources...),
 		Store:                       db.store,
 		Applier:                     db,
@@ -2091,30 +1454,24 @@ func (db *DB) ReplExitError() error {
 
 // --- backup & restore ---
 
+// HoldCommits implements backup.SourceDB.
+func (db *DB) HoldCommits() func() {
+	if db.store == nil {
+		return func() {}
+	}
+	return db.store.HoldCommits()
+}
+
 // Checkpoint implements backup.SourceDB, taking an online snapshot via hard links.
-func (db *DB) Checkpoint(stagingDataDir string) error {
-	return db.store.Checkpoint(stagingDataDir)
-}
-
-// Pin implements backup.SourceDB, pinning data keys during backup.
-func (db *DB) Pin(ctx context.Context, path, kind string) error {
-	if db.keyReg != nil {
-		return db.keyReg.Pin(ctx, path, kind)
+func (db *DB) Checkpoint(ctx context.Context, stagingDataDir string) (func() error, error) {
+	if db.store == nil {
+		return nil, errors.New("murmur: store is closed")
 	}
-	return nil
-}
-
-// Unpin implements backup.SourceDB, unpinning data keys after backup.
-func (db *DB) Unpin(ctx context.Context, path string) error {
-	if db.keyReg != nil {
-		return db.keyReg.Unpin(ctx, path)
+	cp, err := db.store.SpoolCheckpoint(ctx, stagingDataDir)
+	if err != nil {
+		return nil, err
 	}
-	return nil
-}
-
-// KeysDir implements backup.SourceDB.
-func (db *DB) KeysDir() string {
-	return filepath.Join(db.cfg.Path, "keys")
+	return cp.Release, nil
 }
 
 // ClusterID implements backup.SourceDB.
@@ -2181,40 +1538,6 @@ func Restore(ctx context.Context, cfg backup.RestoreConfig) (*backup.Metadata, e
 	return backup.Restore(ctx, cfg)
 }
 
-// recoverRotation leftovers completes or rolls back an interrupted rotation's
-// directory moves without guessing keys. See RotateStorageKey.
-func (db *DB) recoverRotationLeftovers() error {
-	path := db.cfg.Path
-	shadow, prev := path+".rekey", path+".prev"
-	has := func(p string) bool { _, err := os.Stat(p); return err == nil }
-	hasPath, hasShadow, hasPrev := has(path), has(shadow), has(prev)
-	switch {
-	case hasShadow && hasPath:
-		// Pre-cutover crash: shadow incomplete; drop it.
-		if err := os.RemoveAll(shadow); err != nil {
-			return fmt.Errorf("murmur: remove stale %s: %w", shadow, err)
-		}
-	case !hasPath && hasPrev && !hasShadow:
-		// Crash after first rename: roll back to old store (old key).
-		if err := os.Rename(prev, path); err != nil {
-			return fmt.Errorf("murmur: rollback rotation: %w", err)
-		}
-	case !hasPath && hasShadow:
-		// Crash between renames with both spares, or shadow-only: the two
-		// directories need different keys; refuse to guess.
-		return fmt.Errorf("murmur: interrupted rotation: %s and/or %s exist without %s; move the correct store into place manually",
-			shadow, prev, path)
-	case hasPath && hasPrev && !hasShadow:
-		// Cutover completed; cleanup did not. The live store is complete.
-		if err := os.RemoveAll(prev); err != nil {
-			return fmt.Errorf("murmur: remove stale %s: %w", prev, err)
-		}
-	case hasPath && hasPrev && hasShadow:
-		return fmt.Errorf("murmur: interrupted rotation: both %s and %s exist; resolve manually", shadow, prev)
-	}
-	return nil
-}
-
 // --- close ---
 
 // Close stops workers and replication, then closes the query engine and the
@@ -2229,6 +1552,11 @@ func (db *DB) Close() error {
 	// Wake scheduler waiters first (in-flight ticket holders run to
 	// completion), then drain the locks below.
 	db.sched.Close()
+	db.recordPrepMu.Lock()
+	for db.recordPreparers > 0 {
+		db.recordPrepCond.Wait()
+	}
+	db.recordPrepMu.Unlock()
 	// Drain in-flight work (new work is rejected by state checks). The
 	// drains also synchronize with an in-progress key rotation or rewrite
 	// so the manager read below cannot race a maintenance restart.
@@ -2236,6 +1564,9 @@ func (db *DB) Close() error {
 	db.writeMu.Unlock()
 	// Grouped commits release writeMu before their shared fsync; drain
 	// them before the applyMu drain so no group is in flight past Close.
+	if db.grouper != nil {
+		db.grouper.flush()
+	}
 	db.groupWG.Wait()
 	db.applyMu.Lock()
 	db.applyMu.Unlock()
@@ -2253,13 +1584,6 @@ func (db *DB) Close() error {
 	}
 	db.wg.Wait()
 	var first error
-	if db.engine != nil {
-		db.applyMu.Lock()
-		if err := db.flushRemoteLocked(); err != nil {
-			first = fmt.Errorf("murmur: final remote materialization: %w", err)
-		}
-		db.applyMu.Unlock()
-	}
 	if (db.cfg.Durability.SyncInterval > 0 || db.cfg.Durability.MaxUnsyncedBytes > 0) && db.store != nil {
 		if err := db.store.Sync(); err != nil {
 			first = fmt.Errorf("murmur: final durability sync: %w", err)
@@ -2269,11 +1593,13 @@ func (db *DB) Close() error {
 		db.subMgr.close()
 		db.subMgr = nil
 	}
-	if db.engine != nil {
-		if err := db.engine.Close(); err != nil && first == nil {
-			first = err
+	if db.recordDB != nil {
+		db.recordMu.Lock()
+		db.recordDB.Close()
+		for _, retired := range db.retiredRecordDBs {
+			retired.Close()
 		}
-		db.engine = nil
+		db.recordMu.Unlock()
 	}
 	if db.files != nil {
 		if err := db.files.close(); err != nil && first == nil {
@@ -2290,72 +1616,8 @@ func (db *DB) Close() error {
 			first = err
 		}
 	}
-	if db.keyReg != nil {
-		db.keyReg.Close()
-		db.keyReg = nil
-	}
 	db.setState(StateClosed)
 	return first
-}
-
-// firstSQLKeyword returns the uppercased first keyword of q, skipping
-// whitespace and SQL comments, or "" when none is present.
-func firstSQLKeyword(q string) string {
-	s := strings.TrimSpace(q)
-	for {
-		if strings.HasPrefix(s, "--") {
-			if i := strings.IndexByte(s, '\n'); i >= 0 {
-				s = strings.TrimSpace(s[i+1:])
-				continue
-			}
-			return ""
-		}
-		if strings.HasPrefix(s, "/*") {
-			if i := strings.Index(s, "*/"); i >= 0 {
-				s = strings.TrimSpace(s[i+2:])
-				continue
-			}
-			return ""
-		}
-		break
-	}
-	if i := strings.IndexAny(s, " \t\n\r(;"); i >= 0 {
-		s = s[:i]
-	}
-	return strings.ToUpper(s)
-}
-
-// isReadOnlyStatement reports whether q is a read-only statement. Unknown or
-// write-capable statements return false (safe default: write path).
-func isReadOnlyStatement(q string) bool {
-	s := strings.TrimSpace(q)
-	for {
-		if strings.HasPrefix(s, "--") {
-			if i := strings.IndexByte(s, '\n'); i >= 0 {
-				s = strings.TrimSpace(s[i+1:])
-				continue
-			}
-			return true
-		}
-		if strings.HasPrefix(s, "/*") {
-			if i := strings.Index(s, "*/"); i >= 0 {
-				s = strings.TrimSpace(s[i+2:])
-				continue
-			}
-			return false
-		}
-		break
-	}
-	word := s
-	if i := strings.IndexAny(s, " \t\n\r(;"); i >= 0 {
-		word = s[:i]
-	}
-	switch strings.ToUpper(word) {
-	case "SELECT", "EXPLAIN", "PRAGMA", "VALUES", "TABLE":
-		return true
-	default:
-		return false
-	}
 }
 
 var _ replication.Applier = (*DB)(nil)

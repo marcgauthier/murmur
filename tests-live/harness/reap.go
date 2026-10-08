@@ -3,7 +3,6 @@ package harness
 import (
 	"os"
 	"strings"
-	"syscall"
 )
 
 // reapStragglers SIGKILLs any daemon process this cluster started that
@@ -38,15 +37,6 @@ func (c *Cluster) reapStragglers() {
 			c.T.Logf("reaped straggler daemon pid=%d (%s)", pid, node.Label)
 		}
 	}
-}
-
-func processAlive(pid int) bool {
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// Signal 0 probes existence without delivering anything.
-	return proc.Signal(syscall.Signal(0)) == nil
 }
 
 // processCmdlineContains reports whether the process command line

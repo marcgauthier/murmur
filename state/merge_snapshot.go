@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crdt"
 	"github.com/marcgauthier/murmur/ids"
@@ -13,7 +12,7 @@ import (
 	"math"
 )
 
-func (s *Store) iterateCRDTSnapshot(snap *pebble.Snapshot, fn func(codec.SnapshotCell) error) error {
+func (s *Store) iterateCRDTSnapshot(snap *snapshot, fn func(codec.SnapshotCell) error) error {
 	p := []byte{prefixCRDT}
 	it, err := prefixIter(snap, p)
 	if err != nil {
@@ -42,14 +41,14 @@ func (s *Store) iterateCRDTSnapshot(snap *pebble.Snapshot, fn func(codec.Snapsho
 
 // Recompute projections after all causal records are joined. Atomic imports
 // read their indexed batch; resumable imports read already-ingested records.
-func (s *Store) reprojectSnapshot(b *pebble.Batch, indexed bool) error {
-	opt := &pebble.IterOptions{LowerBound: []byte{prefixCRDT}, UpperBound: []byte{prefixCRDT + 1}}
-	var it *pebble.Iterator
+func (s *Store) reprojectSnapshot(b *batch, indexed bool) error {
+	opt := &iterOptions{LowerBound: []byte{prefixCRDT}, UpperBound: []byte{prefixCRDT + 1}}
+	var it *iterator
 	var err error
 	if indexed {
 		it, err = b.NewIter(opt)
 	} else {
-		it, err = s.db.NewIter(opt)
+		it, err = s.mem.newIter(opt)
 	}
 	if err != nil {
 		return err
@@ -120,7 +119,7 @@ func (s *Store) reprojectSnapshot(b *pebble.Batch, indexed bool) error {
 		if err != nil {
 			return err
 		}
-		return b.Set(key, codec.EncodeCellState(nil, codec.CellState{Version: version, Value: projection}), nil)
+		return b.Set(key, codec.EncodeCellState(nil, codec.CellState{Version: version, Value: projection}))
 	}
 	for it.First(); it.Valid(); it.Next() {
 		key := append([]byte(nil), it.Key()...)

@@ -1,14 +1,10 @@
-// Package murmur is an embedded, replicated, in-memory SQL engine.
+// Package murmur is an embedded database with encrypted durable state and
+// masterless replication over QUIC. There is no standalone server. Applications
+// define managed Go record tables with Config.Tables; Murmur commits typed
+// changes to Spool before publishing them through RIME. SQL-only Schema.Tables
+// configurations are no longer accepted by Open.
 //
-// Applications link it directly; there is no standalone server. The query
-// database (SQLite-compatible, memory resident) is a rebuildable
-// materialization of the authoritative durable state in Pebble.
-// Masterless multi-writer replication runs over QUIC with per-column
-// last-writer-wins conflict resolution driven by a hybrid logical clock.
-//
-// Architecture:
-//
-//	Application SQL -> query engine -> TxDelta -> CRDT merge -> Pebble -> QUIC peers
+//	Application -> Murmur facade -> RIME / commit coordinator -> Spool -> QUIC peers
 package murmur
 
 import "github.com/marcgauthier/murmur/ids"

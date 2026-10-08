@@ -11,24 +11,13 @@ package twostreams_test
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
-
-func schemaConfig() *db.SchemaConfig {
-	return &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-		Name: "ts_rows",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-		},
-	}}}
-}
 
 func TestTwoLowDomainsIntoOneHigh(t *testing.T) {
 	workDir := t.TempDir()
@@ -44,17 +33,17 @@ func TestTwoLowDomainsIntoOneHigh(t *testing.T) {
 	}
 
 	lowA := harness.NewCluster(t, harness.ClusterOptions{
-		Name: "two-streams-low-a", NumNodes: 1, Schema: schemaConfig(),
+		Name: "two-streams-low-a", NumNodes: 1, TypedRecords: true, TypedContention: true,
 		Bridge: &harness.BridgeOptions{Role: "low-exporter", Stream: "stream-a", NodeIndex: 0,
 			StagingDir: stagingA, SignerKeyFile: keysA.SignerKeyFile, RecipientPubFile: keysA.RecipientPubFile},
 	})
 	lowB := harness.NewCluster(t, harness.ClusterOptions{
-		Name: "two-streams-low-b", NumNodes: 1, Schema: schemaConfig(),
+		Name: "two-streams-low-b", NumNodes: 1, TypedRecords: true, TypedContention: true,
 		Bridge: &harness.BridgeOptions{Role: "low-exporter", Stream: "stream-b", NodeIndex: 0,
 			StagingDir: stagingB, SignerKeyFile: keysB.SignerKeyFile, RecipientPubFile: keysB.RecipientPubFile},
 	})
 	high := harness.NewCluster(t, harness.ClusterOptions{
-		Name: "two-streams-high", NumNodes: 2, Schema: schemaConfig(),
+		Name: "two-streams-high", NumNodes: 2, TypedRecords: true, TypedContention: true,
 		BridgeByNode: map[int]*harness.BridgeOptions{
 			0: {Role: "high-importer", Stream: "stream-a", NodeIndex: 0,
 				StagingDir: stagingA, RecipientKeyFile: keysA.RecipientKeyFile, SignerPubFile: keysA.SignerPubFile},
@@ -65,10 +54,10 @@ func TestTwoLowDomainsIntoOneHigh(t *testing.T) {
 
 	// Round 1: disjoint rows from both domains land on both High nodes.
 	for i := 0; i < 5; i++ {
-		if err := lowA.ExecSQL(0, "INSERT INTO ts_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 0xA000+i), fmt.Sprintf("a-%d", i)); err != nil {
+		if err := insertRow(lowA, 0, fmt.Sprintf("%032x", 0xA000+i), fmt.Sprintf("a-%d", i)); err != nil {
 			t.Fatal(err)
 		}
-		if err := lowB.ExecSQL(0, "INSERT INTO ts_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 0xB000+i), fmt.Sprintf("b-%d", i)); err != nil {
+		if err := insertRow(lowB, 0, fmt.Sprintf("%032x", 0xB000+i), fmt.Sprintf("b-%d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -85,7 +74,7 @@ func TestTwoLowDomainsIntoOneHigh(t *testing.T) {
 	// Round 2: stream-a only. New A rows arrive; stream-b progress on
 	// High node2 is byte-identical (per-stream isolation).
 	for i := 5; i < 8; i++ {
-		if err := lowA.ExecSQL(0, "INSERT INTO ts_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 0xA000+i), fmt.Sprintf("a-%d", i)); err != nil {
+		if err := insertRow(lowA, 0, fmt.Sprintf("%032x", 0xA000+i), fmt.Sprintf("a-%d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -111,17 +100,17 @@ func TestCrossDomainIdentityCollisionFailsClosed(t *testing.T) {
 	}
 
 	lowA := harness.NewCluster(t, harness.ClusterOptions{
-		Name: "two-streams-col-a", NumNodes: 1, Schema: schemaConfig(),
+		Name: "two-streams-col-a", NumNodes: 1, TypedRecords: true, TypedContention: true,
 		Bridge: &harness.BridgeOptions{Role: "low-exporter", Stream: "sa", NodeIndex: 0,
 			StagingDir: stagingA, SignerKeyFile: keysA.SignerKeyFile, RecipientPubFile: keysA.RecipientPubFile},
 	})
 	lowB := harness.NewCluster(t, harness.ClusterOptions{
-		Name: "two-streams-col-b", NumNodes: 1, Schema: schemaConfig(),
+		Name: "two-streams-col-b", NumNodes: 1, TypedRecords: true, TypedContention: true,
 		Bridge: &harness.BridgeOptions{Role: "low-exporter", Stream: "sb", NodeIndex: 0,
 			StagingDir: stagingB, SignerKeyFile: keysB.SignerKeyFile, RecipientPubFile: keysB.RecipientPubFile},
 	})
 	high := harness.NewCluster(t, harness.ClusterOptions{
-		Name: "two-streams-col-h", NumNodes: 2, Schema: schemaConfig(),
+		Name: "two-streams-col-h", NumNodes: 2, TypedRecords: true, TypedContention: true,
 		BridgeByNode: map[int]*harness.BridgeOptions{
 			0: {Role: "high-importer", Stream: "sa", NodeIndex: 0,
 				StagingDir: stagingA, RecipientKeyFile: keysA.RecipientKeyFile, SignerPubFile: keysA.SignerPubFile},
@@ -132,14 +121,14 @@ func TestCrossDomainIdentityCollisionFailsClosed(t *testing.T) {
 
 	// Domain A lands first; domain B's same-ID row must fail closed.
 	row := fmt.Sprintf("%032x", 0xC001)
-	if err := lowA.ExecSQL(0, "INSERT INTO ts_rows (id, name) VALUES (?, ?)", row, "from-a"); err != nil {
+	if err := insertRow(lowA, 0, row, "from-a"); err != nil {
 		t.Fatal(err)
 	}
 	exportOnce(t, lowA, 0)
 	importOnce(t, high, 0)
 	waitHighConverged(t, high, 1, 30*time.Second)
 
-	if err := lowB.ExecSQL(0, "INSERT INTO ts_rows (id, name) VALUES (?, ?)", row, "from-b"); err != nil {
+	if err := insertRow(lowB, 0, row, "from-b"); err != nil {
 		t.Fatal(err)
 	}
 	exportOnce(t, lowB, 0)
@@ -150,9 +139,9 @@ func TestCrossDomainIdentityCollisionFailsClosed(t *testing.T) {
 	}
 	// First-writer state stands untouched on both High nodes.
 	for i := range high.Nodes {
-		res, err := high.QuerySQL(i, "SELECT name FROM ts_rows")
-		if err != nil || len(res.Rows) != 1 || res.Rows[0][0].(string) != "from-a" {
-			t.Fatalf("high-%d state = %+v err=%v, want intact from-a", i, res, err)
+		rows, err := high.TypedContentionRows(i)
+		if err != nil || len(rows) != 1 || rows[0].Name != "from-a" {
+			t.Fatalf("high-%d state = %+v err=%v, want intact from-a", i, rows, err)
 		}
 	}
 }
@@ -195,16 +184,12 @@ func waitHighConverged(t *testing.T, high *harness.Cluster, want int, timeout ti
 		ok := true
 		var first string
 		for i := range high.Nodes {
-			n, err := high.QueryRowCount(i, "ts_rows")
-			if err != nil || n != want {
+			rows, err := high.TypedContentionRows(i)
+			if err != nil || len(rows) != want {
 				ok = false
 				break
 			}
-			d, err := high.ComputeTableDigest(i, "ts_rows", "name")
-			if err != nil {
-				ok = false
-				break
-			}
+			d := contentionDigest(rows)
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -223,16 +208,21 @@ func waitHighConverged(t *testing.T, high *harness.Cluster, want int, timeout ti
 func assertNames(t *testing.T, high *harness.Cluster, want []string) {
 	t.Helper()
 	for i := range high.Nodes {
-		res, err := high.QuerySQL(i, "SELECT name FROM ts_rows ORDER BY name")
+		rows, err := high.TypedContentionRows(i)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(res.Rows) != len(want) {
-			t.Fatalf("high-%d rows = %d, want %d", i, len(res.Rows), len(want))
+		got := make([]string, len(rows))
+		for j := range rows {
+			got[j] = rows[j].Name
 		}
-		for j, row := range res.Rows {
-			if row[0].(string) != want[j] {
-				t.Fatalf("high-%d row %d = %v, want %s", i, j, row[0], want[j])
+		sort.Strings(got)
+		if len(got) != len(want) {
+			t.Fatalf("high-%d rows = %d, want %d", i, len(got), len(want))
+		}
+		for j, name := range got {
+			if name != want[j] {
+				t.Fatalf("high-%d row %d = %v, want %s", i, j, name, want[j])
 			}
 		}
 	}
@@ -241,9 +231,22 @@ func assertNames(t *testing.T, high *harness.Cluster, want []string) {
 func assertLowOwned(t *testing.T, high *harness.Cluster, rowHex string) {
 	t.Helper()
 	for i := range high.Nodes {
-		present, owner, err := high.Provenance(i, "ts_rows", rowHex, "name")
+		present, owner, err := high.Provenance(i, "live_typed_contention", rowHex, "Name")
 		if err != nil || !present || owner != "low" {
 			t.Fatalf("high-%d provenance(%s) = present=%v owner=%q err=%v, want low-owned", i, rowHex, present, owner, err)
 		}
 	}
+}
+
+func insertRow(c *harness.Cluster, idx int, id, name string) error {
+	return c.TypedContentionInsert(idx, harness.TypedContentionRow{ID: id, Name: name})
+}
+
+func contentionDigest(rows []harness.TypedContentionRow) string {
+	names := make([]string, len(rows))
+	for i := range rows {
+		names[i] = rows[i].Name
+	}
+	sort.Strings(names)
+	return strings.Join(names, "\n")
 }

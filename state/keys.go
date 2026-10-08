@@ -1,4 +1,4 @@
-// Package state implements the durable source of truth on Pebble.
+// Package state implements the durable source of truth on Spool.
 //
 // It stores current winning cell state, row tombstones, per-origin
 // replication logs, watermarks, receipts, and system metadata. The SQL
@@ -26,6 +26,8 @@ const (
 	prefixMember         byte = 0x0b
 	prefixBridgeProgress byte = 0x0c
 	prefixTxnStage       byte = 0x0d
+	prefixLocalCell      byte = 0x10
+	prefixLocalReceipt   byte = 0x11
 )
 
 const (
@@ -48,9 +50,9 @@ const (
 	sysRestoreMarker = "restore_marker"
 )
 
-// FormatVersion records origin-signed transactions and the local signing-key
-// fingerprint. Older binaries must refuse signed stores.
-const FormatVersion uint64 = 5
+// FormatVersion marks the RIME record cutover. Format-5 SQL-era stores are
+// deliberately rejected; applications must start a fresh directory.
+const FormatVersion uint64 = 6
 
 // MinFormatVersion is the oldest persistent format this binary still
 // recognizes for explicit offline migration. Ordinary Open requires signed
@@ -63,8 +65,8 @@ const MinFormatVersion uint64 = 2
 // all three markers at FormatVersion; pre-marker stores default
 // missing minima to their own stored format version on open.
 const (
-	MinReaderVersion uint64 = 5
-	MinWriterVersion uint64 = 5
+	MinReaderVersion uint64 = 6
+	MinWriterVersion uint64 = 6
 )
 
 // CellKey builds 01 | tableID:u32 | rowUUID:16 | columnID:u32.
@@ -98,6 +100,38 @@ func ParseCellKey(k []byte) (tableID uint32, row ids.RowID, col uint32, ok bool)
 	copy(row[:], k[5:21])
 	col = binary.BigEndian.Uint32(k[21:25])
 	return tableID, row, col, true
+}
+
+// LocalCellKey builds the durable node-local cell key. This namespace is
+// intentionally distinct from replicated cells and is omitted from snapshots.
+func LocalCellKey(tableID uint32, row ids.RowID, col uint32) []byte {
+	k := make([]byte, 0, 25)
+	k = append(k, prefixLocalCell)
+	k = binary.BigEndian.AppendUint32(k, tableID)
+	k = append(k, row[:]...)
+	return binary.BigEndian.AppendUint32(k, col)
+}
+
+// LocalCellTablePrefix is the scan prefix for one node-local table.
+func LocalCellTablePrefix(tableID uint32) []byte {
+	k := []byte{prefixLocalCell}
+	return binary.BigEndian.AppendUint32(k, tableID)
+}
+
+// ParseLocalCellKey splits a node-local cell key.
+func ParseLocalCellKey(k []byte) (tableID uint32, row ids.RowID, col uint32, ok bool) {
+	if len(k) != 25 || k[0] != prefixLocalCell {
+		return 0, ids.RowID{}, 0, false
+	}
+	tableID = binary.BigEndian.Uint32(k[1:5])
+	copy(row[:], k[5:21])
+	col = binary.BigEndian.Uint32(k[21:25])
+	return tableID, row, col, true
+}
+
+// LocalReceiptKey builds the receipt key for a node-local-only transaction.
+func LocalReceiptKey(tx ids.TxID) []byte {
+	return append([]byte{prefixLocalReceipt}, tx[:]...)
 }
 
 // TombKey builds 02 | tableID:u32 | rowUUID:16.

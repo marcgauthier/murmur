@@ -1,7 +1,7 @@
 # Simultaneous migrations converge
 
-Run with `go test -count=1 ./tests-live/migration-concurrency`.
-Disjoint additive migrations are published concurrently from
-different nodes (`MURMUR_MIGRATION_CONCURRENCY_SEED` selects the
-variant); the mesh must converge on the union schema at the same
-epoch with all pre- and post-migration rows intact and equal digests.
+Run with `CGO_ENABLED=0 bash tests-live/run.sh migration-concurrency`.
+Managed typed records without SQLite or CGO undergo the same additive
+`Note` migration concurrently on two nodes while all three keep writing.
+Each node must reach a well-defined epoch, preserve acknowledged rows, and
+converge on matching names and migrated field values after the partition heals.

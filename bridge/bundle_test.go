@@ -287,7 +287,7 @@ func sealCrafted(t *testing.T, f *bundleFixture, m Manifest, batches []Batch) []
 	if err != nil {
 		t.Fatal(err)
 	}
-	compressed, err := zstdEncode(payload)
+	compressed, err := compressPayload(payload, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/ids"
 )
@@ -16,6 +15,15 @@ const MaxStagedTransactionBytes int64 = 256 << 20
 const MaxStagedTransactions = 4096
 
 var ErrStagingOverloaded = errors.New("state: staged transaction budget exhausted")
+
+// ErrStagedTransactionPoisoned marks a count-complete staged set that failed
+// verification (digest mismatch, metadata conflict, undecodable fragment).
+// The store drops the whole TxID so a valid re-transfer can proceed; the
+// caller should re-request the chunks. Without the drop, a first-arriving
+// forged fragment (valid origin identity, corrupt bytes) would wedge the
+// transfer permanently: the valid fragment then conflicts as a duplicate,
+// assembly keeps failing, and repair never re-requests present indexes.
+var ErrStagedTransactionPoisoned = errors.New("state: staged transaction failed verification")
 
 type StagedTransactionProgress struct {
 	TxID       ids.TxID
@@ -35,7 +43,7 @@ func (s *Store) StagedTransactionsPage(after ids.TxID, limit int) ([]StagedTrans
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	prefix := []byte{prefixTxnStage}
-	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: []byte{prefixTxnStage + 1}})
+	iter, err := s.mem.newIter(&iterOptions{LowerBound: prefix, UpperBound: []byte{prefixTxnStage + 1}})
 	if err != nil {
 		return nil, false, err
 	}
@@ -78,7 +86,7 @@ func (s *Store) StagedTransactionsPage(after ids.TxID, limit int) ([]StagedTrans
 func (s *Store) stagedBitmapDirect(tx ids.TxID, count uint32) ([]bool, error) {
 	bits := make([]bool, count)
 	prefix := TransactionStagePrefix(tx)
-	it, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	it, err := s.mem.newIter(&iterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +136,7 @@ func (s *Store) ReadStagedTransactionChunks(tx ids.TxID, indexes []uint32) (map[
 }
 
 // StageTransactionChunk durably records one independently validated chunk.
-// Pebble's configured filesystem encrypts these records at rest. The returned
+// Spool encrypts these records at rest. The returned
 // batch is non-nil only after every chunk and the complete digest validate.
 func (s *Store) StageTransactionChunk(_ context.Context, raw []byte, maxBytes int64) (batch *codec.MutationBatch, present []bool, err error) {
 	c, err := codec.DecodeTransactionChunk(raw, maxBytes)
@@ -168,39 +176,25 @@ func (s *Store) StageTransactionChunk(_ context.Context, raw []byte, maxBytes in
 			return nil, nil, fmt.Errorf("state: conflicting duplicate transaction chunk %d", c.Index)
 		}
 	} else if isNotFound(oldErr) {
-		iter, e := s.db.NewIter(&pebble.IterOptions{LowerBound: []byte{prefixTxnStage}, UpperBound: []byte{prefixTxnStage + 1}})
-		if e != nil {
-			return nil, nil, e
+		metaExtra := int64(0)
+		if isNotFound(metaErr) {
+			metaExtra = 252
 		}
-		var staged int64
-		transfers := 0
-		for valid := iter.First(); valid; valid = iter.Next() {
-			staged += int64(len(iter.Value()))
-			key := iter.Key()
-			if len(key) == 21 && binary.BigEndian.Uint32(key[17:21]) == ^uint32(0) {
-				transfers++
-			}
-		}
-		e = iter.Error()
-		_ = iter.Close()
-		if e != nil {
-			return nil, nil, e
-		}
-		if staged+int64(len(raw)) > s.stagedTransactionByteLimit {
+		if s.stagedTransactionBytes+int64(len(raw)) > s.stagedTransactionByteLimit {
 			return nil, nil, fmt.Errorf("%w: staged byte budget exceeded", ErrStagingOverloaded)
 		}
-		if isNotFound(metaErr) && transfers >= s.stagedTransactionCountLimit {
+		if isNotFound(metaErr) && s.stagedTransactionCount >= s.stagedTransactionCountLimit {
 			return nil, nil, fmt.Errorf("%w: staged transaction count budget exceeded", ErrStagingOverloaded)
 		}
-		b := s.db.NewBatch()
+		b := s.mem.newBatch()
 		defer b.Close()
-		if err := b.Set(chunkKey, raw, nil); err != nil {
+		if err := b.Set(chunkKey, raw); err != nil {
 			return nil, nil, err
 		}
 		if metaErr != nil {
 			received = 0
 		}
-		if err := b.Set(metaKey, encodeStagedMeta(c, received+1), nil); err != nil {
+		if err := b.Set(metaKey, encodeStagedMeta(c, received+1)); err != nil {
 			return nil, nil, err
 		}
 		if s.transactionStageFault != nil {
@@ -208,8 +202,12 @@ func (s *Store) StageTransactionChunk(_ context.Context, raw []byte, maxBytes in
 				return nil, nil, err
 			}
 		}
-		if err := s.commitBatch(b, s.writeOpts); err != nil {
+		if err := s.commitBatch(b, s.syncCommits); err != nil {
 			return nil, nil, err
+		}
+		s.stagedTransactionBytes += int64(len(raw)) + metaExtra
+		if isNotFound(metaErr) {
+			s.stagedTransactionCount++
 		}
 		received++
 	} else {
@@ -218,28 +216,41 @@ func (s *Store) StageTransactionChunk(_ context.Context, raw []byte, maxBytes in
 	if received < c.Count {
 		return nil, nil, nil
 	}
-	chunks := make([]*codec.TransactionChunk, c.Count)
-	for i := uint32(0); i < c.Count; i++ {
-		stored, e := s.getDirect(transactionStageKey(c.TxID, i))
-		if e != nil {
-			return nil, nil, fmt.Errorf("state: staged chunk count complete but index %d missing: %w", i, e)
+	assembled, assembleErr := func() (*codec.MutationBatch, error) {
+		chunks := make([]*codec.TransactionChunk, c.Count)
+		for i := uint32(0); i < c.Count; i++ {
+			stored, e := s.getDirect(transactionStageKey(c.TxID, i))
+			if e != nil {
+				return nil, fmt.Errorf("state: staged chunk count complete but index %d missing: %w", i, e)
+			}
+			chunks[i], e = codec.DecodeTransactionChunk(stored, maxBytes)
+			if e != nil {
+				return nil, fmt.Errorf("state: invalid staged chunk %d: %w", i, e)
+			}
+			if !sameStagedTransaction(c, chunks[i]) {
+				return nil, fmt.Errorf("state: staged chunk %d metadata mismatch", i)
+			}
 		}
-		chunks[i], e = codec.DecodeTransactionChunk(stored, maxBytes)
-		if e != nil {
-			return nil, nil, fmt.Errorf("state: invalid staged chunk %d: %w", i, e)
+		assembled, err := codec.AssembleTransactionChunks(chunks, s.limits)
+		if err != nil {
+			return nil, err
 		}
-		if !sameStagedTransaction(c, chunks[i]) {
-			return nil, nil, fmt.Errorf("state: staged chunk %d metadata mismatch", i)
+		if err := s.VerifyOrigin(assembled); err != nil {
+			return nil, err
 		}
+		return assembled, nil
+	}()
+	if assembleErr != nil {
+		// A count-complete set that fails verification is untrustworthy as
+		// a whole: any fragment may be the bad one, and keeping them
+		// wedges the transfer (valid re-sends conflict as duplicates).
+		// Staging is only a transfer cache, so drop it for a clean retry.
+		if cerr := s.clearStagedTransactionLocked(c.TxID); cerr != nil {
+			return nil, nil, assembleErr
+		}
+		return nil, nil, fmt.Errorf("%w: %v", ErrStagedTransactionPoisoned, assembleErr)
 	}
-	batch, err = codec.AssembleTransactionChunks(chunks, s.limits)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := s.VerifyOrigin(batch); err != nil {
-		return nil, nil, err
-	}
-	return batch, nil, nil
+	return assembled, nil, nil
 }
 
 // StagedTransactionChunks returns the durable availability bitmap for a TxID.
@@ -249,7 +260,7 @@ func (s *Store) StagedTransactionChunks(tx ids.TxID) ([]bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	prefix := TransactionStagePrefix(tx)
-	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	iter, err := s.mem.newIter(&iterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
 	if err != nil {
 		return nil, err
 	}
@@ -296,18 +307,32 @@ func (s *Store) ClearStagedTransaction(tx ids.TxID) error {
 	defer s.gate.RUnlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	return s.clearStagedTransactionLocked(tx)
+}
+
+// clearStagedTransactionLocked deletes staged fragments; the caller must hold
+// gate.RLock and writeMu (used by the assembly path, which already holds
+// both, as well as the public ClearStagedTransaction above).
+func (s *Store) clearStagedTransactionLocked(tx ids.TxID) error {
 	prefix := TransactionStagePrefix(tx)
-	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	iter, err := s.mem.newIter(&iterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
 	if err != nil {
 		return err
 	}
 	defer iter.Close()
-	b := s.db.NewBatch()
+	b := s.mem.newBatch()
 	defer b.Close()
 	found := false
+	var clearedBytes int64
+	hasMeta := false
 	for valid := iter.First(); valid; valid = iter.Next() {
 		found = true
-		if err := b.Delete(append([]byte(nil), iter.Key()...), nil); err != nil {
+		clearedBytes += int64(len(iter.Value()))
+		key := iter.Key()
+		if len(key) == 21 && binary.BigEndian.Uint32(key[17:21]) == ^uint32(0) {
+			hasMeta = true
+		}
+		if err := b.Delete(append([]byte(nil), iter.Key()...)); err != nil {
 			return err
 		}
 	}
@@ -317,7 +342,46 @@ func (s *Store) ClearStagedTransaction(tx ids.TxID) error {
 	if !found {
 		return nil
 	}
-	return s.commitBatch(b, s.writeOpts)
+	if err := s.commitBatch(b, s.syncCommits); err != nil {
+		return err
+	}
+	s.stagedTransactionBytes -= clearedBytes
+	if s.stagedTransactionBytes < 0 {
+		s.stagedTransactionBytes = 0
+	}
+	if hasMeta {
+		s.stagedTransactionCount--
+		if s.stagedTransactionCount < 0 {
+			s.stagedTransactionCount = 0
+		}
+	}
+	return nil
+}
+
+func (s *Store) initStagedAccounting() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	prefix := []byte{prefixTxnStage}
+	iter, err := s.mem.newIter(&iterOptions{LowerBound: prefix, UpperBound: []byte{prefixTxnStage + 1}})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	var stagedBytes int64
+	transfers := 0
+	for valid := iter.First(); valid; valid = iter.Next() {
+		stagedBytes += int64(len(iter.Value()))
+		key := iter.Key()
+		if len(key) == 21 && binary.BigEndian.Uint32(key[17:21]) == ^uint32(0) {
+			transfers++
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return err
+	}
+	s.stagedTransactionBytes = stagedBytes
+	s.stagedTransactionCount = transfers
+	return nil
 }
 
 func sameStagedTransaction(a, b *codec.TransactionChunk) bool {

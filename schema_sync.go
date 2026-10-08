@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/marcgauthier/murmur/internal/recordcodec"
 	"github.com/marcgauthier/murmur/replication"
 	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/state"
@@ -47,11 +48,10 @@ func (db *DB) setSchemaIdentity(id replication.SchemaIdentity) {
 	db.schemaId = id
 }
 
-// openSchemaManifest reconciles the configured schema with Pebble storage.
-// Fresh databases publish the configuration as the genesis revision;
-// reopens require the configuration to match the persisted manifest
-// exactly (migrations go through Migrate, never config drift). It returns
-// the registry built from the authoritative persisted tables.
+// openSchemaManifest reconciles the configured typed schema with Spool
+// storage. Fresh databases publish the configuration as the genesis revision.
+// Reopens accept a compatible additive subset and return the authoritative
+// persisted registry, leaving fields unknown to older bindings in Spool.
 func openSchemaManifest(store *state.Store, cfg Config) (*schema.Registry, *schema.Manifest, error) {
 	stored, err := store.LoadSchemaManifest()
 	if err != nil {
@@ -76,8 +76,15 @@ func openSchemaManifest(store *state.Store, cfg Config) (*schema.Registry, *sche
 		return nil, nil, fmt.Errorf("%w: %w", ErrUnsupportedSchema, err)
 	}
 	if reg.Epoch != stored.Version || reg.Hash != stored.Hash {
-		return nil, nil, fmt.Errorf("%w: stored epoch %d != %d (migrate with Migrate, not config drift)",
-			ErrSchemaMismatch, stored.Version, reg.Epoch)
+		if len(cfg.Tables) == 0 || !typedSchemaSubset(stored, reg) {
+			return nil, nil, fmt.Errorf("%w: stored epoch %d != configured epoch %d (migrate with Migrate, not incompatible config drift)",
+				ErrSchemaMismatch, stored.Version, reg.Epoch)
+		}
+		storedReg, err := schema.BuildRegistry(stored.Version, stored.Tables)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: stored typed schema: %v", ErrSchemaMismatch, err)
+		}
+		return storedReg, stored, nil
 	}
 	// The persisted manifest is authoritative for content (the hash match
 	// above proves identical IDs, names, and types), but the manifest
@@ -89,93 +96,50 @@ func openSchemaManifest(store *state.Store, cfg Config) (*schema.Registry, *sche
 	return reg, stored, nil
 }
 
+// typedSchemaSubset accepts an older typed application schema only when every
+// configured table and field remains structurally compatible with the current
+// durable manifest. The manifest remains authoritative; unknown fields and
+// tables stay in Spool and are not projected into the older runtime type.
+func typedSchemaSubset(stored *schema.Manifest, configured *schema.Registry) bool {
+	if stored == nil || configured == nil || configured.Epoch > stored.Version {
+		return false
+	}
+	for _, local := range configured.Tables {
+		var durable *schema.TableSchema
+		for i := range stored.Tables {
+			if stored.Tables[i].ID == local.ID {
+				durable = &stored.Tables[i]
+				break
+			}
+		}
+		if durable == nil || !strings.EqualFold(local.Name, durable.Name) || local.PK != durable.PK ||
+			!recordcodec.DescriptorSupersetPreservingNestedUnknown(local.RecordDescriptor, durable.RecordDescriptor) {
+			return false
+		}
+		for i := range local.Columns {
+			column := durable.ColumnByID(local.Columns[i].ID)
+			if column == nil || column.Type != local.Columns[i].Type || column.Nullable != local.Columns[i].Nullable ||
+				column.MergePolicy != local.Columns[i].MergePolicy {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func registryTables(reg *schema.Registry) []schema.TableSchema {
 	out := make([]schema.TableSchema, len(reg.Tables))
 	for i, p := range reg.Tables {
 		out[i] = *p
 		out[i].Columns = append([]schema.ColumnSchema(nil), p.Columns...)
+		out[i].RecordDescriptor = append([]byte(nil), p.RecordDescriptor...)
 	}
 	return out
 }
 
-// Migrate publishes a new schema revision built from the full new table
-// declaration: additive changes (new tables, new columns) are applied
-// online, everything else fails with ErrUnsupportedSchema identifying the
-// object. Writes and replication block during publication; reads are
-// rejected while the materializer rebuilds.
-//
-// After a successful migration the application should persist the new
-// declaration (version + tables) as its configuration: a reopen requires
-// the configuration to match the published manifest exactly. The new
-// version is always current+1; read it back with SchemaInfo.
-func (db *DB) Migrate(ctx context.Context, newTables []schema.TableSchema) error {
-	return db.migrate(ctx, newTables, nil)
-}
-
-// MigrateWithLocalDDL migrates the replicated schema and replaces the
-// local-only indexes, views, and FTS objects used by materializer rebuilds.
-func (db *DB) MigrateWithLocalDDL(ctx context.Context, newTables []schema.TableSchema, localDDL []string) error {
-	return db.migrate(ctx, newTables, localDDL)
-}
-
-func (db *DB) migrate(ctx context.Context, newTables []schema.TableSchema, localDDL []string) error {
-	db.mu.Lock()
-	st := db.dbState
-	db.mu.Unlock()
-	if st != StateReady {
-		return fmt.Errorf("murmur: migrate in state %s", st)
-	}
-	// Serialize with writes, applies, rotation, and adoption. Lock order
-	// (outer to inner): scheduler ticket, writeMu, applyMu, db.mu, store
-	// gate. Migrations are maintenance-class writers.
-	ticket, err := db.sched.Admit(ctx, WriterMaintenance)
-	if err != nil {
-		return fmt.Errorf("murmur: writer admission: %w", err)
-	}
-	defer ticket.Release()
-	db.writeMu.Lock()
-	defer db.writeMu.Unlock()
-	db.applyMu.Lock()
-	defer db.applyMu.Unlock()
-	if st := db.getState(); st != StateReady {
-		return fmt.Errorf("murmur: migrate in state %s", st)
-	}
-	cur, err := db.store.LoadSchemaManifest()
-	if err != nil {
-		return err
-	}
-	if cur == nil {
-		return fmt.Errorf("murmur: no published schema")
-	}
-	assigned, err := schema.AssignIDs(cur.Tables, newTables)
-	if err != nil {
-		return fmt.Errorf("%w: %w", ErrUnsupportedSchema, err)
-	}
-	reg, err := schema.BuildRegistry(cur.Version+1, assigned)
-	if err != nil {
-		return fmt.Errorf("%w: %w", ErrUnsupportedSchema, err)
-	}
-	if schema.ContentHash(cur.Version, registryTables(reg)) == cur.Hash {
-		return nil // already there; no-op
-	}
-	next, err := schema.NewAuthoredRevision(cur, registryTables(reg), db.cfg.NodeID, db.store.ClockNow())
-	if err != nil {
-		return fmt.Errorf("%w: %w", ErrUnsupportedSchema, err)
-	}
-	if err := db.checkMigrationBackfill(cur.Tables, next.Tables); err != nil {
-		return err
-	}
-	_ = ctx
-	if err := db.publishSchemaRevisionWithLocalDDL(cur, next, localDDL); err != nil {
-		return err
-	}
-	db.metrics.schemaMigrations.Add(1)
-	return nil
-}
-
 // checkMigrationBackfill rejects adding a non-nullable column (no DEFAULT
-// is modeled) to a table with visible rows: SQLite cannot backfill it and
-// the materializer could never rebuild. The check runs before anything is
+// is modeled) to a table with visible rows because no typed value is available
+// to backfill it. The check runs before anything is
 // persisted.
 func (db *DB) checkMigrationBackfill(oldTables, nextTables []schema.TableSchema) error {
 	oldByName := make(map[string]*schema.TableSchema, len(oldTables))
@@ -224,61 +188,61 @@ func (db *DB) countVisibleRows(tableID uint32) (int, error) {
 }
 
 // publishSchemaRevision durably publishes next (already validated against
-// cur), applies the additive DDL, rebuilds and revalidates the
-// materializer, swaps the live registry, and recycles replication sessions
-// so peers re-handshake against the new identity. Reads are rejected while
-// the materializer is dirty; a post-Pebble DDL failure rebuilds before
-// readiness, failing to StateFailed when unrecoverable.
+// cur), rebuilds the private RIME materializer, swaps the live registry, and
+// recycles replication sessions so peers re-handshake against the new
+// identity. Reads are rejected while the materializer is dirty.
 func (db *DB) publishSchemaRevision(cur, next *schema.Manifest) error {
-	return db.publishSchemaRevisionWithLocalDDL(cur, next, nil)
-}
-
-func (db *DB) publishSchemaRevisionWithLocalDDL(cur, next *schema.Manifest, localDDL []string) error {
-	ddl, err := schema.MigrationDDL(cur.Tables, next.Tables)
-	if err != nil {
-		return fmt.Errorf("%w: %w", ErrUnsupportedSchema, err)
+	if runtime := db.schemaRegistry(); runtime == nil || !typedSchemaSubset(next, runtime) {
+		return fmt.Errorf("%w: new typed schema is incompatible with registered Go records", ErrSchemaMismatch)
 	}
+	if err := db.fireCrash(func(h *crashHooks) func() error { return h.beforeSchemaStore }); err != nil {
+		return err
+	}
+	db.setState(StateMaterializerDirty)
 	if err := db.store.StoreSchemaRevision(next); err != nil {
+		if db.store.Failed() != nil {
+			db.setState(StateFailed)
+		} else {
+			db.setState(StateReady)
+		}
+		return err
+	}
+	if err := db.fireCrash(func(h *crashHooks) func() error { return h.afterSchemaStore }); err != nil {
+		db.setState(StateFailed)
 		return err
 	}
 	newReg, err := next.Registry()
 	if err != nil {
+		db.setState(StateFailed)
 		return fmt.Errorf("%w: %w", ErrSchemaMismatch, err)
 	}
-	// Manifests received over the wire carry ID-sorted columns
-	// (EncodeManifest sorts), while locally authored ones keep
-	// declaration order. Order the new registry like the live one so
-	// the rebuild below preserves physical column order identically on
-	// the author and every adopter.
+	// Manifests received over the wire carry ID-sorted columns while locally
+	// authored ones keep declaration order. Preserve local field order so
+	// authored and adopted materializers bind identically.
 	orderRegistryLikeLocal(db.schemaRegistry(), newReg)
-	if err := db.engine.MigrateToWithLocalDDL(newReg, ddl, localDDL); err != nil {
-		db.log.Warn("schema DDL failed; rebuilding materializer", "err", err.Error())
-	}
-	// Rebuild regardless: it validates the migrated state and recovers a
-	// partially applied DDL from generated definitions. Callers hold
-	// applyMu, which rebuildLocked requires.
-	if err := db.rebuildLocked(); err != nil {
-		return fmt.Errorf("murmur: rebuild after schema publish: %w", err)
+	if err := db.rebuildRecordMaterializer(context.Background()); err != nil {
+		db.setState(StateFailed)
+		return fmt.Errorf("murmur: rebuild typed materializer after schema publish: %w", err)
 	}
 	db.setSchemaRegistry(newReg)
 	db.setSchemaIdentity(replication.SchemaIdentity{
-		Epoch:       next.Version,
-		Hash:        next.Hash,
-		Author:      next.CreatedOnNode,
-		TimeCreated: next.TimeCreated,
+		Epoch: next.Version, Hash: next.Hash, Author: next.CreatedOnNode, TimeCreated: next.TimeCreated,
 	})
 	if repl := db.replManager(); repl != nil {
 		repl.RefreshSchema(db.schemaIdentity())
+	}
+	db.setState(StateReady)
+	if db.subMgr != nil {
+		db.subMgr.notifyChange(true)
 	}
 	return nil
 }
 
 // orderRegistryLikeLocal rewrites newReg's column order in place: columns
 // already present locally keep their current relative order and genuinely
-// new columns append sorted by stable ID (matching MigrationDDL's append
-// order). Tables unknown locally keep manifest order. IDs, names, types,
-// and the canonical hash are untouched; only the physical order the
-// materializer rebuilds takes from the registry changes.
+// new columns append sorted by stable ID. Tables unknown locally keep manifest
+// order. IDs, names, types, and the canonical hash are untouched; only the
+// order used when rebuilding the RIME materializer changes.
 func orderRegistryLikeLocal(current, newReg *schema.Registry) {
 	if current == nil || newReg == nil {
 		return
@@ -472,6 +436,7 @@ func (db *DB) syncSchemas(ctx context.Context, revs []*schema.Manifest) replicat
 	}
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
+	db.drainGroupCommitsLocked()
 	db.applyMu.Lock()
 	defer db.applyMu.Unlock()
 	if st := db.getState(); st != StateReady {

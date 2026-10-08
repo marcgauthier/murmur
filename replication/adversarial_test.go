@@ -170,7 +170,7 @@ func (c *testCluster) rawClient(t *testing.T, ctx context.Context, addr string,
 	if err := WriteFrame(stream, MsgHello, 0, EncodeHello(nil, &Hello{
 		ProtocolVersion: ProtocolVersion, MinProtocolVersion: MinProtocolVersion,
 		NodeID: self, DBID: c.dbid, SchemaEpoch: epoch, SchemaHash: hash,
-		Capabilities: CapMergePolicies | CapOriginSignatures | (CapZstd),
+		Capabilities: CapMergePolicies | CapOriginSignatures | (CapCompression),
 	})); err != nil {
 		t.Fatal(err)
 	}

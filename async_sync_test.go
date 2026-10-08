@@ -52,16 +52,30 @@ func TestDurabilitySizeTriggeredSync(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node1")
 	cfg := groupTestConfig(t)
 	cfg.Path = dir
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
 	cfg.Durability = DurabilityConfig{Mode: DurabilityAsync, MaxUnsyncedBytes: 4096}
 	db, err := Open(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
 	const total = 30
 	for i := 0; i < total; i++ {
-		id := ids.NewRowID()
-		if _, err := db.ExecContext(ctx, "INSERT INTO contacts (id, name) VALUES (?, ?)",
-			id[:], fmt.Sprintf("size-sync-%d", i)); err != nil {
+		tx, err := db.BeginTx(ctx)
+		if err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+		if err := table.Insert(tx, &facadeRecord{ID: ids.NewRowID(), Name: fmt.Sprintf("size-sync-%d", i)}); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
 			_ = db.Close()
 			t.Fatal(err)
 		}
@@ -83,8 +97,12 @@ func TestDurabilitySizeTriggeredSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	var count int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM contacts`).Scan(&count); err != nil {
+	table, err = TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, err := table.Where().Count()
+	if err != nil {
 		t.Fatal(err)
 	}
 	if count != total {
@@ -97,6 +115,8 @@ func TestDurabilitySizeTriggeredSync(t *testing.T) {
 func TestDurabilityTimeTriggerWithSizeSet(t *testing.T) {
 	ctx := context.Background()
 	cfg := groupTestConfig(t)
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
 	cfg.Durability = DurabilityConfig{
 		Mode: DurabilityAsync, SyncInterval: 20 * time.Millisecond, MaxUnsyncedBytes: 1 << 40,
 	}
@@ -105,8 +125,18 @@ func TestDurabilityTimeTriggerWithSizeSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	id := ids.NewRowID()
-	if _, err := db.ExecContext(ctx, "INSERT INTO contacts (id, name) VALUES (?, ?)", id[:], "time-wins"); err != nil {
+	table, err := TableOf[facadeRecord](db, "records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := table.Insert(tx, &facadeRecord{ID: ids.NewRowID(), Name: "time-wins"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(2 * time.Second)

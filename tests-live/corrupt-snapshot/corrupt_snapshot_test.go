@@ -12,15 +12,14 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/replication"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -39,13 +38,7 @@ func TestStaleNodeDiscardsCorruptSnapshotThenConverges(t *testing.T) {
 			MaxOfflineLogRetentionMs: 20000,
 			MinRetainedBatches:       10,
 		},
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "snap_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
+		TypedRecords: true,
 	})
 
 	// Phase 1: build the honest mesh explicitly and converge a baseline.
@@ -55,13 +48,12 @@ func TestStaleNodeDiscardsCorruptSnapshotThenConverges(t *testing.T) {
 		}
 	}
 	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("%032x", 1000+i)
-		if err := cluster.ExecSQL(2, "INSERT INTO snap_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("stale-%d", i)); err != nil {
+		if err := cluster.TypedInsert(2, fmt.Sprintf("stale-%d", i)); err != nil {
 			t.Fatalf("node3 pre-stop write: %v", err)
 		}
 	}
-	waitConverged(t, cluster, "snap_rows", 5, 60*time.Second)
-	preStopDigest, err := cluster.ComputeTableDigest(stale, "snap_rows", "id")
+	waitConverged(t, cluster, 5, 60*time.Second)
+	preStopDigest, err := typedDigest(cluster, stale)
 	if err != nil {
 		t.Fatalf("pre-stop digest: %v", err)
 	}
@@ -75,13 +67,12 @@ func TestStaleNodeDiscardsCorruptSnapshotThenConverges(t *testing.T) {
 	}
 	cluster.StopNode(stale)
 	for i := 0; i < 60; i++ {
-		id := fmt.Sprintf("%032x", 2000+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO snap_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("fresh-%d", i)); err != nil {
+		if err := cluster.TypedInsert(0, fmt.Sprintf("fresh-%d", i)); err != nil {
 			t.Fatalf("survivor write: %v", err)
 		}
 	}
-	waitRowCount(t, cluster, 0, "snap_rows", 65, 30*time.Second)
-	waitRowCount(t, cluster, 1, "snap_rows", 65, 30*time.Second)
+	waitRowCount(t, cluster, 0, 65, 30*time.Second)
+	waitRowCount(t, cluster, 1, 65, 30*time.Second)
 	// Same expiry + GC-pass wait as snapshot-resync: node3's member
 	// deadline (20s) must lapse plus one 30s GC pass before its needed
 	// ranges are genuinely unrecoverable from logs.
@@ -147,10 +138,11 @@ func TestStaleNodeDiscardsCorruptSnapshotThenConverges(t *testing.T) {
 	if got := metricValue(t, victimAPI, "spedsql_repl_snapshots_received_total"); got != 0 {
 		t.Fatalf("snapshots_received = %v after corrupt transfer, want 0 (corrupt data published)", got)
 	}
-	if n, err := cluster.QueryRowCount(stale, "snap_rows"); err != nil || n != 5 {
+	if names, err := cluster.TypedNames(stale); err != nil || len(names) != 5 {
+		n := len(names)
 		t.Fatalf("stale node rows = %d, err = %v after corrupt transfer, want 5 (partial publication)", n, err)
 	}
-	if d, err := cluster.ComputeTableDigest(stale, "snap_rows", "id"); err != nil || d != preStopDigest {
+	if d, err := typedDigest(cluster, stale); err != nil || d != preStopDigest {
 		t.Fatalf("stale node digest changed by corrupt transfer: %q -> %q, err = %v", preStopDigest, d, err)
 	}
 	if got := metricValue(t, victimAPI, "spedsql_state_generation"); got != genBeforeAttack {
@@ -163,19 +155,25 @@ func TestStaleNodeDiscardsCorruptSnapshotThenConverges(t *testing.T) {
 			t.Fatalf("honest AddPeer(%d,%d): %v", pair[0], pair[1], err)
 		}
 	}
-	waitConverged(t, cluster, "snap_rows", 65, 120*time.Second)
+	waitConverged(t, cluster, 65, 120*time.Second)
 	// The rejoin completed via an honest snapshot, not the corrupt one.
 	waitMetricDelta(t, victimAPI, "spedsql_repl_snapshots_received_total", 0, 1, 30*time.Second)
 	if got := metricValue(t, victimAPI, "spedsql_state_generation"); got < genBeforeAttack {
 		t.Fatalf("state generation regressed %v -> %v (non-monotonic publication)", genBeforeAttack, got)
 	}
 	// The stale node's acknowledged pre-stop state survives the merge.
-	res, err := cluster.QuerySQL(stale, "SELECT name FROM snap_rows WHERE name LIKE 'stale-%'")
+	res, err := cluster.TypedNames(stale)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Rows) != 5 {
-		t.Fatalf("stale rows after honest resync = %d, want 5", len(res.Rows))
+	staleRows := 0
+	for _, name := range res {
+		if strings.HasPrefix(name, "stale-") {
+			staleRows++
+		}
+	}
+	if staleRows != 5 {
+		t.Fatalf("stale rows after honest resync = %d, want 5", staleRows)
 	}
 }
 
@@ -221,37 +219,33 @@ func anyFrame(frames []*replication.Frame, want func(*replication.Frame) bool) b
 	return false
 }
 
-func waitRowCount(t *testing.T, c *harness.Cluster, idx int, table string, want int, timeout time.Duration) {
+func waitRowCount(t *testing.T, c *harness.Cluster, idx, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		n, err := c.QueryRowCount(idx, table)
-		if err == nil && n == want {
+		names, err := c.TypedNames(idx)
+		if err == nil && len(names) == want {
 			return
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	n, _ := c.QueryRowCount(idx, table)
-	t.Fatalf("node %d %s count = %d, want %d within %v", idx, table, n, want, timeout)
+	names, _ := c.TypedNames(idx)
+	t.Fatalf("node %d typed record count = %d, want %d within %v", idx, len(names), want, timeout)
 }
 
-func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, timeout time.Duration) {
+func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, table)
-			if err != nil || n != want {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, table, "id")
-			if err != nil {
-				ok = false
-				break
-			}
+			d := digestNames(names)
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -265,11 +259,23 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 		time.Sleep(200 * time.Millisecond)
 	}
 	for i := range c.Nodes {
-		n, nerr := c.QueryRowCount(i, table)
-		d, derr := c.ComputeTableDigest(i, table, "id")
-		t.Logf("node %d at timeout: count=%d countErr=%v digest=%s digestErr=%v", i, n, nerr, d, derr)
+		names, err := c.TypedNames(i)
+		t.Logf("node %d at timeout: count=%d readErr=%v digest=%s", i, len(names), err, digestNames(names))
 	}
-	t.Fatalf("nodes did not converge on %d %s rows with equal digests within %v", want, table, timeout)
+	t.Fatalf("nodes did not converge on %d typed records with equal digests within %v", want, timeout)
+}
+
+func typedDigest(c *harness.Cluster, idx int) (string, error) {
+	names, err := c.TypedNames(idx)
+	if err != nil {
+		return "", err
+	}
+	return digestNames(names), nil
+}
+
+func digestNames(names []string) string {
+	sort.Strings(names)
+	return strings.Join(names, "\n")
 }
 
 func metricValue(t *testing.T, apiAddr, name string) float64 {
@@ -283,22 +289,8 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line == "" || line[0] == '#' {
-			continue
-		}
-		if !strings.HasPrefix(line, name) {
-			continue
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(line, name))
-		if i := strings.LastIndex(rest, " "); i >= 0 {
-			rest = rest[i+1:]
-		}
-		v, err := strconv.ParseFloat(rest, 64)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		return v
+	if value, ok := harness.MetricValueFrom(string(raw), name); ok {
+		return value
 	}
 	t.Fatalf("counter %s not present in /metrics", name)
 	return 0

@@ -1,13 +1,20 @@
 package state
 
 import (
+	"context"
 	"errors"
 	"io"
+	"sync/atomic"
 	"syscall"
 	"testing"
 
-	"github.com/cockroachdb/pebble/v2/vfs"
+	"github.com/marcgauthier/murmur/codec"
+	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/spool"
 )
+
+// errTestCause stands in for a terminal storage failure cause.
+var errTestCause = errors.New("state test: injected storage failure")
 
 func TestFatalCaptureStickyFirstWins(t *testing.T) {
 	var c fatalCapture
@@ -30,11 +37,7 @@ func TestFatalCaptureStickyFirstWins(t *testing.T) {
 
 func TestFatalCaptureCauseWrapsENOSPC(t *testing.T) {
 	var c fatalCapture
-	c.noteIOErr(syscall.ENOSPC)
-	if err := c.err(); err != nil {
-		t.Fatalf("cause-only err = %v, want nil (cause must not trip the gate)", err)
-	}
-	c.noteFatal("pebble: fatal commit error")
+	c.noteTerminal("spool: fatal commit error", syscall.ENOSPC)
 	err := c.err()
 	if !IsStorageFailure(err) {
 		t.Fatalf("err = %v, want storage failure", err)
@@ -47,86 +50,77 @@ func TestFatalCaptureCauseWrapsENOSPC(t *testing.T) {
 func TestFatalCaptureNilSafe(t *testing.T) {
 	var c *fatalCapture
 	c.noteFatal("x")
-	c.noteIOErr(io.ErrUnexpectedEOF)
+	c.noteTerminal("y", io.ErrUnexpectedEOF)
 	if err := c.err(); err != nil {
 		t.Fatalf("nil capture err = %v, want nil", err)
 	}
 }
 
-// errFS fails all data-path writes with ENOSPC while letting metadata ops
-// through, proving watchFS records write errors (and only write errors).
-type errFS struct {
-	vfs.FS
-	writeErr error
-}
-
-func (fs *errFS) wrap(f vfs.File, err error) (vfs.File, error) {
-	if err != nil {
-		return nil, err
+// TestTerminalStorageFailureFailsClosed proves an injected Spool append
+// failure trips the sticky fail-closed gate: the commit reports a
+// storage failure with the underlying cause, and every later operation
+// fails without touching storage.
+func TestTerminalStorageFailureFailsClosed(t *testing.T) {
+	var fail atomic.Bool
+	opt := Options{
+		Limits: codec.DefaultLimits(),
+		Spool: spool.Options{
+			Faults: &spool.FaultHooks{Append: func() error {
+				if fail.Load() {
+					return syscall.ENOSPC
+				}
+				return nil
+			}},
+		},
 	}
-	return &errFile{File: f, err: fs.writeErr}, nil
-}
-
-func (fs *errFS) Create(name string, cat vfs.DiskWriteCategory) (vfs.File, error) {
-	f, err := fs.FS.Create(name, cat)
-	return fs.wrap(f, err)
-}
-
-func (fs *errFS) openSignedFixture(name string, opts ...vfs.OpenOption) (vfs.File, error) {
-	f, err := fs.FS.Open(name, opts...)
-	return fs.wrap(f, err)
-}
-
-func (fs *errFS) OpenReadWrite(
-	name string, cat vfs.DiskWriteCategory, opts ...vfs.OpenOption,
-) (vfs.File, error) {
-	f, err := fs.FS.OpenReadWrite(name, cat, opts...)
-	return fs.wrap(f, err)
-}
-
-func (fs *errFS) ReuseForWrite(
-	oldname, newname string, cat vfs.DiskWriteCategory,
-) (vfs.File, error) {
-	f, err := fs.FS.ReuseForWrite(oldname, newname, cat)
-	return fs.wrap(f, err)
-}
-
-func (fs *errFS) Unwrap() vfs.FS { return fs.FS }
-
-type errFile struct {
-	vfs.File
-	err error
-}
-
-func (f *errFile) Write(p []byte) (int, error)            { return 0, f.err }
-func (f *errFile) WriteAt(p []byte, _ int64) (int, error) { return 0, f.err }
-func (f *errFile) Sync() error                            { return f.err }
-func (f *errFile) SyncData() error                        { return f.err }
-func (f *errFile) SyncTo(_ int64) (bool, error)           { return false, f.err }
-
-func TestWatchFSRecordsFirstWriteError(t *testing.T) {
-	var c fatalCapture
-	w := &watchFS{FS: &errFS{FS: vfs.NewMem(), writeErr: syscall.ENOSPC}, fatal: &c}
-	f, err := w.Create("x", vfs.WriteCategoryUnspecified)
+	node := ids.NewNodeID()
+	s, err := openSignedFixture(t.TempDir(), node, ids.DBID{}, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	if _, err := f.Write([]byte("data")); !errors.Is(err, syscall.ENOSPC) {
-		t.Fatalf("Write err = %v, want ENOSPC", err)
+	defer s.Close()
+	ctx := context.Background()
+	row := ids.NewRowID()
+	if _, err := s.CommitLocal(ctx, localBatch(s, s.ClockNow(),
+		codec.Mutation{TableID: 7, RowID: row, ColumnID: 2, Value: codec.Text("healthy")})); err != nil {
+		t.Fatal(err)
 	}
-	// The cause is recorded but the gate stays open until Pebble's own
-	// fatal signal arrives.
-	if err := c.err(); err != nil {
-		t.Fatalf("gate err = %v, want nil before fatal", err)
+	fail.Store(true)
+	_, err = s.CommitLocal(ctx, localBatch(s, s.ClockNow(),
+		codec.Mutation{TableID: 7, RowID: ids.NewRowID(), ColumnID: 2, Value: codec.Text("doomed")}))
+	if !IsStorageFailure(err) {
+		t.Fatalf("commit err = %v, want storage failure", err)
 	}
-	c.noteFatal("boom")
-	if err := c.err(); !errors.Is(err, syscall.ENOSPC) {
-		t.Fatalf("gate err = %v, want ENOSPC cause", err)
+	if !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("commit err = %v, want ENOSPC cause", err)
 	}
-	// Reads and stats flow through untouched.
-	if _, err := f.Stat(); err != nil {
-		t.Fatalf("Stat err = %v, want nil", err)
+	if err := s.Failed(); !IsStorageFailure(err) {
+		t.Fatalf("Failed = %v, want storage failure", err)
+	}
+	// Later reads and writes fail closed.
+	if _, _, err := s.GetCell(7, row, 2); !IsStorageFailure(err) {
+		t.Fatalf("GetCell err = %v, want storage failure", err)
+	}
+	if _, err := s.CommitLocal(ctx, localBatch(s, s.ClockNow(),
+		codec.Mutation{TableID: 7, RowID: ids.NewRowID(), ColumnID: 2, Value: codec.Text("late")})); !IsStorageFailure(err) {
+		t.Fatalf("late commit err = %v, want storage failure", err)
+	}
+	if err := s.Sync(); !IsStorageFailure(err) {
+		t.Fatalf("Sync err = %v, want storage failure", err)
+	}
+	// Restart recovery: the failed commit stayed absent while the
+	// healthy write survived.
+	if err := s.Close(); err != nil {
+		t.Logf("close after failure: %v", err)
+	}
+	s2, err := openSignedFixture(s.openPath, node, s.DBID(), Options{Limits: codec.DefaultLimits()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	st, ok, err := s2.GetCell(7, row, 2)
+	if err != nil || !ok || st.Value.S != "healthy" {
+		t.Fatalf("healthy readback after restart: %v %v %v", st, ok, err)
 	}
 }
 

@@ -33,7 +33,6 @@ package dbidisolation_test
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -43,8 +42,6 @@ import (
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -54,20 +51,11 @@ func TestCrossDatabasePeersNeverConnect(t *testing.T) {
 		t.Fatalf("isolation window %v below the 10s minimum", window)
 	}
 
-	markerSchema := func() *db.SchemaConfig {
-		return &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "markers",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "val", Type: schema.ColText, Nullable: true},
-			},
-		}}}
-	}
 	clusterA := harness.NewCluster(t, harness.ClusterOptions{
-		Name: "dbid-iso-a", NumNodes: 2, AwaitUnlock: true, Schema: markerSchema(),
+		Name: "dbid-iso-a", NumNodes: 2, AwaitUnlock: true, TypedRecords: true,
 	})
 	clusterB := harness.NewCluster(t, harness.ClusterOptions{
-		Name: "dbid-iso-b", NumNodes: 2, AwaitUnlock: true, Schema: markerSchema(),
+		Name: "dbid-iso-b", NumNodes: 2, AwaitUnlock: true, TypedRecords: true,
 	})
 
 	if clusterA.DBID == clusterB.DBID {
@@ -79,14 +67,14 @@ func TestCrossDatabasePeersNeverConnect(t *testing.T) {
 	crossTrustCAs(t, clusterA, clusterB)
 
 	// Positive controls: each cluster converges internally.
-	if err := clusterA.ExecSQL(0, "INSERT INTO markers (id, val) VALUES (?, ?)", fmt.Sprintf("%032x", 100), "a"); err != nil {
+	if err := clusterA.TypedInsert(0, "cluster-a-marker"); err != nil {
 		t.Fatalf("A marker insert: %v", err)
 	}
-	if err := clusterB.ExecSQL(0, "INSERT INTO markers (id, val) VALUES (?, ?)", fmt.Sprintf("%032x", 200), "b"); err != nil {
+	if err := clusterB.TypedInsert(0, "cluster-b-marker"); err != nil {
 		t.Fatalf("B marker insert: %v", err)
 	}
-	waitConverged(t, clusterA, "markers", 1, 60*time.Second)
-	waitConverged(t, clusterB, "markers", 1, 60*time.Second)
+	waitConverged(t, clusterA, 1, 60*time.Second)
+	waitConverged(t, clusterB, 1, 60*time.Second)
 	waitPeerConnected(t, clusterA.Nodes[0].APIAddr, clusterA.Nodes[1].NodeID.String(), true, 30*time.Second)
 	waitPeerConnected(t, clusterB.Nodes[0].APIAddr, clusterB.Nodes[1].NodeID.String(), true, 30*time.Second)
 
@@ -137,8 +125,8 @@ func TestCrossDatabasePeersNeverConnect(t *testing.T) {
 			crossRemovePeer(t, b, a)
 		}
 	}
-	waitConverged(t, clusterA, "markers", 1, 60*time.Second)
-	waitConverged(t, clusterB, "markers", 1, 60*time.Second)
+	waitConverged(t, clusterA, 1, 60*time.Second)
+	waitConverged(t, clusterB, 1, 60*time.Second)
 	assertNoCrossConnection(t, clusterA, clusterB)
 }
 
@@ -291,29 +279,15 @@ func assertNoCrossConnection(t *testing.T, a, b *harness.Cluster) {
 func assertMarkersIsolated(t *testing.T, a, b *harness.Cluster) {
 	t.Helper()
 	for i := range a.Nodes {
-		n, err := a.QueryRowCount(i, "markers")
-		if err != nil || n != 1 {
-			t.Fatalf("A node %d markers=%d (err=%v), want exactly its own", i, n, err)
-		}
-		res, err := a.QuerySQL(i, "SELECT count(*) FROM markers WHERE id = '000000000000000000000000000000c8'")
-		if err != nil {
-			t.Fatalf("A node %d cross-check: %v", i, err)
-		}
-		if c := fmt.Sprint(res.Rows[0][0]); c != "0" {
-			t.Fatalf("B marker leaked onto A node %d", i)
+		names, err := a.TypedNames(i)
+		if err != nil || len(names) != 1 || names[0] != "cluster-a-marker" {
+			t.Fatalf("A node %d names=%v (err=%v), want only its own marker", i, names, err)
 		}
 	}
 	for i := range b.Nodes {
-		n, err := b.QueryRowCount(i, "markers")
-		if err != nil || n != 1 {
-			t.Fatalf("B node %d markers=%d (err=%v), want exactly its own", i, n, err)
-		}
-		res, err := b.QuerySQL(i, "SELECT count(*) FROM markers WHERE id = '00000000000000000000000000000064'")
-		if err != nil {
-			t.Fatalf("B node %d cross-check: %v", i, err)
-		}
-		if c := fmt.Sprint(res.Rows[0][0]); c != "0" {
-			t.Fatalf("A marker leaked onto B node %d", i)
+		names, err := b.TypedNames(i)
+		if err != nil || len(names) != 1 || names[0] != "cluster-b-marker" {
+			t.Fatalf("B node %d names=%v (err=%v), want only its own marker", i, names, err)
 		}
 	}
 }
@@ -332,23 +306,19 @@ func waitPeerConnected(t *testing.T, apiAddr, nodeID string, want bool, timeout 
 	t.Fatalf("peer %s Connected != %v on %s within %v", nodeID, want, apiAddr, timeout)
 }
 
-func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, timeout time.Duration) {
+func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, table)
-			if err != nil || n != want {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, table, "id")
-			if err != nil {
-				ok = false
-				break
-			}
+			d := strings.Join(names, "\x00")
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -361,7 +331,7 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("nodes did not converge on %d %s rows with equal digests within %v", want, table, timeout)
+	t.Fatalf("nodes did not converge on %d typed records with equal names within %v", want, timeout)
 }
 
 func metricInt(t *testing.T, apiAddr, name string) int64 {
@@ -375,23 +345,8 @@ func metricInt(t *testing.T, apiAddr, name string) int64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line == "" || line[0] == '#' || !strings.HasPrefix(line, name) {
-			continue
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(line, name))
-		if i := strings.LastIndex(rest, " "); i >= 0 {
-			rest = rest[i+1:]
-		}
-		v, err := strconv.ParseInt(rest, 10, 64)
-		if err != nil {
-			f, ferr := strconv.ParseFloat(rest, 64)
-			if ferr != nil {
-				t.Fatalf("parse %s: %v", name, err)
-			}
-			return int64(f)
-		}
-		return v
+	if value, ok := harness.MetricValueFrom(string(raw), name); ok {
+		return int64(value)
 	}
 	t.Fatalf("counter %s not present in /metrics", name)
 	return 0

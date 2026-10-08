@@ -3,7 +3,7 @@
 // after fresh init and again after backup plus restore.
 //
 // Scope: this suite asserts the paths the PRODUCT controls: the encrypted
-// key-registry directory (pebble/keys), the registry files, and
+// key container (data/keys.enc), the data directory, and
 // backup/restore artifacts. Operator-owned node directories, public
 // certificates, log files, and the TLS private key are created by the test
 // harness and daemon fixture (node.key is minted and written by the
@@ -19,32 +19,62 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"testing"
 	"time"
 
 	db "github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/backup"
+	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/origin"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
-func schemaConfig() *db.SchemaConfig {
-	return &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-		Name: "perm_rows",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
+type permissionRecord struct {
+	ID    ids.RowID `rime:"primary"`
+	Name  string
+	Count int64
+	Tags  []string
+	Peak  int64
+	Floor float64
+}
+
+type permissionLocalRecord struct {
+	ID   ids.RowID `rime:"primary"`
+	Name string
+}
+
+func tableDefinitions() ([]db.TableDefinition, error) {
+	replicated, err := db.Define[permissionRecord]("live_typed_records", 901, db.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
+		MergePolicies: map[string]db.RecordMergePolicy{
+			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
+			"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
 		},
-	}}}
+	})
+	if err != nil {
+		return nil, err
+	}
+	local, err := db.Define[permissionLocalRecord]("live_node_local_records", 902, db.RecordOptions{
+		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Name": 2}, Scope: db.TableScopeNodeLocal,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []db.TableDefinition{replicated, local}, nil
 }
 
 func TestFilePermissionsFreshInitAndBackupRestore(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file permissions (0600/0700) do not apply to Windows NTFS ACLs")
+	}
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "file-permissions",
-		NumNodes:    2,
-		AwaitUnlock: true,
-		Schema:      schemaConfig(),
+		Name:         "file-permissions",
+		NumNodes:     2,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 
 	// Phase 1: fresh init. Every node's private key material must already
@@ -57,8 +87,7 @@ func TestFilePermissionsFreshInitAndBackupRestore(t *testing.T) {
 	// Positive control: honest writes replicate and converge, proving the
 	// permission posture does not break the database.
 	for i := 0; i < 25; i++ {
-		id := fmt.Sprintf("%032x", 9000+i)
-		if err := cluster.ExecSQL(0, "INSERT INTO perm_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("row-%d", i)); err != nil {
+		if err := cluster.TypedInsert(0, fmt.Sprintf("row-%d", i)); err != nil {
 			t.Fatalf("seed write: %v", err)
 		}
 	}
@@ -93,8 +122,8 @@ func TestFilePermissionsFreshInitAndBackupRestore(t *testing.T) {
 		t.Fatalf("restore: %v", err)
 	}
 	assertTreeLockedDown(t, restoreTarget, "restored-tree")
-	// The restored key registry in particular must be private.
-	assertTreeLockedDown(t, filepath.Join(restoreTarget, "keys"), "restored-keys")
+	// The restored key container and data directory in particular must be private.
+	assertTreeLockedDown(t, filepath.Join(restoreTarget, "data"), "restored-data")
 
 	cluster.StartNode(1)
 	cluster.UnlockNode(1, cluster.Nodes[1].KeyHex)
@@ -115,7 +144,8 @@ func assertSecretPathsLockedDown(t *testing.T, cluster *harness.Cluster, idx int
 	t.Helper()
 	node := cluster.Nodes[idx]
 	secretPaths := []string{
-		filepath.Join(node.PebbleDir, "keys"),
+		filepath.Join(node.Dir, "data", "keys.enc"),
+		filepath.Join(node.Dir, "data"),
 	}
 	for _, p := range secretPaths {
 		assertTreeLockedDown(t, p, fmt.Sprintf("%s node%d %s", phase, idx, p))
@@ -171,7 +201,7 @@ func logModeTable(t *testing.T, cluster *harness.Cluster) {
 	t.Helper()
 	for i, node := range cluster.Nodes {
 		for _, p := range []string{
-			node.Dir, node.PebbleDir, node.LogsDir, node.SchemaDir,
+			node.Dir, node.DataDir, node.LogsDir, node.SchemaDir,
 			node.TLSDir, node.ConfigFile, node.LogFile,
 			filepath.Join(node.TLSDir, "ca.crt"),
 			filepath.Join(node.TLSDir, "node.crt"),
@@ -192,21 +222,16 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
-		var first string
+		var first []string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, "perm_rows")
-			if err != nil || n != want {
-				ok = false
-				break
-			}
-			d, err := c.ComputeTableDigest(i, "perm_rows", "name")
-			if err != nil {
+			names, err := c.TypedNames(i)
+			if err != nil || len(names) != want {
 				ok = false
 				break
 			}
 			if i == 0 {
-				first = d
-			} else if d != first {
+				first = names
+			} else if !reflect.DeepEqual(names, first) {
 				ok = false
 				break
 			}
@@ -217,6 +242,15 @@ func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Dura
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("nodes did not converge on %d rows within %v", want, timeout)
+}
+
+func mustTableDefinitions(t *testing.T) []db.TableDefinition {
+	t.Helper()
+	tables, err := tableDefinitions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tables
 }
 
 func mustLocalDest(t *testing.T, dir string) *backup.LocalDestination {
@@ -245,12 +279,12 @@ func openNodeDir(t *testing.T, ctx context.Context, cluster *harness.Cluster, no
 	// real key. Offline opens carry no replication peers, so Configure
 	// would contribute nothing else.
 	handle, err := db.Open(ctx, db.Config{
-		Path:          node.PebbleDir,
+		Path:          node.Dir,
 		NodeID:        node.NodeID,
 		DBID:          cluster.DBID,
 		OriginSigning: db.OriginSigningConfig{PrivateKey: node.OriginKey, TrustedKeys: registry},
-		Schema:        *schemaConfig(),
-		Pebble:        db.DefaultPebbleConfig(),
+		Tables:        mustTableDefinitions(t),
+		Spool:         db.DefaultSpoolConfig(),
 		Encryption:    db.EncryptionConfig{Key: raw, KeyID: "remote-unlock-key"},
 	})
 	if err != nil {

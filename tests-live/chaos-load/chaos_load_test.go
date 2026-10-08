@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,18 +17,15 @@ import (
 
 func TestContinuousWritesAcrossPartitionAndHealing(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "chaos-load",
-		NumNodes:    3,
-		AwaitUnlock: true,
-		SchemaSQL: `CREATE TABLE IF NOT EXISTS chaos_rows (
-  id BLOB PRIMARY KEY NOT NULL,
-  name TEXT NOT NULL DEFAULT ''
-);`,
+		Name:         "chaos-load",
+		NumNodes:     3,
+		AwaitUnlock:  true,
+		TypedRecords: true,
 	})
 	for _, node := range cluster.Nodes {
 		t.Logf("%s pid=%d dir=%s repl=%s", node.Label, node.Process.Process.Pid, node.Dir, node.ReplAddr)
 	}
-	if err := cluster.ExecSQL(0, "INSERT INTO chaos_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 1), "baseline"); err != nil {
+	if err := cluster.TypedInsert(0, "baseline"); err != nil {
 		t.Fatalf("baseline insert: %v", err)
 	}
 	waitAllCount(t, cluster, 1, 20*time.Second)
@@ -64,9 +63,7 @@ func TestContinuousWritesAcrossPartitionAndHealing(t *testing.T) {
 					continue
 				}
 				seq++
-				id := fmt.Sprintf("%032x", int64(node+1)*1_000_000+seq)
-				err := cluster.ExecSQL(node, "INSERT INTO chaos_rows (id, name) VALUES (?, ?)",
-					id, fmt.Sprintf("node%d-write-%06d", node+1, seq))
+				err := cluster.TypedInsert(node, fmt.Sprintf("node%d-write-%06d", node+1, seq))
 				if err != nil {
 					cluster.MarkFailed(fmt.Sprintf("%s write %d failed: %v", cluster.Nodes[node].Label, seq, err))
 				} else {
@@ -89,11 +86,11 @@ func TestContinuousWritesAcrossPartitionAndHealing(t *testing.T) {
 	waitNodeCount(t, cluster, 0, leftRows, 15*time.Second)
 	waitNodeCount(t, cluster, 1, leftRows, 15*time.Second)
 	waitNodeCount(t, cluster, 2, rightRows, 15*time.Second)
-	leftDigest, err := cluster.ComputeTableDigest(0, "chaos_rows", "name")
+	leftDigest, err := namesDigest(cluster, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rightDigest, err := cluster.ComputeTableDigest(2, "chaos_rows", "name"); err != nil {
+	if rightDigest, err := namesDigest(cluster, 2); err != nil {
 		t.Fatal(err)
 	} else if rightDigest == leftDigest {
 		t.Fatal("partitioned groups unexpectedly have identical state digests")
@@ -122,7 +119,7 @@ func TestContinuousWritesAcrossPartitionAndHealing(t *testing.T) {
 
 	// A new application write after reconciliation must still traverse the
 	// healed mesh.
-	if err := cluster.ExecSQL(1, "INSERT INTO chaos_rows (id, name) VALUES (?, ?)", fmt.Sprintf("%032x", 999_999_999), "post-heal"); err != nil {
+	if err := cluster.TypedInsert(1, "post-heal"); err != nil {
 		t.Fatalf("post-heal write: %v", err)
 	}
 	waitAllCount(t, cluster, totalExpected+1, 20*time.Second)
@@ -187,8 +184,8 @@ func waitAllCount(t *testing.T, cluster *harness.Cluster, want int, timeout time
 	for time.Now().Before(deadline) {
 		all := true
 		for i := range cluster.Nodes {
-			count, err := cluster.QueryRowCount(i, "chaos_rows")
-			if err != nil || count != want {
+			names, err := cluster.TypedNames(i)
+			if err != nil || len(names) != want {
 				all = false
 				break
 			}
@@ -199,8 +196,8 @@ func waitAllCount(t *testing.T, cluster *harness.Cluster, want int, timeout time
 		time.Sleep(100 * time.Millisecond)
 	}
 	for i, node := range cluster.Nodes {
-		count, err := cluster.QueryRowCount(i, "chaos_rows")
-		t.Logf("%s rows=%d err=%v", node.Label, count, err)
+		names, err := cluster.TypedNames(i)
+		t.Logf("%s rows=%d err=%v", node.Label, len(names), err)
 	}
 	t.Fatalf("cluster failed to converge to %d rows within %v", want, timeout)
 }
@@ -209,24 +206,24 @@ func waitNodeCount(t *testing.T, cluster *harness.Cluster, node, want int, timeo
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if got, err := cluster.QueryRowCount(node, "chaos_rows"); err == nil && got == want {
+		if names, err := cluster.TypedNames(node); err == nil && len(names) == want {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	got, err := cluster.QueryRowCount(node, "chaos_rows")
-	t.Fatalf("%s rows=%d err=%v, want %d", cluster.Nodes[node].Label, got, err, want)
+	names, err := cluster.TypedNames(node)
+	t.Fatalf("%s rows=%d err=%v, want %d", cluster.Nodes[node].Label, len(names), err, want)
 }
 
 func assertConverged(t *testing.T, cluster *harness.Cluster, wantRows int) {
 	t.Helper()
 	var digest string
 	for i, node := range cluster.Nodes {
-		count, err := cluster.QueryRowCount(i, "chaos_rows")
-		if err != nil || count != wantRows {
-			t.Fatalf("%s rows=%d err=%v, want %d", node.Label, count, err, wantRows)
+		names, err := cluster.TypedNames(i)
+		if err != nil || len(names) != wantRows {
+			t.Fatalf("%s rows=%d err=%v, want %d", node.Label, len(names), err, wantRows)
 		}
-		got, err := cluster.ComputeTableDigest(i, "chaos_rows", "name")
+		got, err := namesDigest(cluster, i)
 		if err != nil {
 			t.Fatalf("%s digest: %v", node.Label, err)
 		}
@@ -236,6 +233,15 @@ func assertConverged(t *testing.T, cluster *harness.Cluster, wantRows int) {
 			t.Fatalf("%s digest %s != %s", node.Label, got, digest)
 		}
 	}
+}
+
+func namesDigest(cluster *harness.Cluster, node int) (string, error) {
+	names, err := cluster.TypedNames(node)
+	if err != nil {
+		return "", err
+	}
+	sort.Strings(names)
+	return strings.Join(names, "\n"), nil
 }
 
 func envSeconds(name string, fallback int) int {

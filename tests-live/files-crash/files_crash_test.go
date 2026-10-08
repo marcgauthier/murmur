@@ -43,8 +43,9 @@ type attempt struct {
 func TestFileCrashLeavesNoPartialOrPhantom(t *testing.T) {
 	bigMB := envInt("MURMUR_FILES_CRASH_BIG_MB", 3)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:     "files-crash",
-		NumNodes: 2,
+		Name:         "files-crash",
+		NumNodes:     2,
+		TypedRecords: true,
 		Files: &harness.FilesOptions{
 			ObjectKeyHex: objectKey, MaxFileBytes: 4 << 20, FetchIntervalMs: -1,
 		},

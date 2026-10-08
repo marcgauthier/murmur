@@ -24,7 +24,7 @@ The assessment produces findings and reproductions. Applying fixes is a separate
 | Reachable decoders/parsers | Network frames, transactions/chunks, snapshots, schema manifests, CRDT records, encrypted containers, bridge artifacts and service requests. Check lengths, counts, integer overflow, allocation, decompression and aggregate resource limits. |
 | Service interfaces | Authentication and intended separation between ordinary clients and administrators; unlock, rotation, origin authorization, peer changes, bridge administration, debug exposure and request limits. |
 
-Trace supporting code outside these areas only when necessary to establish an attack path. Exclude general SQL functionality, CLI workflows, broad performance tuning and unrelated correctness work.
+Trace supporting code outside these areas only when necessary to establish an attack path. Exclude general query functionality, CLI workflows, broad performance tuning and unrelated correctness work.
 
 **Service qualification:** the library currently ships no HTTP adapter. Its service endpoints are live-test tooling. Review that tooling, but classify missing client/admin separation as a deployment requirement unless an actual shipped security boundary is bypassed. Do not present fixture behavior as a production library vulnerability.
 
@@ -35,7 +35,7 @@ Trace supporting code outside these areas only when necessary to establish an at
 - Use a fresh review session. Do not treat previous implementation explanations or passing tests as evidence of security.
 - Define attacker capabilities separately: unauthenticated network access; an admitted malicious peer with its own credentials; an authorized bridge signer acting maliciously; an ordinary service client; and ciphertext-file tampering without decryption keys.
 - Record documented limitations separately: no Byzantine consensus, no whole-database rollback protection, explicitly trusted snapshot/baseline authorities, and current key-revocation limitations.
-- Validate candidates with minimal reproductions, targeted fuzzing and isolated live daemons. Exercise both SQLite backends where SQL materialization affects the attack.
+- Validate candidates with minimal reproductions, targeted fuzzing and isolated live daemons. Exercise the RIME and spool paths where record materialization affects the attack.
 - For rejected origin/payload attacks, verify that protected state, HLC, generation, receipts and watermarks remain unchanged. For resource attacks, measure consumption and recovery while honest traffic continues.
 - Require a coverage matrix listing reviewed, tested and deferred surfaces. Findings must identify attacker prerequisites, reachable code, violated guarantee, severity, evidence, reproduction and remediation. Separate confirmed issues, unvalidated candidates and deployment gaps.
 

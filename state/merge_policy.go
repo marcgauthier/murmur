@@ -9,7 +9,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crdt"
 	"github.com/marcgauthier/murmur/ids"
@@ -69,7 +68,7 @@ func (s *Store) CRDTRecords(table uint32, row ids.RowID, col uint32) ([]codec.CR
 	s.gate.RLock()
 	defer s.gate.RUnlock()
 	var out []codec.CRDTRecord
-	err := s.snapshot(func(snap *pebble.Snapshot) error {
+	err := s.snapshot(func(snap *snapshot) error {
 		p := crdtPrefix(table, row, col)
 		it, err := prefixIter(snap, p)
 		if err != nil {
@@ -413,7 +412,7 @@ func compareNumber(a, b codec.Value) int {
 func (s *Store) projectCRDT(table uint32, row ids.RowID, col uint32, policy schema.MergePolicy, staged map[string]*remoteGroupCell) (codec.Value, error) {
 	p := crdtPrefix(table, row, col)
 	records := make(map[string][]byte)
-	it, err := s.db.NewIter(&pebble.IterOptions{LowerBound: p, UpperBound: prefixEnd(p)})
+	it, err := s.mem.newIter(&iterOptions{LowerBound: p, UpperBound: prefixEnd(p)})
 	if err != nil {
 		return codec.Value{}, err
 	}
@@ -489,7 +488,7 @@ func ProjectCRDT(policy schema.MergePolicy, records map[string][]byte, max int) 
 	return codec.Text(value), err
 }
 
-func writeStagedCells(b *pebble.Batch, staged map[string]*remoteGroupCell, order []string) ([]WinningChange, error) {
+func writeStagedCells(b *batch, staged map[string]*remoteGroupCell, order []string) ([]WinningChange, error) {
 	var winners []WinningChange
 	for _, key := range order {
 		c := staged[key]
@@ -504,7 +503,7 @@ func writeStagedCells(b *pebble.Batch, staged map[string]*remoteGroupCell, order
 		} else {
 			raw = codec.EncodeCellState(nil, codec.CellState{Version: c.version, Value: c.value})
 		}
-		if err := b.Set(c.key, raw, nil); err != nil {
+		if err := b.Set(c.key, raw); err != nil {
 			return nil, err
 		}
 		if c.key[0] != prefixCRDT && c.key[0] != prefixReceipt {

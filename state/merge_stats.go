@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/schema"
 )
@@ -28,7 +27,7 @@ func (s *Store) MergePolicyStats(ctx context.Context) (MergePolicyStats, error) 
 	s.gate.RLock()
 	defer s.gate.RUnlock()
 	stats := MergePolicyStats{MergeAttempts: s.policyMergeAttempts.Load(), MergeNanos: s.policyMergeNanos.Load(), RejectedBatches: s.policyRejected.Load()}
-	err := s.snapshot(func(snap *pebble.Snapshot) error {
+	err := s.snapshot(func(snap *snapshot) error {
 		it, err := prefixIter(snap, []byte{prefixCRDT})
 		if err != nil {
 			return err

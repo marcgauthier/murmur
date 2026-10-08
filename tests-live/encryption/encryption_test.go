@@ -11,89 +11,49 @@ import (
 	"strings"
 	"testing"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
-func TestEncryptedStoreRejectsWrongKeyAndReopens(t *testing.T) {
+func TestTypedEncryptedStoreKeepsRecordsEncryptedAcrossRestart(t *testing.T) {
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "encryption",
-		NumNodes:    1,
-		AwaitUnlock: true,
-		Schema: &db.SchemaConfig{
-			Version: 1,
-			Tables: []schema.TableSchema{
-				{
-					Name: "secrets",
-					Columns: []schema.ColumnSchema{
-						{Name: "id", Type: schema.ColBlob},
-						{Name: "value", Type: schema.ColText, Nullable: true},
-					},
-				},
-			},
-		},
+		Name: "typed-encryption", NumNodes: 1, TypedRecords: true, AwaitUnlock: true,
 	})
-
-	const secretMarker = "SUPER-CONFIDENTIAL-PLAINTEXT-SECRET-987654321"
-	rowID := fmt.Sprintf("%032x", 12345)
-
-	// Write secret into node 1
-	if err := cluster.ExecSQL(0, "INSERT INTO secrets (id, value) VALUES (?, ?)", rowID, secretMarker); err != nil {
-		t.Fatalf("insert secret: %v", err)
-	}
-
-	// Stop node process
-	t.Logf("Stopping node 1 to inspect at-rest ciphertext...")
-	cluster.StopNode(0)
-
-	// Inspect all files in node1 directory: verify secretMarker is NEVER present in plaintext on disk
-	node1PebbleDir := cluster.Nodes[0].PebbleDir
-	hasPlaintext, err := containsPlaintext(node1PebbleDir, secretMarker)
-	if err != nil {
-		t.Fatalf("scan pebble dir for plaintext: %v", err)
-	}
-	if hasPlaintext {
-		t.Fatalf("SECURITY VIOLATION: plaintext secret marker found unencrypted on disk in %s", node1PebbleDir)
-	}
-	t.Logf("Confidentiality confirmed: 0 occurrences of secret marker in %s", node1PebbleDir)
-
-	// Restart node 1 with await-unlock
-	t.Logf("Restarting node 1 and testing wrong-key rejection...")
-	cluster.StartNode(0)
 	cluster.WaitNodeReady(0)
 
-	// Attempt unlock with wrong key: must be rejected with 401 Unauthorized
+	const secretMarker = "TYPED-CONFIDENTIAL-PLAINTEXT-SECRET-246813579"
+	if err := cluster.TypedInsert(0, secretMarker); err != nil {
+		t.Fatalf("insert typed secret: %v", err)
+	}
+	if got, err := cluster.TypedCount(0, secretMarker); err != nil || got != 1 {
+		t.Fatalf("typed secret before restart = %d, %v; want 1", got, err)
+	}
+
+	cluster.StopNode(0)
+	hasPlaintext, err := containsPlaintext(cluster.Nodes[0].Dir, secretMarker)
+	if err != nil {
+		t.Fatalf("scan typed node directory: %v", err)
+	}
+	if hasPlaintext {
+		t.Fatalf("typed plaintext secret marker found on disk in %s", cluster.Nodes[0].Dir)
+	}
+
+	cluster.StartNode(0)
+	cluster.WaitNodeReady(0)
 	wrongKey := hex.EncodeToString(make([]byte, 32))
+	payload, _ := json.Marshal(map[string]string{"key_hex": wrongKey, "cipher": "chacha20"})
 	unlockURL := fmt.Sprintf("https://%s/v1/admin/unlock", cluster.Nodes[0].APIAddr)
-	payload, _ := json.Marshal(map[string]string{
-		"key_hex": wrongKey,
-		"cipher":  "chacha20",
-	})
 	resp, err := http.Post(unlockURL, "application/json", bytes.NewReader(payload))
 	if err != nil {
-		t.Fatalf("unlock request: %v", err)
+		t.Fatalf("wrong-key unlock request: %v", err)
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode == http.StatusOK {
-		t.Fatalf("node unexpectedly accepted wrong key (status 200)")
+		t.Fatal("typed database unexpectedly accepted the wrong key")
 	}
-	t.Logf("Wrong key properly rejected with HTTP %d", resp.StatusCode)
-
-	// Unlock with correct key
 	cluster.UnlockNode(0, cluster.Nodes[0].KeyHex)
-
-	// Verify query succeeds and secret is intact
-	res, err := cluster.QuerySQL(0, "SELECT value FROM secrets WHERE id = ?", rowID)
-	if err != nil || len(res.Rows) != 1 {
-		t.Fatalf("query secret after correct unlock: err=%v, res=%v", err, res)
+	if got, err := cluster.TypedCount(0, secretMarker); err != nil || got != 1 {
+		t.Fatalf("typed secret after restart = %d, %v; want 1", got, err)
 	}
-	gotVal := fmt.Sprintf("%v", res.Rows[0][0])
-	if gotVal != secretMarker {
-		t.Fatalf("retrieved secret = %q, want %q", gotVal, secretMarker)
-	}
-
-	t.Logf("Node successfully decrypted and returned confidential secret.")
 }
 
 func containsPlaintext(root, marker string) (bool, error) {

@@ -1,42 +1,53 @@
-// Command schema-migrate shows additive schema evolution: open on v1,
-// write rows, migrate to v2 with a new column, and prove old rows are
-// intact while new writes can use the new column.
+// Command schema-migrate demonstrates additive typed schema evolution: it
+// opens v1, writes a record, migrates to v2, and reads/writes the new field.
 //
-// Run it:
+// Run it with:
 //
-//	go run -tags "sqlite_preupdate_hook sqlite_fts5" ./examples/schema-migrate
+//	go run ./examples/schema-migrate
 package main
 
 import (
 	"context"
 	"fmt"
-	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"log"
 	"os"
 
 	"github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
+	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
+	"github.com/marcgauthier/murmur/ids"
 )
 
-func v1Tables() []schema.TableSchema {
-	return []schema.TableSchema{{
-		Name: "contacts",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-		},
-	}}
+type contactV1 struct {
+	ID   ids.RowID `rime:"primary"`
+	Name string
 }
 
-func v2Tables() []schema.TableSchema {
-	return []schema.TableSchema{{
-		Name: "contacts",
-		Columns: []schema.ColumnSchema{
-			{Name: "id", Type: schema.ColBlob},
-			{Name: "name", Type: schema.ColText, Nullable: true},
-			{Name: "phone", Type: schema.ColText, Nullable: true},
-		},
-	}}
+type contactV2 struct {
+	ID    ids.RowID `rime:"primary"`
+	Name  string
+	Phone *string
+}
+
+func v1Definition() murmur.TableDefinition {
+	definition, err := murmur.Define[contactV1]("contacts", 1, murmur.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	return definition
+}
+
+func v2Definition() murmur.TableDefinition {
+	definition, err := murmur.Define[contactV2]("contacts", 1, murmur.RecordOptions{
+		PrimaryField: "ID",
+		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Phone": 3},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	return definition
 }
 
 func main() {
@@ -50,11 +61,11 @@ func main() {
 	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path:   dir,
 		NodeID: murmur.NewNodeID(),
-		Schema: murmur.SchemaConfig{Version: 1, Tables: v1Tables()},
-		Pebble: murmur.DefaultPebbleConfig(),
+		Schema: murmur.SchemaConfig{Version: 1},
+		Tables: []murmur.TableDefinition{v1Definition()},
+		Spool:  murmur.DefaultSpoolConfig(),
 		Encryption: murmur.EncryptionConfig{
-			Key:   []byte("0123456789abcdef0123456789abcdef"),
-			KeyID: "migrate-key",
+			Key: []byte("0123456789abcdef0123456789abcdef"), KeyID: "migrate-key",
 		},
 	}))
 	if err != nil {
@@ -62,38 +73,42 @@ func main() {
 	}
 	defer db.Close()
 
+	oldTable, err := murmur.TableOf[contactV1](db, "contacts")
+	if err != nil {
+		log.Fatal(err)
+	}
 	id := murmur.NewRowID()
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO contacts (id, name) VALUES (?, ?)`, id[:], "ann"); err != nil {
+	if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+		return oldTable.Insert(tx, &contactV1{ID: id, Name: "ann"})
+	}); err != nil {
 		log.Fatal(err)
 	}
 
-	// Additive evolution only: new columns are appended, never renamed
-	// or removed.
-	if err := db.Migrate(ctx, v2Tables()); err != nil {
+	// Additive evolution preserves old data and assigns a stable ID to Phone.
+	if err := db.MigrateRecords(ctx, []murmur.TableDefinition{v2Definition()}); err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("migrated to v2 (added phone column)")
+	fmt.Println("migrated to v2 (added optional phone field)")
 
-	// Old rows survive with NULL in the new column; new writes use it.
-	var name string
-	var phone *string
-	if err := db.QueryRowContext(ctx,
-		`SELECT name, phone FROM contacts WHERE id = ?`, id[:]).Scan(&name, &phone); err != nil {
+	contacts, err := murmur.TableOf[contactV2](db, "contacts")
+	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("old row: name=%s phone=%v\n", name, phone)
+	old, err := contacts.Get(id)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("old row: name=%s phone=%v\n", old.Name, old.Phone)
 
-	id2 := murmur.NewRowID()
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
-		id2[:], "bob", "613-555-0100"); err != nil {
+	phone := "613-555-0100"
+	if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+		return contacts.Insert(tx, &contactV2{ID: murmur.NewRowID(), Name: "bob", Phone: &phone})
+	}); err != nil {
 		log.Fatal(err)
 	}
-	var got string
-	if err := db.QueryRowContext(ctx,
-		`SELECT phone FROM contacts WHERE id = ?`, id2[:]).Scan(&got); err != nil {
+	rows, err := contacts.Where(murmur.FieldOf[contactV2, string](contacts, "Name").Eq("bob")).Find()
+	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("new row phone: %s\n", got)
+	fmt.Printf("new row phone: %s\n", *rows[0].Phone)
 }

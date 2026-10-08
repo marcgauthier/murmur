@@ -10,22 +10,22 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
-	db "github.com/marcgauthier/murmur"
-	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
 func TestPartitionedNodeRepairsTailFromPeerLogs(t *testing.T) {
 	burstRows := envInt("MURMUR_TAIL_REPAIR_BURST_ROWS", 100)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
-		Name:        "tail-repair",
-		NumNodes:    3,
-		AwaitUnlock: true,
+		Name:            "tail-repair",
+		NumNodes:        3,
+		AwaitUnlock:     true,
+		TypedRecords:    true,
+		TypedContention: true,
 		// Generous retention: the missed range must stay comfortably
 		// inside every peer's origin log, so log repair (not snapshot
 		// resync) is the only legitimate healing path.
@@ -34,24 +34,16 @@ func TestPartitionedNodeRepairsTailFromPeerLogs(t *testing.T) {
 			MaxOfflineLogRetentionMs: 600000,
 			MinRetainedBatches:       10000,
 		},
-		Schema: &db.SchemaConfig{Version: 1, Tables: []schema.TableSchema{{
-			Name: "tail_rows",
-			Columns: []schema.ColumnSchema{
-				{Name: "id", Type: schema.ColBlob},
-				{Name: "name", Type: schema.ColText, Nullable: true},
-			},
-		}}},
 	})
 
 	// Baseline: 10 rows on node1, converged everywhere.
 	const baseline = 10
 	for i := 0; i < baseline; i++ {
-		id := fmt.Sprintf("%032x", i)
-		if err := cluster.ExecSQL(0, "INSERT INTO tail_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("base-%d", i)); err != nil {
+		if err := insertMarker(cluster, 0, i, fmt.Sprintf("base-%d", i)); err != nil {
 			t.Fatalf("baseline insert %d: %v", i, err)
 		}
 	}
-	waitConverged(t, cluster, "tail_rows", baseline, 30*time.Second)
+	waitConverged(t, cluster, baseline, 30*time.Second)
 
 	snapRecvBefore := metricValue(t, cluster.Nodes[2].APIAddr, "spedsql_repl_snapshots_received_total")
 	snapReqBefore := metricValue(t, cluster.Nodes[2].APIAddr, "spedsql_repl_snapshot_required_received_total")
@@ -66,30 +58,28 @@ func TestPartitionedNodeRepairsTailFromPeerLogs(t *testing.T) {
 	waitConnectedPeers(t, cluster, 2, 0, 15*time.Second)
 
 	// Isolation probe: one row on node1 must reach node2 but never node3.
-	probeID := fmt.Sprintf("%032x", 9000)
-	if err := cluster.ExecSQL(0, "INSERT INTO tail_rows (id, name) VALUES (?, ?)", probeID, "probe"); err != nil {
+	if err := insertMarker(cluster, 0, 9000, "probe"); err != nil {
 		t.Fatalf("probe insert: %v", err)
 	}
-	waitRowCount(t, cluster, 1, "tail_rows", baseline+1, 15*time.Second)
+	waitRowCount(t, cluster, 1, baseline+1, 15*time.Second)
 	time.Sleep(2 * time.Second) // negative check needs a settle margin
-	if n, err := cluster.QueryRowCount(2, "tail_rows"); err != nil || n != baseline {
-		t.Fatalf("partition leaked: node3 count = %d (err=%v), want %d", n, err, baseline)
+	if rows, err := cluster.TypedContentionRows(2); err != nil || len(rows) != baseline {
+		t.Fatalf("partition leaked: node3 count = %d (err=%v), want %d", len(rows), err, baseline)
 	}
 
 	// Write burst on the survivors while node3 is isolated.
 	for i := 0; i < burstRows; i++ {
-		id := fmt.Sprintf("%032x", 10000+i)
 		node := i % 2
-		if err := cluster.ExecSQL(node, "INSERT INTO tail_rows (id, name) VALUES (?, ?)", id, fmt.Sprintf("burst-%d", i)); err != nil {
+		if err := insertMarker(cluster, node, 10000+i, fmt.Sprintf("burst-%d", i)); err != nil {
 			t.Fatalf("burst insert %d: %v", i, err)
 		}
 	}
 	want := baseline + 1 + burstRows
-	waitRowCount(t, cluster, 0, "tail_rows", want, 30*time.Second)
-	waitRowCount(t, cluster, 1, "tail_rows", want, 30*time.Second)
+	waitRowCount(t, cluster, 0, want, 30*time.Second)
+	waitRowCount(t, cluster, 1, want, 30*time.Second)
 	// Anti-vacuity: node3 must actually be missing the contiguous range.
-	if n, err := cluster.QueryRowCount(2, "tail_rows"); err != nil || n != baseline {
-		t.Fatalf("node3 count = %d (err=%v), want %d (it must miss the burst range)", n, err, baseline)
+	if rows, err := cluster.TypedContentionRows(2); err != nil || len(rows) != baseline {
+		t.Fatalf("node3 count = %d (err=%v), want %d (it must miss the burst range)", len(rows), err, baseline)
 	}
 	t.Logf("node3 missed %d rows while partitioned", want-baseline)
 
@@ -102,7 +92,7 @@ func TestPartitionedNodeRepairsTailFromPeerLogs(t *testing.T) {
 	for i := range cluster.Nodes {
 		waitConnectedPeers(t, cluster, i, 2, 30*time.Second)
 	}
-	waitConverged(t, cluster, "tail_rows", want, 60*time.Second)
+	waitConverged(t, cluster, want, 60*time.Second)
 
 	// The healing must have used log range repair, not the snapshot path.
 	if got := metricValue(t, cluster.Nodes[2].APIAddr, "spedsql_repl_snapshots_received_total"); got != snapRecvBefore {
@@ -123,43 +113,43 @@ func TestPartitionedNodeRepairsTailFromPeerLogs(t *testing.T) {
 		metricValue(t, cluster.Nodes[2].APIAddr, "spedsql_repl_batches_received_total"))
 
 	// Post-heal write on the healed node replicates everywhere.
-	postID := fmt.Sprintf("%032x", 20000)
-	if err := cluster.ExecSQL(2, "INSERT INTO tail_rows (id, name) VALUES (?, ?)", postID, "post-heal"); err != nil {
+	if err := insertMarker(cluster, 2, 20000, "post-heal"); err != nil {
 		t.Fatalf("post-heal insert: %v", err)
 	}
-	waitConverged(t, cluster, "tail_rows", want+1, 30*time.Second)
+	waitConverged(t, cluster, want+1, 30*time.Second)
 }
 
-func waitRowCount(t *testing.T, c *harness.Cluster, idx int, table string, want int, timeout time.Duration) {
+func insertMarker(c *harness.Cluster, node, id int, name string) error {
+	rowID := fmt.Sprintf("%08x-0000-4000-8000-%012x", id, id)
+	return c.TypedContentionInsert(node, harness.TypedContentionRow{ID: rowID, Name: name})
+}
+
+func waitRowCount(t *testing.T, c *harness.Cluster, idx int, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if n, err := c.QueryRowCount(idx, table); err == nil && n == want {
+		if rows, err := c.TypedContentionRows(idx); err == nil && len(rows) == want {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	n, _ := c.QueryRowCount(idx, table)
-	t.Fatalf("node %d %s count = %d, want %d within %v", idx, table, n, want, timeout)
+	rows, _ := c.TypedContentionRows(idx)
+	t.Fatalf("node %d typed row count = %d, want %d within %v", idx, len(rows), want, timeout)
 }
 
-func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, timeout time.Duration) {
+func waitConverged(t *testing.T, c *harness.Cluster, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
 		var first string
 		for i := range c.Nodes {
-			n, err := c.QueryRowCount(i, table)
-			if err != nil || n != want {
+			rows, err := c.TypedContentionRows(i)
+			if err != nil || len(rows) != want {
 				ok = false
 				break
 			}
-			d, err := c.ComputeTableDigest(i, table, "id")
-			if err != nil {
-				ok = false
-				break
-			}
+			d := digestRows(rows)
 			if i == 0 {
 				first = d
 			} else if d != first {
@@ -173,11 +163,15 @@ func waitConverged(t *testing.T, c *harness.Cluster, table string, want int, tim
 		time.Sleep(100 * time.Millisecond)
 	}
 	for i := range c.Nodes {
-		n, _ := c.QueryRowCount(i, table)
-		d, _ := c.ComputeTableDigest(i, table, "id")
-		t.Logf("node %d at timeout: count=%d digest=%s", i, n, d)
+		rows, _ := c.TypedContentionRows(i)
+		t.Logf("node %d at timeout: count=%d digest=%s", i, len(rows), digestRows(rows))
 	}
-	t.Fatalf("nodes did not converge on %d %s rows with equal digests within %v", want, table, timeout)
+	t.Fatalf("nodes did not converge on %d typed rows with equal digests within %v", want, timeout)
+}
+
+func digestRows(rows []harness.TypedContentionRow) string {
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	return fmt.Sprintf("%#v", rows)
 }
 
 func waitConnectedPeers(t *testing.T, c *harness.Cluster, idx, want int, timeout time.Duration) {
@@ -218,19 +212,8 @@ func metricValue(t *testing.T, apiAddr, name string) float64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line == "" || line[0] == '#' || !strings.HasPrefix(line, name) {
-			continue
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(line, name))
-		if i := strings.LastIndex(rest, " "); i >= 0 {
-			rest = rest[i+1:]
-		}
-		v, err := strconv.ParseFloat(rest, 64)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		return v
+	if value, ok := harness.MetricValueFrom(string(raw), name); ok {
+		return value
 	}
 	t.Fatalf("counter %s not present in /metrics", name)
 	return 0

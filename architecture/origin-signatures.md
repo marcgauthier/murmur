@@ -79,7 +79,7 @@ decode, and transaction limits remain necessary against resource exhaustion.
 ## Commit, apply, forwarding and diagnostics
 
 Local single and grouped commits assign sequences, finalize metadata, compute
-the digest, and sign before merging and publishing the atomic Pebble batch.
+the digest, and sign before merging and publishing the atomic Spool commit.
 Signing failure does not publish a sequence, receipt, generation, or state.
 Stored logs preserve the signature through gossip, Plumtree, range repair,
 chunk regeneration, restart, and same-DBID clone restore.
@@ -97,7 +97,7 @@ the origin signature/version/digest. High/Low bridge artifact signatures remain
 independent, and bridge-derived local transactions receive the local node's
 origin signature.
 
-Replication statistics and Prometheus counters expose unsigned inputs, unknown
+Replication statistics and exported metrics expose unsigned inputs, unknown
 origins, invalid signatures/identities, mutation digest mismatches and denied
 snapshot sources. Invalid input does not receive applied progress; ordinary
 batch input is dropped, while malformed chunk/snapshot input terminates its
@@ -113,28 +113,21 @@ cannot repair a gap, diagnostics report that a trusted snapshot source is
 required. Local `ApplySnapshotChunk` remains an administrator-authorized import
 API: it does not independently prove transaction origins.
 
-Replication protocol/minimum version are 5, mutation codec version is 3, and
-transaction chunk version is 2. The handshake requires `CapOriginSignatures` and `CapMergePolicies`;
-protocol overrides cannot disable authentication. Legacy peers are rejected;
-there is no unsigned runtime compatibility mode.
+The RIME cutover uses replication protocol/minimum version 6, mutation codec
+version 4, schema manifest encoding 3, and snapshot manifest format 3. The
+handshake requires `CapOriginSignatures` and `CapMergePolicies`; protocol
+overrides cannot disable authentication. Older peers are rejected; there is no
+unsigned runtime compatibility mode.
 
-Fresh stores use persistent format/minimum reader/minimum writer 5. Signed format-4 stores require explicit offline `MigrateMergePolicies`; see [merge policies](merge-policies.md). Ordinary
-open of legacy format 2/3 fails with instructions to call
-`MigrateOriginBaseline(ctx, cfg)` explicitly. Migration must run offline after
-all legacy writers synchronize and a recoverable backup is taken. Drain
-bridge exports that still depend on legacy logs first. The API disables
-replication, recovers a durable legacy prepare record, preserves current
-cells/tombstones, schema, HLC, sequences, watermarks and receipts, and atomically
-publishes a trusted-baseline marker and format 5. It discards unsigned logs,
-incomplete transaction/snapshot staging, and old peer acknowledgments. It never
-signs old foreign transactions. Interrupted migration can be retried with the
-same authorization; no partially upgraded store is exposed to callers.
-
+Fresh stores use persistent format/minimum reader/minimum writer 6. Format-5
+SQL-era stores and earlier legacy formats fail closed without being rewritten.
+There is no in-place SQLite-to-RIME conversion in this release: use the previous
+release to export legacy data, then open a fresh directory with typed Go table
 A same-DBID clone keeps signed history and adopts a fresh signing NodeID/key.
 A new-DBID reseed cannot reuse signatures bound to the source DBID: it preserves
 current state as a trusted baseline and discards the old replication logs.
-Restored legacy backups also require explicit baseline migration before normal
-open. Older binaries must refuse format 5.
+Legacy backups must be exported with the previous release before use. Older
+binaries must refuse format 6.
 
 ## Verification
 

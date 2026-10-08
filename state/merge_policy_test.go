@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/marcgauthier/murmur/codec"
 	"github.com/marcgauthier/murmur/crdt"
 	"github.com/marcgauthier/murmur/ids"
@@ -133,7 +132,7 @@ func TestSignedFormatFourMigrationPreservesHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{sysFormat, sysMinReader, sysMinWriter} {
-		if err = s.db.Set(SysKey(name), encodeU64(4), pebble.Sync); err != nil {
+		if err = s.dbSet(SysKey(name), encodeU64(4), true); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -163,7 +162,7 @@ func TestSignedFormatFourMigrationPreservesHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	format, reader, writer, err := s.FormatInfo()
-	if err != nil || format != 5 || reader != 5 || writer != 5 {
+	if err != nil || format != 6 || reader != 6 || writer != 6 {
 		t.Fatalf("markers %d/%d/%d: %v", format, reader, writer, err)
 	}
 }
@@ -192,7 +191,7 @@ func TestPolicyOwnershipEpochReorderingRetainsHistory(t *testing.T) {
 	for _, sequence := range [][]int{{0, 1, 2}, {1, 0, 2}, {2, 1, 0}, {2, 0, 1}, {1, 2, 0}, {0, 2, 1}} {
 		staged := make(map[string]*remoteGroupCell)
 		var order []string
-		b := s.db.NewBatch()
+		b := s.mem.newBatch()
 		for _, i := range sequence {
 			if err := s.mergeRemoteGroupBatch(b, &codec.MutationBatch{HLC: times[i], OriginNode: node, Mutations: []codec.Mutation{mutations[i]}}, staged, &order); err != nil {
 				t.Fatal(err)

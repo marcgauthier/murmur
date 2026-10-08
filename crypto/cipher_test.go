@@ -17,8 +17,7 @@ func mustHex(t *testing.T, s string) []byte {
 
 // TestPublishedVectors checks every cipher against published test vectors:
 // NIST SP 800-38D cases (as embedded in Go's own AES-GCM suite), RFC 8439
-// A.5, draft-irtf-cfrg-xchacha-01 A.3.1, and the AEGIS draft appendices A.2/A.3
-// (as embedded in the ericlagergren/aegis suite).
+// A.5, draft-irtf-cfrg-xchacha-01 A.3.1.
 func TestPublishedVectors(t *testing.T) {
 	vectors := []struct {
 		name      string
@@ -74,42 +73,6 @@ func TestPublishedVectors(t *testing.T) {
 			aad:       "50515253c0c1c2c3c4c5c6c7",
 			sealed:    "bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b4522f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff921f9664c97637da9768812f615c68b13b52ec0875924c1c7987947deafd8780acf49",
 		},
-		{
-			name:      "AEGIS-128L/A.2.2",
-			alg:       AlgorithmAEGIS128L,
-			key:       "00000000000000000000000000000000",
-			nonce:     "00000000000000000000000000000000",
-			plaintext: "00000000000000000000000000000000",
-			aad:       "",
-			sealed:    "41de9000a7b5e40e2d68bb64d99ebb19f4d997cc9b94227ada4fe4165422b1c8",
-		},
-		{
-			name:      "AEGIS-128L/A.2.3-empty",
-			alg:       AlgorithmAEGIS128L,
-			key:       "00000000000000000000000000000000",
-			nonce:     "00000000000000000000000000000000",
-			plaintext: "",
-			aad:       "",
-			sealed:    "83cc600dc4e3e7e62d4055826174f149",
-		},
-		{
-			name:      "AEGIS-256/A.3.2",
-			alg:       AlgorithmAEGIS256,
-			key:       "0000000000000000000000000000000000000000000000000000000000000000",
-			nonce:     "0000000000000000000000000000000000000000000000000000000000000000",
-			plaintext: "00000000000000000000000000000000",
-			aad:       "",
-			sealed:    "b98f03a947807713d75a4fff9fc277a6478f3b50dc478ef7d5cf2d0f7cc13180",
-		},
-		{
-			name:      "AEGIS-256/A.3.3-empty",
-			alg:       AlgorithmAEGIS256,
-			key:       "0000000000000000000000000000000000000000000000000000000000000000",
-			nonce:     "0000000000000000000000000000000000000000000000000000000000000000",
-			plaintext: "",
-			aad:       "",
-			sealed:    "f7a0878f68bd083e8065354071fc27c3",
-		},
 	}
 	for _, v := range vectors {
 		t.Run(v.name, func(t *testing.T) {
@@ -142,7 +105,6 @@ func TestAlgorithmRoundTrip(t *testing.T) {
 	algs := []AlgorithmID{
 		AlgorithmAES128GCM, AlgorithmAES192GCM, AlgorithmAES256GCM,
 		AlgorithmChaCha20Poly1305, AlgorithmXChaCha20Poly1305,
-		AlgorithmAEGIS128L, AlgorithmAEGIS256,
 	}
 	for _, alg := range algs {
 		t.Run(alg.String(), func(t *testing.T) {
@@ -227,8 +189,4 @@ func TestDeriveSubkey(t *testing.T) {
 	if _, err := DeriveSubkey(make([]byte, 16), AlgorithmAES256GCM, nil, nil); err == nil {
 		t.Fatal("expected master-length error")
 	}
-}
-
-func TestAEGISBackend(t *testing.T) {
-	t.Logf("aegis backend: %s (hw=%v)", AEGISBackend(), AEGISHardwareAccelerated())
 }

@@ -355,7 +355,7 @@ func (fs *fileStore) commit(mutations []codec.Mutation) error {
 	}
 	// Local file writes record High ownership exactly like local SQL
 	// writes, so later Low imports protect High-uploaded files.
-	localPolicy, err := policyMutationsForTx(db, &Tx{txID: batch.TxID}, mutations)
+	localPolicy, err := policyMutationsForTx(db, &policyTx{db: db, txID: batch.TxID}, mutations)
 	if err != nil {
 		return fmt.Errorf("murmur: bridge policy: %w", err)
 	}
@@ -372,9 +372,7 @@ func (fs *fileStore) commit(mutations []codec.Mutation) error {
 	if err != nil {
 		return err
 	}
-	if len(db.remoteRows) == 0 {
-		db.materializedGeneration.Store(gen)
-	}
+	db.materializedGeneration.Store(gen)
 	if repl := db.replManager(); repl != nil {
 		repl.NotifyLocal()
 	}
