@@ -217,7 +217,7 @@ Spool, and makes new typed handles available. Existing table and field IDs,
 types, and merge policies must remain unchanged; drops and incompatible edits
 fail before the manifest changes. Peers with compatible older typed bindings
 can adopt the new manifest and retain fields they do not know. Operational
-feature ports remain incomplete. See [the migration plan](../MIGRATION_PLAN.md)
+feature ports remain incomplete. See [the migration plan](migration-plan.md)
 for the cutover gates.
 
 `SpoolConfig` is required; use `DefaultSpoolConfig()` for standard settings. `Config.Path` is the database directory. Expose block/segment sizing, worker concurrency, pending-memory bounds, compaction, and compression. Validate settings before opening Spool. Encryption keys come from `Encryption.Key` or `Encryption.Provider`; never weaken the replication acknowledgement or durability contract through storage options.

@@ -73,12 +73,12 @@ Implementation defaults chosen by this plan:
 
 Before cutover, Murmur used a shared in-memory SQLite instance to execute SQL,
 capture writes and materialize durable winners. That engine, capture path and
-driver have been removed. The current [commit coordinator](db.go) prepares
+driver have been removed. The current [commit coordinator](../db.go) prepares
 managed typed writes, commits them to Spool, then publishes through RIME;
-durable receive uses the same native materializer. [Schema manifests](schema/manifest.go)
+durable receive uses the same native materializer. [Schema manifests](../schema/manifest.go)
 retain stable identifiers, ancestry and schema identities.
 
-[RIME](rime/ARCHITECTURE.md) provides native record storage, sharded lookups,
+[RIME](../rime/ARCHITECTURE.md) provides native record storage, sharded lookups,
 MVCC, hash/ordered/prefix/compound indexes, typed filters, scans, aggregates,
 joins, staged query overlays, deep ownership for exported mutable fields,
 explicit `Optional[T]` presence, and explicit write transactions. It now exposes
@@ -98,7 +98,7 @@ query materializer. Remaining SQL references in `tests-live/` are limited to
 removed-endpoint rejection tests and the previous-release compatibility fixture;
 they are not a supported current-runtime mode.
 
-[Spool](spool/README.md), the authoritative state layer, CRDT/version comparison,
+[Spool](../spool/README.md), the authoritative state layer, CRDT/version comparison,
 QUIC transport, origin signatures and replication scheduling remain foundations.
 The state layer currently retains its own memory index; migration must measure
 that memory in addition to RIME rather than claiming one in-memory copy.
@@ -171,7 +171,7 @@ first release to avoid ambiguous recovery semantics.
 ## 4. Record schema, encoding and evolution
 
 Implementation status for this milestone is tracked in
-[the RIME migration schema document](architecture/rime-migration-schema.md).
+[the RIME migration schema document](rime-migration-schema.md).
 
 ### 4.1. Rich Go types and canonical encoding
 
@@ -412,7 +412,7 @@ may coexist, but there is no released dual-engine product or SQL fallback.
 | 7. Performance and release | Profile scans/mutations/rebuild/replication, apply independent optimizations and publish resource limits | Fixed-host performance cells and full live qualification pass; release notes describe breaking API/format changes |
 
 Phase 0 version allocation is recorded in
-[`internal/migrationcontract/versions.go`](internal/migrationcontract/versions.go):
+[`internal/migrationcontract/versions.go`](../internal/migrationcontract/versions.go):
 store format 6, replication protocol 6, mutation codec 4, schema manifest
 encoding 3, snapshot manifest 3, and record-value encoding 1. Runtime constants
 now use format 6, replication protocol 6, mutation codec 4 and snapshot
@@ -438,8 +438,8 @@ Recent verification on the current worktree:
 - `CGO_ENABLED=0 GOMAXPROCS=1 go test -p 1 ./internal/rimeadapter -run '^TestFailedSpoolAppendReturnsUncertainOutcome$' -count=1 -timeout=2m` — passed. The Murmur adapter fault-injection test rejects publication after an append failure, returns a transaction-scoped uncertain receipt, and keeps subsequent managed writes failed closed.
 - `CGO_ENABLED=0 GOMAXPROCS=1 MURMUR_LIVE_RUNTIME=/tmp/murmur-migration-delete-pruning-20261008 bash tests-live/run.sh delete-pruning` — passed in 30.6s after the tombstone-resurrection fix; three nodes converged across concurrent delete/update/resurrection, and GC collected 770 log batches.
 - `CGO_ENABLED=0 go test -p 1 . -count=1` — passed.
-- Five sequential process-isolated runs of `CGO_ENABLED=0 GOMAXPROCS=1 MURMUR_PERF_TIER=standard MURMUR_PERF_ONLY=store go test -run '^TestPerfMatrix$' -count=1 -timeout=5m .` from `tests-benchmark/benchmark` — passed; each run measured the 100K Murmur local-store cells without starting testnodes. Medians and observed ranges are in [the characterization matrix](architecture/benchmarks.md#current-typed-store-characterization-2026-10-08).
-- Five sequential process-isolated runs of `CGO_ENABLED=0 GOMAXPROCS=1 MURMUR_PERF_TIER=standard MURMUR_PERF_ONLY=tx go test -run '^TestPerfMatrix$' -count=1 -timeout=5m .` from `tests-benchmark/benchmark` — passed; each run measured 100K-record Murmur insert batches of 1, 10, 100 and 1,000 without starting testnodes. Medians and observed ranges are in [the characterization matrix](architecture/benchmarks.md#current-typed-store-characterization-2026-10-08).
+- Five sequential process-isolated runs of `CGO_ENABLED=0 GOMAXPROCS=1 MURMUR_PERF_TIER=standard MURMUR_PERF_ONLY=store go test -run '^TestPerfMatrix$' -count=1 -timeout=5m .` from `tests-benchmark/benchmark` — passed; each run measured the 100K Murmur local-store cells without starting testnodes. Medians and observed ranges are in [the characterization matrix](benchmarks.md#current-typed-store-characterization-2026-10-08).
+- Five sequential process-isolated runs of `CGO_ENABLED=0 GOMAXPROCS=1 MURMUR_PERF_TIER=standard MURMUR_PERF_ONLY=tx go test -run '^TestPerfMatrix$' -count=1 -timeout=5m .` from `tests-benchmark/benchmark` — passed; each run measured 100K-record Murmur insert batches of 1, 10, 100 and 1,000 without starting testnodes. Medians and observed ranges are in [the characterization matrix](benchmarks.md#current-typed-store-characterization-2026-10-08).
 - `CGO_ENABLED=0 go test -p 1 . -run '^TestGroupCommit' -count=1 -timeout=2m` — passed.
 - `CGO_ENABLED=0 GOMAXPROCS=1 go test -p 1 ./spool -count=1 -timeout=3m` — passed after bounding the key-rotation/prune stress fixture; its focused rerun exercised 745 seals, 262 rotations and 282 prunes in 3.1 seconds, then reopened and verified the store.
 - `CGO_ENABLED=0 GOMAXPROCS=1 go test -run '^$' -p 1 ./... -count=1` — passed (all root-module packages, examples and live tests compile; tests were not executed).
@@ -512,7 +512,7 @@ below are required during implementation, when validation execution is requested
 - **Operations:** live four-reader/four-writer workloads with GC/pinned snapshots,
   bridge retries, file transfers, rotations, disk-full handling, subscriptions,
   peer retirement, retention, shutdown and cancellation. Preserve relevant
-  [existing live rehearsals](tests-live/README.md).
+  [existing live rehearsals](../tests-live/README.md).
 
 Run relevant package/model tests per milestone, `go test -race ./...`, `go vet
 ./...`, and the applicable live suites. At SQLite removal, `CGO_ENABLED=0 go test
@@ -526,7 +526,7 @@ disjoint/hot keys, raw scans, filtered scans, aggregates, joins, restart rebuild
 and remote catch-up. Keep in-memory-only RIME, async persistence and synchronous
 persistence results separate. SQLite measurements are historical references,
 not required application semantics. Use medians of at least five fixed-host runs
-and capture profiles separately, following [benchmark methodology](architecture/rime-benchmarks.md).
+and capture profiles separately, following [benchmark methodology](rime-benchmarks.md).
 
 Report successful records/s, retries, read/commit p50/p95/p99, bytes/allocations
 per operation, total retained heap, disk bytes and replication bandwidth. Use a
@@ -557,10 +557,10 @@ Update topic documents for transactions, schemas, storage, queries, replication,
 conflict resolution, subscriptions, security and operational recovery as their
 implementations land. Rewrite the root README around the new Go API only at
 cutover; before then keep a clearly marked target-design link. Maintain
-[RIME architecture](rime/ARCHITECTURE.md), the
-[architecture index](architecture/README.md) and the vendor inventory. No new
+[RIME architecture](../rime/ARCHITECTURE.md), the
+[architecture index](README.md) and the vendor inventory. No new
 external dependency is required by this plan. If one is introduced later, document
-its version, maintainer, origin, license and purpose in [VENDORS.md](VENDORS.md).
+its version, maintainer, origin, license and purpose in [VENDORS.md](../VENDORS.md).
 
 Migration is complete when applications use Murmur's managed RIME API, all durable
 writes go through Spool, masterless peers converge under live faults, restart

@@ -73,7 +73,7 @@ encrypted file-object transfer with High-local re-encryption (proven by
 ## Delivery order
 
 The implementation order below is complete; remaining release qualification is
-tracked in the [migration plan](../MIGRATION_PLAN.md#8-implementation-milestones)
+tracked in the [migration plan](migration-plan.md#8-implementation-milestones)
 and [release inventory](release-status.md#1-verified-feature-matrix).
 
 1. Snapshot generation publication, restore policy cleanup/reseed, bounded
@@ -92,7 +92,7 @@ and [release inventory](release-status.md#1-verified-feature-matrix).
    library API; callers provide explicit `RowID` primary keys.
 5. Remaining work: long-duration impaired-network and multi-hour soak
    acceptance, plus the storage-fault and replication-interleaving gates in
-   `MIGRATION_PLAN.md`.
+   `migration-plan.md`.
 
 Update the [TODO list](../TODO.md) and project status only when the
 corresponding implementation and acceptance checks exist.

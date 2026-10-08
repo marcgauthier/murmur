@@ -12,7 +12,7 @@ Search, write/replication, and startup performance scenarios.
 > Current managed-database workloads live in the nested
 > [`tests-benchmark/benchmark`](../tests-benchmark/README.md) module. Fixed-host
 > rich-record acceptance remains pending under Phase 7 of the
-> [migration plan](../MIGRATION_PLAN.md#8-implementation-milestones).
+> [migration plan](migration-plan.md#8-implementation-milestones).
 
 ## Contents
 

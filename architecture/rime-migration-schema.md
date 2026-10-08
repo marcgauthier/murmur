@@ -1,7 +1,7 @@
 # RIME migration schema and codec
 
 This document tracks the implementation state of the rich Go record schema
-described in [the migration plan](../MIGRATION_PLAN.md#4-record-schema-encoding-and-evolution).
+described in [the migration plan](migration-plan.md#4-record-schema-encoding-and-evolution).
 The production cutover has removed the legacy SQL engine. The typed facade
 provides
 available through `Define[T]`, `Config.Tables`, `TableOf[T]`, and
@@ -131,4 +131,4 @@ descriptors still fail closed.
 
 Sources: [descriptor.go](../internal/recordcodec/descriptor.go),
 [RIME presence types](../rime/optional.go), and
-[the migration plan](../MIGRATION_PLAN.md#4-record-schema-encoding-and-evolution).
+[the migration plan](migration-plan.md#4-record-schema-encoding-and-evolution).

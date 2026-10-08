@@ -31,7 +31,7 @@ Typed RIME peers reconcile remote tombstones idempotently, including when a
 delete arrives before the corresponding row. The SQLite engine, SQL application API, driver dependency, and CGO build tags
 have been removed from the production module. RIME is the only managed query
 materializer and Spool is authoritative. Migration qualification remains in
-progress; see [the migration plan](MIGRATION_PLAN.md#8-implementation-milestones)
+progress; see [the migration plan](architecture/migration-plan.md#8-implementation-milestones)
 for the remaining fault, replication, and release gates. The breaking API and
 format changes are listed in [release notes](RELEASE_NOTES.md).
 
@@ -86,7 +86,7 @@ See [RIME's usage reference](rime/USAGE.md) for its current Go syntax and
 [architecture](rime/ARCHITECTURE.md) for storage, snapshots, indexes and
 reader/writer coordination.
 
-The [migration plan](MIGRATION_PLAN.md) records the remaining release
+The [migration plan](architecture/migration-plan.md) records the remaining release
 qualification for the managed RIME API. Applications define tables with
 `Define[T]`, provide them through `Config.Tables`, and access them with
 `TableOf[T]`. `WriteTxContext` and explicit `BeginTx` transactions persist
@@ -97,7 +97,7 @@ node-local durable tables, and ephemeral tables. Remote winners rebuild into
 RIME without echo. For ambiguous durable failures,
 `CommitOutcomeUncertainError` exposes the transaction ID and
 `HasTransactionReceipt` resolves it after reopen. The remaining migration gates
-are listed in [MIGRATION_PLAN.md](MIGRATION_PLAN.md).
+are listed in [the migration plan](architecture/migration-plan.md).
 `DB.GC(ctx)` runs a context-bounded replication log and receipt collection pass
 using persisted peer acknowledgements and retention limits.
 Remote materialization streams affected rows from one authoritative snapshot
@@ -120,7 +120,7 @@ source receipts through Spool before RIME publication. The live
 Bridge row imports now require managed typed tables; the legacy SQL import
 transaction has been removed.
 See the
-[migration status](MIGRATION_PLAN.md).
+[migration status](architecture/migration-plan.md).
 
 ## Quick start
 
@@ -453,7 +453,7 @@ The Murmur root suite passes with CGO disabled, and bounded five-node combined
 fault and three-node maintenance-under-load scenarios have passed. Release
 qualification is still in progress: extended soaks and broader performance
 measurements remain, and this host cannot run privileged tmpfs ENOSPC or
-`tc/netem` impairment checks. See [the migration plan](MIGRATION_PLAN.md) for
+`tc/netem` impairment checks. See [the migration plan](architecture/migration-plan.md) for
 the gate-by-gate record.
 Snapshot source retention leases and bootstrap-configured SWIM runtime wiring
 exist. Remaining acceptance includes source-lease safety through receiver tail

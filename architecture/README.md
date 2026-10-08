@@ -50,7 +50,7 @@ soaks remain. The query materialization is in-memory only.
 | [Runtime and diagnostics](runtime-and-diagnostics.md) | Lifecycle, startup progress, workers, metrics, concurrency, and optional service adapter. | 45, 46, 52, 53, 54, 62, 63, 64 |
 | [Query and search](query-and-search.md) | Indexes, FTS, prepared statements, and reactive query subscriptions. | 23, 24, 65 |
 | [RIME in-memory engine](rime.md) | Package overview, API guide, scope, concurrency limits and implementation/qualification references. | New topic |
-| [Murmur migration plan](../MIGRATION_PLAN.md) | In-progress replacement of SQLite/SQL with RIME, rich Go records, Spool persistence and masterless replication; breaking API/format changes and qualification gates. | New topic |
+| [Murmur migration plan](migration-plan.md) | SQLite-to-RIME implementation milestones, cutover contract, and outstanding release qualification gates. | New topic |
 | [Release notes](../RELEASE_NOTES.md) | Breaking typed API, storage/protocol format changes, legacy export requirements, and qualification status. | New topic |
 | [RIME migration schema](rime-migration-schema.md) | Recursive descriptor compiler, canonical record codec, and typed facade/adapter migration status. | New topic |
 | [RIME detailed architecture](../rime/ARCHITECTURE.md) | Implemented storage, snapshots, commit paths, locks, index structures, query execution, maintained views, hooks, GC and performance tradeoffs. | New topic |

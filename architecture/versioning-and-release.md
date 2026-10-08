@@ -49,7 +49,7 @@ Require a new replication transport protocol version for shared membership/repli
 
 Version the new range/chunk and Plumtree message formats, schema ancestry, snapshot manifest/generation publication, and restore identity metadata. Negotiate required capabilities before starting transfers; an old peer must not interpret observed heads or staging receipts as applied watermarks. Preserve transaction identities across chunking and existing HLC/LWW semantics. Range/chunk transfer, Plumtree, snapshot publication, and restore metadata have implementations; their evidence and acceptance limits are recorded in [release status](release-status.md#1-verified-feature-matrix).
 
-The RIME cutover uses store format/minimum reader/minimum writer 6, replication protocol/minimum protocol 6, mutation codec 4, schema manifest encoding 3, and snapshot manifest format 3. Protocol 6 requires origin signatures and merge-policy capabilities. Format-5 SQL-era stores fail closed without rewrite; applications start from a fresh directory. See [origin signatures](origin-signatures.md) and the [migration plan](../MIGRATION_PLAN.md).
+The RIME cutover uses store format/minimum reader/minimum writer 6, replication protocol/minimum protocol 6, mutation codec 4, schema manifest encoding 3, and snapshot manifest format 3. Protocol 6 requires origin signatures and merge-policy capabilities. Format-5 SQL-era stores fail closed without rewrite; applications start from a fresh directory. See [origin signatures](origin-signatures.md) and the [migration plan](migration-plan.md).
 
 The breaking API and format changes are summarized in the project
 [release notes](../RELEASE_NOTES.md). They describe typed-table adoption,

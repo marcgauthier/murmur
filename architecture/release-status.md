@@ -6,7 +6,7 @@ against a specific revision are separate claims.
 
 [Architecture index](README.md) · [Project README](../README.md) ·
 [Versioning and release](versioning-and-release.md) ·
-[Migration plan](../MIGRATION_PLAN.md)
+[Migration plan](migration-plan.md)
 
 The status below was reconciled against the current worktree on 2026-10-08.
 No release tag or clean candidate revision is claimed.
@@ -64,7 +64,7 @@ example.
 The SQL application API and SQLite runtime have been removed. Format-5 SQL-era
 stores fail closed without being rewritten; use the previous release to export
 legacy data and start this release with a fresh directory. Protocol-5 peers are
-not compatible with protocol 6. See [the migration plan](../MIGRATION_PLAN.md)
+not compatible with protocol 6. See [the migration plan](migration-plan.md)
 for the breaking changes and remaining qualification gates.
 
 ## 4. Verification record

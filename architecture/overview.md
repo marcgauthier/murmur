@@ -88,7 +88,7 @@ Application: Go records and typed queries
 ```
 
 The migration's remaining release gates are recorded in
-[the migration plan](../MIGRATION_PLAN.md),
+[the migration plan](migration-plan.md),
 [capability gaps](capability-gaps.md), and
 [release status](release-status.md). They include broader storage-fault,
 delivery-permutation/live soak

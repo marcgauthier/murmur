@@ -31,6 +31,6 @@ isolated under `tests-benchmark/` and excluded from production builds.
 The sequential live release gate and the Murmur root test suite passed on the
 current worktree. The all-package suite, scheduled long-duration soaks, and
 fixed-host rich-record performance acceptance remain pending; this note does
-not represent a final release approval. See the [migration plan](MIGRATION_PLAN.md)
+not represent a final release approval. See the [migration plan](architecture/migration-plan.md)
 and [release status](architecture/release-status.md) for current evidence and
 remaining gates.
