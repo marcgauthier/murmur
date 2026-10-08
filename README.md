@@ -449,6 +449,12 @@ acceptance requirements.
 
 The [release inventory and verification record](architecture/release-status.md)
 separates implementation, available tests, and historical execution results.
+The Murmur root suite passes with CGO disabled, and bounded five-node combined
+fault and three-node maintenance-under-load scenarios have passed. Release
+qualification is still in progress: extended soaks and broader performance
+measurements remain, and this host cannot run privileged tmpfs ENOSPC or
+`tc/netem` impairment checks. See [the migration plan](MIGRATION_PLAN.md) for
+the gate-by-gate record.
 Snapshot source retention leases and bootstrap-configured SWIM runtime wiring
 exist. Remaining acceptance includes source-lease safety through receiver tail
 catch-up, actual seed-only discovery, and multi-hour/impaired-network soaks.

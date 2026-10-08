@@ -380,6 +380,118 @@ func TestApplyRemoteTombstoneRemovesTypedRow(t *testing.T) {
 	}
 }
 
+func TestLocalUpdateAfterConcurrentTombstoneKeepsPrimaryFieldForRebuild(t *testing.T) {
+	ctx := context.Background()
+	node := ids.NewNodeID()
+	private := testidentity.Key(node)
+	opts := recordcodec.CompileOptions{TableID: 81, PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Name": 2}}
+	record, err := recordcodec.Compile(reflectType[adapterRecord](), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desc, err := recordcodec.MarshalDescriptor(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := schema.NewGenesis([]schema.TableSchema{{
+		ID: 81, Name: "records", PK: 1, RecordDescriptor: desc,
+		Columns: []schema.ColumnSchema{
+			{ID: 1, Name: "id", Type: schema.ColBlob, MergePolicy: schema.LWW},
+			{ID: 2, Name: "name", Type: schema.ColBlob, MergePolicy: schema.LWW},
+		},
+	}}, 1, node, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storePath := t.TempDir()
+	storeOptions := state.Options{
+		OriginSigning: testidentity.Config(node), Limits: codec.DefaultLimits(),
+		Spool: spool.Options{Encryption: spool.EncryptionAES256GCM, MasterKey: private[:32]},
+	}
+	store, err := state.Open(storePath, node, testidentity.DBID, storeOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if store != nil {
+			_ = store.Close()
+		}
+	})
+	if err := store.StoreSchemaRevision(manifest); err != nil {
+		t.Fatal(err)
+	}
+	rdb := rime.New()
+	defer rdb.Close()
+	a, err := New(store, rdb, manifest, nil, recordcodec.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	table, err := Register[adapterRecord](a, "records", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := &adapterRecord{ID: ids.NewRowID(), Name: "before tombstone"}
+	if err := a.Write(ctx, func(tx *Tx) error { return table.Insert(tx, row) }); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the race where durable state receives a remote tombstone while
+	// the local RIME materialization still contains the row being updated.
+	remote := ids.NewNodeID()
+	epoch, hash, err := store.SchemaEpoch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tombstone := &codec.MutationBatch{
+		DBID: store.DBID(), OriginNode: remote, Sequence: 1, TxID: ids.NewTxID(),
+		HLC: store.ClockNow() + 10, SchemaEpoch: epoch, SchemaHash: hash,
+		Mutations: []codec.Mutation{{Policy: schema.LWW, TableID: 81, RowID: row.ID, ColumnID: codec.ColumnTombstone, Flags: codec.FlagTombstone}},
+	}
+	if _, err := store.CommitRemote(ctx, testidentity.Sign(tombstone, store.DBID())); err != nil {
+		t.Fatalf("commit concurrent remote tombstone: %v", err)
+	}
+	updated := &adapterRecord{ID: row.ID, Name: "resurrected after tombstone"}
+	if err := a.Write(ctx, func(tx *Tx) error { return table.Upsert(tx, updated) }); err != nil {
+		t.Fatalf("local resurrection update: %v", err)
+	}
+
+	rows, err := store.GetRows([]state.RowRef{{Table: 81, ID: row.ID}})
+	if err != nil || len(rows) != 1 || !rows[0].Visible() {
+		t.Fatalf("resurrected authoritative row = %#v, %v", rows, err)
+	}
+	if _, ok := rows[0].Cells[1]; !ok {
+		t.Fatal("resurrected durable row lost its primary-key field")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close durable store before reopen: %v", err)
+	}
+	store = nil
+	store, err = state.Open(storePath, node, testidentity.DBID, storeOptions)
+	if err != nil {
+		t.Fatalf("reopen durable store after tombstone resurrection: %v", err)
+	}
+
+	// Startup rebuild must be able to recover the resurrected row from only
+	// the re-opened encrypted store, including its immutable identity.
+	rebuiltDB := rime.New()
+	defer rebuiltDB.Close()
+	rebuiltAdapter, err := New(store, rebuiltDB, manifest, nil, recordcodec.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebuiltTable, err := Register[adapterRecord](rebuiltAdapter, "records", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rebuiltAdapter.Rebuild(ctx, 16); err != nil {
+		t.Fatalf("rebuild after tombstone resurrection: %v", err)
+	}
+	got, err := rebuiltTable.inner.Get(row.ID)
+	if err != nil || got.Name != updated.Name {
+		t.Fatalf("rebuilt resurrected row = %#v, %v", got, err)
+	}
+}
+
 func TestApplyRemoteStreamsRowsBeyondBulkReadLimit(t *testing.T) {
 	ctx := context.Background()
 	node := ids.NewNodeID()

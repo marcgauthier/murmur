@@ -382,7 +382,7 @@ func registerTable[T any](a *Adapter, tableName string, ts *schema.TableSchema, 
 		}
 		key, err := primaryID(record, &value)
 		if err != nil || key != expected {
-			return fmt.Errorf("%w: encoded primary key does not match row identity", ErrSchemaMismatch)
+			return fmt.Errorf("%w: encoded primary key %s does not match row identity %s (table %s, decode error %v)", ErrSchemaMismatch, key, expected, tableName, err)
 		}
 		return inner.In(tx).Upsert(&value)
 	}
@@ -1615,7 +1615,11 @@ func (a *Adapter) batchAll(changes []rime.PreparedChange, counterOps []counterDe
 				if err != nil {
 					return nil, err
 				}
-				if equal {
+				// A newer update can resurrect a row after a concurrent
+				// tombstone. Re-emit its immutable identity so the durable
+				// row remains self-describing even when older cells are
+				// hidden by that tombstone during merge/rebuild.
+				if equal && field.ID != bound.record.PrimaryID {
 					continue
 				}
 			}

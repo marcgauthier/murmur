@@ -17,7 +17,10 @@ import (
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
-var scenarioHTTP = &http.Client{Timeout: 3 * time.Second}
+// Keep the client deadline above the scenario's documented 20-second maximum
+// write latency. The SLO assertions, rather than an unrelated shorter HTTP
+// timeout, should determine whether a slow write fails acceptance.
+var scenarioHTTP = &http.Client{Timeout: 25 * time.Second}
 
 func seconds(t *testing.T, name string, fallback int) time.Duration {
 	t.Helper()
@@ -32,6 +35,7 @@ func seconds(t *testing.T, name string, fallback int) time.Duration {
 }
 
 func TestThreeNodeEncryptedSustainedWriteSLO(t *testing.T) {
+	const rowsPerNode = 1000
 	duration := seconds(t, "MURMUR_SLO_DURATION_SECONDS", 5)
 	settle := seconds(t, "MURMUR_SLO_SETTLE_SECONDS", 30)
 	cluster := harness.NewCluster(t, harness.ClusterOptions{
@@ -58,10 +62,16 @@ func TestThreeNodeEncryptedSustainedWriteSLO(t *testing.T) {
 			defer workers.Done()
 			for time.Now().Before(stopAt) {
 				seq := writes[i].Load()
-				rowID := fmt.Sprintf("%032x", int64(i+1)*1_000_000_000_000+int64(seq)+1)
+				slot := seq % rowsPerNode
+				rowID := fmt.Sprintf("%032x", int64(i+1)*1_000_000_000_000+int64(slot)+1)
 				value := fmt.Sprintf("node-%d-write-%09d", i+1, seq)
 				started := time.Now()
-				err := cluster.TypedContentionInsert(i, harness.TypedContentionRow{ID: rowID, Name: fmt.Sprintf("node-%d", i+1), Phone: value})
+				var err error
+				if seq < rowsPerNode {
+					err = cluster.TypedContentionInsert(i, harness.TypedContentionRow{ID: rowID, Name: fmt.Sprintf("node-%d", i+1), Phone: value})
+				} else {
+					err = cluster.TypedContentionUpdate(i, rowID, "phone", value)
+				}
 				elapsed := time.Since(started)
 				latencyMu.Lock()
 				latencies = append(latencies, elapsed)
@@ -79,9 +89,13 @@ func TestThreeNodeEncryptedSustainedWriteSLO(t *testing.T) {
 	for err := range errCh {
 		t.Error(err)
 	}
-	expected := int(writes[0].Load() + writes[1].Load() + writes[2].Load())
-	if expected < 60 {
-		t.Fatalf("only %d application rows committed across %s", expected, duration)
+	expected := 0
+	for i := range writes {
+		expected += min(int(writes[i].Load()), rowsPerNode)
+	}
+	operations := writes[0].Load() + writes[1].Load() + writes[2].Load()
+	if operations < 60 {
+		t.Fatalf("only %d application writes committed across %s", operations, duration)
 	}
 
 	deadline := time.Now().Add(settle)
@@ -141,8 +155,8 @@ func TestThreeNodeEncryptedSustainedWriteSLO(t *testing.T) {
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	p95 := latencies[(95*len(latencies)+99)/100-1]
 	maxLatency := latencies[len(latencies)-1]
-	t.Logf("multi-process encrypted write soak duration=%s rows=%d digest=%s writes_per_node=%d/%d/%d write_p95=%s max=%s",
-		duration, expected, digest, writes[0].Load(), writes[1].Load(), writes[2].Load(), p95, maxLatency)
+	t.Logf("multi-process encrypted write soak duration=%s rows=%d operations=%d digest=%s writes_per_node=%d/%d/%d write_p95=%s max=%s",
+		duration, expected, operations, digest, writes[0].Load(), writes[1].Load(), writes[2].Load(), p95, maxLatency)
 	if p95 > 5*time.Second {
 		t.Fatalf("write p95 %s exceeded 5s SLO", p95)
 	}

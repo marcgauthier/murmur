@@ -203,10 +203,12 @@ LWW cell winner and ordered logical-state digest. Run it with
 The `tests-live/long-running-five-node/` scenario keeps five encrypted daemon
 processes writing over a full mesh, restarts two node directories during load,
 and verifies retained rows, common logical-state digests, materialized
-generations, and persistent-store capacity. Its smoke run is 30 seconds; use
-`MURMUR_FIVE_NODE_DURATION_SECONDS=3600
-MURMUR_FIVE_NODE_SETTLE_SECONDS=300 go test -count=1 -timeout=75m
-./tests-live/long-running-five-node` for the one-hour acceptance profile.
+generations, and persistent-store capacity. Its smoke run is 30 seconds. The
+one-hour profile passed on 2026-10-08 with 72,925 acknowledged writes, two
+successful persistence restarts, and a converged five-node digest. The test
+harness gives a single unlock request up to 60 seconds because reopening an
+existing store can outlast the ordinary live-request timeout. See the
+[five-node soak record](../tests-live/long-running-five-node/README.md).
 
 The four-node partition smoke test at `tests-live/partition/` splits a full
 mesh into two pairs, verifies writes stay isolated, heals the mesh, compares
@@ -438,6 +440,9 @@ thirds under aggressive log retention. A log-GC pass is forced
 mid-flight and all nodes must converge on exact counts plus equal
 PK-ordered digests. Run it with
 `go test -count=1 ./tests-live/delete-pruning`.
+Post-fix Murmur qualification passed on 2026-10-08 in 30.6s with 300 rows:
+all three daemons converged after concurrent delete/update/resurrection, and
+GC collected 770 log batches.
 
 The `tests-live/tail-repair/` scenario partitions one node during a
 peer write burst, proves the isolation (frozen count, zero snapshots
@@ -661,6 +666,14 @@ post-chaos write. Run it with
 `go test -count=1 ./tests-live/endurance-chaos` (short runs fit the
 default timeout; 24h/72h profiles need `-timeout=26h`/`-timeout=76h`).
 
+Migration qualification on 2026-10-08: the fixed five-node, 10-minute
+run passed with 20,913 acknowledged writes and exact convergence. It
+observed five restarts, three key rotations, seven logical peer flaps,
+four disk-pressure holds, two snapshot resyncs, and GC on every node.
+The host lacked `CAP_NET_ADMIN` and libfaketime; packet shaping therefore
+degraded to logical peer flaps and clock skew was skipped. A privileged
+impaired-network run and 24–72 hour acceptance remain outstanding.
+
 Invariant:
 
 ```text
@@ -729,9 +742,11 @@ Implemented acceptance coverage: `replication.TestPeerScalingCapsAcrossChurn` si
 
 ### Recovery, dissemination, and overload acceptance
 
+- `internal/rimeadapter.TestFailedSpoolAppendReturnsUncertainOutcome` injects a Murmur durable-append failure and checks the managed transaction returns an uncertain receipt, publishes nothing to the materializer, and fails subsequent managed writes closed.
 - Supply the same origin out of order from several peers; retain missing ranges across restart, switch repair sources, and never acknowledge observed/staged heads as applied progress. Exercise unavailable retained history and snapshot fallback.
 - Transfer a transaction larger than a frame using chunks; interrupt/restart, duplicate chunks across peers, inject conflicting digests/indexes, and verify durable contiguous acknowledgement followed by atomic RIME publication. Reject a local transaction above `MaxTransactionBytes` before success and enforce decompression/reassembly limits.
 - Recover an offline node whose acknowledged insert/update/delete was never propagated. A peer snapshot must preserve its winning cells/tombstones and valid local sequence, while legitimately newer competing versions may win. Test source writes after the snapshot cut, candidate publication crashes, cancellation, and schema incompatibility.
+- `internal/rimeadapter.TestLocalUpdateAfterConcurrentTombstoneKeepsPrimaryFieldForRebuild` places a remote tombstone in durable state while the local materializer still holds the row, performs a local resurrection update, closes and reopens the encrypted store, and rebuilds a fresh materializer. It verifies the immutable primary field is republished with the update so the resurrected row remains decodable after restart.
 - Restore an older backup under its original identity and verify writable startup is rejected. Restore with a fresh identity/certificate and repair with the existing DBID; reseed a cluster with a new DBID and verify old nodes are isolated. Verify historical origin identities are preserved and source acknowledgement/retirement state is not inherited.
 - Merge independent compatible schema additions with equal and unequal epochs in different orders; repeat exchanges without epoch churn. Reject same-column type/default/nullability conflicts and identity collisions, preserve local additions, and leave mutation watermarks unchanged under strict policy or conflict.
 - The standalone `plumtree` state machine tests bounded eager/lazy selection, forwarding, duplicate pruning, GRAFT cache replies, conflicting identities, and cache/neighbor limits. After replication-manager integration, also test `IHAVE` delay scheduling, protected ring neighbors, payload-log fallback, partition repair, incompatible-mode rejection, and compare payload bytes/duplicates against default gossip without relaxing session/connection caps.

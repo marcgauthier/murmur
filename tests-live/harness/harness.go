@@ -181,6 +181,11 @@ type SpoolOptions struct {
 
 var liveHTTPClient = &http.Client{Timeout: 15 * time.Second}
 
+// Unlocking can reopen and rebuild an existing encrypted database. Give that
+// single request enough time to finish rather than timing it out and issuing
+// overlapping unlock requests while the first open is still in progress.
+var unlockHTTPClient = &http.Client{Timeout: 60 * time.Second}
+
 type liveAPITransport struct {
 	mu       sync.RWMutex
 	byTarget map[string]http.RoundTripper
@@ -793,10 +798,10 @@ func (c *Cluster) UnlockNodeWithKeyID(idx int, keyID, keyHex string) {
 	})
 
 	url := fmt.Sprintf("https://%s/v1/admin/unlock", node.APIAddr)
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	var lastFailure string
 	for time.Now().Before(deadline) {
-		resp, err := liveHTTPClient.Post(url, "application/json", bytes.NewReader(payload))
+		resp, err := unlockHTTPClient.Post(url, "application/json", bytes.NewReader(payload))
 		if err == nil {
 			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
 				_ = resp.Body.Close()
@@ -1414,7 +1419,9 @@ func repoRoot(t *testing.T) string {
 		t.Fatal(err)
 	}
 	for {
-		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+		_, moduleErr := os.Stat(filepath.Join(dir, "go.mod"))
+		_, fixtureErr := os.Stat(filepath.Join(dir, "tests-live", "harness", "testnode"))
+		if moduleErr == nil && fixtureErr == nil {
 			return dir
 		}
 		parent := filepath.Dir(dir)

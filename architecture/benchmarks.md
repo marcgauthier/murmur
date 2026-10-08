@@ -672,6 +672,21 @@ had substantial run variance. This local storage/read/update characterization
 does not close the full fixed-host write-mix matrix, live-network performance,
 soak, or storage/interleaving release gates.
 
+### Exploratory live replication matrix (2026-10-08)
+
+One sequential standard-tier Murmur live matrix passed with `GOMAXPROCS=1`
+and no CGO. The 2,000-row mesh blast measured 204 rows/s at one node,
+234 rows/s at two nodes, and 111 rows/s at five nodes. Sampled full-mesh
+visibility p95 was 6.1 ms, 461 ms, and 883 ms respectively. Two-node
+reconnect measured 977 rows/s for a 1,000-row backlog and 2,076 rows/s for a
+10,000-row backlog; neither backlog crossed the snapshot threshold. A separate
+Go test workload was active on the host during this run, so these single-run
+measurements are exploratory and are not fixed-host acceptance evidence.
+The smoke mesh/reconnect run also passed (two nodes, 2,000-row mesh at
+133 rows/s and a 1,000-row backlog at 2,103 rows/s). Repeatable, quiet-host
+samples, impaired-network cells and larger reconnect/snapshot backlogs remain
+necessary to close the live performance gate.
+
 The same five-process procedure also ran the 100K synchronous insert-batch
 cells (one Spool commit per transaction):
 

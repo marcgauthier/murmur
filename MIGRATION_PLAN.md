@@ -20,7 +20,13 @@ storage-fault qualification, delivery-permutation and remote-interleaving
 qualification, long-duration impaired-network/live soak runs, and reproducible
 rich-record performance measurements. Exact before/after schema-manifest-store
 crash recovery with two surviving peers and the sequential live release gate
-have passed.
+have passed. The fixed 10-minute, five-node endurance-chaos run also passed on
+2026-10-08 after fixing primary-key field replay during tombstone resurrection:
+20,913 writes were acknowledged, all five nodes converged, GC and snapshot
+resync were observed, and restart, rotation, logical-link-flap, and disk-pressure
+faults ran. Packet shaping and clock skew were unavailable on this host, so the
+scenario reported those two legs as degraded/skipped; privileged impaired-link
+and extended-duration acceptance remain pending.
 Current-version live fixtures use managed typed operations, with SQL requests
 retained only in explicit endpoint-rejection tests; the release-upgrade fixture
 uses SQL solely to seed the pinned previous-release binary. Historical SQLite
@@ -420,14 +426,17 @@ directory.
 | 0. Contract and baseline | Implemented | Version allocation is recorded in `internal/migrationcontract/versions.go`; baseline and qualification work is documented in `architecture/rime-benchmarks.md` and `architecture/rime-performance-plan.md`. |
 | 1. RIME transaction correctness | Implemented; focused test follow-up pending | Deterministic model equivalence, transaction lifecycle, managed publication, staged overlays, ownership, contexts, and race checks are covered by the RIME suite. The current one-thread all-module run exposed a scheduler-dependent OCC conflict assertion; its test now uses a first-wave barrier, but the RIME suite was not rerun. |
 | 2. Rich schema and codec | Implemented; continued adversarial qualification | Recursive descriptors, stable IDs, canonical values, presence, unknown-field preservation, and custom codecs are implemented. Continue hostile-input fuzzing and schema compatibility qualification. |
-| 3. Durable local database | Implemented; release fault matrix remains | Managed typed writes use durable-first Spool commits, rebuild, uncertain receipts, and synchronous group commit. The root suite passes with CGO disabled. Continue broad process-kill and storage-fault qualification. |
+| 3. Durable local database | Implemented; extended release fault matrix remains | Managed typed writes use durable-first Spool commits, rebuild, uncertain receipts, and synchronous group commit. The root suite and one-hour five-node persistence/restart soak pass with CGO disabled. Continue broad process-kill and storage-fault qualification. |
 | 4. Replication and evolution | Implemented; release interleaving gates remain | Typed replication, schema evolution, CRDT operations, snapshots, and bridge import have live coverage. Randomized three-origin delivery with duplicates, exact before/after manifest-store crashes on an isolated peer with two surviving peers, and concurrent local/remote same-record plus disjoint-key commits followed by reopen pass. Broader transport/interleaving stress remains required. |
-| 5. Operational feature port | Implemented; soak acceptance remains | Typed subscriptions, bridges, files, backup/restore, rotation, maintenance, and diagnostics use the managed API. The full release live gate passed sequentially; impaired-network and scheduled soak acceptance remain. |
+| 5. Operational feature port | Implemented; extended soak qualification remains | Typed subscriptions, bridges, files, backup/restore, rotation, maintenance, and diagnostics use the managed API. The full release live gate, one-hour five-node persistence soak, and two-hour three-node encrypted-write soak passed; impaired-network and longer-capacity soak acceptance remain. |
 | 6. SQLite removal | Production cutover implemented; complete all-package suite pending | Production SQL API, SQLite engine/package/driver, SQL CLI commands, and SQLite build-tag dependency are removed. The root Murmur suite passes with CGO disabled; current-version live fixtures use managed typed operations; the previous-release fixture retains SQL helpers only to seed the historical binary, and API-removal tests assert current endpoints reject SQL requests. Isolated benchmark modules retain historical SQLite comparisons. |
-| 7. Performance and release | In progress | Breaking API/format notes are drafted in `RELEASE_NOTES.md` and the full live gate passed. Five independent Murmur 100K local-store and transaction-batch characterization runs are recorded in `architecture/benchmarks.md`; the broader fixed-host concurrency/write-mix and live-network performance matrix, scheduled soak qualification, and remaining storage/interleaving gates must pass before claiming migration completion. |
+| 7. Performance and release | In progress | Breaking API/format notes are drafted in `RELEASE_NOTES.md` and the full live gate passed. Five independent Murmur 100K local-store and transaction-batch characterization runs are recorded in `architecture/benchmarks.md`; the broader fixed-host concurrency/write-mix and live-network performance matrix, extended capacity/chaos soaks, and remaining storage/interleaving gates must pass before claiming migration completion. |
 
 Recent verification on the current worktree:
 
+- `CGO_ENABLED=0 GOMAXPROCS=1 go test -p 1 ./internal/rimeadapter -run '^TestLocalUpdateAfterConcurrentTombstoneKeepsPrimaryFieldForRebuild$' -count=1 -timeout=2m` — passed. The Murmur adapter integration regression injects a remote tombstone while a stale materialized row is locally updated, closes and reopens the encrypted store, then rebuilds a fresh materializer and verifies the primary key and resurrected row survive.
+- `CGO_ENABLED=0 GOMAXPROCS=1 go test -p 1 ./internal/rimeadapter -run '^TestFailedSpoolAppendReturnsUncertainOutcome$' -count=1 -timeout=2m` — passed. The Murmur adapter fault-injection test rejects publication after an append failure, returns a transaction-scoped uncertain receipt, and keeps subsequent managed writes failed closed.
+- `CGO_ENABLED=0 GOMAXPROCS=1 MURMUR_LIVE_RUNTIME=/tmp/murmur-migration-delete-pruning-20261008 bash tests-live/run.sh delete-pruning` — passed in 30.6s after the tombstone-resurrection fix; three nodes converged across concurrent delete/update/resurrection, and GC collected 770 log batches.
 - `CGO_ENABLED=0 go test -p 1 . -count=1` — passed.
 - Five sequential process-isolated runs of `CGO_ENABLED=0 GOMAXPROCS=1 MURMUR_PERF_TIER=standard MURMUR_PERF_ONLY=store go test -run '^TestPerfMatrix$' -count=1 -timeout=5m .` from `tests-benchmark/benchmark` — passed; each run measured the 100K Murmur local-store cells without starting testnodes. Medians and observed ranges are in [the characterization matrix](architecture/benchmarks.md#current-typed-store-characterization-2026-10-08).
 - Five sequential process-isolated runs of `CGO_ENABLED=0 GOMAXPROCS=1 MURMUR_PERF_TIER=standard MURMUR_PERF_ONLY=tx go test -run '^TestPerfMatrix$' -count=1 -timeout=5m .` from `tests-benchmark/benchmark` — passed; each run measured 100K-record Murmur insert batches of 1, 10, 100 and 1,000 without starting testnodes. Medians and observed ranges are in [the characterization matrix](architecture/benchmarks.md#current-typed-store-characterization-2026-10-08).
@@ -443,13 +452,17 @@ Recent verification on the current worktree:
 - `CGO_ENABLED=0 GOMAXPROCS=1 go test -p 1 . -run '^TestTypedLocalAndRemoteCommitsInterleaveAndRecover$' -count=1 -timeout=2m` — passed; 64 local transactions and 65 remote batches raced on one Murmur database, preserving 129 records and the version-defined same-row winner across reopen; remote batches did not echo to the local log.
 - `CGO_ENABLED=0 GOMAXPROCS=1 go test -p 1 ./state -run '^TestConvergenceProperty$' -count=1 -timeout=2m` — passed; three origins delivered 180 mutation batches in differing orders with 10% duplicate replays to separate Murmur stores, which converged to identical final state.
 - CGO-disabled live runs for `api-mtls`, `backup-restore`, `backup-under-fire`, `bridge-two-streams`, `files-bridge`, `files-corrupt-source`, `files-crash`, `merge-policies`, `migration-concurrency`, `migration-crash`, `origin-signatures`, `partition`, `rekey`, `schema-evolution`, `snapshot-resync`, `tampered-backup`, `three-node-sync`, `typed-bridge`, and `views` — passed sequentially. These runs used at most four nodes at once.
-- `long-running-five-node` — passed a bounded 9-second typed-write smoke with five nodes, two orderly restarts, and convergence verified by sorted record digest; the one-hour acceptance duration remains pending.
+- `long-running-five-node` — passed both a bounded restart smoke and the one-hour five-node acceptance run recorded below.
 - `rejoin-storm` — passed with 12 outage writes, simultaneous restart of two nodes, convergence and post-rejoin writes; `crash-loop` — passed two SIGKILL/restart rounds with 152 acknowledged writes recovered. Both used typed RIME records and CGO-disabled binaries.
 - `hostile-peer` and `hostile-schema` — passed live against managed typed records, including malformed/replayed replication frames, schema quarantine, and post-attack convergence.
 - `chaos-load` — passed a bounded partition/heal smoke with three typed-record writers; nodes held divergent state while isolated and converged after healing.
 - `corrupt-snapshot` — passed its full 98-second retention-expiry run; the typed-record receiver rejected a tampered snapshot without publication and converged from an honest source.
 - `txchunk-resume` — passed a bounded 8.6 MiB typed `InsertMany` transaction with a mid-transfer receiver SIGKILL, restart, atomic visibility, and replay completion; CGO was disabled and the cluster used three nodes.
 - `scale-mesh` — passed live with ten daemons, 400 managed typed rows from two origins, converged digests, and no selected-peer fanout above four; runtime cleanup completed (7.3s test).
+- `CGO_ENABLED=0 GOMAXPROCS=1 MURMUR_FIVE_NODE_DURATION_SECONDS=3600 MURMUR_FIVE_NODE_SETTLE_SECONDS=300 MURMUR_FIVE_NODE_INTERVAL_MS=200 MURMUR_LIVE_RUNTIME=/tmp/murmur-migration-five-node-rerun-20261008 bash tests-live/run.sh long-running-five-node` — passed in 3,660.4s with five nodes; both data-directory restarts preserved acknowledged rows, 72,925 writes converged to one digest, and runtime cleanup completed. The run observed 35 transient HTTP write errors. The initial attempt with the pre-fix harness is excluded: its 10-second unlock deadline expired while reopening node2; the unlock helper now waits for one in-flight request up to 60 seconds, and the 30-second five-node smoke passed both restarts before the acceptance rerun.
+- `CGO_ENABLED=0 GOMAXPROCS=1 MURMUR_SLO_DURATION_SECONDS=7200 MURMUR_SLO_SETTLE_SECONDS=300 MURMUR_LIVE_RUNTIME=/tmp/murmur-migration-soak-bounded-20261008 bash tests-live/run.sh soak-slo` — passed a two-hour, three-node encrypted managed-record workload and final convergence checks in 7,216.7s; 597,169 writes across 3,000 bounded rows, write p95 107.4ms, maximum 2.47s, and runtime cleanup completed. An earlier unbounded attempt failed at the 512 MiB disk guard and is not counted as acceptance evidence; the bounded workload passed a short live smoke before this run.
+- `CGO_ENABLED=0 GOMAXPROCS=1 MURMUR_ENDURANCE_NODES=5 MURMUR_ENDURANCE_DURATION_SECONDS=600 MURMUR_ENDURANCE_SETTLE_SECONDS=300 MURMUR_ENDURANCE_WRITE_INTERVAL_MS=100 MURMUR_LIVE_RUNTIME=/tmp/murmur-migration-endurance-fix-20261008 bash tests-live/run.sh endurance-chaos` — passed in 630s after the tombstone-resurrection fix; 20,913 writes were acknowledged and all five nodes converged to the same digest after five restarts, three key rotations, seven logical peer flaps, four disk-pressure holds, two snapshot windows/resyncs, and GC on all nodes. `tc/netem` was unavailable, so impairment used logical flaps; libfaketime was unavailable, so clock skew was skipped. The fixed-host impaired-network and extended-duration runs remain pending.
+- `CGO_ENABLED=0 GOMAXPROCS=1 MURMUR_PERF_TIER=standard MURMUR_PERF_ONLY=mesh,reconnect go test -run '^TestPerfMatrix$' -count=1 -timeout=30m .` from `tests-benchmark/benchmark` — passed in 142.9s across 1/2/5-node 2,000-row mesh blasts and 1,000/10,000-row reconnects. An unrelated Go test was active on the host; results are exploratory, not fixed-host acceptance. The nested module also exposed and prompted a fix for harness repository-root discovery.
 - `CGO_ENABLED=1 GOMAXPROCS=1 bash tests-live/run.sh gate` — passed every release-gate scenario sequentially (936s); typed scenarios used the runner's CGO-disabled builds, and previous-release compatibility used its pinned SQLite-era build. The gate included ten-node scale mesh, storage/process-kill recovery, format rejection, hostile inputs, live bridges/files/backups, partition healing, certificate lifecycle, and the unlock anti-oracle check.
 
 The all-package `go test ./...` acceptance remains incomplete. A constrained
@@ -461,12 +474,14 @@ then rerun and passed. The OCC test now synchronizes its first transaction wave,
 but that RIME suite was not rerun. Per the current test-scope instruction,
 qualification runs are limited to Murmur tests and live Murmur scenarios;
 RIME and Spool package suites are not run. The complete release gate and
-ten-node scale acceptance have passed; fixed-host performance, scheduled soaks,
-and remaining storage/interleaving qualification remain pending. Legacy SQL calls
+ten-node scale acceptance, the one-hour five-node persistence soak, and the
+two-hour three-node typed soak have passed;
+fixed-host performance, extended capacity/chaos soaks, and remaining
+storage/interleaving qualification remain pending. Legacy SQL calls
 remain only in previous-release compatibility fixtures and explicit tests that
 verify the removed SQL endpoints reject requests. The migration remains incomplete
-until remaining Phase 3–5 fault/interleaving, typed live soak, Phase 6 full-suite,
-and Phase 7 performance/release gates pass. Historical SQLite comparisons are retained
+until remaining Phase 3–5 fault/interleaving and extended capacity/chaos soak,
+Phase 6 full-suite, and Phase 7 performance/release gates pass. Historical SQLite comparisons are retained
 only under `tests-benchmark/` nested modules and are not part of the production
 module or API.
 

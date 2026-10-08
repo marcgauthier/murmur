@@ -102,6 +102,18 @@ Each run writes `endurance-report-<unixtime>.md` next to the test; on
 FAIL the harness preserves node logs and `DumpForensics` captures
 status, peers, metrics, and goroutine stacks.
 
+## Recorded migration qualification
+
+On 2026-10-08, the fixed five-node, ten-minute run passed after the
+adapter began replaying unchanged primary-key fields when a row update
+resurrects state after a tombstone. It acknowledged 20,913 writes and
+converged all five nodes to one digest. The run observed five restarts,
+three key rotations, seven logical peer flaps, four disk-pressure holds,
+two offline snapshot windows/resyncs, and GC on every node. The host did
+not provide `CAP_NET_ADMIN` or libfaketime, so packet shaping degraded to
+logical peer flaps and clock skew was skipped. This is bounded fault
+coverage, not the 24–72 hour acceptance run.
+
 ## Limits
 
 - One table, one bounded working set; no file traffic or schema
