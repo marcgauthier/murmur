@@ -34,8 +34,8 @@ matrix (dataset sizes, tx batches, ciphers, live mesh scaling,
 impairment, reconnect). Tiers via `MURMUR_PERF_TIER`:
 
 - `smoke` — 10K rows, 1 cipher, 2-node mesh, 1K backlog; minutes.
-- `standard` (default) — 10K+100K rows, 3 ciphers, 1/2/5-node meshes,
-  delay/loss cells when privileged, 1K/10K backlogs; tens of minutes.
+- `standard` (default) — 10K+100K rows, AES-256-GCM at rest, 1/2/5-node
+  meshes, delay/loss cells when privileged, 1K/10K backlogs; tens of minutes.
 - `full` — adds 1M rows (template build takes minutes), 10-node mesh,
   50K backlog; ~1–2h. `MURMUR_PERF_MESH_ROWS` overrides the mesh blast
   size (default 2000). `MURMUR_PERF_ONLY=<substr>` restricts the run to

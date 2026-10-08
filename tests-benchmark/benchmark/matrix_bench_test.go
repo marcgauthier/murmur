@@ -14,8 +14,8 @@ import (
 )
 
 // BenchmarkCipherMatrix measures single-cell update throughput across
-// cipher x block-compression x value-compressibility combinations on a
-// fixed 2K-row dataset, reporting on-disk bytes alongside latency so
+// supported-cipher x block-compression x value-compressibility combinations
+// on a fixed 2K-row dataset, reporting on-disk bytes alongside latency so
 // encrypted-container overhead and compression effects compare directly.
 // All combinations run with encryption enabled (production configuration).
 func BenchmarkCipherMatrix(b *testing.B) {

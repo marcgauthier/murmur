@@ -16,10 +16,11 @@ cover concurrent writers, contended rows, shared-fsync failure, process exit
 before durability, close while a group is pending, and reopen reconstruction.
 
 The overall migration is not complete. Remaining required work includes broad
-storage-fault qualification, multi-peer crash qualification at the exact schema
-manifest-store boundary, delivery-permutation and remote-interleaving qualification,
-long-duration impaired-network/live soak runs, and reproducible rich-record
-performance measurements. The sequential live release gate has passed.
+storage-fault qualification, delivery-permutation and remote-interleaving
+qualification, long-duration impaired-network/live soak runs, and reproducible
+rich-record performance measurements. Exact before/after schema-manifest-store
+crash recovery with two surviving peers and the sequential live release gate
+have passed.
 Current-version live fixtures use managed typed operations, with SQL requests
 retained only in explicit endpoint-rejection tests; the release-upgrade fixture
 uses SQL solely to seed the pinned previous-release binary. Historical SQLite
@@ -457,9 +458,11 @@ scheduler-dependent OCC conflict assertion in RIME and later entered the
 ten-node, ten-minute `tests-live/abuse` default. The run was stopped before
 completion to keep test scope and process use bounded; the root Murmur suite was
 then rerun and passed. The OCC test now synchronizes its first transaction wave,
-but that RIME suite was not rerun. The complete release gate and ten-node scale
-acceptance have passed; fixed-host performance, scheduled soaks, and remaining
-storage/interleaving qualification remain pending. Legacy SQL calls
+but that RIME suite was not rerun. Per the current test-scope instruction,
+qualification runs are limited to Murmur tests and live Murmur scenarios;
+RIME and Spool package suites are not run. The complete release gate and
+ten-node scale acceptance have passed; fixed-host performance, scheduled soaks,
+and remaining storage/interleaving qualification remain pending. Legacy SQL calls
 remain only in previous-release compatibility fixtures and explicit tests that
 verify the removed SQL endpoints reject requests. The migration remains incomplete
 until remaining Phase 3–5 fault/interleaving, typed live soak, Phase 6 full-suite,

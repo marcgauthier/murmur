@@ -500,15 +500,16 @@ network shapes, and reconnect backlogs, plus a JSON report
 (`tests-benchmark/benchmark/perf-report-<ts>.json`, git-ignored) and a
 Markdown table in the test log ready for publication below. Tiers via
 `MURMUR_PERF_TIER`: `smoke` (10K rows, 2-node mesh; minutes),
-`standard` (10K+100K rows, 1/2/5-node meshes, 3 ciphers; tens of
+`standard` (10K+100K rows, the currently supported AES-256-GCM cipher,
+1/2/5-node meshes; tens of
 minutes), `full` (adds 1M rows, 10-node mesh, 50K backlog; ~1–2h).
 `MURMUR_PERF_MESH_ROWS` overrides the mesh blast size (default 2000).
 
 Method, shared by every cell:
 
-- Encryption is always on (AES-256-GCM unless the cell varies the
-  cipher); datasets are seeded (`populate` seed 42) and single-node
-  cells share one lazily built template store per size.
+- Encryption is always on and uses Murmur's currently supported at-rest cipher,
+  AES-256-GCM. Datasets are seeded (`populate` seed 42), and single-node cells
+  share one lazily built template store per size.
 - Every cell records wall time, throughput, p50/p95 where sampled,
   on-disk bytes, and peak RSS (process `VmHWM` in-process, max daemon
   `VmHWM` for live cells). Cells never constrain memory; RAM

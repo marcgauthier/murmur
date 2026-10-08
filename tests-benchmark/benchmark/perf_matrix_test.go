@@ -1,11 +1,11 @@
 // Performance characterization matrix: tiered, repeatable measurements
-// across dataset sizes, transaction batches, and storage ciphers, with
-// machine-stamped JSON reports for publication.
+// across dataset sizes, transaction batches, and the supported storage cipher,
+// with machine-stamped JSON reports for publication.
 //
 // Tiers (MURMUR_PERF_TIER=smoke|standard|full, default standard):
 //
 //	smoke:    10K rows, one cipher; minutes.
-//	standard: 10K+100K rows, three ciphers; tens of minutes.
+//	standard: 10K+100K rows, AES-256-GCM; tens of minutes.
 //	full:     adds 1M rows (template build takes several minutes); ~1h.
 //
 // Live mesh / impairment / reconnect cells live in perf_live_test.go and
@@ -531,7 +531,7 @@ func perfTxCells(t *testing.T, rep *perfReport, tier string) {
 	}
 }
 
-// perfCipherCells compares ciphers at bulk-I/O scale: fresh-store
+// perfCipherCells measures the supported cipher at bulk-I/O scale: fresh-store
 // populate throughput plus full-reopen time and on-disk footprint.
 // Single-row updates are deliberately NOT the cipher probe (fsync cost
 // hides cipher cost at that granularity; see BenchmarkCipherMatrix).
