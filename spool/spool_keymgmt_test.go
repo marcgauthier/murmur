@@ -12,8 +12,38 @@ import (
 	"testing"
 	"time"
 
+	"bytes"
+
 	"github.com/marcgauthier/murmur/spool"
 )
+
+func TestValidateWrappingKeyAuthenticatesEnvelope(t *testing.T) {
+	dir := t.TempDir()
+	options := testOptions(t, dir)
+	options.MasterKey = bytes.Repeat([]byte{0x4a}, 32)
+	options.WrappingKeyID = "current"
+	store, err := spool.Open(options)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	hint, err := spool.ReadKeyHint(dir)
+	if err != nil {
+		t.Fatalf("ReadKeyHint: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := spool.ValidateWrappingKey(dir, options.MasterKey, hint.ContextID[:], "current"); err != nil {
+		t.Fatalf("ValidateWrappingKey: %v", err)
+	}
+	if err := spool.ValidateWrappingKey(dir, bytes.Repeat([]byte{0x4b}, 32), nil, "current"); !errors.Is(err, spool.ErrWrongKey) {
+		t.Fatalf("wrong key returned %v, want ErrWrongKey", err)
+	}
+	wrongContext := bytes.Repeat([]byte{0x4c}, 16)
+	if err := spool.ValidateWrappingKey(dir, options.MasterKey, wrongContext, "current"); !errors.Is(err, spool.ErrContextMismatch) {
+		t.Fatalf("wrong context returned %v, want ErrContextMismatch", err)
+	}
+}
 
 // TestPlaintextAudit writes high-entropy canary keys and values
 // through every mutation path, rotates, rewrites, and checkpoints,

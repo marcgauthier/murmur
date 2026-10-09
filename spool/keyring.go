@@ -494,3 +494,42 @@ func ReadKeyHint(dir string) (KeyHint, error) {
 	hint.KeyringSeq = h.seq
 	return hint, nil
 }
+
+// ValidateWrappingKey authenticates a store's key envelope without opening a
+// writable Spool instance or scanning its records. expectedContext and
+// expectedWrappingID are optional; when supplied they must match the
+// authenticated envelope identity.
+func ValidateWrappingKey(dir string, masterKey, expectedContext []byte, expectedWrappingID string) error {
+	if len(masterKey) != 32 {
+		return fmt.Errorf("spool: master key must be 32 bytes")
+	}
+	if len(expectedContext) != 0 && len(expectedContext) != 16 {
+		return fmt.Errorf("spool: expected context must be 16 bytes")
+	}
+	hint, err := ReadKeyHint(dir)
+	if err != nil {
+		return err
+	}
+	if !hint.Encrypted {
+		return fmt.Errorf("spool: store is not encrypted: %w", ErrWrongKey)
+	}
+	if len(expectedContext) == 16 && string(expectedContext) != string(hint.ContextID[:]) {
+		return fmt.Errorf("spool: expected context does not match store: %w", ErrContextMismatch)
+	}
+	ring, err := readKeys(dir, masterKey, "", hint.StoreID, hint.ContextID)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		ring.mu.Lock()
+		defer ring.mu.Unlock()
+		for _, key := range ring.keys {
+			wipe(key.Key[:])
+		}
+		clear(ring.keys)
+	}()
+	if expectedWrappingID != "" && ring.wrapID != expectedWrappingID {
+		return fmt.Errorf("spool: authenticated wrapping-key id %q does not match %q: %w", ring.wrapID, expectedWrappingID, ErrWrongKey)
+	}
+	return nil
+}
