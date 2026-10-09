@@ -200,6 +200,8 @@ go run ./examples/basic
 
 The examples use managed typed records. See
 [examples/README.md](examples/README.md) for the complete index.
+For querying — get by ID, `Where` filters, ordering, aggregates, compiled
+queries, and joins — see [USAGE.md](USAGE.md).
 
 ### Display startup progress
 

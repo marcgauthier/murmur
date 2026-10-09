@@ -55,6 +55,7 @@ soaks remain. The query materialization is in-memory only.
 | [RIME migration schema](rime-migration-schema.md) | Recursive descriptor compiler, canonical record codec, and typed facade/adapter migration status. | New topic |
 | [RIME detailed architecture](../rime/ARCHITECTURE.md) | Implemented storage, snapshots, commit paths, locks, index structures, query execution, maintained views, hooks, GC and performance tradeoffs. | New topic |
 | [RIME usage and syntax](../rime/USAGE.md) | Public Go API, schema syntax, CRUD, transaction-bound handles, queries, relations, maintained views, events, limits and optional code generation. | New topic |
+| [Murmur query usage](../USAGE.md) | Reading Murmur databases: get by ID, all-rows scans, `Where` filters, ordering, aggregates, group-by, compiled queries, joins, and snapshot reads. | New topic |
 | [RIME production qualification](rime-testing.md) | Correctness gates, model fuzzing, memory retention, standalone live workload, and release acceptance. | New topic |
 | [RIME benchmarks](rime-benchmarks.md) | Benchmark methods, measured development samples, and remaining baseline work. | New topic |
 | [RIME performance plan](rime-performance-plan.md) | Profile-driven mutation, MVCC history, concurrent commit and query optimization milestones with measurement and correctness gates. | New topic |
