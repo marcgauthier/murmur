@@ -81,6 +81,42 @@ func joinPairs(t testing.TB, rows []ItemJoinRow) map[string]string {
 	return out
 }
 
+func TestItemDBJoinLive(t *testing.T) {
+	db := openItemTestDB(t, joinDefinitions(t)...)
+	seedJoinRows(t, db)
+	ctx := context.Background()
+
+	inner, err := db.InnerJoin(ctx, joinAuthor{}, "Name", joinBook{}, "Author")
+	if err != nil {
+		t.Fatalf("DB InnerJoin: %v", err)
+	}
+	pairs := joinPairs(t, inner)
+	for _, want := range []string{"ann/a1", "ann/a2", "bob/b1"} {
+		if _, ok := pairs[want]; !ok {
+			t.Fatalf("DB InnerJoin pairs = %v, missing %s", pairs, want)
+		}
+	}
+	if len(pairs) != 3 {
+		t.Fatalf("DB InnerJoin pairs = %v, want 3", pairs)
+	}
+	left, err := db.LeftJoin(ctx, joinAuthor{}, "Name", joinBook{}, "Author")
+	if err != nil {
+		t.Fatalf("DB LeftJoin: %v", err)
+	}
+	if len(left) != 4 {
+		t.Fatalf("DB LeftJoin rows = %d, want 4", len(left))
+	}
+	matched := 0
+	for _, row := range left {
+		if row.Right != nil {
+			matched++
+		}
+	}
+	if matched != 3 {
+		t.Fatalf("DB LeftJoin matched = %d, want 3", matched)
+	}
+}
+
 func TestItemJoinLive(t *testing.T) {
 	db := openItemTestDB(t, joinDefinitions(t)...)
 	seedJoinRows(t, db)

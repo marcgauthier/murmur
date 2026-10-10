@@ -49,9 +49,9 @@ func (c recordSubscriptionCursor) isZero() bool {
 type recordChangeType string
 
 const (
-	RecordAdded   recordChangeType = "added"
-	RecordUpdated recordChangeType = "updated"
-	RecordRemoved recordChangeType = "removed"
+	recordAdded   recordChangeType = "added"
+	recordUpdated recordChangeType = "updated"
+	recordRemoved recordChangeType = "removed"
 )
 
 // recordSubscriptionChange is one canonical primary-key diff. Row is nil for
@@ -368,7 +368,7 @@ func diffTypedRows[T any](oldRows, newRows []*T, table *rimeadapter.Table[T]) ([
 	for key, row := range newByKey {
 		previous, exists := oldByKey[key]
 		if !exists {
-			changes = append(changes, recordSubscriptionChange[T]{Type: RecordAdded, Key: key, Row: row})
+			changes = append(changes, recordSubscriptionChange[T]{Type: recordAdded, Key: key, Row: row})
 			continue
 		}
 		equal, err := table.Equal(previous, row)
@@ -376,12 +376,12 @@ func diffTypedRows[T any](oldRows, newRows []*T, table *rimeadapter.Table[T]) ([
 			return nil, err
 		}
 		if !equal {
-			changes = append(changes, recordSubscriptionChange[T]{Type: RecordUpdated, Key: key, Row: row})
+			changes = append(changes, recordSubscriptionChange[T]{Type: recordUpdated, Key: key, Row: row})
 		}
 	}
 	for key := range oldByKey {
 		if _, exists := newByKey[key]; !exists {
-			changes = append(changes, recordSubscriptionChange[T]{Type: RecordRemoved, Key: key})
+			changes = append(changes, recordSubscriptionChange[T]{Type: recordRemoved, Key: key})
 		}
 	}
 	sort.Slice(changes, func(i, j int) bool { return bytes.Compare(changes[i].Key[:], changes[j].Key[:]) < 0 })

@@ -70,7 +70,7 @@ Foreign-key declarations and normal JOIN queries are allowed, but enforcement mu
 
 The SQL validation rules and DDL examples in this section are retained only as
 historical design context. Production callers define stable typed descriptors
-through `Define[T]` and `Config.Tables`; RIME registers the corresponding
+through `Model[T]` and `Config.Tables`; RIME registers the corresponding
 primary keys and supported indexes. Unsupported distributed constraints are
 rejected during typed schema compilation.
 

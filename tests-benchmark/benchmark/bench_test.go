@@ -124,13 +124,8 @@ func BenchmarkJoin(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				start := time.Now()
-				rtx, err := db.ReadTxContext(ctx)
+				pairs, err := db.InnerJoin(ctx, benchContact{}, "ID", benchOrder{}, "ContactID")
 				if err != nil {
-					b.Fatal(err)
-				}
-				pairs, err := rtx.InnerJoin(benchContact{}, "ID", benchOrder{}, "ContactID")
-				if err != nil {
-					_ = rtx.Close()
 					b.Fatal(err)
 				}
 				// Filter + group + limit client-side (score > ? GROUP BY id LIMIT 100).
@@ -145,9 +140,6 @@ func BenchmarkJoin(b *testing.B) {
 					if len(sums) >= 100 {
 						break
 					}
-				}
-				if err := rtx.Close(); err != nil {
-					b.Fatal(err)
 				}
 				lat.record(time.Since(start))
 			}

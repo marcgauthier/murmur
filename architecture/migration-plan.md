@@ -148,6 +148,14 @@ API fixtures before implementation:
   encryption and backup APIs with Go-schema equivalents. Remove SQL statement
   caches, SQL preparation/results, SQL DDL configuration and the SQL driver.
 
+As-built note: the typed table/query handles shipped as Murmur's private
+engine layer instead of the public surface. Applications use the generic item
+API (`Config.Models`, `Model[T]`, item CRUD, `DB.Query`, `DB.Subscribe`);
+`Define[T]`, `TableOf[T]`, `RecordTable`, `RecordQuery`, `RecordTx`, and the
+`DB.ReadTxContext`/`ReadAt` snapshot entry points are no longer exported. The
+ownership rules above still hold: no writable raw RIME tables and no raw
+`rime.Query` objects escape the facade.
+
 Published pointers remain immutable. Readers may share them; applications needing
 mutable output use an explicit clone helper. Query builders and write transactions
 remain owned by one goroutine. A read snapshot is local, not a cluster-wide time.

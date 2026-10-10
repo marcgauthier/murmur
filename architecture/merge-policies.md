@@ -42,12 +42,15 @@ type Item struct {
     Peak  int64
 }
 
-definition, err := murmur.Define[Item]("items", 1, murmur.RecordOptions{
-    PrimaryField: "ID",
-    MergePolicies: map[string]murmur.RecordMergePolicy{
-        "Count": murmur.RecordMergeCounter,
-        "Tags":  murmur.RecordMergeORSet,
-        "Peak":  murmur.RecordMergeMax,
+definition, err := murmur.Model[Item](murmur.ModelOptions{
+    Name: "items", TableID: 1,
+    RecordOptions: murmur.RecordOptions{
+        PrimaryField: "ID",
+        MergePolicies: map[string]murmur.RecordMergePolicy{
+            "Count": murmur.RecordMergeCounter,
+            "Tags":  murmur.RecordMergeORSet,
+            "Peak":  murmur.RecordMergeMax,
+        },
     },
 })
 ```
@@ -57,17 +60,16 @@ assignment to existing CRDT-owned fields is rejected, and zero deltas or
 removal of an absent set element are no-ops.
 
 ```go
-table, err := murmur.TableOf[Item](database, "items")
-if err != nil { return err }
 return database.WriteTxContext(ctx, func(tx *murmur.Tx) error {
-    if err := table.Insert(tx, &Item{ID: row, Peak: 4}); err != nil { return err }
-    if err := murmur.RecordCounterAdd(tx, table, row, "Count", 3); err != nil { return err }
-    if err := murmur.RecordSetAdd(tx, table, row, "Tags", "ready"); err != nil { return err }
-    return murmur.RecordMax(tx, table, row, "Peak", int64(5))
+    if err := tx.InsertItem(&Item{ID: row, Peak: 4}); err != nil { return err }
+    key := &Item{ID: row}
+    if err := tx.CounterAdd(key, "Count", 3); err != nil { return err }
+    if err := tx.SetAdd(key, "Tags", "ready"); err != nil { return err }
+    return tx.Max(key, "Peak", int64(5))
 })
 ```
 
-Read the merged projection with `table.Get(row)`. There is no assignment/reset
+Read the merged projection with `GetItem`. There is no assignment/reset
 API for CRDT-owned fields: create a new row identity to reset. Existing LWW row
 tombstone/resurrection rules still control visibility; delete and reinsert of
 the same row identity retains its causal history.

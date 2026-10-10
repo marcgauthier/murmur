@@ -4,22 +4,22 @@ This document tracks the implementation state of the rich Go record schema
 described in [the migration plan](migration-plan.md#4-record-schema-encoding-and-evolution).
 The production cutover has removed the legacy SQL engine. The typed facade
 provides
-available through `Config.Models`, `Model[T]`, `Define[T]`, `Config.Tables`, `TableOf[T]`, and
+available through `Config.Models`, `Model[T]`, `Config.Tables`, and
 `DB.WriteTxContext`; typed mode disables SQL entry points. `Open` binds the
 compiled definitions to a private RIME database, rebuilds it from encrypted
 Spool on open and after completed snapshots, and routes local and accepted
 remote writes through the adapter. Typed opens accept compatible additive
 schema subsets and use the persisted manifest as authoritative; older writers
 retain unknown top-level cells in Spool. The adapter supports LWW BLOB fields,
-numeric MIN/MAX fields (updated with `RecordMin` and `RecordMax`), top-level
-int64 PN_COUNTER fields (updated with `RecordCounterAdd`), plus
-top-level `[]string` OR_SET fields (updated with `RecordSetAdd` and
-`RecordSetRemove`). These use managed CRUD/batches, read-only query
+numeric MIN/MAX fields (updated with `Min` and `Max`), top-level
+int64 PN_COUNTER fields (updated with `CounterAdd`), plus
+top-level `[]string` OR_SET fields (updated with `SetAdd` and
+`SetRemove`). These use managed CRUD/batches, read-only query
 filters/order/page/count,
 compiled positional parameters, aggregates/grouping, and snapshot-bound inner
 and left joins. Query and join outputs are cloned through the registered codec.
 Successful durable local typed commits advance the shared observer cursor and
-wake the replication sender. `RecordTable.Subscribe` emits typed initial and
+wake the replication sender. `DB.Subscribe` emits typed initial and
 update snapshots, coalesces changes, and resets on bounded-buffer overflow. The
 live `typed-records` scenario verifies two-process propagation, counter and set
 convergence, peer restart reconstruction, additive runtime migration, older-peer
@@ -56,8 +56,8 @@ transaction/import fallback has been removed.
 primary field and stable field IDs. The replicated primary key must be a
 16-byte array. Every exported persisted field, including fields in nested
 structs, requires a nonzero ID supplied separately from Go declaration order.
-`Model[T]` and runtime model exemplars generate these identities; `Define[T]`
-keeps explicit IDs. See [automatic models](model-api.md) for derivation and
+`Model[T]` and runtime model exemplars generate these identities, with
+explicit IDs through `ModelOptions`. See [automatic models](model-api.md) for derivation and
 legacy overrides. Both `murmur:"-"` and `rime:"-"` exclude persisted fields.
 The compiler retains Go field names only as local bindings; IDs and value kinds
 are the durable identities.

@@ -1,6 +1,7 @@
 package murmur
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 
@@ -18,15 +19,34 @@ type ItemJoinRow struct {
 	Left, Right any
 }
 
-// InnerJoin hash-joins two models on equal key fields, returning one row per
-// matching pair. Both keys must share the same comparable Go type.
+// InnerJoin hash-joins two models on equal key fields over one pinned
+// snapshot, returning one row per matching pair. Both keys must share the
+// same comparable Go type.
+func (db *DB) InnerJoin(ctx context.Context, leftModel any, leftField string, rightModel any, rightField string) ([]ItemJoinRow, error) {
+	return db.joinItems(ctx, leftModel, leftField, rightModel, rightField, false)
+}
+
 func (tx *recordReadTx) InnerJoin(leftModel any, leftField string, rightModel any, rightField string) ([]ItemJoinRow, error) {
 	return tx.joinItems(leftModel, leftField, rightModel, rightField, false)
 }
 
 // LeftJoin keeps every left row, with a nil Right when nothing matches.
+func (db *DB) LeftJoin(ctx context.Context, leftModel any, leftField string, rightModel any, rightField string) ([]ItemJoinRow, error) {
+	return db.joinItems(ctx, leftModel, leftField, rightModel, rightField, true)
+}
+
 func (tx *recordReadTx) LeftJoin(leftModel any, leftField string, rightModel any, rightField string) ([]ItemJoinRow, error) {
 	return tx.joinItems(leftModel, leftField, rightModel, rightField, true)
+}
+
+// joinItems pins one read snapshot and hash-joins both models inside it.
+func (db *DB) joinItems(ctx context.Context, leftModel any, leftField string, rightModel any, rightField string, outer bool) ([]ItemJoinRow, error) {
+	tx, err := db.readTxContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Close()
+	return tx.joinItems(leftModel, leftField, rightModel, rightField, outer)
 }
 
 func (tx *recordReadTx) joinItems(leftModel any, leftField string, rightModel any, rightField string, outer bool) ([]ItemJoinRow, error) {

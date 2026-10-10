@@ -216,7 +216,7 @@ func TestTypedEphemeralTableResetsOnOpenAndRejectsMixedTransactions(t *testing.T
 	if got, err := ephemeral.Get(scratch.ID); err != nil || got == nil || got.Name != scratch.Name {
 		t.Fatalf("ephemeral read = %+v, %v", got, err)
 	}
-	if event := receiveRecordEvent(t, sub); event.Type != EventUpdate || len(event.Changes) != 1 || event.Changes[0].Type != RecordAdded || event.Changes[0].Key != scratch.ID {
+	if event := receiveRecordEvent(t, sub); event.Type != EventUpdate || len(event.Changes) != 1 || event.Changes[0].Type != recordAdded || event.Changes[0].Key != scratch.ID {
 		t.Fatalf("ephemeral subscription did not observe published insert: %+v", event)
 	}
 	if seq, err := db.store.LocalSeq(); err != nil || seq != 0 {
@@ -996,7 +996,7 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 	if updateEvent.Type != EventUpdate || len(updateEvent.Rows) != 2 {
 		t.Fatalf("typed subscription update event = %+v; want two updated records", updateEvent)
 	}
-	if len(updateEvent.Changes) != 1 || updateEvent.Changes[0].Type != RecordUpdated || updateEvent.Changes[0].Key != unmatched.ID || updateEvent.Changes[0].Row == nil || updateEvent.Changes[0].Row.Name != "changed" {
+	if len(updateEvent.Changes) != 1 || updateEvent.Changes[0].Type != recordUpdated || updateEvent.Changes[0].Key != unmatched.ID || updateEvent.Changes[0].Row == nil || updateEvent.Changes[0].Row.Name != "changed" {
 		t.Fatalf("typed subscription keyed diff = %+v; want one update for %s", updateEvent.Changes, unmatched.ID)
 	}
 	changedVisible := false
@@ -1041,7 +1041,7 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	removed := receiveRecordEvent(t, membership)
-	if len(removed.Changes) != 1 || removed.Changes[0].Type != RecordRemoved || removed.Changes[0].Key != unmatched.ID || removed.Changes[0].Row != nil {
+	if len(removed.Changes) != 1 || removed.Changes[0].Type != recordRemoved || removed.Changes[0].Key != unmatched.ID || removed.Changes[0].Row != nil {
 		t.Fatalf("typed membership removal = %+v", removed.Changes)
 	}
 	if err := db.WriteTxContext(context.Background(), func(tx *Tx) error {
@@ -1053,7 +1053,7 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	added := receiveRecordEvent(t, membership)
-	if len(added.Changes) != 1 || added.Changes[0].Type != RecordAdded || added.Changes[0].Key != unmatched.ID || added.Changes[0].Row == nil {
+	if len(added.Changes) != 1 || added.Changes[0].Type != recordAdded || added.Changes[0].Key != unmatched.ID || added.Changes[0].Row == nil {
 		t.Fatalf("typed membership addition = %+v", added.Changes)
 	}
 	if err := membership.Close(); err != nil {

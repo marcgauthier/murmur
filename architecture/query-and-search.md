@@ -77,17 +77,17 @@ Do not replicate FTS internal mutations.
 
 ## Reactive query subscriptions
 
-### Typed RIME record subscriptions
+### RIME record subscriptions
 
-In native `Config.Tables` mode, `RecordTable.Subscribe` evaluates queries on
+In native `Config.Tables` mode, `DB.Subscribe` evaluates queries on
 pinned RIME read snapshots. Snapshot acquisition and observer-cursor capture
 share the local apply lock, but query evaluation releases that lock so writers
 can continue. Each update carries the full detached `Rows` snapshot plus a
 deterministically ordered primary-key diff in `Changes`: additions and updates
 carry detached rows, while removals carry only the key. Equality uses each
 field's canonical built-in semantics or its registered custom codec equality
-hook. Keep `RecordSubscription.ResumeCursor()` and pass it back as
-`RecordSubscriptionOptions.ResumeFrom` to reconnect within the same database
+hook. Keep `ItemSubscription.ResumeCursor()` and pass it back as
+`ItemSubscriptionOptions.ResumeFrom` to reconnect within the same database
 open epoch. Tokens bind database identity, open epoch, and materializer
 generation. Resume validates the retained sequence and sends the latest
 snapshot as an update; stale, future, cross-database, or expired tokens return
@@ -97,18 +97,18 @@ or application checkpoint; configuring synchronous durability does not change
 that contract. Slow consumers receive a bounded-buffer `EventReset`; rebuilds
 invalidate tokens and reset active subscriptions.
 
-The legacy SQL query subscription API has been removed. Applications use typed
-`RecordTable.Subscribe` for RIME-backed snapshots and row diffs; it is available
+The legacy SQL query subscription API has been removed. Applications use
+`DB.Subscribe` for RIME-backed snapshots and row diffs; it is available
 for databases with `Config.Tables` and does not parse SQL.
 
 ### Cursor and Resumption Model
 
-Typed subscription events carry a monotonic local cursor sequence (`Cursor
+Subscription events carry a monotonic local cursor sequence (`Cursor
 uint64`), distinct from mesh origin sequences. The database retains a
 configurable history buffer (`MaxRetainedEvents`) allowing reconnecting
-subscribers to resume from `RecordSubscriptionCursor` via
-`RecordSubscriptionOptions.ResumeFrom`. If a requested resume token has expired
-from the history buffer or is invalid, `RecordTable.Subscribe` returns
+subscribers to resume from `ItemSubscriptionCursor` via
+`ItemSubscriptionOptions.ResumeFrom`. If a requested resume token has expired
+from the history buffer or is invalid, `DB.Subscribe` returns
 `ErrSubscriptionExpired`.
 
 ### Slow Consumers and Resets

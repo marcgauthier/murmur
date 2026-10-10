@@ -96,8 +96,8 @@ name and a process-local sequence; it is distinct from business-key derivation.
 For an encrypted application database, [Murmur's application API](../USAGE.md)
 registers `Models: []any{Device{}}` with an `ID ids.RowID` tagged `rime:"ID"`.
 Its optional separate business `primary` derives UUIDv5, and without a business
-key it generates UUIDv4. `Model[T]` provides automatic schema with typed handles;
-`Define[T]` provides explicit durable identities. These APIs keep persistence,
+key it generates UUIDv4. `Model[T]` provides automatic schema, with explicit
+durable identities through `ModelOptions`. These APIs keep persistence,
 replication, ID generation and local business-key rules in Murmur's adapter.
 
 ## Table handles, transactions, and contexts

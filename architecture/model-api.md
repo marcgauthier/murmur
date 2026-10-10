@@ -13,8 +13,8 @@ introduced by model registration.
 Models require an exported `ID ids.RowID` tagged `rime:"ID"`, or the legacy
 `ID rime:"primary"` form. `ModelOptions` embeds `RecordOptions` for explicit
 identity-field selection, field IDs, merge rules, codecs, scope and depth;
-`Name` and `TableID` override the default collection identity. `Define[T]`
-retains its explicit contract.
+`Name` and `TableID` override the default collection identity. `Model[T]`
+is the only table-definition API.
 
 Automatic IDs use the existing SHA-256 name derivation in `schema`: tables use
 `table:<lowercase model name>`; root fields use
@@ -61,8 +61,9 @@ Reflective accessors unwrap that carrier; typed tables retain direct field
 loads. Prepared changes unwrap carriers to native records before durable codec
 capture. This is a registration representation, not a new storage engine.
 
-`Model[T]` installs typed adapter handles. Plain exemplars install runtime
-handles for the item API; `TableOf[T]` explains when no typed handle exists.
+`Model[T]` installs explicitly identified adapter handles. Plain exemplars
+install runtime handles for the item API. A struct registered for more than
+one table is ambiguous for the item API and must use distinct model names.
 The adapter shares descriptor validation, encrypted persistence, snapshot
 reconstruction, bridge checks and remote reconciliation for both forms.
 RIME remains restricted to the Go standard library.

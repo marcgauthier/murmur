@@ -83,8 +83,8 @@ when collecting a large backlog.
 
 The `database/sql/driver` wrapper, SQL statement/query/transaction methods,
 SQL subscription worker, SQLite materializer, and SQLite package have been
-removed. Reusable parameterized queries use the typed `RecordQuery.Compile`
-API. `RecordTable.Subscribe` is the managed subscription surface.
+removed. Reusable parameterized queries use the `ItemQuery.Compile`
+API. `DB.Subscribe` is the managed subscription surface.
 
 `Config.OnOpenProgress func(OpenProgress)` optionally reports startup while
 `Open` is blocked. `OpenProgress` contains `Phase`, `StartedAt`, `Elapsed`,
@@ -114,26 +114,26 @@ must identify the offending table, field, or index.
 `Config.Models: []any{Device{}, User{}}` discovers stable schemas automatically.
 Use `ID ids.RowID` tagged `rime:"ID"`, or legacy `ID rime:"primary"`.
 A separate `primary` field derives unset IDs with UUIDv5; without it, generation
-uses UUIDv4. Explicit IDs are retained. `Model[T]` provides typed handles and
-identity/configuration overrides; `Define[T]` retains explicit schema control.
+uses UUIDv4. Explicit IDs are retained. `Model[T]` provides
+identity/configuration overrides and is the only table-definition API.
 `Transaction`, item CRUD, partial updates, and insert/update/save/delete batches
 use the existing durable coordinator. `MigrateModels` is explicit and additive.
 See [automatic model architecture](model-api.md) for exact identity and
 registration rules and [application usage](../USAGE.md) for examples.
 
-### Native typed record API status
+### Managed record API status
 
 `RecordOptions.Scope` defaults to `TableScopeReplicated`. Set it to
-`TableScopeNodeLocal` for a persistent typed table whose cells stay in the
+`TableScopeNodeLocal` for a persistent table whose cells stay in the
 node-local Spool namespace and are absent from replication logs and snapshots.
-Set it to `TableScopeEphemeral` for an in-memory typed table that resets on
+Set it to `TableScopeEphemeral` for an in-memory table that resets on
 reopen. Both local scopes currently support LWW fields only. Persistent
-node-local writes can share one atomic Spool commit with replicated typed
+node-local writes can share one atomic Spool commit with replicated
 writes; ephemeral writes cannot share a transaction with durable tables.
-Node-local tables are not eligible for typed bridge import or export.
+Node-local tables are not eligible for bridge import or export.
 
 
-The managed record facade is the only supported database API. `Open` requires
+The generic item API is the only supported database API. `Open` requires
 at least one model or compiled `Config.Tables` definition and rejects SQL-only
 `Schema.Tables` configurations before opening Spool:
 
@@ -143,9 +143,12 @@ type Contact struct {
     Name string
 }
 
-definition, err := murmur.Define[Contact]("contacts", 17, murmur.RecordOptions{
-    PrimaryField: "ID",
-    FieldIDs: map[string]uint32{"ID": 1, "Name": 2},
+definition, err := murmur.Model[Contact](murmur.ModelOptions{
+    Name: "contacts", TableID: 17,
+    RecordOptions: murmur.RecordOptions{
+        PrimaryField: "ID",
+        FieldIDs: map[string]uint32{"ID": 1, "Name": 2},
+    },
 })
 if err != nil { return err }
 
@@ -157,30 +160,32 @@ db, err := murmur.Open(ctx, murmur.Config{
 })
 ```
 
-`Define[T]` requires a stable nonzero table ID, a 16-byte primary field marked
-`rime:"primary"`, and explicit stable IDs for all exported persisted fields.
-`TableOf[T]` returns a typed handle; `Get` returns a mutable deep clone, while
-`Insert`, `Save`, `Update`, `Delete`, and their batch forms stage through
-`DB.WriteTxContext` and `Tx`. `WriteTxContext` runs its callback before
+`Model[T]` with explicit `ModelOptions` requires a stable nonzero table ID,
+a 16-byte primary field marked `rime:"primary"`, and explicit stable IDs for
+all exported persisted fields. `InsertItem`, `GetItem`, `SaveItem`,
+`UpdateFields`, `DeleteItem`, and their batch forms stage through
+`DB.WriteTxContext` and `Tx`; `GetItem` populates the supplied pointer with a
+mutable deep clone. `WriteTxContext` runs its callback before
 writer admission, so independent callbacks can stage concurrently. Commits are
 still serialized; stale transactions may return `rime.ErrConflict`, while
 disjoint writes can proceed. The database tracks these in-flight callbacks so
-`Close` drains them before closing RIME or Spool. `Where` and `WhereTx` return
-a read-only query wrapper with predicates, ordering, pagination, `Find`, `First`, `Count`,
-`Exists`, `Each`, read-only `Aggregate`/`AggregateContext`, and typed `GroupBy`
-with grouped aggregate methods; returned records are independent deep copies.
-`InnerJoinReadTx` and `LeftJoinReadTx` join typed tables on one pinned read
-snapshot using `FieldOf` key handles, and return detached record pairs.
-`RecordTable.Compile` creates a reusable parameterized read query; `CompileTx`
-and `CompileReadTx` bind it to a managed write overlay or pinned read snapshot.
-Compiled `Find` returns detached rows and `Count` retains RIME's parameter
-count/type validation. `RecordTable.Subscribe` pins a RIME read snapshot while
+`Close` drains them before closing RIME or Spool. `DB.Query` returns
+a read-only query builder with `q` matchers, ordering, pagination,
+`FindInto`, `FirstInto`, `Count`, `Exists`, `Explain`, read-only `Aggregate`,
+and `GroupBy` with grouped aggregate methods; returned records are independent
+deep copies.
+`DB.InnerJoin` and `DB.LeftJoin` join two models on equal key fields over one
+pinned read snapshot, and return detached `ItemJoinRow` pairs.
+`ItemQuery.Compile` creates a reusable parameterized read query with `q.Param()`
+placeholders; `In` and `WithContext` bind copies to a managed write overlay or
+cancellation. Compiled terminals return detached rows and retain RIME's
+parameter count/type validation. `DB.Subscribe` pins a RIME read snapshot while
 capturing its observer cursor, then evaluates without holding the writer lock.
 Events include the full current `Rows` snapshot and, for updates, deterministic
-primary-key `Changes` (`RecordAdded`, `RecordUpdated`, or `RecordRemoved`).
+primary-key `Changes` (`ItemAdded`, `ItemUpdated`, or `ItemRemoved`).
 Equality uses built-in canonical field semantics and registered custom codec
-equality hooks. Keep `RecordSubscription.ResumeCursor()` and provide that
-`RecordSubscriptionCursor` through `RecordSubscriptionOptions.ResumeFrom` to
+equality hooks. Keep `ItemSubscription.ResumeCursor()` and provide that
+`ItemSubscriptionCursor` through `ItemSubscriptionOptions.ResumeFrom` to
 resume after the retained sequence during the same database open. Tokens bind
 the database ID, observer epoch, and RIME materializer generation, so tokens
 from another database, another open, or a rebuild fail with
@@ -188,10 +193,10 @@ from another database, another open, or a rebuild fail with
 durable replication or application checkpoint; synchronous durability does not
 make it survive reopening. A full bounded buffer or a rebuild emits
 `EventReset` with `ErrSubscriptionReset`.
-Use `StringFieldOf[T]` for RIME's indexed prefix, suffix, substring, and LIKE
-predicates; these operations do not provide tokenized full-text search or
-ranking.
-If storage failure makes a typed commit outcome uncertain,
+Use `q.StartsWith`/`EndsWith`/`Contains`/`Like` for RIME's indexed prefix,
+suffix, substring, and LIKE predicates; these operations do not provide
+tokenized full-text search or ranking.
+If storage failure makes a commit outcome uncertain,
 `WriteTxContext` returns `*CommitOutcomeUncertainError` with its `TxID`.
 Reopen the database and call `HasTransactionReceipt(TxID)` to determine whether
 that transaction committed.
@@ -199,55 +204,51 @@ that transaction committed.
 Host-managed lifecycles can use `DB.BeginTx(ctx)`, then stage operations
 through the returned `*Tx` and call `Commit`, `CommitContext`, or
 `Rollback`. Commit follows the same writer scheduler and Spool-before-RIME
-publication path as `WriteTxContext`. A transaction opened before a typed
+publication path as `WriteTxContext`. A transaction opened before a
 schema/materializer generation change is rejected at commit. The former SQL
-transaction methods are gone from Murmur's public API. The `RecordTx` name remains
-a temporary compatibility alias for `Tx`; new code should use `Tx` in callback
-signatures and typed declarations. Production has no SQLite materializer or
-SQL application interface.
-Use `rime.Count[T]()` for row counts and
-`murmur.NumericFieldOf[T, V](table, "Field")` with RIME's `SumOf`/`AvgOf` to
-build numeric aggregates. The current
+transaction methods are gone from Murmur's public API. Production has no SQLite
+materializer or SQL application interface.
+Use `q.Count()` for row counts and `q.Sum`/`q.Avg`/`q.Min`/`q.Max` with
+`ItemQuery.Aggregate` or `GroupBy` to build aggregates. The current
 durable facade accepts LWW fields, numeric MIN/MAX fields, top-level int64
 PN_COUNTER fields, and top-level `[]string` OR_SET fields. Extrema, counters,
-and sets change through `RecordMin`, `RecordMax`, `RecordCounterAdd`,
-`RecordSetAdd`, and `RecordSetRemove`; existing extrema fields cannot be
+and sets change through `Min`, `Max`, `CounterAdd`,
+`SetAdd`, and `SetRemove`; existing extrema fields cannot be
 replaced directly. A new record's initial numeric value seeds its MIN/MAX field.
 The removed SQL methods cannot bypass Spool. Opened databases rebuild directly
-into RIME. A typed configuration whose
+into RIME. A configuration whose
 descriptor is an additive subset of the stored schema can reopen as an older
 writer; unknown top-level and supported nested fields remain durable through
 its writes. Custom field types can register stable codec IDs and versions with
-encode, decode, clone, and equality hooks in `RecordOptions.Codecs`. Typed
-`DB.ReadTxContext` pins a local MVCC snapshot for `GetRead` and `WhereReadTx`;
-`RecordReadTx.Snapshot` returns its local commit ID and `DB.ReadAt` can reopen a
-retained snapshot. Close read transactions promptly so old versions can be
-reclaimed. Snapshot IDs are local to one materializer generation, not
-cluster-wide timestamps. `MigrateRecords(ctx, completeDefinitions)` publishes
-an additive typed schema revision, rebuilds the private RIME materializer from
-Spool, and makes new typed handles available. Existing table and field IDs,
+encode, decode, clone, and equality hooks in `RecordOptions.Codecs`. Read
+snapshots stay inside the engine: joins and subscriptions pin a local MVCC
+snapshot and release it promptly so old versions can be reclaimed. Snapshot
+IDs are local to one materializer generation, not cluster-wide timestamps.
+`MigrateModels` and `MigrateRecords(ctx, completeDefinitions)` publish an
+additive schema revision, rebuild the private RIME materializer from
+Spool, and rebind adapter handles. Existing table and field IDs,
 types, and merge policies must remain unchanged; drops and incompatible edits
-fail before the manifest changes. Peers with compatible older typed bindings
+fail before the manifest changes. Peers with compatible older bindings
 can adopt the new manifest and retain fields they do not know. Operational
 feature ports remain incomplete. See [the migration plan](migration-plan.md)
 for the cutover gates.
 
 A generic Storm-style item API serves every registered struct through one
-function per operation, without per-table handles. `Define[T]`, `Model[T]` and runtime exemplars capture
-type-erased operation bindings per table; `Open` and migration helpers build
-a struct-type registry from them. `DB.InsertItem`, `DB.GetItem` (populating
-the supplied pointer), `DB.SaveItem` (full-record upsert), `DB.UpdateFields`
-(partial update, including zero values), and `DB.DeleteItem` resolve the
-table from the item's Go type and commit through the same Spool-before-RIME
-path as the typed API. `DB.CounterAdd`, `DB.SetAdd`, `DB.SetRemove`, `DB.Max`,
-and `DB.Min` mutate merge-policy fields the same way. `Tx` offers the same
-ten operations in a managed transaction, `RecordReadTx` offers `GetItem`,
-and `DB.Query` builds read-only
+function per operation, without per-table handles. `Model[T]` and runtime
+exemplars capture type-erased operation bindings per table; `Open` and
+migration helpers build a struct-type registry from them. `DB.InsertItem`,
+`DB.GetItem` (populating the supplied pointer), `DB.SaveItem` (full-record
+upsert), `DB.UpdateFields` (partial update, including zero values), and
+`DB.DeleteItem` resolve the table from the item's Go type and commit through
+the same Spool-before-RIME path as the engine. `DB.CounterAdd`, `DB.SetAdd`,
+`DB.SetRemove`, `DB.Max`, and `DB.Min` mutate merge-policy fields the same
+way. `Tx` offers the same ten operations in a managed transaction, and
+`DB.Query` builds read-only
 queries from `q` matchers (`Eq`, `Ne`, `Gt`, `Gte`, `Lt`, `Lte`, `In`, `And`,
 `Or`, `Not`) with `Where`, `OrderBy`/`OrderByDescending`, `Limit`, `Offset`,
-`In`/`InRead`/`WithContext` bindings, and `FindInto`/`FirstInto`/`Count`/
+`In`/`WithContext` bindings, and `FindInto`/`FirstInto`/`Count`/
 `Exists`, `Explain`, and `Aggregate` terminals, plus `GroupBy` grouped
-aggregation over `q` descriptors. `RecordReadTx.InnerJoin`/`LeftJoin` join
+aggregation over `q` descriptors. `DB.InnerJoin`/`DB.LeftJoin` join
 two models on equal key fields over one pinned snapshot. `DB.Subscribe`
 streams an initial snapshot plus coalesced primary-key diffs for a filtered
 item query with observer cursors and reset semantics. `ItemQuery.Compile`
@@ -255,13 +256,13 @@ prepares a reusable
 query whose `q.Param()` placeholders bind positionally per execution through
 the same terminals; binds coerce through the same conversions as one-shot
 queries, ordering/limit/offset are fixed at compile time, and
-`In`/`InRead`/`WithContext` rebind copies for transactions, snapshots, and
-cancellation. Matchers translate into typed RIME predicates so
+`In`/`WithContext` rebind copies for transactions and cancellation. Matchers
+translate into typed RIME predicates so
 equality and range filters keep using indexes; queryable field types are
 exactly `string`, `bool`, integer/float widths, `ids.RowID`/`[16]byte`, and
 `rime.UUID`. A struct registered for more than one table is ambiguous for
-the item API and must use `TableOf`. Arbitrary `map[string]any` records
-without a struct definition remain unsupported.
+the item API and must use distinct model names. Arbitrary `map[string]any`
+records without a struct definition remain unsupported.
 
 `SpoolConfig` is required; use `DefaultSpoolConfig()` for standard settings. `Config.Path` is the database directory. Expose block/segment sizing, worker concurrency, pending-memory bounds, compaction, and compression. Validate settings before opening Spool. Encryption keys come from `Encryption.Key` or `Encryption.Provider`; never weaken the replication acknowledgement or durability contract through storage options.
 

@@ -29,13 +29,12 @@ asynchronous; it does not provide global serializability.
 
 The storage layer owns durable state, transaction receipts, origin logs,
 snapshots, membership metadata, encryption and recovery. Applications provide
-Go record definitions and use Murmur-managed typed table and transaction
-handles.
+Go record definitions and use the Murmur-managed item API.
 
 ## 2. Managed Go API
 
-Applications define schemas with `Define[T]`, supply definitions using
-`Config.Tables`, and obtain managed handles using `TableOf[T]`. Writes use
+Applications register models with `Config.Models`, or supply `Model[T]`
+definitions using `Config.Tables`. Writes use
 `WriteTxContext` or explicit `BeginTx` transactions. Murmur stages changes,
 validates them against the durable schema, commits them to Spool, then
 publishes the prepared transaction to RIME. The API does not expose writable
