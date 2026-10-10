@@ -69,7 +69,7 @@ type RecordCodec struct {
 }
 
 // TableDefinition is an immutable, compiled typed-table definition for Config.
-// Construct it with Define[T].
+// Construct it with Model[T].
 type TableDefinition struct {
 	name      string
 	id        uint32
@@ -80,6 +80,14 @@ type TableDefinition struct {
 	register    func(*rimeadapter.Adapter) (any, error)
 	bridgeExist func(any, ids.RowID) (bool, error)
 	bridgeCheck func(uint32, ids.RowID, codec.Value) error
+
+	// goType is the registered struct type T; primaryField names its
+	// replicated primary field. itemOps holds type-erased bindings so the
+	// generic item API can call recordTable[T] methods without knowing T.
+	goType       reflect.Type
+	primaryField string
+	itemOps      *itemOps
+	model        *modelIdentity
 }
 
 // BridgeSourceReceipt binds one imported Low transaction identity to its
@@ -90,9 +98,13 @@ type BridgeSourceReceipt struct {
 	Sequence uint64
 }
 
-// Define compiles T into a stable rich-record schema. Runtime RIME field/index
+// define compiles T into a stable rich-record schema. Runtime RIME field/index
 // options remain on T's `rime` tags; replicated field IDs are supplied here.
-func Define[T any](name string, tableID uint32, options RecordOptions) (TableDefinition, error) {
+func define[T any](name string, tableID uint32, options RecordOptions) (TableDefinition, error) {
+	return defineType[T](reflect.TypeFor[T](), name, tableID, options, nil)
+}
+
+func defineType[T any](typ reflect.Type, name string, tableID uint32, options RecordOptions, identity *modelIdentity) (TableDefinition, error) {
 	if name == "" || tableID == 0 {
 		return TableDefinition{}, fmt.Errorf("murmur: record table name and nonzero ID are required: %w", ErrUnsupportedSchema)
 	}
@@ -114,12 +126,11 @@ func Define[T any](name string, tableID uint32, options RecordOptions) (TableDef
 		}
 	}
 	compile := recordcodec.CompileOptions{TableID: tableID, PrimaryField: options.PrimaryField, FieldIDs: fieldIDs, MergePolicies: policies, Codecs: codecs, MaxDepth: options.MaxDepth}
-	typ := reflect.TypeFor[T]()
 	if typ.Kind() != reflect.Struct {
 		return TableDefinition{}, fmt.Errorf("murmur: typed table records must be structs: %w", ErrUnsupportedSchema)
 	}
 	primary, ok := typ.FieldByName(options.PrimaryField)
-	if !ok || !hasRIMEPrimaryTag(primary.Tag.Get("rime")) {
+	if !ok || (identity == nil && !hasRIMEPrimaryTag(primary.Tag.Get("rime"))) {
 		return TableDefinition{}, fmt.Errorf("murmur: primary field %q must carry the rime primary tag: %w", options.PrimaryField, ErrUnsupportedSchema)
 	}
 	record, err := recordcodec.Compile(typ, compile)
@@ -171,20 +182,38 @@ func Define[T any](name string, tableID uint32, options RecordOptions) (TableDef
 		default:
 			return TableDefinition{}, fmt.Errorf("murmur: unsupported merge policy for field %s: %w", field.Path, ErrUnsupportedSchema)
 		}
+		columnName := field.GoName
+		if identity != nil {
+			goField, _ := typ.FieldByName(field.GoName)
+			_, logical := itemRimeTag(goField.Tag.Get("rime"))
+			if logical != "" {
+				columnName = logical
+			}
+		}
 		table.Columns = append(table.Columns, schema.ColumnSchema{
-			ID: field.ID, Name: field.GoName, Type: columnType,
+			ID: field.ID, Name: columnName, Type: columnType,
 			Nullable: nullable, MergePolicy: merge,
 		})
 	}
-	definition := TableDefinition{name: name, id: tableID, local: options.Scope == TableScopeNodeLocal, ephemeral: options.Scope == TableScopeEphemeral, table: table}
+	definition := TableDefinition{model: identity, name: name, id: tableID, local: options.Scope == TableScopeNodeLocal, ephemeral: options.Scope == TableScopeEphemeral, table: table}
 	definition.register = func(adapter *rimeadapter.Adapter) (any, error) {
-		if options.Scope == TableScopeNodeLocal {
-			return rimeadapter.RegisterLocal[T](adapter, name, table, compile)
+		var registered *rimeadapter.Table[T]
+		var err error
+		if typ != reflect.TypeFor[T]() {
+			runtime, runtimeErr := rimeadapter.RegisterType(adapter, typ, name, table, compile, definition.local, definition.ephemeral)
+			registered, _ = any(runtime).(*rimeadapter.Table[T])
+			err = runtimeErr
+		} else if definition.local {
+			registered, err = rimeadapter.RegisterLocal[T](adapter, name, table, compile)
+		} else if definition.ephemeral {
+			registered, err = rimeadapter.RegisterEphemeral[T](adapter, name, table, compile)
+		} else {
+			registered, err = rimeadapter.Register[T](adapter, name, compile)
 		}
-		if options.Scope == TableScopeEphemeral {
-			return rimeadapter.RegisterEphemeral[T](adapter, name, table, compile)
+		if err == nil && identity != nil {
+			registered.SetModelPolicy(identity.ensure, identity.sameKey)
 		}
-		return rimeadapter.Register[T](adapter, name, compile)
+		return registered, err
 	}
 	definition.bridgeExist = func(handle any, key ids.RowID) (bool, error) {
 		table, ok := handle.(*rimeadapter.Table[T])
@@ -222,6 +251,12 @@ func Define[T any](name string, tableID uint32, options RecordOptions) (TableDef
 			}
 		}
 		return nil
+	}
+	definition.goType = typ
+	definition.primaryField = options.PrimaryField
+	definition.itemOps = newItemOps[T](name)
+	if typ != reflect.TypeFor[T]() {
+		definition.itemOps = runtimeItemOps(name, typ)
 	}
 	return definition, nil
 }
@@ -266,6 +301,12 @@ func (d TableDefinition) schemaTable() schema.TableSchema {
 }
 
 func (c *Config) applyTableDefinitions() error {
+	models, err := compileModels(c.Models)
+	if err != nil {
+		return err
+	}
+	c.Tables = append(append([]TableDefinition(nil), c.Tables...), models...)
+	c.Models = nil
 	if len(c.Tables) == 0 {
 		return nil
 	}
@@ -398,6 +439,10 @@ func (db *DB) MigrateRecords(ctx context.Context, definitions []TableDefinition)
 		}
 		return err
 	}
+	if err := db.registerItemBindings(); err != nil {
+		db.setState(StateFailed)
+		return err
+	}
 	if changed {
 		db.metrics.schemaMigrations.Add(1)
 	}
@@ -413,9 +458,6 @@ type Tx struct {
 	generation uint64
 	done       bool
 }
-
-// RecordTx is retained as a compatibility alias while callers migrate to Tx.
-type RecordTx = Tx
 
 // BeginTx opens a managed typed write transaction. All writes commit through
 // Spool before RIME publication.
@@ -437,7 +479,7 @@ func (db *DB) BeginTx(ctx context.Context) (*Tx, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &RecordTx{db: db, inner: inner, ctx: ctx, generation: generation}, nil
+	return &Tx{db: db, inner: inner, ctx: ctx, generation: generation}, nil
 }
 
 // Commit durably commits the staged records before publishing them to RIME.
@@ -471,64 +513,66 @@ func (tx *Tx) Rollback() error {
 	return nil
 }
 
-// RecordReadTx pins one local RIME MVCC snapshot. It is single-goroutine owned
+// recordReadTx pins one local RIME MVCC snapshot. It is single-goroutine owned
 // and must be closed promptly so old versions can be reclaimed.
-type RecordReadTx struct {
-	db     *DB
-	inner  *rime.Tx
-	ctx    context.Context
-	tables map[string]any
-	gen    uint64
-	done   bool
+type recordReadTx struct {
+	db            *DB
+	inner         *rime.Tx
+	ctx           context.Context
+	tables        map[string]any
+	itemBindings  map[reflect.Type]*itemBinding
+	itemAmbiguous map[reflect.Type][]string
+	gen           uint64
+	done          bool
 }
 
-// RecordSnapshotID identifies a commit snapshot in one local materializer
+// recordSnapshotID identifies a commit snapshot in one local materializer
 // generation. It cannot be used on another node or after a rebuild.
-type RecordSnapshotID struct {
+type recordSnapshotID struct {
 	generation uint64
 	commit     rime.TxID
 }
 
-// RecordJoinRow contains detached records returned by a managed typed join.
+// recordJoinRow contains detached records returned by a managed typed join.
 // Right is nil for an unmatched left-join row.
-type RecordJoinRow[A, B any] struct {
+type recordJoinRow[A, B any] struct {
 	Left  *A
 	Right *B
 }
 
-// RecordTable is a typed table handle owned by a Murmur DB.
-type RecordTable[T any] struct {
+// recordTable is a typed table handle owned by a Murmur DB.
+type recordTable[T any] struct {
 	db   *DB
 	name string
 }
 
-// RecordQuery is a read-only typed query. It deliberately omits RIME's query
+// recordQuery is a read-only typed query. It deliberately omits RIME's query
 // mutation methods so query execution cannot bypass Murmur's durable writer.
-type RecordQuery[T any] struct {
+type recordQuery[T any] struct {
 	db    *DB
 	inner *rime.Query[T]
 	clone func(*T) (*T, error)
 	err   error
 }
 
-// RecordGroupedQuery is a read-only typed grouping wrapper.
-type RecordGroupedQuery[T any] struct {
+// recordGroupedQuery is a read-only typed grouping wrapper.
+type recordGroupedQuery[T any] struct {
 	db    *DB
 	inner *rime.GroupedQuery[T]
 	err   error
 }
 
-// RecordCompiledQuery is a reusable read-only query with typed positional
+// recordCompiledQuery is a reusable read-only query with typed positional
 // parameters. It exposes no RIME mutation methods.
-type RecordCompiledQuery[T any] struct {
+type recordCompiledQuery[T any] struct {
 	db    *DB
 	inner *rime.Compiled[T]
 	clone func(*T) (*T, error)
 	err   error
 }
 
-// TableOf returns a registered typed table and verifies the Go record type.
-func TableOf[T any](db *DB, name string) (*RecordTable[T], error) {
+// tableOf returns a registered typed table and verifies the Go record type.
+func tableOf[T any](db *DB, name string) (*recordTable[T], error) {
 	if db == nil {
 		return nil, fmt.Errorf("murmur: typed record tables are not configured: %w", ErrUnsupportedSchema)
 	}
@@ -541,7 +585,7 @@ func TableOf[T any](db *DB, name string) (*RecordTable[T], error) {
 	if !ok || inner == nil {
 		return nil, fmt.Errorf("murmur: typed table %q is absent or has record type %T, requested %T: %w", name, db.recordTables[strings.ToLower(name)], (*rimeadapter.Table[T])(nil), ErrUnsupportedSchema)
 	}
-	return &RecordTable[T]{db: db, name: strings.ToLower(name)}, nil
+	return &recordTable[T]{db: db, name: strings.ToLower(name)}, nil
 }
 
 // BridgeTypedRowExists checks row identity against the native typed materializer.
@@ -750,7 +794,7 @@ func (db *DB) CommitTypedBridgeImport(ctx context.Context, txID ids.TxID, source
 	return nil
 }
 
-func (t *RecordTable[T]) lockInner() (*rimeadapter.Table[T], func(), error) {
+func (t *recordTable[T]) lockInner() (*rimeadapter.Table[T], func(), error) {
 	if t == nil || t.db == nil {
 		return nil, nil, ErrClosed
 	}
@@ -764,7 +808,7 @@ func (t *RecordTable[T]) lockInner() (*rimeadapter.Table[T], func(), error) {
 }
 
 // Get reads one currently published record by its replicated RowID.
-func (t *RecordTable[T]) Get(key ids.RowID) (*T, error) {
+func (t *recordTable[T]) Get(key ids.RowID) (*T, error) {
 	if t == nil || t.db == nil {
 		return nil, ErrClosed
 	}
@@ -787,7 +831,7 @@ func (t *RecordTable[T]) Get(key ids.RowID) (*T, error) {
 }
 
 // GetTx reads through the transaction's RIME snapshot and staged overlay.
-func (t *RecordTable[T]) GetTx(tx *Tx, key ids.RowID) (*T, error) {
+func (t *recordTable[T]) GetTx(tx *Tx, key ids.RowID) (*T, error) {
 	if tx == nil {
 		return nil, rime.ErrTxClosed
 	}
@@ -804,7 +848,7 @@ func (t *RecordTable[T]) GetTx(tx *Tx, key ids.RowID) (*T, error) {
 }
 
 // GetRead reads one record from a pinned read transaction.
-func (t *RecordTable[T]) GetRead(tx *RecordReadTx, key ids.RowID) (*T, error) {
+func (t *recordTable[T]) GetRead(tx *recordReadTx, key ids.RowID) (*T, error) {
 	if t == nil || t.db == nil || tx == nil || tx.done || tx.db != t.db {
 		return nil, rime.ErrTxClosed
 	}
@@ -823,7 +867,7 @@ func (t *RecordTable[T]) GetRead(tx *RecordReadTx, key ids.RowID) (*T, error) {
 }
 
 // Insert stages a new record. The row ID must be a nonzero 16-byte value.
-func (t *RecordTable[T]) Insert(tx *Tx, value *T) error {
+func (t *recordTable[T]) Insert(tx *Tx, value *T) error {
 	if tx == nil {
 		return rime.ErrTxClosed
 	}
@@ -836,7 +880,7 @@ func (t *RecordTable[T]) Insert(tx *Tx, value *T) error {
 }
 
 // InsertMany stages a bounded atomic insert batch in tx.
-func (t *RecordTable[T]) InsertMany(tx *Tx, values []*T) error {
+func (t *recordTable[T]) InsertMany(tx *Tx, values []*T) error {
 	if tx == nil {
 		return rime.ErrTxClosed
 	}
@@ -850,7 +894,7 @@ func (t *RecordTable[T]) InsertMany(tx *Tx, values []*T) error {
 
 // Save inserts or replaces a complete record. Unknown durable top-level fields
 // and compatible nested-struct payloads are retained by the adapter.
-func (t *RecordTable[T]) Save(tx *Tx, value *T) error {
+func (t *recordTable[T]) Save(tx *Tx, value *T) error {
 	if tx == nil {
 		return rime.ErrTxClosed
 	}
@@ -863,7 +907,7 @@ func (t *RecordTable[T]) Save(tx *Tx, value *T) error {
 }
 
 // SaveMany stages an atomic insert-or-replace batch in tx.
-func (t *RecordTable[T]) SaveMany(tx *Tx, values []*T) error {
+func (t *recordTable[T]) SaveMany(tx *Tx, values []*T) error {
 	if tx == nil {
 		return rime.ErrTxClosed
 	}
@@ -876,7 +920,7 @@ func (t *RecordTable[T]) SaveMany(tx *Tx, values []*T) error {
 }
 
 // Update stages an update to a private copy of a currently visible record.
-func (t *RecordTable[T]) Update(tx *Tx, key ids.RowID, fn func(*T) error) error {
+func (t *recordTable[T]) Update(tx *Tx, key ids.RowID, fn func(*T) error) error {
 	if tx == nil {
 		return rime.ErrTxClosed
 	}
@@ -892,7 +936,7 @@ func (t *RecordTable[T]) Update(tx *Tx, key ids.RowID, fn func(*T) error) error 
 }
 
 // Delete stages a tombstone for one record.
-func (t *RecordTable[T]) Delete(tx *Tx, key ids.RowID) error {
+func (t *recordTable[T]) Delete(tx *Tx, key ids.RowID) error {
 	if tx == nil {
 		return rime.ErrTxClosed
 	}
@@ -905,7 +949,7 @@ func (t *RecordTable[T]) Delete(tx *Tx, key ids.RowID) error {
 }
 
 // DeleteMany stages an atomic tombstone batch in tx.
-func (t *RecordTable[T]) DeleteMany(tx *Tx, keys []ids.RowID) error {
+func (t *recordTable[T]) DeleteMany(tx *Tx, keys []ids.RowID) error {
 	if tx == nil {
 		return rime.ErrTxClosed
 	}
@@ -921,10 +965,10 @@ func (t *RecordTable[T]) DeleteMany(tx *Tx, keys []ids.RowID) error {
 	return inner.DeleteMany(tx.inner, anyKeys)
 }
 
-// RecordCounterAdd stages one PN_COUNTER delta against a typed int64 field.
+// recordCounterAdd stages one PN_COUNTER delta against a typed int64 field.
 // Direct record replacement cannot change counter fields; use this operation
 // so Spool receives causal actor components instead of an LWW projection.
-func RecordCounterAdd[T any](tx *Tx, table *RecordTable[T], key ids.RowID, field string, delta int64) error {
+func recordCounterAdd[T any](tx *Tx, table *recordTable[T], key ids.RowID, field string, delta int64) error {
 	if tx == nil {
 		return rime.ErrTxClosed
 	}
@@ -936,8 +980,8 @@ func RecordCounterAdd[T any](tx *Tx, table *RecordTable[T], key ids.RowID, field
 	return inner.CounterAdd(tx.inner, key, field, delta)
 }
 
-// RecordSetAdd adds a string to a top-level []string OR_SET field.
-func RecordSetAdd[T any](tx *Tx, table *RecordTable[T], key ids.RowID, field, value string) error {
+// recordSetAdd adds a string to a top-level []string OR_SET field.
+func recordSetAdd[T any](tx *Tx, table *recordTable[T], key ids.RowID, field, value string) error {
 	if tx == nil {
 		return rime.ErrTxClosed
 	}
@@ -949,8 +993,8 @@ func RecordSetAdd[T any](tx *Tx, table *RecordTable[T], key ids.RowID, field, va
 	return inner.SetAdd(tx.inner, key, field, value)
 }
 
-// RecordSetRemove removes a string from a top-level []string OR_SET field.
-func RecordSetRemove[T any](tx *Tx, table *RecordTable[T], key ids.RowID, field, value string) error {
+// recordSetRemove removes a string from a top-level []string OR_SET field.
+func recordSetRemove[T any](tx *Tx, table *recordTable[T], key ids.RowID, field, value string) error {
 	if tx == nil {
 		return rime.ErrTxClosed
 	}
@@ -962,9 +1006,9 @@ func RecordSetRemove[T any](tx *Tx, table *RecordTable[T], key ids.RowID, field,
 	return inner.SetRemove(tx.inner, key, field, value)
 }
 
-// RecordMax applies a numeric maximum to a top-level MIN/MAX-policy field.
+// recordMax applies a numeric maximum to a top-level MIN/MAX-policy field.
 // The supplied value must have exactly the field's Go type.
-func RecordMax[T any](tx *Tx, table *RecordTable[T], key ids.RowID, field string, value any) error {
+func recordMax[T any](tx *Tx, table *recordTable[T], key ids.RowID, field string, value any) error {
 	if tx == nil {
 		return rime.ErrTxClosed
 	}
@@ -980,9 +1024,9 @@ func RecordMax[T any](tx *Tx, table *RecordTable[T], key ids.RowID, field string
 	return err
 }
 
-// RecordMin applies a numeric minimum to a top-level MIN/MAX-policy field.
+// recordMin applies a numeric minimum to a top-level MIN/MAX-policy field.
 // The supplied value must have exactly the field's Go type.
-func RecordMin[T any](tx *Tx, table *RecordTable[T], key ids.RowID, field string, value any) error {
+func recordMin[T any](tx *Tx, table *recordTable[T], key ids.RowID, field string, value any) error {
 	if tx == nil {
 		return rime.ErrTxClosed
 	}
@@ -998,8 +1042,8 @@ func RecordMin[T any](tx *Tx, table *RecordTable[T], key ids.RowID, field string
 	return err
 }
 
-// FieldOf creates a typed field handle for predicates and ordering.
-func FieldOf[T any, V comparable](table *RecordTable[T], name string) rime.Field[T, V] {
+// fieldOf creates a typed field handle for predicates and ordering.
+func fieldOf[T any, V comparable](table *recordTable[T], name string) rime.Field[T, V] {
 	inner, unlock, err := table.lockInner()
 	if err != nil {
 		panic(err)
@@ -1008,9 +1052,9 @@ func FieldOf[T any, V comparable](table *RecordTable[T], name string) rime.Field
 	return rimeadapter.FieldOf[T, V](inner, name)
 }
 
-// StringFieldOf creates a typed string field handle for prefix, suffix,
+// stringFieldOf creates a typed string field handle for prefix, suffix,
 // substring, and LIKE predicates without exposing a writable RIME table.
-func StringFieldOf[T any](table *RecordTable[T], name string) rime.StringField[T] {
+func stringFieldOf[T any](table *recordTable[T], name string) rime.StringField[T] {
 	inner, unlock, err := table.lockInner()
 	if err != nil {
 		panic(err)
@@ -1019,9 +1063,9 @@ func StringFieldOf[T any](table *RecordTable[T], name string) rime.StringField[T
 	return rimeadapter.StringFieldOf(inner, name)
 }
 
-// NumericFieldOf creates a typed numeric field handle for ordering and
+// numericFieldOf creates a typed numeric field handle for ordering and
 // aggregate builders without exposing a writable RIME table.
-func NumericFieldOf[T any, V rime.Number](table *RecordTable[T], name string) rime.OrderedField[T, V] {
+func numericFieldOf[T any, V rime.Number](table *recordTable[T], name string) rime.OrderedField[T, V] {
 	inner, unlock, err := table.lockInner()
 	if err != nil {
 		panic(err)
@@ -1031,27 +1075,27 @@ func NumericFieldOf[T any, V rime.Number](table *RecordTable[T], name string) ri
 }
 
 // Where starts a latest-snapshot read query.
-func (t *RecordTable[T]) Where(exprs ...rime.Expr[T]) *RecordQuery[T] {
+func (t *recordTable[T]) Where(exprs ...rime.Expr[T]) *recordQuery[T] {
 	inner, unlock, err := t.lockInner()
 	if err != nil {
-		return &RecordQuery[T]{db: t.db, err: err}
+		return &recordQuery[T]{db: t.db, err: err}
 	}
 	defer unlock()
-	return &RecordQuery[T]{db: t.db, inner: inner.Where(exprs...), clone: inner.Clone}
+	return &recordQuery[T]{db: t.db, inner: inner.Where(exprs...), clone: inner.Clone}
 }
 
 // Compile builds a reusable read-only query with typed positional parameters.
-func (t *RecordTable[T]) Compile(exprs ...rime.Expr[T]) *RecordCompiledQuery[T] {
+func (t *recordTable[T]) Compile(exprs ...rime.Expr[T]) *recordCompiledQuery[T] {
 	inner, unlock, err := t.lockInner()
 	if err != nil {
-		return &RecordCompiledQuery[T]{db: t.db, err: err}
+		return &recordCompiledQuery[T]{db: t.db, err: err}
 	}
 	defer unlock()
-	return &RecordCompiledQuery[T]{db: t.db, inner: inner.Compile(exprs...), clone: inner.Clone}
+	return &recordCompiledQuery[T]{db: t.db, inner: inner.Compile(exprs...), clone: inner.Clone}
 }
 
 // WhereTx starts a query bound to tx's snapshot and staged writes.
-func (t *RecordTable[T]) WhereTx(tx *Tx, exprs ...rime.Expr[T]) (*RecordQuery[T], error) {
+func (t *recordTable[T]) WhereTx(tx *Tx, exprs ...rime.Expr[T]) (*recordQuery[T], error) {
 	if tx == nil {
 		return nil, rime.ErrTxClosed
 	}
@@ -1064,11 +1108,11 @@ func (t *RecordTable[T]) WhereTx(tx *Tx, exprs ...rime.Expr[T]) (*RecordQuery[T]
 	if err != nil {
 		return nil, err
 	}
-	return &RecordQuery[T]{db: t.db, inner: query.WithContext(tx.ctx), clone: inner.Clone}, nil
+	return &recordQuery[T]{db: t.db, inner: query.WithContext(tx.ctx), clone: inner.Clone}, nil
 }
 
 // CompileTx builds a reusable query bound to tx's snapshot and staged writes.
-func (t *RecordTable[T]) CompileTx(tx *Tx, exprs ...rime.Expr[T]) (*RecordCompiledQuery[T], error) {
+func (t *recordTable[T]) CompileTx(tx *Tx, exprs ...rime.Expr[T]) (*recordCompiledQuery[T], error) {
 	if tx == nil {
 		return nil, rime.ErrTxClosed
 	}
@@ -1081,11 +1125,11 @@ func (t *RecordTable[T]) CompileTx(tx *Tx, exprs ...rime.Expr[T]) (*RecordCompil
 	if err != nil {
 		return nil, err
 	}
-	return &RecordCompiledQuery[T]{db: t.db, inner: compiled, clone: inner.Clone}, nil
+	return &recordCompiledQuery[T]{db: t.db, inner: compiled, clone: inner.Clone}, nil
 }
 
 // WhereReadTx starts a read query bound to tx's pinned MVCC snapshot.
-func (t *RecordTable[T]) WhereReadTx(tx *RecordReadTx, exprs ...rime.Expr[T]) (*RecordQuery[T], error) {
+func (t *recordTable[T]) WhereReadTx(tx *recordReadTx, exprs ...rime.Expr[T]) (*recordQuery[T], error) {
 	if t == nil || t.db == nil || tx == nil || tx.done || tx.db != t.db {
 		return nil, rime.ErrTxClosed
 	}
@@ -1093,11 +1137,11 @@ func (t *RecordTable[T]) WhereReadTx(tx *RecordReadTx, exprs ...rime.Expr[T]) (*
 	if !ok || inner == nil {
 		return nil, fmt.Errorf("murmur: typed table %q is unavailable in this snapshot: %w", t.name, ErrUnsupportedSchema)
 	}
-	return &RecordQuery[T]{db: t.db, inner: inner.Where(exprs...).In(tx.inner).WithContext(tx.ctx), clone: inner.Clone}, nil
+	return &recordQuery[T]{db: t.db, inner: inner.Where(exprs...).In(tx.inner).WithContext(tx.ctx), clone: inner.Clone}, nil
 }
 
 // CompileReadTx builds a reusable query pinned to tx's read snapshot.
-func (t *RecordTable[T]) CompileReadTx(tx *RecordReadTx, exprs ...rime.Expr[T]) (*RecordCompiledQuery[T], error) {
+func (t *recordTable[T]) CompileReadTx(tx *recordReadTx, exprs ...rime.Expr[T]) (*recordCompiledQuery[T], error) {
 	if t == nil || t.db == nil || tx == nil || tx.done || tx.db != t.db {
 		return nil, rime.ErrTxClosed
 	}
@@ -1105,12 +1149,12 @@ func (t *RecordTable[T]) CompileReadTx(tx *RecordReadTx, exprs ...rime.Expr[T]) 
 	if !ok || inner == nil {
 		return nil, fmt.Errorf("murmur: typed table %q is unavailable in this snapshot: %w", t.name, ErrUnsupportedSchema)
 	}
-	return &RecordCompiledQuery[T]{db: t.db, inner: inner.CompileReadTx(tx.inner, tx.ctx, exprs...), clone: inner.Clone}, nil
+	return &recordCompiledQuery[T]{db: t.db, inner: inner.CompileReadTx(tx.inner, tx.ctx, exprs...), clone: inner.Clone}, nil
 }
 
-// ReadTxContext opens a context-aware snapshot over all currently registered
+// readTxContext opens a context-aware snapshot over all currently registered
 // typed tables.
-func (db *DB) ReadTxContext(ctx context.Context) (*RecordReadTx, error) {
+func (db *DB) readTxContext(ctx context.Context) (*recordReadTx, error) {
 	if db == nil {
 		return nil, fmt.Errorf("murmur: typed read transactions are not configured: %w", ErrUnsupportedSchema)
 	}
@@ -1126,12 +1170,14 @@ func (db *DB) ReadTxContext(ctx context.Context) (*RecordReadTx, error) {
 		return nil, ErrClosed
 	}
 	tx := db.recordDB.ReadTxContext(ctx)
-	return &RecordReadTx{db: db, inner: tx, ctx: ctx, tables: db.recordTables, gen: db.recordGeneration}, nil
+	db.itemMu.RLock()
+	defer db.itemMu.RUnlock()
+	return &recordReadTx{db: db, inner: tx, ctx: ctx, tables: db.recordTables, itemBindings: db.itemBindings, itemAmbiguous: db.itemAmbiguous, gen: db.recordGeneration}, nil
 }
 
-// ReadAt opens a typed read transaction pinned to a retained local RIME
-// snapshot ID returned by RecordReadTx.Snapshot or another RIME snapshot.
-func (db *DB) ReadAt(snapshot RecordSnapshotID) (*RecordReadTx, error) {
+// readAt opens a typed read transaction pinned to a retained local RIME
+// snapshot ID returned by recordReadTx.Snapshot or another RIME snapshot.
+func (db *DB) readAt(snapshot recordSnapshotID) (*recordReadTx, error) {
 	if db == nil {
 		return nil, fmt.Errorf("murmur: typed read transactions are not configured: %w", ErrUnsupportedSchema)
 	}
@@ -1147,19 +1193,21 @@ func (db *DB) ReadAt(snapshot RecordSnapshotID) (*RecordReadTx, error) {
 		return nil, rime.ErrSnapshotUnavailable
 	}
 	tx := db.recordDB.ReadAt(snapshot.commit)
-	return &RecordReadTx{db: db, inner: tx, ctx: context.Background(), tables: db.recordTables, gen: db.recordGeneration}, nil
+	db.itemMu.RLock()
+	defer db.itemMu.RUnlock()
+	return &recordReadTx{db: db, inner: tx, ctx: context.Background(), tables: db.recordTables, itemBindings: db.itemBindings, itemAmbiguous: db.itemAmbiguous, gen: db.recordGeneration}, nil
 }
 
 // Snapshot returns the local RIME commit ID pinned by tx.
-func (tx *RecordReadTx) Snapshot() RecordSnapshotID {
+func (tx *recordReadTx) Snapshot() recordSnapshotID {
 	if tx == nil || tx.inner == nil {
-		return RecordSnapshotID{}
+		return recordSnapshotID{}
 	}
-	return RecordSnapshotID{generation: tx.gen, commit: tx.inner.Snapshot()}
+	return recordSnapshotID{generation: tx.gen, commit: tx.inner.Snapshot()}
 }
 
 // Close releases the pinned RIME snapshot. Repeated calls are harmless.
-func (tx *RecordReadTx) Close() error {
+func (tx *recordReadTx) Close() error {
 	if tx == nil || tx.done {
 		return nil
 	}
@@ -1170,58 +1218,58 @@ func (tx *RecordReadTx) Close() error {
 	return nil
 }
 
-func (q *RecordCompiledQuery[T]) WithContext(ctx context.Context) *RecordCompiledQuery[T] {
+func (q *recordCompiledQuery[T]) WithContext(ctx context.Context) *recordCompiledQuery[T] {
 	if q == nil {
-		return &RecordCompiledQuery[T]{}
+		return &recordCompiledQuery[T]{}
 	}
 	if q.inner == nil {
-		return &RecordCompiledQuery[T]{db: q.db, err: q.err}
+		return &recordCompiledQuery[T]{db: q.db, err: q.err}
 	}
-	return &RecordCompiledQuery[T]{db: q.db, inner: q.inner.WithContext(ctx), clone: q.clone}
+	return &recordCompiledQuery[T]{db: q.db, inner: q.inner.WithContext(ctx), clone: q.clone}
 }
 
-func (q *RecordCompiledQuery[T]) Limit(n int) *RecordCompiledQuery[T] {
+func (q *recordCompiledQuery[T]) Limit(n int) *recordCompiledQuery[T] {
 	if q == nil || q.inner == nil {
 		if q == nil {
-			return &RecordCompiledQuery[T]{}
+			return &recordCompiledQuery[T]{}
 		}
-		return &RecordCompiledQuery[T]{db: q.db, err: q.err}
+		return &recordCompiledQuery[T]{db: q.db, err: q.err}
 	}
-	return &RecordCompiledQuery[T]{db: q.db, inner: q.inner.Limit(n), clone: q.clone}
+	return &recordCompiledQuery[T]{db: q.db, inner: q.inner.Limit(n), clone: q.clone}
 }
 
-func (q *RecordCompiledQuery[T]) Offset(n int) *RecordCompiledQuery[T] {
+func (q *recordCompiledQuery[T]) Offset(n int) *recordCompiledQuery[T] {
 	if q == nil || q.inner == nil {
 		if q == nil {
-			return &RecordCompiledQuery[T]{}
+			return &recordCompiledQuery[T]{}
 		}
-		return &RecordCompiledQuery[T]{db: q.db, err: q.err}
+		return &recordCompiledQuery[T]{db: q.db, err: q.err}
 	}
-	return &RecordCompiledQuery[T]{db: q.db, inner: q.inner.Offset(n), clone: q.clone}
+	return &recordCompiledQuery[T]{db: q.db, inner: q.inner.Offset(n), clone: q.clone}
 }
 
-func (q *RecordCompiledQuery[T]) OrderByAsc(field rime.OrderField[T]) *RecordCompiledQuery[T] {
+func (q *recordCompiledQuery[T]) OrderByAsc(field rime.OrderField[T]) *recordCompiledQuery[T] {
 	if q == nil || q.inner == nil {
 		if q == nil {
-			return &RecordCompiledQuery[T]{}
+			return &recordCompiledQuery[T]{}
 		}
-		return &RecordCompiledQuery[T]{db: q.db, err: q.err}
+		return &recordCompiledQuery[T]{db: q.db, err: q.err}
 	}
-	return &RecordCompiledQuery[T]{db: q.db, inner: q.inner.OrderByAsc(field), clone: q.clone}
+	return &recordCompiledQuery[T]{db: q.db, inner: q.inner.OrderByAsc(field), clone: q.clone}
 }
 
-func (q *RecordCompiledQuery[T]) OrderByDesc(field rime.OrderField[T]) *RecordCompiledQuery[T] {
+func (q *recordCompiledQuery[T]) OrderByDesc(field rime.OrderField[T]) *recordCompiledQuery[T] {
 	if q == nil || q.inner == nil {
 		if q == nil {
-			return &RecordCompiledQuery[T]{}
+			return &recordCompiledQuery[T]{}
 		}
-		return &RecordCompiledQuery[T]{db: q.db, err: q.err}
+		return &recordCompiledQuery[T]{db: q.db, err: q.err}
 	}
-	return &RecordCompiledQuery[T]{db: q.db, inner: q.inner.OrderByDesc(field), clone: q.clone}
+	return &recordCompiledQuery[T]{db: q.db, inner: q.inner.OrderByDesc(field), clone: q.clone}
 }
 
 // Find executes a compiled query and returns detached records.
-func (q *RecordCompiledQuery[T]) Find(args ...any) ([]*T, error) {
+func (q *recordCompiledQuery[T]) Find(args ...any) ([]*T, error) {
 	if err := q.check(); err != nil {
 		return nil, err
 	}
@@ -1245,7 +1293,7 @@ func (q *RecordCompiledQuery[T]) Find(args ...any) ([]*T, error) {
 }
 
 // Count executes a compiled query count.
-func (q *RecordCompiledQuery[T]) Count(args ...any) (int, error) {
+func (q *recordCompiledQuery[T]) Count(args ...any) (int, error) {
 	if err := q.check(); err != nil {
 		return 0, err
 	}
@@ -1257,7 +1305,7 @@ func (q *RecordCompiledQuery[T]) Count(args ...any) (int, error) {
 	return q.inner.Count(args...)
 }
 
-func (q *RecordCompiledQuery[T]) check() error {
+func (q *recordCompiledQuery[T]) check() error {
 	if q == nil {
 		return rime.ErrBadView
 	}
@@ -1270,19 +1318,19 @@ func (q *RecordCompiledQuery[T]) check() error {
 	return nil
 }
 
-// InnerJoinReadTx joins two registered tables using one pinned local snapshot.
-// Use FieldOf handles for both keys. Returned records are detached clones.
-func InnerJoinReadTx[A, B any, K comparable](tx *RecordReadTx, left *RecordTable[A], lfield rime.KeyField[A, K], right *RecordTable[B], rfield rime.KeyField[B, K]) ([]RecordJoinRow[A, B], error) {
+// innerJoinReadTx joins two registered tables using one pinned local snapshot.
+// Use fieldOf handles for both keys. Returned records are detached clones.
+func innerJoinReadTx[A, B any, K comparable](tx *recordReadTx, left *recordTable[A], lfield rime.KeyField[A, K], right *recordTable[B], rfield rime.KeyField[B, K]) ([]recordJoinRow[A, B], error) {
 	return joinRecordTables(tx, left, lfield, right, rfield, false)
 }
 
-// LeftJoinReadTx joins two registered tables using one pinned local snapshot,
+// leftJoinReadTx joins two registered tables using one pinned local snapshot,
 // retaining left records with no match. Returned records are detached clones.
-func LeftJoinReadTx[A, B any, K comparable](tx *RecordReadTx, left *RecordTable[A], lfield rime.KeyField[A, K], right *RecordTable[B], rfield rime.KeyField[B, K]) ([]RecordJoinRow[A, B], error) {
+func leftJoinReadTx[A, B any, K comparable](tx *recordReadTx, left *recordTable[A], lfield rime.KeyField[A, K], right *recordTable[B], rfield rime.KeyField[B, K]) ([]recordJoinRow[A, B], error) {
 	return joinRecordTables(tx, left, lfield, right, rfield, true)
 }
 
-func joinRecordTables[A, B any, K comparable](tx *RecordReadTx, left *RecordTable[A], lfield rime.KeyField[A, K], right *RecordTable[B], rfield rime.KeyField[B, K], outer bool) ([]RecordJoinRow[A, B], error) {
+func joinRecordTables[A, B any, K comparable](tx *recordReadTx, left *recordTable[A], lfield rime.KeyField[A, K], right *recordTable[B], rfield rime.KeyField[B, K], outer bool) ([]recordJoinRow[A, B], error) {
 	if tx == nil || tx.done || tx.inner == nil || left == nil || right == nil || left.db == nil || left.db != right.db || tx.db != left.db {
 		return nil, rime.ErrTxClosed
 	}
@@ -1310,7 +1358,7 @@ func joinRecordTables[A, B any, K comparable](tx *RecordReadTx, left *RecordTabl
 	if err != nil {
 		return nil, err
 	}
-	out := make([]RecordJoinRow[A, B], len(joined))
+	out := make([]recordJoinRow[A, B], len(joined))
 	for i, row := range joined {
 		out[i].Left, err = lt.Clone(row.Left)
 		if err != nil {
@@ -1326,67 +1374,67 @@ func joinRecordTables[A, B any, K comparable](tx *RecordReadTx, left *RecordTabl
 	return out, nil
 }
 
-func (q *RecordQuery[T]) WithContext(ctx context.Context) *RecordQuery[T] {
+func (q *recordQuery[T]) WithContext(ctx context.Context) *recordQuery[T] {
 	if q == nil {
-		return &RecordQuery[T]{}
+		return &recordQuery[T]{}
 	}
 	if q.inner == nil {
-		return &RecordQuery[T]{db: q.db, err: q.err}
+		return &recordQuery[T]{db: q.db, err: q.err}
 	}
-	return &RecordQuery[T]{db: q.db, inner: q.inner.WithContext(ctx), clone: q.clone}
+	return &recordQuery[T]{db: q.db, inner: q.inner.WithContext(ctx), clone: q.clone}
 }
 
-func (q *RecordQuery[T]) Where(exprs ...rime.Expr[T]) *RecordQuery[T] {
+func (q *recordQuery[T]) Where(exprs ...rime.Expr[T]) *recordQuery[T] {
 	if q == nil {
-		return &RecordQuery[T]{}
+		return &recordQuery[T]{}
 	}
 	if q.inner == nil {
-		return &RecordQuery[T]{db: q.db, err: q.err}
+		return &recordQuery[T]{db: q.db, err: q.err}
 	}
-	return &RecordQuery[T]{db: q.db, inner: q.inner.Where(exprs...), clone: q.clone}
+	return &recordQuery[T]{db: q.db, inner: q.inner.Where(exprs...), clone: q.clone}
 }
 
-func (q *RecordQuery[T]) Limit(n int) *RecordQuery[T] {
+func (q *recordQuery[T]) Limit(n int) *recordQuery[T] {
 	if q == nil {
-		return &RecordQuery[T]{}
+		return &recordQuery[T]{}
 	}
 	if q.inner == nil {
-		return &RecordQuery[T]{db: q.db, err: q.err}
+		return &recordQuery[T]{db: q.db, err: q.err}
 	}
-	return &RecordQuery[T]{db: q.db, inner: q.inner.Limit(n), clone: q.clone}
+	return &recordQuery[T]{db: q.db, inner: q.inner.Limit(n), clone: q.clone}
 }
 
-func (q *RecordQuery[T]) Offset(n int) *RecordQuery[T] {
+func (q *recordQuery[T]) Offset(n int) *recordQuery[T] {
 	if q == nil {
-		return &RecordQuery[T]{}
+		return &recordQuery[T]{}
 	}
 	if q.inner == nil {
-		return &RecordQuery[T]{db: q.db, err: q.err}
+		return &recordQuery[T]{db: q.db, err: q.err}
 	}
-	return &RecordQuery[T]{db: q.db, inner: q.inner.Offset(n), clone: q.clone}
+	return &recordQuery[T]{db: q.db, inner: q.inner.Offset(n), clone: q.clone}
 }
 
-func (q *RecordQuery[T]) OrderByAsc(field rime.OrderField[T]) *RecordQuery[T] {
+func (q *recordQuery[T]) OrderByAsc(field rime.OrderField[T]) *recordQuery[T] {
 	if q == nil {
-		return &RecordQuery[T]{}
+		return &recordQuery[T]{}
 	}
 	if q.inner == nil {
-		return &RecordQuery[T]{db: q.db, err: q.err}
+		return &recordQuery[T]{db: q.db, err: q.err}
 	}
-	return &RecordQuery[T]{db: q.db, inner: q.inner.OrderByAsc(field), clone: q.clone}
+	return &recordQuery[T]{db: q.db, inner: q.inner.OrderByAsc(field), clone: q.clone}
 }
 
-func (q *RecordQuery[T]) OrderByDesc(field rime.OrderField[T]) *RecordQuery[T] {
+func (q *recordQuery[T]) OrderByDesc(field rime.OrderField[T]) *recordQuery[T] {
 	if q == nil {
-		return &RecordQuery[T]{}
+		return &recordQuery[T]{}
 	}
 	if q.inner == nil {
-		return &RecordQuery[T]{db: q.db, err: q.err}
+		return &recordQuery[T]{db: q.db, err: q.err}
 	}
-	return &RecordQuery[T]{db: q.db, inner: q.inner.OrderByDesc(field), clone: q.clone}
+	return &recordQuery[T]{db: q.db, inner: q.inner.OrderByDesc(field), clone: q.clone}
 }
 
-func (q *RecordQuery[T]) Find() ([]*T, error) {
+func (q *recordQuery[T]) Find() ([]*T, error) {
 	if err := q.check(); err != nil {
 		return nil, err
 	}
@@ -1413,7 +1461,7 @@ func (q *RecordQuery[T]) Find() ([]*T, error) {
 	return owned, nil
 }
 
-func (q *RecordQuery[T]) First() (*T, error) {
+func (q *recordQuery[T]) First() (*T, error) {
 	rows, err := q.Limit(1).Find()
 	if err != nil {
 		return nil, err
@@ -1424,7 +1472,7 @@ func (q *RecordQuery[T]) First() (*T, error) {
 	return rows[0], nil
 }
 
-func (q *RecordQuery[T]) Count() (int, error) {
+func (q *recordQuery[T]) Count() (int, error) {
 	if err := q.check(); err != nil {
 		return 0, err
 	}
@@ -1436,7 +1484,7 @@ func (q *RecordQuery[T]) Count() (int, error) {
 	return q.inner.Count()
 }
 
-func (q *RecordQuery[T]) Exists() (bool, error) {
+func (q *recordQuery[T]) Exists() (bool, error) {
 	if err := q.check(); err != nil {
 		return false, err
 	}
@@ -1450,7 +1498,7 @@ func (q *RecordQuery[T]) Exists() (bool, error) {
 
 // Aggregate runs read-only RIME aggregates over the query matches. Aggregate
 // descriptors cannot mutate records, and returned values are scalar results.
-func (q *RecordQuery[T]) Aggregate(aggs ...rime.Agg[T]) ([]any, error) {
+func (q *recordQuery[T]) Aggregate(aggs ...rime.Agg[T]) ([]any, error) {
 	if err := q.check(); err != nil {
 		return nil, err
 	}
@@ -1463,7 +1511,7 @@ func (q *RecordQuery[T]) Aggregate(aggs ...rime.Agg[T]) ([]any, error) {
 }
 
 // AggregateContext runs read-only aggregates with cancellation.
-func (q *RecordQuery[T]) AggregateContext(ctx context.Context, aggs ...rime.Agg[T]) ([]any, error) {
+func (q *recordQuery[T]) AggregateContext(ctx context.Context, aggs ...rime.Agg[T]) ([]any, error) {
 	if err := q.check(); err != nil {
 		return nil, err
 	}
@@ -1477,15 +1525,15 @@ func (q *RecordQuery[T]) AggregateContext(ctx context.Context, aggs ...rime.Agg[
 
 // GroupBy groups query matches by typed fields. It is read-only and preserves
 // the query's snapshot, filters, ordering and pagination.
-func (q *RecordQuery[T]) GroupBy(fields ...rime.GroupField[T]) *RecordGroupedQuery[T] {
+func (q *recordQuery[T]) GroupBy(fields ...rime.GroupField[T]) *recordGroupedQuery[T] {
 	if err := q.check(); err != nil {
-		return &RecordGroupedQuery[T]{db: q.db, err: err}
+		return &recordGroupedQuery[T]{db: q.db, err: err}
 	}
-	return &RecordGroupedQuery[T]{db: q.db, inner: q.inner.GroupBy(fields...)}
+	return &recordGroupedQuery[T]{db: q.db, inner: q.inner.GroupBy(fields...)}
 }
 
 // Aggregate runs aggregates within each group.
-func (q *RecordGroupedQuery[T]) Aggregate(aggs ...rime.Agg[T]) ([]rime.GroupRow, error) {
+func (q *recordGroupedQuery[T]) Aggregate(aggs ...rime.Agg[T]) ([]rime.GroupRow, error) {
 	if q == nil || q.db == nil || q.inner == nil {
 		if q != nil && q.err != nil {
 			return nil, q.err
@@ -1501,7 +1549,7 @@ func (q *RecordGroupedQuery[T]) Aggregate(aggs ...rime.Agg[T]) ([]rime.GroupRow,
 }
 
 // AggregateContext runs grouped aggregates with cancellation.
-func (q *RecordGroupedQuery[T]) AggregateContext(ctx context.Context, aggs ...rime.Agg[T]) ([]rime.GroupRow, error) {
+func (q *recordGroupedQuery[T]) AggregateContext(ctx context.Context, aggs ...rime.Agg[T]) ([]rime.GroupRow, error) {
 	if q == nil || q.db == nil || q.inner == nil {
 		if q != nil && q.err != nil {
 			return nil, q.err
@@ -1516,7 +1564,7 @@ func (q *RecordGroupedQuery[T]) AggregateContext(ctx context.Context, aggs ...ri
 	return q.inner.WithContext(ctx).Aggregate(aggs...)
 }
 
-func (q *RecordQuery[T]) Each(fn func(*T) error) error {
+func (q *recordQuery[T]) Each(fn func(*T) error) error {
 	if err := q.check(); err != nil {
 		return err
 	}
@@ -1540,7 +1588,7 @@ func (q *RecordQuery[T]) Each(fn func(*T) error) error {
 	})
 }
 
-func (q *RecordQuery[T]) check() error {
+func (q *recordQuery[T]) check() error {
 	if q == nil {
 		return rime.ErrBadView
 	}
@@ -1579,7 +1627,7 @@ func (db *DB) WriteTxContext(ctx context.Context, fn func(*Tx) error) error {
 	staged, err := func() (*rimeadapter.Tx, error) {
 		defer db.endRecordPrepare()
 		return adapter.Stage(ctx, func(inner *rimeadapter.Tx) error {
-			return fn(&RecordTx{db: db, inner: inner, ctx: ctx, generation: recordGeneration})
+			return fn(&Tx{db: db, inner: inner, ctx: ctx, generation: recordGeneration})
 		})
 	}()
 	if err != nil {
@@ -1982,6 +2030,11 @@ func (db *DB) rebuildRecordMaterializer(ctx context.Context) error {
 		rdb.Close()
 		return err
 	}
+	bindings, ambiguous, err := compileItemBindings(definitions)
+	if err != nil {
+		rdb.Close()
+		return err
+	}
 	db.recordMu.Lock()
 	if db.recordDB != nil {
 		db.retiredRecordDBs = append(db.retiredRecordDBs, db.recordDB)
@@ -1989,6 +2042,9 @@ func (db *DB) rebuildRecordMaterializer(ctx context.Context) error {
 	db.recordDB = rdb
 	db.recordAdapter = adapter
 	db.recordTables = tables
+	db.itemMu.Lock()
+	db.itemBindings, db.itemAmbiguous = bindings, ambiguous
+	db.itemMu.Unlock()
 	db.recordGeneration++
 	db.recordMu.Unlock()
 	if generation, err := db.store.StateGeneration(); err != nil {

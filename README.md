@@ -17,7 +17,8 @@ shape whenever its nodes talk again.
 
 Murmur is a security-focused embedded Go database. RIME provides the in-memory
 typed query engine, Spool provides encrypted persistence, and replication is
-masterless. Applications define managed record tables with `Config.Tables`.
+masterless. Applications register models with `Config.Models`; `Model[T]` and
+`Define[T]` provide typed handles and explicit control.
 
 - **Typed records and queries** through RIME
 - **Durable state** in Spool (authoritative; RIME materialization rebuilds from it)
@@ -87,13 +88,17 @@ See [RIME's usage reference](rime/USAGE.md) for its current Go syntax and
 reader/writer coordination.
 
 The [migration plan](architecture/migration-plan.md) records the remaining release
-qualification for the managed RIME API. Applications define tables with
-`Define[T]`, provide them through `Config.Tables`, and access them with
+qualification for the managed RIME API. Applications register exemplars through
+`Config.Models`, or use `Model[T]`/`Define[T]` for typed handles through
 `TableOf[T]`. `WriteTxContext` and explicit `BeginTx` transactions persist
 changes to encrypted Spool before publishing them to RIME. The typed API
 supports managed CRUD, LWW fields, MIN/MAX, PN_COUNTER, OR_SET, pinned reads,
 filters, order/page/count, compiled parameters, aggregates, joins, subscriptions,
-node-local durable tables, and ephemeral tables. Remote winners rebuild into
+node-local durable tables, and ephemeral tables. A generic Storm-style item API
+(`InsertItem`/`GetItem`/`SaveItem`/`UpdateFields`/`DeleteItem` plus
+`Find`/`FindOne`/`Count`/`Exists` and `DB.Query` with comparison, membership,
+string, and range matchers; `Update` accepts explicit `Set` assignments) serves
+every registered struct through one function per operation. Remote winners rebuild into
 RIME without echo. For ambiguous durable failures,
 `CommitOutcomeUncertainError` exposes the transaction ID and
 `HasTransactionReceipt` resolves it after reopen. The remaining migration gates
@@ -124,55 +129,48 @@ See the
 
 ## Quick start
 
-The application loads a persisted Ed25519 private key and provisions public
-bindings independently of TLS. `origin` below is
-`github.com/marcgauthier/murmur/origin`; `ed25519` is `crypto/ed25519`.
+Register models once and use the same operations for every collection:
 
 ```go
-nodeID := murmur.MustNodeID("00000000-0000-4000-8000-000000000001")
-originKeys, err := origin.NewKeyRegistry(map[murmur.NodeID]ed25519.PublicKey{
-    nodeID: signingPrivateKey.Public().(ed25519.PublicKey),
-    peerID: peerSigningPublicKey,
+type Device struct {
+    ID       murmur.RowID `rime:"ID"`
+    Name     string       `rime:"primary"`
+    Hostname string       `rime:"index"`
+    Site     string       `rime:"index"`
+    Status   int          `rime:"ordered"`
+    Online   bool
+}
+
+db, err := murmur.Open(ctx, murmur.Config{
+    Path:          "./node-data",
+    NodeID:        nodeID,
+    Models:        []any{Device{}},
+    Schema:        murmur.SchemaConfig{Version: 1},
+    Spool:         murmur.DefaultSpoolConfig(),
+    Encryption:    murmur.EncryptionConfig{Key: key32, KeyID: "app-key-1"},
+    OriginSigning: signing,
 })
 if err != nil { return err }
-db, err := murmur.Open(ctx, murmur.Config{
-    Path:   "./node-data",
-    NodeID: nodeID,
-    OriginSigning: murmur.OriginSigningConfig{PrivateKey: signingPrivateKey, TrustedKeys: originKeys},
-    Schema: murmur.SchemaConfig{
-        Version: 1,
-        Tables: []schema.TableSchema{{
-            Name: "contacts",
-            Columns: []schema.ColumnSchema{
-                {Name: "id", Type: schema.ColBlob},
-                {Name: "name", Type: schema.ColText, Nullable: true},
-                {Name: "phone", Type: schema.ColText, Nullable: true},
-            },
-        }},
-    },
-    Spool: murmur.DefaultSpoolConfig(),
-    Encryption: murmur.EncryptionConfig{
-        Key:             key32, // or Provider for KMS/file/env sourcing
-        KeyID:           "app-key-1",
-        DataKeyRotation: 24 * time.Hour,
-    },
-    Replication: murmur.ReplicationConfig{
-        ListenAddr: "127.0.0.1:7443",
-        TLS:        &murmur.TLSCredential{CertPEM: cert, KeyPEM: key, CAPEM: ca},
-        Peers:      []murmur.Peer{{NodeID: peerID, Addrs: []string{"127.0.0.1:7444"}}},
-        TrustedSnapshotSources: []murmur.NodeID{peerID}, // explicitly trusted for merged recovery
-    },
-})
-if err != nil {
-    return err
-}
 defer db.Close()
 
-id := murmur.NewRowID()
-_, err = db.ExecContext(ctx,
-    `INSERT INTO contacts (id, name, phone) VALUES (?, ?, ?)`,
-    id[:], "ann", "613-555-0100")
+device := Device{Name: "router-01", Hostname: "router-01", Site: "OTT"}
+err = db.InsertItem(ctx, &device) // generates UUIDv5 from the business key
+err = db.Update(ctx, &device, murmur.Set("Status", 2))
+var devices []Device
+err = db.Find(ctx, &devices, q.Eq("Site", "OTT"), q.Gte("Status", 2))
 ```
+
+Import `q` from `github.com/marcgauthier/murmur/q`. The application supplies a
+persistent node identity, a 32-byte encryption key, and an Ed25519 origin signing
+configuration; see [origin signatures](architecture/origin-signatures.md).
+`ID rime:"ID"` is required, with the legacy `ID rime:"primary"` form also
+accepted. Without a separate business key, unset IDs become UUIDv4. Supplied IDs
+are retained. `Model[T]` adds automatic schema generation with typed handles and
+explicit overrides; `Define[T]` remains available for explicit schema control.
+
+See [USAGE.md](USAGE.md) for CRUD, transactions, atomic batches, indexed queries,
+and explicit `MigrateModels` examples. Replication options still configure the
+existing QUIC/TLS mesh; opening a local database does not require peers.
 
 For local applications that accept a short loss window after a crash, set
 `Durability: murmur.DurabilityConfig{Mode: murmur.DurabilityAsync,
@@ -198,7 +196,7 @@ Run the native typed-record example without CGO or SQLite build tags:
 go run ./examples/basic
 ```
 
-The examples use managed typed records. See
+The basic and transaction examples use automatic models and the item API. See
 [examples/README.md](examples/README.md) for the complete index.
 For querying — get by ID, `Where` filters, ordering, aggregates, compiled
 queries, and joins — see [USAGE.md](USAGE.md).
@@ -227,15 +225,14 @@ See [startup progress details](architecture/runtime-and-diagnostics.md#startup-p
 ## Schema rules (v1)
 
 Every replicated table must have an explicit `BLOB(16)` primary key
-(generated by the application, e.g. `murmur.NewRowID()` — never SQLite
-rowid/autoincrement). Tables/columns get stable numeric IDs for replication;
+(supplied explicitly or generated by model insertion as UUIDv4/UUIDv5). Tables/columns get stable numeric IDs for replication;
 derived deterministically unless set explicitly. Additive evolution only:
-typed `DB.MigrateRecords` adds record tables/fields (never drops or changes
+`DB.MigrateModels` and typed `DB.MigrateRecords` add record tables/fields (never drops or changes
 stable IDs incompatibly); the schema manifest is stored in Spool, replicated
 to peers with ancestry/merge exchange before mutation sync, and applied under
 the `AcceptRemoteSchema` policy (auto-upgrade or strict refusal). SQL-only
 `Schema.Tables` configurations are rejected by `Open`; define tables through
-`Config.Tables` and `Define[T]`. Secondary `UNIQUE` constraints, virtual tables,
+`Config.Models`, `Model[T]`, or explicit `Config.Tables` and `Define[T]`. Secondary `UNIQUE` constraints, virtual tables,
 and non-additive schema changes are out of scope for v1. Foreign keys are
 application-level (not enforced during remote apply/rebuild).
 

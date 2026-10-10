@@ -225,6 +225,31 @@ func RegisterEphemeral[T any](a *Adapter, tableName string, ts schema.TableSchem
 }
 
 func registerTable[T any](a *Adapter, tableName string, ts *schema.TableSchema, opts recordcodec.CompileOptions, local, ephemeral bool) (*Table[T], error) {
+	return registerTableType[T](a, tableName, ts, opts, local, ephemeral, reflect.TypeFor[T]())
+}
+
+// RegisterType binds a runtime struct to the ordinary managed adapter.
+func RegisterType(a *Adapter, typ reflect.Type, tableName string, ts schema.TableSchema, opts recordcodec.CompileOptions, local, ephemeral bool) (*Table[any], error) {
+	if a == nil || typ == nil || tableName == "" {
+		return nil, fmt.Errorf("rimeadapter: adapter, type and table name are required")
+	}
+	if !local && !ephemeral {
+		found := false
+		for _, durable := range a.manifest.Tables {
+			if strings.EqualFold(durable.Name, tableName) {
+				ts = durable
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("%w: table %q is absent", ErrSchemaMismatch, tableName)
+		}
+	}
+	return registerTableType[any](a, tableName, &ts, opts, local, ephemeral, typ)
+}
+
+func registerTableType[T any](a *Adapter, tableName string, ts *schema.TableSchema, opts recordcodec.CompileOptions, local, ephemeral bool, typ reflect.Type) (*Table[T], error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.broken != nil {
@@ -241,7 +266,7 @@ func registerTable[T any](a *Adapter, tableName string, ts *schema.TableSchema, 
 		codecs = a.registry
 	}
 	opts.TableID = ts.ID
-	record, err := recordcodec.Compile(reflect.TypeOf(*new(T)), opts)
+	record, err := recordcodec.Compile(typ, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +300,14 @@ func registerTable[T any](a *Adapter, tableName string, ts *schema.TableSchema, 
 			}
 		}
 	}
-	inner, err := rime.Register[T](a.db, rime.WithTableName[T](tableName))
+	var inner *rime.Table[T]
+	if typ == reflect.TypeFor[T]() {
+		inner, err = rime.Register[T](a.db, rime.WithTableName[T](tableName), rime.WithPrimaryField[T](opts.PrimaryField), rime.WithPrimaryKey[T](func(value *T) any { id, _ := primaryID(record, nativeRecord(value)); return id }))
+	} else {
+		runtime, runtimeErr := rime.RegisterType(a.db, typ, rime.WithTableName[any](tableName), rime.WithPrimaryField[any](opts.PrimaryField), rime.WithPrimaryKey[any](func(value *any) any { id, _ := primaryID(record, nativeRecord(value)); return id }))
+		err = runtimeErr
+		inner, _ = any(runtime).(*rime.Table[T])
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -352,11 +384,14 @@ func registerTable[T any](a *Adapter, tableName string, ts *schema.TableSchema, 
 		if err != nil {
 			return err
 		}
+		if reflect.TypeFor[T]() == reflect.TypeFor[any]() {
+			decoded = recordPointer(decoded)
+		}
 		value, ok := decoded.(T)
 		if !ok {
 			return fmt.Errorf("%w: decoded %T does not match registered type", ErrSchemaMismatch, decoded)
 		}
-		valuePtr := reflect.ValueOf(&value).Elem()
+		valuePtr := reflect.ValueOf(nativeRecord(&value)).Elem()
 		for id, counter := range counterValues {
 			field, _ := record.FieldByID(id)
 			goField := valuePtr.FieldByName(field.GoName)
@@ -380,7 +415,7 @@ func registerTable[T any](a *Adapter, tableName string, ts *schema.TableSchema, 
 				return fmt.Errorf("%w: extrema field %s: %v", ErrSchemaMismatch, field.Path, err)
 			}
 		}
-		key, err := primaryID(record, &value)
+		key, err := primaryID(record, nativeRecord(&value))
 		if err != nil || key != expected {
 			return fmt.Errorf("%w: encoded primary key %s does not match row identity %s (table %s, decode error %v)", ErrSchemaMismatch, key, expected, tableName, err)
 		}
@@ -406,20 +441,25 @@ func registerTable[T any](a *Adapter, tableName string, ts *schema.TableSchema, 
 
 // Table is a typed handle usable only through an adapter transaction.
 type Table[T any] struct {
-	adapter *Adapter
-	inner   *rime.Table[T]
-	record  *recordcodec.Schema
-	table   *schema.TableSchema
-	codecs  *recordcodec.CodecRegistry
+	adapter   *Adapter
+	inner     *rime.Table[T]
+	record    *recordcodec.Schema
+	table     *schema.TableSchema
+	codecs    *recordcodec.CodecRegistry
+	prepare   func(any, bool) error
+	immutable func(any, any) error
 }
 
 func (t *Table[T]) clone(value *T) (*T, error) {
 	if t == nil || value == nil {
 		return nil, errors.New("rimeadapter: cannot clone nil record")
 	}
-	cloned, err := recordcodec.CloneRecord(t.record, value, t.codecs)
+	cloned, err := recordcodec.CloneRecord(t.record, nativeRecord(value), t.codecs)
 	if err != nil {
 		return nil, err
+	}
+	if reflect.TypeFor[T]() == reflect.TypeFor[any]() {
+		cloned = recordPointer(cloned)
 	}
 	result, ok := cloned.(T)
 	if !ok {
@@ -436,7 +476,7 @@ func (t *Table[T]) PrimaryKey(value *T) (ids.RowID, error) {
 	if t == nil || value == nil {
 		return ids.RowID{}, fmt.Errorf("rimeadapter: nil table or record")
 	}
-	return primaryID(t.record, value)
+	return primaryID(t.record, nativeRecord(value))
 }
 
 // Equal compares known fields using canonical built-in equality and registered
@@ -446,7 +486,7 @@ func (t *Table[T]) Equal(a, b *T) (bool, error) {
 		return a == nil && b == nil, nil
 	}
 	for _, field := range t.record.Fields {
-		equal, err := recordcodec.EqualField(t.record, field.ID, a, b, t.codecs)
+		equal, err := recordcodec.EqualField(t.record, field.ID, nativeRecord(a), nativeRecord(b), t.codecs)
 		if err != nil || !equal {
 			return equal, err
 		}
@@ -472,6 +512,11 @@ func (t *Table[T]) Insert(tx *Tx, value *T) error {
 	if err != nil {
 		return err
 	}
+	if t.prepare != nil {
+		if err := t.prepare(nativeRecord(value), true); err != nil {
+			return err
+		}
+	}
 	cloned, err := t.clone(value)
 	if err != nil {
 		return err
@@ -479,6 +524,9 @@ func (t *Table[T]) Insert(tx *Tx, value *T) error {
 	return b.Insert(cloned)
 }
 func (t *Table[T]) InsertMany(tx *Tx, values []*T) error {
+	if t.prepare != nil {
+		return tx.Batch("insert", len(values), func(i int) error { return t.Insert(tx, values[i]) })
+	}
 	b, err := t.bound(tx)
 	if err != nil {
 		return err
@@ -494,13 +542,36 @@ func (t *Table[T]) Upsert(tx *Tx, value *T) error {
 	if err != nil {
 		return err
 	}
+	if t.prepare != nil {
+		if err := t.prepare(nativeRecord(value), true); err != nil {
+			return err
+		}
+	}
 	cloned, err := t.clone(value)
 	if err != nil {
 		return err
 	}
+	if t.immutable != nil {
+		key, err := t.PrimaryKey(cloned)
+		if err != nil {
+			return err
+		}
+		old, err := b.Get(key)
+		if err != nil && !errors.Is(err, rime.ErrNotFound) {
+			return err
+		}
+		if err == nil {
+			if err := t.immutable(nativeRecord(old), nativeRecord(cloned)); err != nil {
+				return err
+			}
+		}
+	}
 	return b.Upsert(cloned)
 }
 func (t *Table[T]) UpsertMany(tx *Tx, values []*T) error {
+	if t.prepare != nil {
+		return tx.Batch("upsert", len(values), func(i int) error { return t.Upsert(tx, values[i]) })
+	}
 	b, err := t.bound(tx)
 	if err != nil {
 		return err
@@ -524,7 +595,16 @@ func (t *Table[T]) Update(tx *Tx, key any, fn func(*T) error) error {
 		if err := fn(cloned); err != nil {
 			return err
 		}
-		*current = *cloned
+		if t.immutable != nil {
+			if err := t.immutable(nativeRecord(current), nativeRecord(cloned)); err != nil {
+				return err
+			}
+		}
+		owned, err := t.clone(cloned)
+		if err != nil {
+			return err
+		}
+		*current = *owned
 		return nil
 	})
 }
@@ -658,6 +738,19 @@ func StringFieldOf[T any](t *Table[T], name string) rime.StringField[T] {
 // without exposing the underlying mutable RIME table.
 func NumericFieldOf[T any, V rime.Number](t *Table[T], name string) rime.OrderedField[T, V] {
 	return rime.NumericFieldOf[V](t.inner, name)
+}
+
+// Ordered constrains ordered column types, mirroring RIME's ordered set
+// (strings plus all int, uint, and float widths, including named types).
+type Ordered interface {
+	~string | ~int | ~int8 | ~int16 | ~int32 | ~int64 |
+		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~float32 | ~float64
+}
+
+// OrderedFieldOf constructs a typed ordered field for range predicates and
+// ordering without exposing the underlying mutable RIME table.
+func OrderedFieldOf[T any, V Ordered](t *Table[T], name string) rime.OrderedField[T, V] {
+	return rime.OF[T, V](t.inner, name)
 }
 
 // InnerJoinOnRead joins adapter tables on a pinned RIME read transaction.
@@ -1976,4 +2069,49 @@ func primaryID(schema *recordcodec.Schema, value any) (ids.RowID, error) {
 		return ids.RowID{}, fmt.Errorf("%w: primary field %q is inaccessible", ErrSchemaMismatch, f.GoName)
 	}
 	return rowID(key.Interface())
+}
+
+func nativeRecord(record any) any {
+	if carrier, ok := record.(*any); ok {
+		return *carrier
+	}
+	return record
+}
+
+func recordPointer(record any) any {
+	v := reflect.ValueOf(record)
+	if v.Kind() == reflect.Pointer {
+		return record
+	}
+	p := reflect.New(v.Type())
+	p.Elem().Set(v)
+	return p.Interface()
+}
+
+// SetModelPolicy configures local identity rules before this handle is published.
+func (t *Table[T]) SetModelPolicy(prepare func(any, bool) error, immutable func(any, any) error) {
+	t.prepare, t.immutable = prepare, immutable
+}
+
+// Batch uses RIME's operation savepoint and retains preceding staged writes.
+func (tx *Tx) Batch(operation string, n int, apply func(int) error) error {
+	if tx == nil || tx.done || tx.inner == nil {
+		return rime.ErrTxClosed
+	}
+	c, s, e := len(tx.counterOps), len(tx.setOps), len(tx.extremaOps)
+	err := tx.inner.Batch(operation, n, apply)
+	if err != nil {
+		tx.counterOps = tx.counterOps[:c]
+		tx.setOps = tx.setOps[:s]
+		tx.extremaOps = tx.extremaOps[:e]
+	}
+	return err
+}
+
+// RecordType identifies the native struct behind typed or runtime registrations.
+func (t *Table[T]) RecordType() reflect.Type { return t.record.Record.GoType }
+
+// DynamicFieldOf returns a checked runtime scalar or timestamp field.
+func DynamicFieldOf[T any](table *Table[T], name string) (rime.DynamicField[T], error) {
+	return rime.DynamicFieldOf(table.inner, name)
 }

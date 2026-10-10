@@ -26,7 +26,7 @@ type BenchCommand struct{}
 
 func (c *BenchCommand) Name() string { return "bench" }
 func (c *BenchCommand) Description() string {
-	return "Benchmark encryption ciphers and typed RIME storage"
+	return "Benchmark encryption ciphers and record storage"
 }
 func (c *BenchCommand) Usage() string {
 	return "murmur bench [--duration=3s] [--json]"
@@ -109,17 +109,14 @@ func (c *BenchCommand) Run(ctx context.Context, globalOpts GlobalOptions, args [
 	}
 	chachaMBs := float64(chachaBytes) / (1024 * 1024) / time.Since(chachaStart).Seconds()
 
-	// 4. Benchmark durable typed record writes and point reads.
+	// 4. Benchmark durable record writes and point reads.
 	tempDir, err := os.MkdirTemp("", "murmur-bench-*")
 	if err != nil {
 		return fmt.Errorf("create temp bench dir: %w", err)
 	}
 	defer os.RemoveAll(tempDir)
 
-	definition, err := murmur.Define[benchRecord]("bench", 1, murmur.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs:     map[string]uint32{"ID": 1, "Val": 2},
-	})
+	definition, err := murmur.Model[benchRecord]()
 	if err != nil {
 		return fmt.Errorf("define benchmark record: %w", err)
 	}
@@ -150,10 +147,6 @@ func (c *BenchCommand) Run(ctx context.Context, globalOpts GlobalOptions, args [
 		return fmt.Errorf("open benchmark database: %w", err)
 	}
 	defer db.Close()
-	bench, err := murmur.TableOf[benchRecord](db, "bench")
-	if err != nil {
-		return fmt.Errorf("open benchmark table: %w", err)
-	}
 
 	insertStart := time.Now()
 	var insertCount int64
@@ -163,9 +156,7 @@ func (c *BenchCommand) Run(ctx context.Context, globalOpts GlobalOptions, args [
 		for i := range batch {
 			batch[i] = &benchRecord{ID: murmur.NewRowID(), Val: "bench-payload-val-1234567890"}
 		}
-		if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
-			return bench.InsertMany(tx, batch)
-		}); err != nil {
+		if err := db.InsertMany(ctx, batch); err != nil {
 			return fmt.Errorf("write benchmark batch: %w", err)
 		}
 		insertCount += int64(len(batch))
@@ -177,7 +168,8 @@ func (c *BenchCommand) Run(ctx context.Context, globalOpts GlobalOptions, args [
 	var readCount int64
 	for time.Since(readStart) < duration {
 		readCount++
-		if _, err := bench.Get(lastID); err != nil {
+		probe := benchRecord{ID: lastID}
+		if err := db.GetItem(ctx, &probe); err != nil {
 			return fmt.Errorf("read benchmark record: %w", err)
 		}
 	}

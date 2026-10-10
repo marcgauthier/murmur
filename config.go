@@ -388,8 +388,11 @@ type Config struct {
 	Encryption  EncryptionConfig
 	Replication ReplicationConfig
 	Schema      SchemaConfig
-	// Tables defines native Go record tables. It is mutually exclusive with
-	// Schema.Tables is the stable descriptor metadata derived from Config.Tables.
+	// Models registers named struct exemplars or compiled Model definitions.
+	// Models and Tables are combined and validated before opening storage.
+	Models []any
+	// Tables supplies explicit or generic compiled definitions alongside Models.
+	// Schema.Tables is internal metadata derived from those definitions.
 	Tables     []TableDefinition
 	Durability DurabilityConfig
 	Backup     BackupScheduleConfig

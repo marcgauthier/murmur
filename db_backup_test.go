@@ -32,7 +32,7 @@ type backupUser struct {
 
 func testBackupTables(t *testing.T) []TableDefinition {
 	t.Helper()
-	definition, err := Define[backupUser]("backup_users", 82, RecordOptions{
+	definition, err := define[backupUser]("backup_users", 82, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Email": 3, "Balance": 4},
 	})
@@ -42,7 +42,7 @@ func testBackupTables(t *testing.T) []TableDefinition {
 	return []TableDefinition{definition}
 }
 
-func insertBackupUser(ctx context.Context, db *DB, table *RecordTable[backupUser], rec *backupUser) error {
+func insertBackupUser(ctx context.Context, db *DB, table *recordTable[backupUser], rec *backupUser) error {
 	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		return err
@@ -76,9 +76,9 @@ func TestDBOnlineBackupAndRestoreIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open primary DB failed: %v", err)
 	}
-	table, err := TableOf[backupUser](db, "backup_users")
+	table, err := tableOf[backupUser](db, "backup_users")
 	if err != nil {
-		t.Fatalf("TableOf: %v", err)
+		t.Fatalf("tableOf: %v", err)
 	}
 
 	// 2. Insert initial rows
@@ -216,9 +216,9 @@ func TestDBOnlineBackupAndRestoreIntegration(t *testing.T) {
 		t.Fatalf("Open restored DB failed: %v", err)
 	}
 	defer restoredDB.Close()
-	restoredTable, err := TableOf[backupUser](restoredDB, "backup_users")
+	restoredTable, err := tableOf[backupUser](restoredDB, "backup_users")
 	if err != nil {
-		t.Fatalf("TableOf restored: %v", err)
+		t.Fatalf("tableOf restored: %v", err)
 	}
 
 	// The durable marker records the adoption; the fresh writer starts at
@@ -279,9 +279,9 @@ func TestDBRestoreWrongKeyFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	table, err := TableOf[backupUser](db, "backup_users")
+	table, err := tableOf[backupUser](db, "backup_users")
 	if err != nil {
-		t.Fatalf("TableOf: %v", err)
+		t.Fatalf("tableOf: %v", err)
 	}
 	_ = insertBackupUser(ctx, db, table, &backupUser{ID: ids.NewRowID(), Name: "User 1", Email: "u1@ex.com", Balance: 100})
 	dest, _ := backup.NewLocalDestination(backupDir)
@@ -336,7 +336,7 @@ func TestRestoreCloneIdentityEnforcement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +406,7 @@ func TestRestoreCloneIdentityEnforcement(t *testing.T) {
 		_ = rdb.Close()
 		t.Fatalf("intent not cleared: %v", err)
 	}
-	rtable, err := TableOf[facadeRecord](rdb, "records")
+	rtable, err := tableOf[facadeRecord](rdb, "records")
 	if err != nil {
 		_ = rdb.Close()
 		t.Fatal(err)
@@ -451,7 +451,7 @@ func TestRestoreCloneIdentityEnforcement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rdb.Close()
-	rtable, err = TableOf[facadeRecord](rdb, "records")
+	rtable, err = tableOf[facadeRecord](rdb, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +480,7 @@ func TestReseedFlowRejectsOldCluster(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tableA, err := TableOf[facadeRecord](dbA, "records")
+	tableA, err := tableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,7 +516,7 @@ func TestReseedFlowRejectsOldCluster(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbC.Close()
-	tableC, err := TableOf[facadeRecord](dbC, "records")
+	tableC, err := tableOf[facadeRecord](dbC, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,7 +537,7 @@ func TestReseedFlowRejectsOldCluster(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
-	tableA, err = TableOf[facadeRecord](dbA, "records")
+	tableA, err = tableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +562,7 @@ func TestReseedFlowRejectsOldCluster(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	countWhere := func(table *RecordTable[facadeRecord], match func(*facadeRecord) bool) int {
+	countWhere := func(table *recordTable[facadeRecord], match func(*facadeRecord) bool) int {
 		t.Helper()
 		found, err := table.Where().Find()
 		if err != nil {
@@ -601,7 +601,7 @@ func TestReseedAbortedRebindRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tableA, err := TableOf[facadeRecord](dbA, "records")
+	tableA, err := tableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -634,7 +634,7 @@ func TestReseedAbortedRebindRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tableC, err := TableOf[facadeRecord](dbC, "records")
+	tableC, err := tableOf[facadeRecord](dbC, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -653,7 +653,7 @@ func TestReseedAbortedRebindRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbC.Close()
-	tableC, err = TableOf[facadeRecord](dbC, "records")
+	tableC, err = tableOf[facadeRecord](dbC, "records")
 	if err != nil {
 		t.Fatal(err)
 	}

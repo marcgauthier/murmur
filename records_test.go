@@ -35,7 +35,7 @@ func TestTypedWriteCallbacksPrepareConcurrently(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestTypedWriteCallbacksPrepareConcurrently(t *testing.T) {
 func TestTypedNodeLocalTableCommitsWithReplicatedRowsAndReopens(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.Schema.Tables = nil
-	localDefinition, err := Define[facadeRecord]("private_records", 72, RecordOptions{
+	localDefinition, err := define[facadeRecord]("private_records", 72, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2},
 		Scope:        TableScopeNodeLocal,
@@ -88,11 +88,11 @@ func TestTypedNodeLocalTableCommitsWithReplicatedRowsAndReopens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open with node-local table: %v", err)
 	}
-	replicated, err := TableOf[facadeRecord](db, "records")
+	replicated, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	local, err := TableOf[facadeRecord](db, "private_records")
+	local, err := tableOf[facadeRecord](db, "private_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,11 +124,11 @@ func TestTypedNodeLocalTableCommitsWithReplicatedRowsAndReopens(t *testing.T) {
 		t.Fatalf("reopen node-local database: %v", err)
 	}
 	defer db.Close()
-	replicated, err = TableOf[facadeRecord](db, "records")
+	replicated, err = tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	local, err = TableOf[facadeRecord](db, "private_records")
+	local, err = tableOf[facadeRecord](db, "private_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestTypedNodeLocalTableCommitsWithReplicatedRowsAndReopens(t *testing.T) {
 func TestTypedDatabaseCanUseOnlyNodeLocalTables(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.Schema.Tables = nil
-	definition, err := Define[facadeRecord]("private_records", 72, RecordOptions{
+	definition, err := define[facadeRecord]("private_records", 72, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2},
 		Scope:        TableScopeNodeLocal,
@@ -159,7 +159,7 @@ func TestTypedDatabaseCanUseOnlyNodeLocalTables(t *testing.T) {
 		t.Fatalf("open local-only database: %v", err)
 	}
 	defer db.Close()
-	table, err := TableOf[facadeRecord](db, "private_records")
+	table, err := tableOf[facadeRecord](db, "private_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestTypedDatabaseCanUseOnlyNodeLocalTables(t *testing.T) {
 func TestTypedEphemeralTableResetsOnOpenAndRejectsMixedTransactions(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.Schema.Tables = nil
-	ephemeralDefinition, err := Define[facadeRecord]("scratch_records", 73, RecordOptions{
+	ephemeralDefinition, err := define[facadeRecord]("scratch_records", 73, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2},
 		Scope:        TableScopeEphemeral,
@@ -193,15 +193,15 @@ func TestTypedEphemeralTableResetsOnOpenAndRejectsMixedTransactions(t *testing.T
 	if err != nil {
 		t.Fatalf("open ephemeral table database: %v", err)
 	}
-	replicated, err := TableOf[facadeRecord](db, "records")
+	replicated, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ephemeral, err := TableOf[facadeRecord](db, "scratch_records")
+	ephemeral, err := tableOf[facadeRecord](db, "scratch_records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sub, err := ephemeral.Subscribe(context.Background(), RecordSubscriptionOptions{})
+	sub, err := ephemeral.Subscribe(context.Background(), recordSubscriptionOptions{})
 	if err != nil {
 		t.Fatalf("subscribe to ephemeral table: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestTypedEphemeralTableResetsOnOpenAndRejectsMixedTransactions(t *testing.T
 		t.Fatalf("reopen ephemeral table database: %v", err)
 	}
 	defer db.Close()
-	ephemeral, err = TableOf[facadeRecord](db, "scratch_records")
+	ephemeral, err = tableOf[facadeRecord](db, "scratch_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +264,7 @@ func TestCloseDrainsTypedWritePreparation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +313,7 @@ func TestConcurrentTypedWritesToSameRowConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +373,7 @@ func TestConcurrentTypedWritesToSameRowConflict(t *testing.T) {
 func TestTypedDurableCommitCrashBoundaries(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	cfg.Schema.Tables = nil
-	localDefinition, err := Define[facadeRecord]("private_records", 72, RecordOptions{
+	localDefinition, err := define[facadeRecord]("private_records", 72, RecordOptions{
 		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Name": 2}, Scope: TableScopeNodeLocal,
 	})
 	if err != nil {
@@ -384,11 +384,11 @@ func TestTypedDurableCommitCrashBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	localTable, err := TableOf[facadeRecord](db, "private_records")
+	localTable, err := tableOf[facadeRecord](db, "private_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,14 +436,14 @@ func TestTypedDurableCommitCrashBoundaries(t *testing.T) {
 	if err != nil || !committed {
 		t.Fatalf("uncertain transaction receipt = %t, %v; want committed", committed, err)
 	}
-	table, err = TableOf[facadeRecord](reopened, "records")
+	table, err = tableOf[facadeRecord](reopened, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, err := table.Get(after.ID); err != nil || got.Name != after.Name {
 		t.Fatalf("durable typed row after reopen = %+v, %v", got, err)
 	}
-	localTable, err = TableOf[facadeRecord](reopened, "private_records")
+	localTable, err = tableOf[facadeRecord](reopened, "private_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,9 +489,9 @@ func TestTypedProcessCrashAfterDurableCommit(t *testing.T) {
 		default:
 			t.Fatalf("unexpected helper crash phase %q", phase)
 		}
-		table, err := TableOf[facadeRecord](db, "records")
+		table, err := tableOf[facadeRecord](db, "records")
 		if err != nil {
-			t.Fatalf("helper TableOf: %v", err)
+			t.Fatalf("helper tableOf: %v", err)
 		}
 		rowID := ids.RowID{0x71, 0x72, 0x73}
 		if err := db.WriteTxContext(context.Background(), func(tx *Tx) error {
@@ -537,7 +537,7 @@ func TestTypedProcessCrashAfterDurableCommit(t *testing.T) {
 				t.Fatalf("reopen after abrupt process death: %v; helper output: %s", err, output)
 			}
 			defer db.Close()
-			table, err := TableOf[facadeRecord](db, "records")
+			table, err := tableOf[facadeRecord](db, "records")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -614,7 +614,7 @@ func TestTypedSchemaMigrationProcessCrashBoundary(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			base, err := TableOf[facadeRecord](db, "records")
+			base, err := tableOf[facadeRecord](db, "records")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -654,7 +654,7 @@ func TestTypedSchemaMigrationProcessCrashBoundary(t *testing.T) {
 				t.Fatalf("schema epoch after %s crash = %d, want %d", tc.phase, got, tc.epoch)
 			}
 			if tc.v2 {
-				table, err := TableOf[facadeRecordV2](reopened, "records")
+				table, err := tableOf[facadeRecordV2](reopened, "records")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -665,7 +665,7 @@ func TestTypedSchemaMigrationProcessCrashBoundary(t *testing.T) {
 					}
 				}
 			} else {
-				table, err := TableOf[facadeRecord](reopened, "records")
+				table, err := tableOf[facadeRecord](reopened, "records")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -730,7 +730,7 @@ var facadeCustomEqualCalls atomic.Int64
 
 func recordDefinition(t *testing.T) TableDefinition {
 	t.Helper()
-	definition, err := Define[facadeRecord]("records", 71, RecordOptions{
+	definition, err := define[facadeRecord]("records", 71, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2},
 	})
@@ -742,7 +742,7 @@ func recordDefinition(t *testing.T) TableDefinition {
 
 func recordReferenceDefinition(t *testing.T) TableDefinition {
 	t.Helper()
-	definition, err := Define[facadeRecord]("record_refs", 74, RecordOptions{
+	definition, err := define[facadeRecord]("record_refs", 74, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2},
 	})
@@ -754,7 +754,7 @@ func recordReferenceDefinition(t *testing.T) TableDefinition {
 
 func recordDefinitionV2(t *testing.T) TableDefinition {
 	t.Helper()
-	definition, err := Define[facadeRecordV2]("records", 71, RecordOptions{
+	definition, err := define[facadeRecordV2]("records", 71, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Secret": 3},
 	})
@@ -766,7 +766,7 @@ func recordDefinitionV2(t *testing.T) TableDefinition {
 
 func nestedRecordDefinitionV1(t *testing.T) TableDefinition {
 	t.Helper()
-	d, err := Define[facadeNestedRecordV1]("nested_records", 72, RecordOptions{
+	d, err := define[facadeNestedRecordV1]("nested_records", 72, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Profile": 2, "Profile.Name": 1},
 	})
@@ -778,7 +778,7 @@ func nestedRecordDefinitionV1(t *testing.T) TableDefinition {
 
 func nestedRecordDefinitionV2(t *testing.T) TableDefinition {
 	t.Helper()
-	d, err := Define[facadeNestedRecordV2]("nested_records", 72, RecordOptions{
+	d, err := define[facadeNestedRecordV2]("nested_records", 72, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Profile": 2, "Profile.Name": 1, "Profile.Region": 2},
 	})
@@ -790,7 +790,7 @@ func nestedRecordDefinitionV2(t *testing.T) TableDefinition {
 
 func collectionRecordDefinitionV1(t *testing.T) TableDefinition {
 	t.Helper()
-	d, err := Define[facadeCollectionRecordV1]("collection_records", 75, RecordOptions{
+	d, err := define[facadeCollectionRecordV1]("collection_records", 75, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Items": 2, "Items[].Name": 1, "ByKey": 3, "ByKey{}.Name": 1},
 	})
@@ -802,7 +802,7 @@ func collectionRecordDefinitionV1(t *testing.T) TableDefinition {
 
 func collectionRecordDefinitionV2(t *testing.T) TableDefinition {
 	t.Helper()
-	d, err := Define[facadeCollectionRecordV2]("collection_records", 75, RecordOptions{
+	d, err := define[facadeCollectionRecordV2]("collection_records", 75, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Items": 2, "Items[].Name": 1, "Items[].Region": 2, "ByKey": 3, "ByKey{}.Name": 1, "ByKey{}.Region": 2},
 	})
@@ -814,7 +814,7 @@ func collectionRecordDefinitionV2(t *testing.T) TableDefinition {
 
 func customRecordDefinition(t *testing.T) TableDefinition {
 	t.Helper()
-	d, err := Define[facadeCustomRecord]("custom_records", 73, RecordOptions{
+	d, err := define[facadeCustomRecord]("custom_records", 73, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Token": 2},
 		Codecs: []RecordCodec{{
@@ -852,11 +852,11 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	refs, err := TableOf[facadeRecord](db, "record_refs")
+	refs, err := tableOf[facadeRecord](db, "record_refs")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -873,7 +873,7 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 		if err := refs.Insert(tx, ref); err != nil {
 			return err
 		}
-		query, err := table.WhereTx(tx, FieldOf[facadeRecord, string](table, "Name").Eq("durable"))
+		query, err := table.WhereTx(tx, fieldOf[facadeRecord, string](table, "Name").Eq("durable"))
 		if err != nil {
 			return err
 		}
@@ -891,7 +891,7 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 		if aggregate[0] != 1 {
 			return errors.New("typed aggregate did not include staged record")
 		}
-		compiled, err := table.CompileTx(tx, FieldOf[facadeRecord, string](table, "Name").Eq(rime.Param[string]()))
+		compiled, err := table.CompileTx(tx, fieldOf[facadeRecord, string](table, "Name").Eq(rime.Param[string]()))
 		if err != nil {
 			return err
 		}
@@ -922,7 +922,7 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 	if err != nil || *got != *want {
 		t.Fatalf("Get() = %+v, %v; want %+v", got, err, want)
 	}
-	query := table.Where(FieldOf[facadeRecord, string](table, "Name").Eq("durable"))
+	query := table.Where(fieldOf[facadeRecord, string](table, "Name").Eq("durable"))
 	rows, err := query.Limit(4).Find()
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("typed query rows = %d, %v; want 1", len(rows), err)
@@ -931,7 +931,7 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 	if err != nil || len(aggregates) != 1 || aggregates[0] != 1 {
 		t.Fatalf("typed query aggregate = %v, %v; want [1]", aggregates, err)
 	}
-	compiled := table.Compile(FieldOf[facadeRecord, string](table, "Name").Eq(rime.Param[string]()))
+	compiled := table.Compile(fieldOf[facadeRecord, string](table, "Name").Eq(rime.Param[string]()))
 	compiledRows, err := compiled.Find("durable")
 	if err != nil || len(compiledRows) != 1 || compiledRows[0].ID != want.ID {
 		t.Fatalf("typed compiled query rows = %+v, %v; want durable record", compiledRows, err)
@@ -939,15 +939,15 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 	if _, err := compiled.Find(42); err == nil {
 		t.Fatal("typed compiled query accepted a parameter with the wrong type")
 	}
-	grouped, err := table.Where(FieldOf[facadeRecord, string](table, "Name").Eq("durable")).GroupBy(FieldOf[facadeRecord, string](table, "Name")).Aggregate(rime.Count[facadeRecord]())
+	grouped, err := table.Where(fieldOf[facadeRecord, string](table, "Name").Eq("durable")).GroupBy(fieldOf[facadeRecord, string](table, "Name")).Aggregate(rime.Count[facadeRecord]())
 	if err != nil || len(grouped) != 1 || len(grouped[0].Keys) != 1 || grouped[0].Keys[0] != "durable" || grouped[0].Values[0] != 1 {
 		t.Fatalf("typed grouped aggregate = %+v, %v; want one durable row with count 1", grouped, err)
 	}
-	joinTx, err := db.ReadTxContext(context.Background())
+	joinTx, err := db.readTxContext(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	joined, err := InnerJoinReadTx(joinTx, table, FieldOf[facadeRecord, string](table, "Name"), refs, FieldOf[facadeRecord, string](refs, "Name"))
+	joined, err := innerJoinReadTx(joinTx, table, fieldOf[facadeRecord, string](table, "Name"), refs, fieldOf[facadeRecord, string](refs, "Name"))
 	if err != nil || len(joined) != 1 || joined[0].Left.Name != "durable" || joined[0].Right.Name != "durable" {
 		t.Fatalf("typed read-snapshot inner join = %+v, %v; want one durable pair", joined, err)
 	}
@@ -955,7 +955,7 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 	if got, err := table.Get(want.ID); err != nil || got.Name != "durable" {
 		t.Fatalf("join exposed a mutable published record: %+v, %v", got, err)
 	}
-	leftJoined, err := LeftJoinReadTx(joinTx, table, FieldOf[facadeRecord, string](table, "Name"), refs, FieldOf[facadeRecord, string](refs, "Name"))
+	leftJoined, err := leftJoinReadTx(joinTx, table, fieldOf[facadeRecord, string](table, "Name"), refs, fieldOf[facadeRecord, string](refs, "Name"))
 	if err != nil || len(leftJoined) != 2 {
 		t.Fatalf("typed read-snapshot left join = %+v, %v; want two rows", leftJoined, err)
 	}
@@ -971,7 +971,7 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 	if err := joinTx.Close(); err != nil {
 		t.Fatal(err)
 	}
-	sub, err := table.Subscribe(context.Background(), RecordSubscriptionOptions{}, FieldOf[facadeRecord, string](table, "Name").IsNotNull())
+	sub, err := table.Subscribe(context.Background(), recordSubscriptionOptions{}, fieldOf[facadeRecord, string](table, "Name").IsNotNull())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1009,7 +1009,7 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 	if err := sub.Close(); err != nil {
 		t.Fatal(err)
 	}
-	resumed, err := table.Subscribe(context.Background(), RecordSubscriptionOptions{ResumeFrom: initialEvent.ResumeCursor}, FieldOf[facadeRecord, string](table, "Name").IsNotNull())
+	resumed, err := table.Subscribe(context.Background(), recordSubscriptionOptions{ResumeFrom: initialEvent.ResumeCursor}, fieldOf[facadeRecord, string](table, "Name").IsNotNull())
 	if err != nil {
 		t.Fatalf("resume typed subscription: %v", err)
 	}
@@ -1022,10 +1022,10 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 	}
 	future := updateEvent.ResumeCursor
 	future.Sequence++
-	if _, err := table.Subscribe(context.Background(), RecordSubscriptionOptions{ResumeFrom: future}); !errors.Is(err, ErrSubscriptionExpired) {
+	if _, err := table.Subscribe(context.Background(), recordSubscriptionOptions{ResumeFrom: future}); !errors.Is(err, ErrSubscriptionExpired) {
 		t.Fatalf("future typed subscription cursor error = %v; want ErrSubscriptionExpired", err)
 	}
-	membership, err := table.Subscribe(context.Background(), RecordSubscriptionOptions{}, FieldOf[facadeRecord, string](table, "Name").Eq("changed"))
+	membership, err := table.Subscribe(context.Background(), recordSubscriptionOptions{}, fieldOf[facadeRecord, string](table, "Name").Eq("changed"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1059,7 +1059,7 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 	if err := membership.Close(); err != nil {
 		t.Fatal(err)
 	}
-	resetSub, err := table.Subscribe(context.Background(), RecordSubscriptionOptions{})
+	resetSub, err := table.Subscribe(context.Background(), recordSubscriptionOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1075,10 +1075,10 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 	if err := resetSub.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := table.Subscribe(context.Background(), RecordSubscriptionOptions{ResumeFrom: oldGenerationCursor}); !errors.Is(err, ErrSubscriptionExpired) {
+	if _, err := table.Subscribe(context.Background(), recordSubscriptionOptions{ResumeFrom: oldGenerationCursor}); !errors.Is(err, ErrSubscriptionExpired) {
 		t.Fatalf("stale typed subscription generation error = %v; want ErrSubscriptionExpired", err)
 	}
-	overflowSub, err := table.Subscribe(context.Background(), RecordSubscriptionOptions{BufferSize: 1}, FieldOf[facadeRecord, string](table, "Name").IsNotNull())
+	overflowSub, err := table.Subscribe(context.Background(), recordSubscriptionOptions{BufferSize: 1}, fieldOf[facadeRecord, string](table, "Name").IsNotNull())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1123,24 +1123,24 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err = TableOf[facadeRecord](db, "records")
+	table, err = tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := table.Subscribe(context.Background(), RecordSubscriptionOptions{ResumeFrom: updateEvent.ResumeCursor}); !errors.Is(err, ErrSubscriptionExpired) {
+	if _, err := table.Subscribe(context.Background(), recordSubscriptionOptions{ResumeFrom: updateEvent.ResumeCursor}); !errors.Is(err, ErrSubscriptionExpired) {
 		t.Fatalf("cross-open typed subscription cursor error = %v; want ErrSubscriptionExpired", err)
 	}
 	got, err = table.Get(want.ID)
 	if err != nil || *got != *want {
 		t.Fatalf("reopened Get() = %+v, %v; want %+v", got, err, want)
 	}
-	readTx, err := db.ReadTxContext(context.Background())
+	readTx, err := db.readTxContext(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer readTx.Close()
 	readSnapshot := readTx.Snapshot()
-	readQuery, err := table.WhereReadTx(readTx, FieldOf[facadeRecord, string](table, "Name").Eq("durable"))
+	readQuery, err := table.WhereReadTx(readTx, fieldOf[facadeRecord, string](table, "Name").Eq("durable"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1164,7 +1164,7 @@ func TestTypedRecordFacadeDurableReopenAndSQLIsolation(t *testing.T) {
 	if err != nil || len(rows) != 1 || rows[0].Name != "durable" {
 		t.Fatalf("pinned query = %+v, %v; want original value", rows, err)
 	}
-	oldRead, err := db.ReadAt(readSnapshot)
+	oldRead, err := db.readAt(readSnapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1185,21 +1185,21 @@ func TestTypedSubscriptionSubscriberLimitAndRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := table.Subscribe(context.Background(), RecordSubscriptionOptions{})
+	first, err := table.Subscribe(context.Background(), recordSubscriptionOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := table.Subscribe(context.Background(), RecordSubscriptionOptions{}); !errors.Is(err, ErrMaxSubscribersReached) {
+	if _, err := table.Subscribe(context.Background(), recordSubscriptionOptions{}); !errors.Is(err, ErrMaxSubscribersReached) {
 		t.Fatalf("second typed subscription error = %v; want ErrMaxSubscribersReached", err)
 	}
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-	second, err := table.Subscribe(context.Background(), RecordSubscriptionOptions{})
+	second, err := table.Subscribe(context.Background(), recordSubscriptionOptions{})
 	if err != nil {
 		t.Fatalf("subscription after releasing capacity: %v", err)
 	}
@@ -1216,7 +1216,7 @@ func TestTypedExplicitTransactionCommitAndRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1265,7 +1265,7 @@ func TestTypedExplicitTransactionCommitAndRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err = TableOf[facadeRecord](db, "records")
+	table, err = tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1286,7 +1286,7 @@ func TestTypedRecordRuntimeAdditiveSchemaMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := TableOf[facadeRecord](db, "records")
+	first, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1303,7 +1303,7 @@ func TestTypedRecordRuntimeAdditiveSchemaMigration(t *testing.T) {
 	if err := db.MigrateRecords(context.Background(), []TableDefinition{recordDefinition(t)}); !errors.Is(err, ErrUnsupportedSchema) {
 		t.Fatalf("dropping a typed field returned %v, want ErrUnsupportedSchema", err)
 	}
-	upgraded, err := TableOf[facadeRecordV2](db, "records")
+	upgraded, err := tableOf[facadeRecordV2](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1329,7 +1329,7 @@ func TestTypedRecordRuntimeAdditiveSchemaMigration(t *testing.T) {
 		t.Fatalf("reopen upgraded typed schema: %v", err)
 	}
 	defer db.Close()
-	upgraded, err = TableOf[facadeRecordV2](db, "records")
+	upgraded, err = tableOf[facadeRecordV2](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1339,7 +1339,7 @@ func TestTypedRecordRuntimeAdditiveSchemaMigration(t *testing.T) {
 	}
 }
 
-func receiveRecordEvent(t *testing.T, sub *RecordSubscription[facadeRecord]) RecordSubscriptionEvent[facadeRecord] {
+func receiveRecordEvent(t *testing.T, sub *recordSubscription[facadeRecord]) recordSubscriptionEvent[facadeRecord] {
 	t.Helper()
 	select {
 	case event, ok := <-sub.Events():
@@ -1349,15 +1349,15 @@ func receiveRecordEvent(t *testing.T, sub *RecordSubscription[facadeRecord]) Rec
 		return event
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for typed subscription event")
-		return RecordSubscriptionEvent[facadeRecord]{}
+		return recordSubscriptionEvent[facadeRecord]{}
 	}
 }
 
-func receiveRecordEventType(t *testing.T, sub *RecordSubscription[facadeRecord], want SubscriptionEventType) RecordSubscriptionEvent[facadeRecord] {
+func receiveRecordEventType(t *testing.T, sub *recordSubscription[facadeRecord], want SubscriptionEventType) recordSubscriptionEvent[facadeRecord] {
 	t.Helper()
 	timer := time.NewTimer(3 * time.Second)
 	defer timer.Stop()
-	var last RecordSubscriptionEvent[facadeRecord]
+	var last recordSubscriptionEvent[facadeRecord]
 	for {
 		select {
 		case event, ok := <-sub.Events():
@@ -1370,14 +1370,14 @@ func receiveRecordEventType(t *testing.T, sub *RecordSubscription[facadeRecord],
 			}
 		case <-timer.C:
 			t.Fatalf("timed out waiting for typed subscription %q event; last=%+v cursor=%d", want, last, sub.Cursor())
-			return RecordSubscriptionEvent[facadeRecord]{}
+			return recordSubscriptionEvent[facadeRecord]{}
 		}
 	}
 }
 
 func TestDefineRejectsMissingRIMEPrimaryTag(t *testing.T) {
 	type badRecord struct{ ID ids.RowID }
-	if _, err := Define[badRecord]("records", 72, RecordOptions{
+	if _, err := define[badRecord]("records", 72, RecordOptions{
 		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1},
 	}); err == nil {
 		t.Fatal("definition without a RIME primary key tag was accepted")
@@ -1394,7 +1394,7 @@ func TestTypedRecordRemoteApplyDoesNotEcho(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer source.Close()
-	sourceTable, err := TableOf[facadeRecord](source, "records")
+	sourceTable, err := tableOf[facadeRecord](source, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1425,7 +1425,7 @@ func TestTypedRecordRemoteApplyDoesNotEcho(t *testing.T) {
 	if err != nil || !batchApplied {
 		t.Fatalf("apply logged remote batch: applied=%v err=%v", batchApplied, err)
 	}
-	destTable, err := TableOf[facadeRecord](dest, "records")
+	destTable, err := tableOf[facadeRecord](dest, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1455,7 +1455,7 @@ func TestTypedRemoteMaterializeFailureRetriesApply(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer source.Close()
-	sourceTable, err := TableOf[facadeRecord](source, "records")
+	sourceTable, err := tableOf[facadeRecord](source, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1490,7 +1490,7 @@ func TestTypedRemoteMaterializeFailureRetriesApply(t *testing.T) {
 	if status := dest.Status(); status.State != StateReady || status.StateGeneration != status.MaterializedGeneration {
 		t.Fatalf("remote recovery status = %+v; want ready and converged", status)
 	}
-	destTable, err := TableOf[facadeRecord](dest, "records")
+	destTable, err := tableOf[facadeRecord](dest, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1521,7 +1521,7 @@ func TestTypedLocalAndRemoteCommitsInterleaveAndRecover(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer source.Close()
-	sourceTable, err := TableOf[facadeRecord](source, "records")
+	sourceTable, err := tableOf[facadeRecord](source, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1573,7 +1573,7 @@ func TestTypedLocalAndRemoteCommitsInterleaveAndRecover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	destTable, err := TableOf[facadeRecord](dest, "records")
+	destTable, err := tableOf[facadeRecord](dest, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1674,7 +1674,7 @@ func TestTypedLocalAndRemoteCommitsInterleaveAndRecover(t *testing.T) {
 		t.Fatalf("reopen interleaved database: %v", err)
 	}
 	defer reopened.Close()
-	reopenedTable, err := TableOf[facadeRecord](reopened, "records")
+	reopenedTable, err := tableOf[facadeRecord](reopened, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1703,7 +1703,7 @@ func TestTypedRecordSnapshotRebuildsMaterializer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer source.Close()
-	sourceTable, err := TableOf[facadeRecord](source, "records")
+	sourceTable, err := tableOf[facadeRecord](source, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1723,11 +1723,11 @@ func TestTypedRecordSnapshotRebuildsMaterializer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dest.Close()
-	destTable, err := TableOf[facadeRecord](dest, "records")
+	destTable, err := tableOf[facadeRecord](dest, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldRead, err := dest.ReadTxContext(ctx)
+	oldRead, err := dest.readTxContext(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1767,8 +1767,8 @@ func TestTypedRecordSnapshotRebuildsMaterializer(t *testing.T) {
 	if _, err := destTable.GetRead(oldRead, want.ID); !errors.Is(err, rime.ErrNotFound) {
 		t.Fatalf("pre-snapshot read transaction observed newly installed row: %v", err)
 	}
-	if _, err := dest.ReadAt(oldSnapshot); !errors.Is(err, rime.ErrSnapshotUnavailable) {
-		t.Fatalf("ReadAt accepted a snapshot from a retired materializer generation: %v", err)
+	if _, err := dest.readAt(oldSnapshot); !errors.Is(err, rime.ErrSnapshotUnavailable) {
+		t.Fatalf("readAt accepted a snapshot from a retired materializer generation: %v", err)
 	}
 	if got, want := dest.Status().MaterializedGeneration, func() uint64 {
 		generation, err := dest.store.StateGeneration()
@@ -1785,7 +1785,7 @@ func TestTypedRecordBackupRestoreWithoutSQLite(t *testing.T) {
 	ctx := context.Background()
 	cfg := testConfig(t.TempDir())
 	cfg.Schema.Tables = nil
-	localDefinition, err := Define[facadeRecord]("private_records", 72, RecordOptions{
+	localDefinition, err := define[facadeRecord]("private_records", 72, RecordOptions{
 		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Name": 2}, Scope: TableScopeNodeLocal,
 	})
 	if err != nil {
@@ -1798,12 +1798,12 @@ func TestTypedRecordBackupRestoreWithoutSQLite(t *testing.T) {
 	}
 	defer db.Close()
 	dbID := db.DBID()
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := &facadeRecord{ID: ids.NewRowID(), Name: "backup-record"}
-	localTable, err := TableOf[facadeRecord](db, "private_records")
+	localTable, err := tableOf[facadeRecord](db, "private_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1845,7 +1845,7 @@ func TestTypedRecordBackupRestoreWithoutSQLite(t *testing.T) {
 	restoredCfg.DBID = dbID
 	restoredCfg.OriginSigning = testidentity.Config(freshNode)
 	restoredCfg.Schema.Tables = nil
-	restoredLocalDefinition, err := Define[facadeRecord]("private_records", 72, RecordOptions{
+	restoredLocalDefinition, err := define[facadeRecord]("private_records", 72, RecordOptions{
 		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Name": 2}, Scope: TableScopeNodeLocal,
 	})
 	if err != nil {
@@ -1857,7 +1857,7 @@ func TestTypedRecordBackupRestoreWithoutSQLite(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer restored.Close()
-	restoredTable, err := TableOf[facadeRecord](restored, "records")
+	restoredTable, err := tableOf[facadeRecord](restored, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1865,7 +1865,7 @@ func TestTypedRecordBackupRestoreWithoutSQLite(t *testing.T) {
 	if err != nil || *got != *want {
 		t.Fatalf("restored typed record = %+v, %v; want %+v", got, err, want)
 	}
-	restoredLocalTable, err := TableOf[facadeRecord](restored, "private_records")
+	restoredLocalTable, err := tableOf[facadeRecord](restored, "private_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1887,7 +1887,7 @@ func TestOlderTypedWriterPreservesUnknownFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := &facadeRecordV2{ID: ids.NewRowID(), Name: "before", Secret: "keep-me"}
-	newTable, err := TableOf[facadeRecordV2](newer, "records")
+	newTable, err := tableOf[facadeRecordV2](newer, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1908,7 +1908,7 @@ func TestOlderTypedWriterPreservesUnknownFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open compatible older typed schema: %v", err)
 	}
-	oldTable, err := TableOf[facadeRecord](older, "records")
+	oldTable, err := tableOf[facadeRecord](older, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1930,7 +1930,7 @@ func TestOlderTypedWriterPreservesUnknownFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer newer.Close()
-	newTable, err = TableOf[facadeRecordV2](newer, "records")
+	newTable, err = tableOf[facadeRecordV2](newer, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1955,7 +1955,7 @@ func TestOlderTypedWriterPreservesUnknownNestedStructFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := &facadeNestedRecordV2{ID: ids.NewRowID(), Profile: facadeNestedProfileV2{Name: "Ada", Region: "North"}}
-	newTable, err := TableOf[facadeNestedRecordV2](newer, "nested_records")
+	newTable, err := tableOf[facadeNestedRecordV2](newer, "nested_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1976,7 +1976,7 @@ func TestOlderTypedWriterPreservesUnknownNestedStructFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open compatible older nested schema: %v", err)
 	}
-	oldTable, err := TableOf[facadeNestedRecordV1](older, "nested_records")
+	oldTable, err := tableOf[facadeNestedRecordV1](older, "nested_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1997,7 +1997,7 @@ func TestOlderTypedWriterPreservesUnknownNestedStructFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer newer.Close()
-	newTable, err = TableOf[facadeNestedRecordV2](newer, "nested_records")
+	newTable, err = tableOf[facadeNestedRecordV2](newer, "nested_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2025,7 +2025,7 @@ func TestOlderTypedWriterPreservesUnknownFieldsInsideCollections(t *testing.T) {
 		Items: []facadeCollectionItemV2{{Name: "first", Region: "north"}, {Name: "second", Region: "south"}},
 		ByKey: map[string]facadeCollectionItemV2{"a": {Name: "alpha", Region: "east"}, "z": {Name: "zeta", Region: "west"}},
 	}
-	newTable, err := TableOf[facadeCollectionRecordV2](newer, "collection_records")
+	newTable, err := tableOf[facadeCollectionRecordV2](newer, "collection_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2044,7 +2044,7 @@ func TestOlderTypedWriterPreservesUnknownFieldsInsideCollections(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open compatible older collection schema: %v", err)
 	}
-	oldTable, err := TableOf[facadeCollectionRecordV1](older, "collection_records")
+	oldTable, err := tableOf[facadeCollectionRecordV1](older, "collection_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2069,7 +2069,7 @@ func TestOlderTypedWriterPreservesUnknownFieldsInsideCollections(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer newer.Close()
-	newTable, err = TableOf[facadeCollectionRecordV2](newer, "collection_records")
+	newTable, err = tableOf[facadeCollectionRecordV2](newer, "collection_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2094,7 +2094,7 @@ func TestTypedCustomRecordCodecPersistsAndReopens(t *testing.T) {
 	facadeCustomCloneCalls.Store(0)
 	facadeCustomEqualCalls.Store(0)
 	want := &facadeCustomRecord{ID: ids.NewRowID(), Token: "stable-token"}
-	table, err := TableOf[facadeCustomRecord](db, "custom_records")
+	table, err := tableOf[facadeCustomRecord](db, "custom_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2120,7 +2120,7 @@ func TestTypedCustomRecordCodecPersistsAndReopens(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err = TableOf[facadeCustomRecord](db, "custom_records")
+	table, err = tableOf[facadeCustomRecord](db, "custom_records")
 	if err != nil {
 		t.Fatal(err)
 	}

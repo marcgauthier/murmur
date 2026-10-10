@@ -1,4 +1,4 @@
-// Command prepared-statements shows reusable compiled typed queries with
+// Command prepared-statements shows reusable compiled queries with
 // positional parameters.
 //
 // Run it with:
@@ -15,7 +15,7 @@ import (
 	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"github.com/marcgauthier/murmur/ids"
-	"github.com/marcgauthier/murmur/rime"
+	"github.com/marcgauthier/murmur/q"
 )
 
 type sensor struct {
@@ -32,8 +32,11 @@ func main() {
 	}
 	defer os.RemoveAll(dir)
 
-	definition, err := murmur.Define[sensor]("sensors", 20, murmur.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Name": 2, "Value": 3},
+	definition, err := murmur.Model[sensor](murmur.ModelOptions{
+		Name: "sensors", TableID: 20,
+		RecordOptions: murmur.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Name": 2, "Value": 3},
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -53,22 +56,18 @@ func main() {
 	}
 	defer db.Close()
 
-	sensors, err := murmur.TableOf[sensor](db, "sensors")
-	if err != nil {
-		log.Fatal(err)
-	}
 	if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
 		rows := make([]*sensor, 50)
 		for i := range rows {
 			rows[i] = &sensor{ID: murmur.NewRowID(), Name: fmt.Sprintf("sensor-%d", i%5), Value: i}
 		}
-		return sensors.InsertMany(tx, rows)
+		return tx.InsertMany(rows)
 	}); err != nil {
 		log.Fatal(err)
 	}
 
 	// Compile once, then bind a different value at each execution.
-	byName := sensors.Compile(murmur.FieldOf[sensor, string](sensors, "Name").Eq(rime.Param[string]()))
+	byName := db.Query(sensor{}, q.Eq("Name", q.Param())).Compile()
 	n, err := byName.Count("sensor-2")
 	if err != nil {
 		log.Fatal(err)

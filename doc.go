@@ -1,6 +1,6 @@
 // Package murmur is an embedded database with encrypted durable state and
 // masterless replication over QUIC. There is no standalone server. Applications
-// define managed Go record tables with Config.Tables; Murmur commits typed
+// register Go models with Config.Models or explicit Config.Tables; Murmur commits typed
 // changes to Spool before publishing them through RIME. SQL-only Schema.Tables
 // configurations are no longer accepted by Open.
 //

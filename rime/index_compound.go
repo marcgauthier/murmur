@@ -3,6 +3,7 @@ package rime
 import (
 	"reflect"
 	"sort"
+	"time"
 )
 
 // compoundIdx is a multi-field equality index over native comparable values.
@@ -27,7 +28,7 @@ type compoundLevel struct {
 func comparableIndexType(t reflect.Type) bool {
 	switch t.Kind() {
 	case reflect.Slice, reflect.Map, reflect.Func, reflect.Struct:
-		if t == reflect.TypeOf(UUID{}) {
+		if t == reflect.TypeOf(UUID{}) || t == reflect.TypeFor[time.Time]() {
 			return true
 		}
 		if t.Kind() == reflect.Struct {
@@ -258,7 +259,7 @@ func (ix *indexSet) compoundLookup(name string, eq map[string]any) (map[any]stru
 		if !ok {
 			return nil, false
 		}
-		vals[i] = v
+		vals[i] = normalizeIndexValue(v)
 	}
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()

@@ -24,7 +24,7 @@ type soakRecord struct {
 
 func soakRecordDefinition(t *testing.T) TableDefinition {
 	t.Helper()
-	definition, err := Define[soakRecord]("contacts", 80, RecordOptions{
+	definition, err := define[soakRecord]("contacts", 80, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Phone": 3, "Score": 4},
 	})
@@ -73,7 +73,7 @@ func TestSoakTwoNodes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
-	tableA, err := TableOf[soakRecord](dbA, "contacts")
+	tableA, err := tableOf[soakRecord](dbA, "contacts")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestSoakTwoNodes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbB.Close()
-	tableB, err := TableOf[soakRecord](dbB, "contacts")
+	tableB, err := tableOf[soakRecord](dbB, "contacts")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestSoakTwoNodes(t *testing.T) {
 	var firstErr atomic.Value // error
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	worker := func(db *DB, table *RecordTable[soakRecord], seed int64) {
+	worker := func(db *DB, table *recordTable[soakRecord], seed int64) {
 		defer wg.Done()
 		rng := rand.New(rand.NewSource(seed))
 		for {
@@ -144,7 +144,7 @@ func TestSoakTwoNodes(t *testing.T) {
 	}
 }
 
-func soakOp(ctx context.Context, db *DB, table *RecordTable[soakRecord], rng *rand.Rand, mu *sync.Mutex, pool *[]RowID) error {
+func soakOp(ctx context.Context, db *DB, table *recordTable[soakRecord], rng *rand.Rand, mu *sync.Mutex, pool *[]RowID) error {
 	roll := rng.Intn(100)
 	switch {
 	case roll < 40:
@@ -193,7 +193,7 @@ func soakOp(ctx context.Context, db *DB, table *RecordTable[soakRecord], rng *ra
 	return nil
 }
 
-func soakUpdate(ctx context.Context, db *DB, table *RecordTable[soakRecord], id RowID, update func(*soakRecord)) error {
+func soakUpdate(ctx context.Context, db *DB, table *recordTable[soakRecord], id RowID, update func(*soakRecord)) error {
 	err := soakWrite(ctx, db, func(tx *Tx) error {
 		return table.Update(tx, id, func(value *soakRecord) error {
 			update(value)
@@ -226,7 +226,7 @@ func soakWrite(ctx context.Context, db *DB, fn func(*Tx) error) error {
 	return fmt.Errorf("murmur: typed soak write exceeded conflict retry limit in state %s: %w", db.Status().State, lastErr)
 }
 
-func soakSnapshot(table *RecordTable[soakRecord]) (map[RowID]soakRecord, error) {
+func soakSnapshot(table *recordTable[soakRecord]) (map[RowID]soakRecord, error) {
 	rows, err := table.Where().Find()
 	if err != nil {
 		return nil, err

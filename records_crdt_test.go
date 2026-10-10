@@ -37,7 +37,7 @@ type extremaRecord struct {
 
 func extremaDefinition(t *testing.T) TableDefinition {
 	t.Helper()
-	d, err := Define[extremaRecord]("extrema_records", 93, RecordOptions{
+	d, err := define[extremaRecord]("extrema_records", 93, RecordOptions{
 		PrimaryField:  "ID",
 		FieldIDs:      map[string]uint32{"ID": 1, "High": 2, "Low": 3},
 		MergePolicies: map[string]RecordMergePolicy{"High": RecordMergeMax, "Low": RecordMergeMin},
@@ -50,7 +50,7 @@ func extremaDefinition(t *testing.T) TableDefinition {
 
 func setDefinition(t *testing.T) TableDefinition {
 	t.Helper()
-	d, err := Define[setRecord]("set_records", 92, RecordOptions{
+	d, err := define[setRecord]("set_records", 92, RecordOptions{
 		PrimaryField:  "ID",
 		FieldIDs:      map[string]uint32{"ID": 1, "Tags": 2},
 		MergePolicies: map[string]RecordMergePolicy{"Tags": RecordMergeORSet},
@@ -63,7 +63,7 @@ func setDefinition(t *testing.T) TableDefinition {
 
 func counterDefinition(t *testing.T) TableDefinition {
 	t.Helper()
-	d, err := Define[counterRecord]("counter_records", 91, RecordOptions{
+	d, err := define[counterRecord]("counter_records", 91, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Count": 2},
 		MergePolicies: map[string]RecordMergePolicy{
@@ -85,7 +85,7 @@ func TestTypedCounterUsesDurablePNComponents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[counterRecord](db, "counter_records")
+	table, err := tableOf[counterRecord](db, "counter_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,10 +94,10 @@ func TestTypedCounterUsesDurablePNComponents(t *testing.T) {
 		if err := table.Insert(tx, want); err != nil {
 			return err
 		}
-		if err := RecordCounterAdd(tx, table, want.ID, "Count", 5); err != nil {
+		if err := recordCounterAdd(tx, table, want.ID, "Count", 5); err != nil {
 			return err
 		}
-		return RecordCounterAdd(tx, table, want.ID, "Count", -2)
+		return recordCounterAdd(tx, table, want.ID, "Count", -2)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestTypedCounterUsesDurablePNComponents(t *testing.T) {
 		t.Fatalf("direct counter assignment error = %v, want ErrUnsupportedSchema", err)
 	}
 	if err := db.WriteTxContext(ctx, func(tx *Tx) error {
-		return RecordCounterAdd(tx, table, want.ID, "Count", math.MaxInt64)
+		return recordCounterAdd(tx, table, want.ID, "Count", math.MaxInt64)
 	}); err == nil {
 		t.Fatal("counter accepted an int64 overflow")
 	}
@@ -126,7 +126,7 @@ func TestTypedCounterUsesDurablePNComponents(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err = TableOf[counterRecord](db, "counter_records")
+	table, err = tableOf[counterRecord](db, "counter_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestTypedORSetUsesDurableCausalRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[setRecord](db, "set_records")
+	table, err := tableOf[setRecord](db, "set_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,16 +155,16 @@ func TestTypedORSetUsesDurableCausalRecords(t *testing.T) {
 		if err := table.Insert(tx, want); err != nil {
 			return err
 		}
-		if err := RecordSetAdd(tx, table, want.ID, "Tags", "z"); err != nil {
+		if err := recordSetAdd(tx, table, want.ID, "Tags", "z"); err != nil {
 			return err
 		}
-		if err := RecordSetAdd(tx, table, want.ID, "Tags", "aa"); err != nil {
+		if err := recordSetAdd(tx, table, want.ID, "Tags", "aa"); err != nil {
 			return err
 		}
-		if err := RecordSetAdd(tx, table, want.ID, "Tags", "red"); err != nil {
+		if err := recordSetAdd(tx, table, want.ID, "Tags", "red"); err != nil {
 			return err
 		}
-		return RecordSetRemove(tx, table, want.ID, "Tags", "red")
+		return recordSetRemove(tx, table, want.ID, "Tags", "red")
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestTypedORSetUsesDurableCausalRecords(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err = TableOf[setRecord](db, "set_records")
+	table, err = tableOf[setRecord](db, "set_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestTypedUncertainCommitReceiptResolvesAfterReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[setRecord](db, "set_records")
+	table, err := tableOf[setRecord](db, "set_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestTypedUncertainCommitReceiptResolvesAfterReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	armed.Store(true)
-	err = db.WriteTxContext(ctx, func(tx *Tx) error { return RecordSetAdd(tx, table, want.ID, "Tags", "possibly-durable") })
+	err = db.WriteTxContext(ctx, func(tx *Tx) error { return recordSetAdd(tx, table, want.ID, "Tags", "possibly-durable") })
 	armed.Store(false)
 	if !errors.Is(err, ErrCommitOutcomeUncertain) {
 		t.Fatalf("typed write error=%v, want ErrCommitOutcomeUncertain", err)
@@ -249,7 +249,7 @@ func TestTypedUncertainCommitReceiptResolvesAfterReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err = TableOf[setRecord](db, "set_records")
+	table, err = tableOf[setRecord](db, "set_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +271,7 @@ func TestTypedNumericExtremaUseDurablePolicies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[extremaRecord](db, "extrema_records")
+	table, err := tableOf[extremaRecord](db, "extrema_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,21 +280,21 @@ func TestTypedNumericExtremaUseDurablePolicies(t *testing.T) {
 		if err := table.Insert(tx, want); err != nil {
 			return err
 		}
-		if err := RecordMax(tx, table, want.ID, "High", int64(-20)); err != nil {
+		if err := recordMax(tx, table, want.ID, "High", int64(-20)); err != nil {
 			return err
 		}
-		if err := RecordMax(tx, table, want.ID, "High", int64(15)); err != nil {
+		if err := recordMax(tx, table, want.ID, "High", int64(15)); err != nil {
 			return err
 		}
-		if err := RecordMin(tx, table, want.ID, "Low", float64(20)); err != nil {
+		if err := recordMin(tx, table, want.ID, "Low", float64(20)); err != nil {
 			return err
 		}
-		return RecordMin(tx, table, want.ID, "Low", float64(-4))
+		return recordMin(tx, table, want.ID, "Low", float64(-4))
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.WriteTxContext(ctx, func(tx *Tx) error {
-		return RecordMin(tx, table, want.ID, "Low", math.NaN())
+		return recordMin(tx, table, want.ID, "Low", math.NaN())
 	}); !errors.Is(err, ErrUnsupportedSchema) {
 		t.Fatalf("non-finite extrema error=%v, want ErrUnsupportedSchema", err)
 	}
@@ -315,7 +315,7 @@ func TestTypedNumericExtremaUseDurablePolicies(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err = TableOf[extremaRecord](db, "extrema_records")
+	table, err = tableOf[extremaRecord](db, "extrema_records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +327,7 @@ func TestTypedNumericExtremaUseDurablePolicies(t *testing.T) {
 
 func TestTypedMergeSnapshotPreservesRemovedSetHistory(t *testing.T) {
 	ctx := context.Background()
-	definition, err := Define[mergeConvergenceRecord]("merge_rows", 101, RecordOptions{
+	definition, err := define[mergeConvergenceRecord]("merge_rows", 101, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Count": 2, "Tags": 3},
 		MergePolicies: map[string]RecordMergePolicy{
@@ -347,7 +347,7 @@ func TestTypedMergeSnapshotPreservesRemovedSetHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer source.Close()
-	sourceTable, err := TableOf[mergeConvergenceRecord](source, "merge_rows")
+	sourceTable, err := tableOf[mergeConvergenceRecord](source, "merge_rows")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,10 +356,10 @@ func TestTypedMergeSnapshotPreservesRemovedSetHistory(t *testing.T) {
 		if err := sourceTable.Insert(tx, &mergeConvergenceRecord{ID: row}); err != nil {
 			return err
 		}
-		if err := RecordCounterAdd(tx, sourceTable, row, "Count", 20); err != nil {
+		if err := recordCounterAdd(tx, sourceTable, row, "Count", 20); err != nil {
 			return err
 		}
-		if err := RecordSetAdd(tx, sourceTable, row, "Tags", "red"); err != nil {
+		if err := recordSetAdd(tx, sourceTable, row, "Tags", "red"); err != nil {
 			return err
 		}
 		return sourceTable.Insert(tx, &mergeConvergenceRecord{ID: empty})
@@ -367,7 +367,7 @@ func TestTypedMergeSnapshotPreservesRemovedSetHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := source.WriteTxContext(ctx, func(tx *Tx) error {
-		return RecordSetRemove(tx, sourceTable, row, "Tags", "red")
+		return recordSetRemove(tx, sourceTable, row, "Tags", "red")
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +381,7 @@ func TestTypedMergeSnapshotPreservesRemovedSetHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer destination.Close()
-	destinationTable, err := TableOf[mergeConvergenceRecord](destination, "merge_rows")
+	destinationTable, err := tableOf[mergeConvergenceRecord](destination, "merge_rows")
 	if err != nil {
 		t.Fatal(err)
 	}

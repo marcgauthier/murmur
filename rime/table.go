@@ -14,6 +14,8 @@ type TableOption[T any] func(*tableConfig[T])
 
 type tableConfig[T any] struct {
 	name      string
+	primary   string
+	key       func(*T) any
 	shards    int
 	compounds []compoundDef
 	checks    []func(*T) error
@@ -31,6 +33,24 @@ type fkDef struct {
 // WithTableName overrides the default table name (the Go struct name).
 func WithTableName[T any](name string) TableOption[T] {
 	return func(c *tableConfig[T]) { c.name = name }
+}
+
+// WithPrimaryField explicitly selects the physical row key. Other primary tags
+// become equality indexes; this lets adapters separate identity from business keys.
+func WithPrimaryField[T any](name string) TableOption[T] {
+	return func(c *tableConfig[T]) { c.primary = name }
+}
+
+// WithPrimaryKey supplies the canonical key representation used by an adapter.
+// The accessor must be deterministic and retain all physical identity bits.
+func WithPrimaryKey[T any](get func(*T) any) TableOption[T] {
+	return func(c *tableConfig[T]) { c.key = get }
+}
+
+// RegisterType registers a runtime struct type using the same engine as Register.
+// Records are carried as *any whose value is a pointer to the registered struct.
+func RegisterType(db *DB, typ reflect.Type, opts ...TableOption[any]) (*Table[any], error) {
+	return registerType[any](db, typ, opts...)
 }
 
 // WithTableShards sets the shard count for this table.
@@ -137,6 +157,13 @@ type Table[T any] struct {
 // Register compiles schema metadata for T and creates its sharded storage.
 // The struct name is the default table name.
 func Register[T any](db *DB, opts ...TableOption[T]) (*Table[T], error) {
+	return registerType[T](db, reflect.TypeFor[T](), opts...)
+}
+
+func registerType[T any](db *DB, typ reflect.Type, opts ...TableOption[T]) (*Table[T], error) {
+	if db == nil {
+		return nil, ErrDBClosed
+	}
 	if db.faulted.Load() {
 		return nil, ErrDBFaulted
 	}
@@ -147,8 +174,6 @@ func Register[T any](db *DB, opts ...TableOption[T]) (*Table[T], error) {
 	for _, o := range opts {
 		o(&cfg)
 	}
-	var zero T
-	typ := reflect.TypeOf(zero)
 	if typ == nil {
 		return nil, fmt.Errorf("%w: nil record type", ErrBadSchema)
 	}
@@ -159,7 +184,7 @@ func Register[T any](db *DB, opts ...TableOption[T]) (*Table[T], error) {
 	if cfg.name != "" {
 		name = cfg.name
 	}
-	sch, err := buildSchema(name, typ)
+	sch, err := buildSchemaPrimary(name, typ, cfg.primary)
 	if err != nil {
 		return nil, err
 	}
@@ -175,6 +200,9 @@ func Register[T any](db *DB, opts ...TableOption[T]) (*Table[T], error) {
 	pkGet, _, err := getter[T](sch, pk.name)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.key != nil {
+		pkGet = cfg.key
 	}
 	clone := cfg.cloner
 	if clone == nil {
@@ -240,10 +268,10 @@ func (t *Table[T]) tableName() string { return t.name }
 func (t *Table[T]) preparedChange(key any, base TxID, old, next any, op Operation) PreparedChange {
 	change := PreparedChange{Table: t.name, Key: key, Operation: op, Base: base, owner: t}
 	if old != nil {
-		change.Old = cloneForUpdate(t.clone, old.(*T))
+		change.Old = nativeRecord(cloneForUpdate(t.clone, old.(*T)))
 	}
 	if next != nil {
-		change.New = cloneForUpdate(t.clone, next.(*T))
+		change.New = nativeRecord(cloneForUpdate(t.clone, next.(*T)))
 	}
 	return change
 }
@@ -410,7 +438,7 @@ func (t *Table[T]) DeleteMany(keys []any) error   { return t.In(nil).DeleteMany(
 // value into an interface.
 func setFieldKey[T any](t *Table[T], fm fieldMeta) {
 	idx := fm.index
-	at := func(r *T) reflect.Value { return reflect.ValueOf(r).Elem().FieldByIndex(idx) }
+	at := func(r *T) reflect.Value { return recordStruct(r).FieldByIndex(idx) }
 	switch keyKindOf(fm.typ) {
 	case kString:
 		t.keyStr[fm.name] = func(r *T) string { return at(r).String() }
@@ -1505,10 +1533,16 @@ func (t *Table[T]) prepareNew(rec *T) (*T, any, error) {
 	if rec == nil {
 		return nil, nil, fmt.Errorf("%w: nil record", ErrBadSchema)
 	}
+	if err := t.validateRecordType(rec); err != nil {
+		return nil, nil, err
+	}
 	out := cloneForUpdate(t.clone, rec)
+	if err := t.validateRecordType(out); err != nil {
+		return nil, nil, err
+	}
 	applyDefaults(t.sch, out)
 	if t.pk.uuid5 {
-		rv := reflect.ValueOf(out).Elem().FieldByIndex(t.pk.index)
+		rv := recordStruct(out).FieldByIndex(t.pk.index)
 		if isZero(rv.Interface()) {
 			id := NewUUIDv5(TableNamespace(t.name), fmt.Sprintf("%s:%d", t.name, t.db.idSeq.Add(1)))
 			switch rv.Kind() {
@@ -1531,10 +1565,13 @@ func (t *Table[T]) prepareNew(rec *T) (*T, any, error) {
 
 // validateNew runs NOT NULL, CHECK, and FK validation for a new value.
 func (t *Table[T]) validateNew(rec *T) error {
+	if err := t.validateRecordType(rec); err != nil {
+		return err
+	}
 	if t.skipValidate.Load() {
 		return nil
 	}
-	rv := reflect.ValueOf(rec).Elem()
+	rv := recordStruct(rec)
 	for _, fm := range t.sch.fields {
 		if fm.notNull && fm.optional && isAbsent(rv.FieldByIndex(fm.index).Interface()) {
 			return &ConstraintError{Table: t.name, Field: fm.name, Err: ErrNotNull}
@@ -1676,6 +1713,9 @@ func (t *Table[T]) runBeforeDelete(rec *T) error {
 func (t *Table[T]) buffer(tx *Tx, p *pendingWrite) error {
 	if max := t.db.cfg.maxMutations; max > 0 && len(tx.pending)+1 > max {
 		return ErrLimitExceeded
+	}
+	if prior := t.ownPending(tx, p.key); prior != nil {
+		prior.superseded = true
 	}
 	tx.pending = append(tx.pending, p)
 	// The staged map exists only after ownPending builds it on demand;
@@ -1859,10 +1899,22 @@ func (t *Table[T]) batchAt(tx *Tx, n int, operation string, apply func(*Tx, int)
 	if err := t.checkTx(tx); err != nil {
 		return err
 	}
+	return tx.Batch(operation, n, func(i int) error { return apply(tx, i) })
+}
+
+// Batch stages operations atomically, preserving earlier transaction writes on failure.
+func (tx *Tx) Batch(operation string, n int, apply func(int) error) error {
+	if tx == nil || n < 0 || apply == nil {
+		return ErrTxClosed
+	}
 	if err := tx.mustWrite(); err != nil {
 		return err
 	}
 	start, hint := len(tx.pending), tx.stageHint
+	superseded := make([]bool, start)
+	for i, p := range tx.pending {
+		superseded[i] = p.superseded
+	}
 	growPending(tx, n)
 	rollback := func() {
 		for _, p := range tx.pending[start:] {
@@ -1870,6 +1922,9 @@ func (t *Table[T]) batchAt(tx *Tx, n int, operation string, apply func(*Tx, int)
 			pendingWritePool.Put(p)
 		}
 		tx.pending = tx.pending[:start]
+		for i, p := range tx.pending {
+			p.superseded = superseded[i]
+		}
 		tx.stageHint = hint
 		if tx.pendingByKey != nil {
 			clear(tx.pendingByKey)
@@ -1883,7 +1938,7 @@ func (t *Table[T]) batchAt(tx *Tx, n int, operation string, apply func(*Tx, int)
 			rollback()
 			return err
 		}
-		if err := apply(tx, i); err != nil {
+		if err := apply(i); err != nil {
 			rollback()
 			return &BatchError{Operation: operation, Index: i, Err: err}
 		}
@@ -2019,8 +2074,7 @@ func (t *Table[T]) checkTx(tx *Tx) error {
 
 func (t *Table[T]) snapshotBase(tx *Tx, key any) (version[T], bool) {
 	if p := t.ownPending(tx, key); p != nil {
-		// Stacked write: the prior write is final no longer.
-		p.superseded = true
+		// Use the original optimistic base; supersede only after staging succeeds.
 		var val *T
 		if p.old != nil {
 			val = p.old.(*T)
@@ -2035,4 +2089,22 @@ func (t *Table[T]) snapshotBase(tx *Tx, key any) (version[T], bool) {
 		return version[T]{}, false
 	}
 	return c.visible(tx.snap)
+}
+
+func nativeRecord(record any) any {
+	if carrier, ok := record.(*any); ok {
+		return *carrier
+	}
+	return record
+}
+
+func (t *Table[T]) validateRecordType(rec *T) error {
+	if t.sch.typ == reflect.TypeFor[T]() {
+		return nil
+	}
+	value := recordStruct(rec)
+	if !value.IsValid() || value.Type() != t.sch.typ || !value.CanAddr() {
+		return fmt.Errorf("%w: runtime table %s requires a native *%s carrier", ErrBadSchema, t.name, t.sch.typ)
+	}
+	return nil
 }

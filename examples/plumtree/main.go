@@ -37,12 +37,12 @@ func freePort() int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-func waitCounts(tables []*murmur.RecordTable[note], want int, timeout time.Duration) {
+func waitCounts(dbs []*murmur.DB, want int, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
-		for _, table := range tables {
-			n, err := table.Where().Count()
+		for _, db := range dbs {
+			n, err := db.Count(context.Background(), note{})
 			if err != nil || n != want {
 				ok = false
 				break
@@ -71,8 +71,11 @@ func main() {
 	dbid := murmur.NewDBID()
 
 	const nodes = 3
-	definition, err := murmur.Define[note]("notes", 11, murmur.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+	definition, err := murmur.Model[note](murmur.ModelOptions{
+		Name: "notes", TableID: 11,
+		RecordOptions: murmur.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -80,7 +83,6 @@ func main() {
 	ids := make([]murmur.NodeID, nodes)
 	addrs := make([]string, nodes)
 	dbs := make([]*murmur.DB, nodes)
-	tables := make([]*murmur.RecordTable[note], nodes)
 	for i := range ids {
 		ids[i] = murmur.NewNodeID()
 		addrs[i] = fmt.Sprintf("127.0.0.1:%d", freePort())
@@ -124,30 +126,25 @@ func main() {
 			log.Fatal(err)
 		}
 		defer dbs[i].Close()
-		tables[i], err = murmur.TableOf[note](dbs[i], "notes")
-		if err != nil {
-			log.Fatal(err)
-		}
 	}
 
 	var wg sync.WaitGroup
 	for i, db := range dbs {
-		table := tables[i]
 		wg.Add(1)
-		go func(i int, db *murmur.DB, table *murmur.RecordTable[note]) {
+		go func(i int, db *murmur.DB) {
 			defer wg.Done()
 			if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
 				batch := make([]*note, 5)
 				for r := range batch {
 					batch[r] = &note{ID: murmur.NewRowID(), Body: fmt.Sprintf("node%d-note%d", i+1, r)}
 				}
-				return table.InsertMany(tx, batch)
+				return tx.InsertMany(batch)
 			}); err != nil {
 				log.Fatal(err)
 			}
-		}(i, db, table)
+		}(i, db)
 	}
 	wg.Wait()
-	waitCounts(tables, 15, 90*time.Second)
+	waitCounts(dbs, 15, 90*time.Second)
 	fmt.Println("15 rows converged on all 3 Plumtree nodes")
 }

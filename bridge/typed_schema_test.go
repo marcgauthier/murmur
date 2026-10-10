@@ -55,9 +55,11 @@ type typedBridgeCRDTRecord struct {
 func TestImporterSchemaGateUsesTypedManifest(t *testing.T) {
 	ctx := context.Background()
 	node := ids.NewNodeID()
-	definition, err := db.Define[typedBridgeSchemaRecord]("typed_rows", 91, db.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2},
+	definition, err := db.Model[typedBridgeSchemaRecord](db.ModelOptions{
+		Name: "typed_rows", TableID: 91,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Name": 2},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -93,13 +95,9 @@ func TestImporterSchemaGateUsesTypedManifest(t *testing.T) {
 	if got, err := importer.pkColumn(ctx, "typed_rows"); err != nil || got != "ID" {
 		t.Fatalf("typed primary key = %q, %v; want ID", got, err)
 	}
-	typedTable, err := db.TableOf[typedBridgeSchemaRecord](database, "typed_rows")
-	if err != nil {
-		t.Fatal(err)
-	}
 	want := &typedBridgeSchemaRecord{ID: ids.NewRowID(), Name: "existing"}
 	if err := database.WriteTxContext(ctx, func(tx *db.Tx) error {
-		return typedTable.Insert(tx, want)
+		return tx.InsertItem(want)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +123,9 @@ func TestImporterAppliesTypedRowsWithAtomicProvenance(t *testing.T) {
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2},
 	}
-	definition, err := db.Define[typedBridgeSchemaRecord]("typed_rows", 92, options)
+	definition, err := db.Model[typedBridgeSchemaRecord](db.ModelOptions{
+		Name: "typed_rows", TableID: 92, RecordOptions: options,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,12 +177,9 @@ func TestImporterAppliesTypedRowsWithAtomicProvenance(t *testing.T) {
 	if err := importer.ApplyBundle(ctx, bundle); err != nil {
 		t.Fatalf("apply typed bridge bundle: %v", err)
 	}
-	table, err := db.TableOf[typedBridgeSchemaRecord](database, "typed_rows")
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := table.Get(row)
-	if err != nil || got.Name != "low-value" {
+	var got typedBridgeSchemaRecord
+	got.ID = row
+	if err := database.GetItem(ctx, &got); err != nil || got.Name != "low-value" {
 		t.Fatalf("typed imported row = %+v, %v", got, err)
 	}
 	policy, ok, err := database.BridgeRowProvenance("typed_rows", row)
@@ -193,10 +190,7 @@ func TestImporterAppliesTypedRowsWithAtomicProvenance(t *testing.T) {
 		t.Fatalf("typed source receipt present=%v err=%v", has, err)
 	}
 	if err := database.WriteTxContext(ctx, func(tx *db.Tx) error {
-		return table.Update(tx, row, func(record *typedBridgeSchemaRecord) error {
-			record.Name = "high-value"
-			return nil
-		})
+		return tx.Update(&typedBridgeSchemaRecord{ID: row}, db.Set("Name", "high-value"))
 	}); err != nil {
 		t.Fatalf("High typed override: %v", err)
 	}
@@ -226,8 +220,7 @@ func TestImporterAppliesTypedRowsWithAtomicProvenance(t *testing.T) {
 	if err := importer.ApplyBundle(ctx, nextBundle); err != nil {
 		t.Fatalf("apply typed bundle after High override: %v", err)
 	}
-	got, err = table.Get(row)
-	if err != nil || got.Name != "high-value" {
+	if err := database.GetItem(ctx, &got); err != nil || got.Name != "high-value" {
 		t.Fatalf("Low import replaced a High-owned typed field: %+v, %v", got, err)
 	}
 	if err := database.Close(); err != nil {
@@ -238,16 +231,11 @@ func TestImporterAppliesTypedRowsWithAtomicProvenance(t *testing.T) {
 		t.Fatalf("reopen typed High database: %v", err)
 	}
 	defer database.Close()
-	table, err = db.TableOf[typedBridgeSchemaRecord](database, "typed_rows")
-	if err != nil {
-		t.Fatal(err)
-	}
 	importer, err = NewImporter(database)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err = table.Get(row)
-	if err != nil || got.Name != "high-value" {
+	if err := database.GetItem(ctx, &got); err != nil || got.Name != "high-value" {
 		t.Fatalf("typed restart did not resolve High-owned shadow: %+v, %v", got, err)
 	}
 	if applied, ok, err := database.BridgeStreamProgress(bundle.Manifest.Stream); err != nil || !ok || applied != 2 {
@@ -282,8 +270,7 @@ func TestImporterAppliesTypedRowsWithAtomicProvenance(t *testing.T) {
 	if err := importer.ApplyBundle(ctx, thirdBundle); err != nil {
 		t.Fatalf("apply typed bundle after ownership release: %v", err)
 	}
-	got, err = table.Get(row)
-	if err != nil || got.Name != "low-after-release" {
+	if err := database.GetItem(ctx, &got); err != nil || got.Name != "low-after-release" {
 		t.Fatalf("released typed field rejected Low update: %+v, %v", got, err)
 	}
 }
@@ -300,7 +287,9 @@ func TestImporterPreservesTypedCRDTCausality(t *testing.T) {
 			"Peak":  db.RecordMergeMax,
 		},
 	}
-	definition, err := db.Define[typedBridgeCRDTRecord]("typed_crdt_rows", 93, options)
+	definition, err := db.Model[typedBridgeCRDTRecord](db.ModelOptions{
+		Name: "typed_crdt_rows", TableID: 93, RecordOptions: options,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,12 +350,9 @@ func TestImporterPreservesTypedCRDTCausality(t *testing.T) {
 	if err := importer.ApplyBundle(ctx, bundle); err != nil {
 		t.Fatalf("apply typed CRDT bridge bundle: %v", err)
 	}
-	table, err := db.TableOf[typedBridgeCRDTRecord](database, "typed_crdt_rows")
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := table.Get(row)
-	if err != nil || got.Count != 9 || len(got.Tags) != 1 || got.Tags[0] != "blue" || got.Peak != 17 {
+	var got typedBridgeCRDTRecord
+	got.ID = row
+	if err := database.GetItem(ctx, &got); err != nil || got.Count != 9 || len(got.Tags) != 1 || got.Tags[0] != "blue" || got.Peak != 17 {
 		t.Fatalf("typed CRDT import = %+v, %v", got, err)
 	}
 	var foundCounter bool

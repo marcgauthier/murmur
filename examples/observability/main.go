@@ -1,5 +1,5 @@
 // Command observability demonstrates slog-backed Murmur logs, status, and
-// metrics with typed record writes.
+// metrics with record writes.
 //
 // Run it with:
 //
@@ -37,8 +37,11 @@ func main() {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	definition, err := murmur.Define[event]("events", 6, murmur.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+	definition, err := murmur.Model[event](murmur.ModelOptions{
+		Name: "events", TableID: 6,
+		RecordOptions: murmur.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -53,16 +56,12 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
-	events, err := murmur.TableOf[event](db, "events")
-	if err != nil {
-		log.Fatal(err)
-	}
 	if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
 		batch := make([]*event, 5)
 		for i := range batch {
 			batch[i] = &event{ID: murmur.NewRowID(), Body: fmt.Sprintf("event-%d", i)}
 		}
-		return events.InsertMany(tx, batch)
+		return tx.InsertMany(batch)
 	}); err != nil {
 		log.Fatal(err)
 	}

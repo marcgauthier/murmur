@@ -22,7 +22,13 @@ import (
 
 const rowsPerTable = 6000
 
-type progressRecord struct {
+type progressRequest struct {
+	ID      ids.RowID `rime:"primary"`
+	Message string
+	Ordinal int64
+}
+
+type progressEvent struct {
 	ID      ids.RowID `rime:"primary"`
 	Message string
 	Ordinal int64
@@ -33,20 +39,72 @@ type fixture struct {
 	DB   db.DBID
 }
 
+func progressDefinition[T any](name string, id uint32) (db.TableDefinition, error) {
+	return db.Model[T](db.ModelOptions{
+		Name: name, TableID: id,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Message": 2, "Ordinal": 3},
+		},
+	})
+}
+
 func config(dir string, f fixture) (db.Config, error) {
-	var definitions []db.TableDefinition
-	for i, name := range []string{"requests", "events"} {
-		definition, err := db.Define[progressRecord](name, uint32(301+i), db.RecordOptions{
-			PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Message": 2, "Ordinal": 3},
-		})
-		if err != nil {
-			return db.Config{}, err
-		}
-		definitions = append(definitions, definition)
+	requests, err := progressDefinition[progressRequest]("requests", 301)
+	if err != nil {
+		return db.Config{}, err
 	}
+	events, err := progressDefinition[progressEvent]("events", 302)
+	if err != nil {
+		return db.Config{}, err
+	}
+	definitions := []db.TableDefinition{requests, events}
 	return testdb.Configure(db.Config{Path: filepath.Join(dir, "db"), NodeID: f.Node, DBID: f.DB,
 		Tables: definitions, Spool: db.DefaultSpoolConfig(),
 		Encryption: db.EncryptionConfig{Key: bytes.Repeat([]byte{0x63}, 32), KeyID: "open-progress-live"}}), nil
+}
+
+func populateProgressTable[T any](t *testing.T, live *db.DB, make func(i int) *T) {
+	t.Helper()
+	for start := 0; start < rowsPerTable; start += 1000 {
+		err := live.WriteTxContext(context.Background(), func(tx *db.Tx) error {
+			for i := start; i < start+1000; i++ {
+				if err := tx.InsertItem(make(i)); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func verifyProgressTable[T any](t *testing.T, live *db.DB, name string, ordinal func(*T) int64) {
+	t.Helper()
+	var rows []T
+	if err := live.Find(context.Background(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	n := int64(len(rows))
+	var sum int64
+	for i := range rows {
+		sum += ordinal(&rows[i])
+	}
+	if n != rowsPerTable || sum != rowsPerTable*(rowsPerTable-1)/2 {
+		t.Fatalf("wrong contents %s", name)
+	}
+}
+
+func countProgressTable[T any](t *testing.T, live *db.DB, name string) {
+	t.Helper()
+	n, err := live.Count(context.Background(), *new(T))
+	if err != nil {
+		t.Fatalf("table-tracking: count %s: %v", name, err)
+	}
+	if int64(n) != rowsPerTable {
+		t.Fatalf("table-tracking: %s count=%d want %d", name, n, rowsPerTable)
+	}
 }
 
 func TestEmbeddedOpenProgressLive(t *testing.T) {
@@ -103,26 +161,12 @@ func TestOpenProgressChild(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer live.Close()
-		for _, name := range []string{"requests", "events"} {
-			table, err := db.TableOf[progressRecord](live, name)
-			if err != nil {
-				t.Fatal(err)
-			}
-			for start := 0; start < rowsPerTable; start += 1000 {
-				err := live.WriteTxContext(context.Background(), func(tx *db.Tx) error {
-					for i := start; i < start+1000; i++ {
-						row := &progressRecord{ID: db.NewRowID(), Message: "realistic diagnostic " + fmt.Sprint(i) + " " + string(bytes.Repeat([]byte("trace "), 512)), Ordinal: int64(i)}
-						if err := table.Insert(tx, row); err != nil {
-							return err
-						}
-					}
-					return nil
-				})
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-		}
+		populateProgressTable(t, live, func(i int) *progressRequest {
+			return &progressRequest{ID: db.NewRowID(), Message: "realistic diagnostic " + fmt.Sprint(i) + " " + string(bytes.Repeat([]byte("trace "), 512)), Ordinal: int64(i)}
+		})
+		populateProgressTable(t, live, func(i int) *progressEvent {
+			return &progressEvent{ID: db.NewRowID(), Message: "realistic diagnostic " + fmt.Sprint(i) + " " + string(bytes.Repeat([]byte("trace "), 512)), Ordinal: int64(i)}
+		})
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -167,24 +211,8 @@ func TestOpenProgressChild(t *testing.T) {
 		if p == nil || p.Phase != db.OpenReady || p.TotalItemsKnown || p.ProcessedItems != rowsPerTable*2*3 || p.RowsInserted != rowsPerTable*2 || p.RowsSkipped != 0 || p.PercentComplete != 0 {
 			t.Fatalf("terminal=%+v", p)
 		}
-		for _, name := range []string{"requests", "events"} {
-			table, err := db.TableOf[progressRecord](live, name)
-			if err != nil {
-				t.Fatal(err)
-			}
-			rows, err := table.Where().Find()
-			if err != nil {
-				t.Fatal(err)
-			}
-			n := int64(len(rows))
-			var sum int64
-			for _, row := range rows {
-				sum += row.Ordinal
-			}
-			if n != rowsPerTable || sum != rowsPerTable*(rowsPerTable-1)/2 {
-				t.Fatalf("wrong contents %s", name)
-			}
-		}
+		verifyProgressTable(t, live, "requests", func(row *progressRequest) int64 { return row.Ordinal })
+		verifyProgressTable(t, live, "events", func(row *progressEvent) int64 { return row.Ordinal })
 	}
 	if overlap.Load() {
 		t.Fatal("overlapping callbacks")
@@ -343,26 +371,12 @@ func TestOpenProgressChildExtra(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer live.Close()
-		for _, name := range []string{"requests", "events"} {
-			table, err := db.TableOf[progressRecord](live, name)
-			if err != nil {
-				t.Fatal(err)
-			}
-			for start := 0; start < rowsPerTable; start += 1000 {
-				err := live.WriteTxContext(context.Background(), func(tx *db.Tx) error {
-					for i := start; i < start+1000; i++ {
-						row := &progressRecord{ID: db.NewRowID(), Message: "extra-live-" + fmt.Sprint(i) + "-" + string(bytes.Repeat([]byte("x"), 256)), Ordinal: int64(i)}
-						if err := table.Insert(tx, row); err != nil {
-							return err
-						}
-					}
-					return nil
-				})
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-		}
+		populateProgressTable(t, live, func(i int) *progressRequest {
+			return &progressRequest{ID: db.NewRowID(), Message: "extra-live-" + fmt.Sprint(i) + "-" + string(bytes.Repeat([]byte("x"), 256)), Ordinal: int64(i)}
+		})
+		populateProgressTable(t, live, func(i int) *progressEvent {
+			return &progressEvent{ID: db.NewRowID(), Message: "extra-live-" + fmt.Sprint(i) + "-" + string(bytes.Repeat([]byte("x"), 256)), Ordinal: int64(i)}
+		})
 		return
 	}
 
@@ -398,20 +412,8 @@ func TestOpenProgressChildExtra(t *testing.T) {
 			t.Fatalf("table-tracking: CurrentTable=%q not cleared after open", p.CurrentTable)
 		}
 		// Verify both tables are actually queryable with the correct row counts.
-		for _, name := range []string{"requests", "events"} {
-			table, err := db.TableOf[progressRecord](live, name)
-			if err != nil {
-				t.Fatalf("table-tracking: query %s: %v", name, err)
-			}
-			rows, err := table.Where().Count()
-			if err != nil {
-				t.Fatalf("table-tracking: count %s: %v", name, err)
-			}
-			n := int64(rows)
-			if n != rowsPerTable {
-				t.Fatalf("table-tracking: %s count=%d want %d", name, n, rowsPerTable)
-			}
-		}
+		countProgressTable[progressRequest](t, live, "requests")
+		countProgressTable[progressEvent](t, live, "events")
 		// At least one rebuilding event must have a non-empty CurrentTable or
 		// RowsInserted>0, indicating table-level progress was tracked.
 		mu.Lock()

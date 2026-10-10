@@ -15,11 +15,13 @@ import (
 	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/q"
 )
 
 type contact struct {
-	ID   ids.RowID `rime:"primary"`
-	Name string
+	ID     ids.RowID `rime:"ID"`
+	Name   string    `rime:"primary"`
+	Online bool
 }
 
 func main() {
@@ -30,18 +32,11 @@ func main() {
 	}
 	defer os.RemoveAll(dir)
 
-	definition, err := murmur.Define[contact]("contacts", 1, murmur.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
 	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path:   dir,
 		NodeID: murmur.NewNodeID(),
 		Schema: murmur.SchemaConfig{Version: 1},
-		Tables: []murmur.TableDefinition{definition},
+		Models: []any{contact{}},
 		Spool:  murmur.DefaultSpoolConfig(),
 		Encryption: murmur.EncryptionConfig{
 			// Demo key. Production applications load key material from a
@@ -55,26 +50,19 @@ func main() {
 	}
 	defer db.Close()
 
-	contacts, err := murmur.TableOf[contact](db, "contacts")
-	if err != nil {
+	contacts := []contact{{Name: "ann"}, {Name: "bob"}}
+	if err := db.InsertMany(ctx, &contacts); err != nil {
 		log.Fatal(err)
 	}
-	if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
-		for _, name := range []string{"ann", "bob"} {
-			if err := contacts.Insert(tx, &contact{ID: murmur.NewRowID(), Name: name}); err != nil {
-				return err
-			}
-		}
-		return nil
-	}); err != nil {
+	if err := db.Update(ctx, &contacts[0], murmur.Set("Online", true)); err != nil {
 		log.Fatal(err)
 	}
-	rows, err := contacts.Where().OrderByAsc(murmur.FieldOf[contact, string](contacts, "Name")).Find()
-	if err != nil {
+	var rows []contact
+	if err := db.Find(ctx, &rows, q.Eq("Online", true)); err != nil {
 		log.Fatal(err)
 	}
 	for _, row := range rows {
-		fmt.Println(row.Name)
+		fmt.Println(row.Name, row.ID)
 	}
 
 	st := db.Status()

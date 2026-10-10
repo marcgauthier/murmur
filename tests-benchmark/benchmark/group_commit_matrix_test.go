@@ -70,11 +70,6 @@ func runDurabilityMatrixCase(t *testing.T, durability replicateddb.DurabilityCon
 			_ = db.Close()
 		}
 	}()
-	table, err := replicateddb.TableOf[writerBenchRow](db, "writer_bench")
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	type result struct {
 		writes int
 		err    error
@@ -98,7 +93,7 @@ func runDurabilityMatrixCase(t *testing.T, durability replicateddb.DurabilityCon
 					results <- result{writes: writes, err: fmt.Errorf("writer %d: %w", worker+1, err)}
 					return
 				}
-				if err := table.Insert(tx, &writerBenchRow{ID: id, Val: "durability-matrix"}); err != nil {
+				if err := tx.InsertItem(&writerBenchRow{ID: id, Val: "durability-matrix"}); err != nil {
 					results <- result{writes: writes, err: fmt.Errorf("writer %d: %w", worker+1, err)}
 					return
 				}
@@ -146,11 +141,7 @@ func runDurabilityMatrixCase(t *testing.T, durability replicateddb.DurabilityCon
 	if err != nil {
 		t.Fatalf("reopen after writes: %v", err)
 	}
-	table, err = replicateddb.TableOf[writerBenchRow](db, "writer_bench")
-	if err != nil {
-		t.Fatal(err)
-	}
-	count, err := table.Where().Count()
+	count, err := db.Count(ctx, writerBenchRow{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,4 +1,4 @@
-// Command backup-restore demonstrates typed online backup and clone restore
+// Command backup-restore demonstrates online backup and clone restore
 // under a fresh writer identity.
 //
 // Run it with:
@@ -25,8 +25,11 @@ type record struct {
 }
 
 func definition() murmur.TableDefinition {
-	d, err := murmur.Define[record]("records", 4, murmur.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+	d, err := murmur.Model[record](murmur.ModelOptions{
+		Name: "records", TableID: 4,
+		RecordOptions: murmur.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -55,16 +58,12 @@ func main() {
 	defer os.RemoveAll(base)
 
 	source := open(ctx, filepath.Join(base, "node"), murmur.NewNodeID())
-	records, err := murmur.TableOf[record](source, "records")
-	if err != nil {
-		log.Fatal(err)
-	}
 	if err := source.WriteTxContext(ctx, func(tx *murmur.Tx) error {
 		batch := make([]*record, 5)
 		for i := range batch {
 			batch[i] = &record{ID: murmur.NewRowID(), Body: fmt.Sprintf("record-%d", i)}
 		}
-		return records.InsertMany(tx, batch)
+		return tx.InsertMany(batch)
 	}); err != nil {
 		log.Fatal(err)
 	}
@@ -91,11 +90,7 @@ func main() {
 	}
 	clone := open(ctx, restored, fresh)
 	defer clone.Close()
-	clonedRecords, err := murmur.TableOf[record](clone, "records")
-	if err != nil {
-		log.Fatal(err)
-	}
-	n, err := clonedRecords.Where().Count()
+	n, err := clone.Count(ctx, record{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -104,7 +99,7 @@ func main() {
 		log.Fatalf("want 5 restored rows, got %d", n)
 	}
 	if err := clone.WriteTxContext(ctx, func(tx *murmur.Tx) error {
-		return clonedRecords.Insert(tx, &record{ID: murmur.NewRowID(), Body: "post-restore"})
+		return tx.InsertItem(&record{ID: murmur.NewRowID(), Body: "post-restore"})
 	}); err != nil {
 		log.Fatal(err)
 	}

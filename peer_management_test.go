@@ -87,7 +87,7 @@ func TestPeerExclusionAndRetirement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
-	tableA, err := TableOf[facadeRecord](dbA, "records")
+	tableA, err := tableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestPeerExclusionAndRetirement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbB.Close()
-	tableB, err := TableOf[facadeRecord](dbB, "records")
+	tableB, err := tableOf[facadeRecord](dbB, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestPeerExclusionAndRetirement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbB2.Close()
-	tableB2, err := TableOf[facadeRecord](dbB2, "records")
+	tableB2, err := tableOf[facadeRecord](dbB2, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestPeerExclusionAndRetirement(t *testing.T) {
 	waitForRecordCount(t, tableB2, 2, 5*time.Second)
 }
 
-func waitForRecordCount(t *testing.T, table *RecordTable[facadeRecord], want int, timeout time.Duration) {
+func waitForRecordCount(t *testing.T, table *recordTable[facadeRecord], want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

@@ -35,18 +35,18 @@ func freePort() int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-func count(table *murmur.RecordTable[note]) int {
-	n, err := table.Where().Count()
+func count(db *murmur.DB) int {
+	n, err := db.Count(context.Background(), note{})
 	if err != nil {
 		log.Fatal(err)
 	}
 	return n
 }
 
-func waitCount(table *murmur.RecordTable[note], want int, timeout time.Duration) {
+func waitCount(db *murmur.DB, want int, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if count(table) == want {
+		if count(db) == want {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -61,8 +61,11 @@ func main() {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(base)
-	definition, err := murmur.Define[note]("notes", 10, murmur.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+	definition, err := murmur.Model[note](murmur.ModelOptions{
+		Name: "notes", TableID: 10,
+		RecordOptions: murmur.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -119,22 +122,14 @@ func main() {
 
 	nodeA, nodeB := open(0), open(1)
 	defer nodeB.Close()
-	tableA, err := murmur.TableOf[note](nodeA, "notes")
-	if err != nil {
-		log.Fatal(err)
-	}
-	tableB, err := murmur.TableOf[note](nodeB, "notes")
-	if err != nil {
-		log.Fatal(err)
-	}
 	for r := 0; r < 2; r++ {
 		if err := nodeA.WriteTxContext(ctx, func(tx *murmur.Tx) error {
-			return tableA.Insert(tx, &note{ID: murmur.NewRowID(), Body: fmt.Sprintf("base-%d", r)})
+			return tx.InsertItem(&note{ID: murmur.NewRowID(), Body: fmt.Sprintf("base-%d", r)})
 		}); err != nil {
 			log.Fatal(err)
 		}
 	}
-	waitCount(tableB, 2, 30*time.Second)
+	waitCount(nodeB, 2, 30*time.Second)
 	fmt.Println("baseline converged; node A retires node B")
 
 	if err := nodeA.RemovePeer(ctx, ids[1]); err != nil {
@@ -147,10 +142,6 @@ func main() {
 	// Reopen: the exclusion is durable, so no session reforms.
 	nodeA = open(0)
 	defer nodeA.Close()
-	tableA, err = murmur.TableOf[note](nodeA, "notes")
-	if err != nil {
-		log.Fatal(err)
-	}
 	time.Sleep(5 * time.Second)
 	if got := nodeA.Status().ConnectedPeers; got != 0 {
 		log.Fatalf("node A reconnected to retired peer (%d sessions)", got)
@@ -163,10 +154,10 @@ func main() {
 	}
 	id := murmur.NewRowID()
 	if err := nodeB.WriteTxContext(ctx, func(tx *murmur.Tx) error {
-		return tableB.Insert(tx, &note{ID: id, Body: "reunion"})
+		return tx.InsertItem(&note{ID: id, Body: "reunion"})
 	}); err != nil {
 		log.Fatal(err)
 	}
-	waitCount(tableA, 3, 30*time.Second)
+	waitCount(nodeA, 3, 30*time.Second)
 	fmt.Println("readmitted: reunion row replicated to node A")
 }

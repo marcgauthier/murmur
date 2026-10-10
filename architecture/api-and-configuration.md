@@ -20,7 +20,7 @@ Keep the public API small.
 
 `SchemaConfig` accepts the replicated version, table descriptors and
 remote-adoption policy. It no longer accepts raw SQL schema or local-object
-DDL; define native tables and indexes through `Config.Tables` and typed RIME
+DDL; define native tables and indexes through `Config.Models`, `Config.Tables` and typed RIME
 options.
 
 Initial concept:
@@ -100,7 +100,7 @@ for processed-cell, timing, callback, and cancellation semantics. Totals and
 estimates remain unknown; their numeric fields stay zero. `OpenCounting` remains
 defined for compatibility but is never emitted. No counting scan is performed.
 
-`Open` requires `cfg.Spool` and managed definitions in `Config.Tables`. Only
+`Open` requires `cfg.Spool` and managed definitions in `Config.Models` or `Config.Tables`. Only
 replicated definitions enter the cluster manifest, so a local-only database
 may have an empty replicated table set. `Schema.Tables` is manifest metadata
 produced from managed definitions; it is not an alternate SQL configuration.
@@ -108,6 +108,18 @@ Do not infer replicated table or column declarations from existing data.
 Validate definitions against [Section 6](schema.md#6-schema-rules-for-version-1)
 and persisted metadata before rebuilding data or starting replication. Errors
 must identify the offending table, field, or index.
+
+### Automatic model API
+
+`Config.Models: []any{Device{}, User{}}` discovers stable schemas automatically.
+Use `ID ids.RowID` tagged `rime:"ID"`, or legacy `ID rime:"primary"`.
+A separate `primary` field derives unset IDs with UUIDv5; without it, generation
+uses UUIDv4. Explicit IDs are retained. `Model[T]` provides typed handles and
+identity/configuration overrides; `Define[T]` retains explicit schema control.
+`Transaction`, item CRUD, partial updates, and insert/update/save/delete batches
+use the existing durable coordinator. `MigrateModels` is explicit and additive.
+See [automatic model architecture](model-api.md) for exact identity and
+registration rules and [application usage](../USAGE.md) for examples.
 
 ### Native typed record API status
 
@@ -122,7 +134,7 @@ Node-local tables are not eligible for typed bridge import or export.
 
 
 The managed record facade is the only supported database API. `Open` requires
-at least one compiled `Config.Tables` definition and rejects SQL-only
+at least one model or compiled `Config.Tables` definition and rejects SQL-only
 `Schema.Tables` configurations before opening Spool:
 
 ```go
@@ -219,6 +231,37 @@ fail before the manifest changes. Peers with compatible older typed bindings
 can adopt the new manifest and retain fields they do not know. Operational
 feature ports remain incomplete. See [the migration plan](migration-plan.md)
 for the cutover gates.
+
+A generic Storm-style item API serves every registered struct through one
+function per operation, without per-table handles. `Define[T]`, `Model[T]` and runtime exemplars capture
+type-erased operation bindings per table; `Open` and migration helpers build
+a struct-type registry from them. `DB.InsertItem`, `DB.GetItem` (populating
+the supplied pointer), `DB.SaveItem` (full-record upsert), `DB.UpdateFields`
+(partial update, including zero values), and `DB.DeleteItem` resolve the
+table from the item's Go type and commit through the same Spool-before-RIME
+path as the typed API. `DB.CounterAdd`, `DB.SetAdd`, `DB.SetRemove`, `DB.Max`,
+and `DB.Min` mutate merge-policy fields the same way. `Tx` offers the same
+ten operations in a managed transaction, `RecordReadTx` offers `GetItem`,
+and `DB.Query` builds read-only
+queries from `q` matchers (`Eq`, `Ne`, `Gt`, `Gte`, `Lt`, `Lte`, `In`, `And`,
+`Or`, `Not`) with `Where`, `OrderBy`/`OrderByDescending`, `Limit`, `Offset`,
+`In`/`InRead`/`WithContext` bindings, and `FindInto`/`FirstInto`/`Count`/
+`Exists`, `Explain`, and `Aggregate` terminals, plus `GroupBy` grouped
+aggregation over `q` descriptors. `RecordReadTx.InnerJoin`/`LeftJoin` join
+two models on equal key fields over one pinned snapshot. `DB.Subscribe`
+streams an initial snapshot plus coalesced primary-key diffs for a filtered
+item query with observer cursors and reset semantics. `ItemQuery.Compile`
+prepares a reusable
+query whose `q.Param()` placeholders bind positionally per execution through
+the same terminals; binds coerce through the same conversions as one-shot
+queries, ordering/limit/offset are fixed at compile time, and
+`In`/`InRead`/`WithContext` rebind copies for transactions, snapshots, and
+cancellation. Matchers translate into typed RIME predicates so
+equality and range filters keep using indexes; queryable field types are
+exactly `string`, `bool`, integer/float widths, `ids.RowID`/`[16]byte`, and
+`rime.UUID`. A struct registered for more than one table is ambiguous for
+the item API and must use `TableOf`. Arbitrary `map[string]any` records
+without a struct definition remain unsupported.
 
 `SpoolConfig` is required; use `DefaultSpoolConfig()` for standard settings. `Config.Path` is the database directory. Expose block/segment sizing, worker concurrency, pending-memory bounds, compaction, and compression. Validate settings before opening Spool. Encryption keys come from `Encryption.Key` or `Encryption.Provider`; never weaken the replication acknowledgement or durability contract through storage options.
 
@@ -423,3 +466,13 @@ The internal membership adapter implements `memberlist.NodeAwareTransport` on th
 ---
 
 Current schema-level counter, set and extrema behavior, causal storage, signed wire formats, bridge ownership and upgrade requirements are specified in [merge policies](merge-policies.md). LWW remains the default.
+
+### Item API conveniences
+
+`DB.Find(ctx, dest, filters...)` and `FindOne` infer the registered collection
+from slice and struct pointers. `Count` and `Exists` take a model exemplar.
+`Tx` and `RecordReadTx` expose the same reads without context arguments;
+pinned reads retain their model bindings across migration. `DB.Update(ctx,
+item, Set(...))` and `Tx.Update` are explicit partial assignments that share
+`UpdateFields` validation and atomicity. See [model API](model-api.md) and the
+[application guide](../USAGE.md) for matcher and timestamp semantics.

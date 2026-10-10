@@ -629,3 +629,40 @@ func TestCompileUsesRegisteredCustomIdentity(t *testing.T) {
 		t.Fatalf("custom descriptor: %+v", f.Descriptor)
 	}
 }
+
+func TestNilCollectionsConsumePresenceTag(t *testing.T) {
+	type record struct {
+		ID         [16]byte
+		Values     []string
+		Attributes map[string]int
+	}
+	compiled, err := Compile(reflect.TypeFor[record](), CompileOptions{TableID: 1, PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Values": 2, "Attributes": 3}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := record{}
+	encoded, err := Encode(compiled, &original, nil, nil, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, _, err := Decode(compiled, encoded, nil, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := decoded.(record)
+	if value.Values != nil || value.Attributes != nil {
+		t.Fatalf("decoded=%+v", value)
+	}
+	for _, id := range []uint32{2, 3} {
+		field, err := EncodeField(compiled, id, &original, nil, Limits{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err = DecodeFieldWithUnknown(compiled, id, field, nil, Limits{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err = DecodeFieldWithUnknown(compiled, id, append(field, 0), nil, Limits{}); err == nil {
+			t.Fatal("nil collection accepted trailing bytes")
+		}
+	}
+}

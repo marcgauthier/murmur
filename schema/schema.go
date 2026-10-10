@@ -305,3 +305,6 @@ func deriveID(s string) uint32 {
 	}
 	return id
 }
+
+// StableID derives an identity using the registry's existing name algorithm.
+func StableID(name string) uint32 { return deriveID(name) }

@@ -24,11 +24,11 @@ done
 
 | Example | Replication | What it shows |
 |---|---|---|
-| `basic` | no | One embedded node: typed schema, managed transaction, ordered query, status. |
+| `basic` | no | Automatic models, generated IDs, atomic batch insert, `Set` updates, destination-inferred reads, status. |
 | `intermediate` | no | AES-GCM configuration, a local RIME secondary index, an atomic typed batch, and close/reopen durability with a stable NodeID. |
 | `durability-async` | no | Opt-in scheduled Spool syncs with typed writes, graceful-close sync, and durable reopen. |
 | `prefix-search` | no | Indexed RIME string-prefix matching, which does not include full-text tokenization or ranking. |
-| `transactions` | no | Managed typed transactions: atomic record batches and rollback when the application callback fails. |
+| `transactions` | no | Simple Transaction and InsertMany methods, plus rollback when the callback fails. |
 | `schema-migrate` | no | Additive typed evolution with `DB.MigrateRecords`: old records intact, optional new field writable. |
 | `subscriptions` | no | Reactive typed queries: receive an initial record snapshot and updates with observer cursors. |
 | `prepared-statements` | no | Compile a typed query once and execute it repeatedly with positional parameters. |

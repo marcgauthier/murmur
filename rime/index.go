@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"time"
 )
 
 // indexSet is the type-erased index bundle for one table. Record values are
@@ -399,7 +400,7 @@ func (ix *indexSet) uniqueOwner(field string, val any) (any, bool) {
 		}
 	default:
 		if _, ok := ix.uniqueKinds[field]; ok {
-			owner, ok := ix.uniqueAny[field][val]
+			owner, ok := ix.uniqueAny[field][normalizeIndexValue(val)]
 			return owner, ok
 		}
 	}
@@ -437,7 +438,7 @@ func (ix *indexSet) hashBucketFor(field string, val any) (hashBucket, bool) {
 		}
 	default:
 		if _, ok := ix.hashKinds[field]; ok {
-			b, ok := ix.hashAny[field][val]
+			b, ok := ix.hashAny[field][normalizeIndexValue(val)]
 			return b, ok
 		}
 	}
@@ -485,7 +486,7 @@ func (ix *indexSet) uniqueInstall(field string, val, owner any) {
 			if owner == nil {
 				delete(ix.uniqueAny[field], val)
 			} else {
-				ix.uniqueAny[field][val] = owner
+				ix.uniqueAny[field][normalizeIndexValue(val)] = owner
 			}
 		}
 	}
@@ -1056,9 +1057,12 @@ func selectivity(distinct, entries int64) float64 {
 
 // comparatorFor compiles an any-domain comparator for an ordered field type.
 func comparatorFor(typ reflect.Type) (func(a, b any) int, error) {
+	if typ == reflect.TypeFor[time.Time]() {
+		return func(a, b any) int { return canonicalTime(a.(time.Time)).Compare(canonicalTime(b.(time.Time))) }, nil
+	}
 	switch typ.Kind() {
 	case reflect.String:
-		return func(a, b any) int { return cmp.Compare(a.(string), b.(string)) }, nil
+		return func(a, b any) int { return cmp.Compare(reflect.ValueOf(a).String(), reflect.ValueOf(b).String()) }, nil
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return func(a, b any) int { return cmp.Compare(toInt64(a), toInt64(b)) }, nil
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:

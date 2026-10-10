@@ -19,7 +19,7 @@ func TestStatusWriterMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestReplicationDiagnostics(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
-	tableA, err := TableOf[facadeRecord](dbA, "records")
+	tableA, err := tableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestReplicationDiagnostics(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbB.Close()
-	tableB, err := TableOf[facadeRecord](dbB, "records")
+	tableB, err := tableOf[facadeRecord](dbB, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestReplicationDiagnostics(t *testing.T) {
 	}
 }
 
-func insertRecord(ctx context.Context, db *DB, table *RecordTable[facadeRecord], rec *facadeRecord) error {
+func insertRecord(ctx context.Context, db *DB, table *recordTable[facadeRecord], rec *facadeRecord) error {
 	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		return err
@@ -203,7 +203,7 @@ func insertRecord(ctx context.Context, db *DB, table *RecordTable[facadeRecord],
 	return tx.Commit()
 }
 
-func waitForRecordName(t *testing.T, table *RecordTable[facadeRecord], id RowID, want string, timeout time.Duration) {
+func waitForRecordName(t *testing.T, table *recordTable[facadeRecord], id RowID, want string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

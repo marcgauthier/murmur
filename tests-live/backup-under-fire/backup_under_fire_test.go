@@ -49,10 +49,12 @@ type backupFireRecord struct {
 
 func typedDefinition(t *testing.T) db.TableDefinition {
 	t.Helper()
-	definition, err := db.Define[backupFireRecord]("live_typed_records", 901, db.RecordOptions{
-		PrimaryField:  "ID",
-		FieldIDs:      map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
-		MergePolicies: map[string]db.RecordMergePolicy{"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin},
+	definition, err := db.Model[backupFireRecord](db.ModelOptions{
+		Name: "live_typed_records", TableID: 901,
+		RecordOptions: db.RecordOptions{
+			FieldIDs:      map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
+			MergePolicies: map[string]db.RecordMergePolicy{"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -637,11 +639,7 @@ func restoreAndCount(ctx context.Context, t *testing.T, cluster *harness.Cluster
 	target, fresh := restoreTo(t, ctx, srcDir, name)
 	handle := offlineOpen(t, ctx, cluster, target, fresh)
 	defer handle.Close()
-	rows, err := db.TableOf[backupFireRecord](handle, "live_typed_records")
-	if err != nil {
-		t.Fatal(err)
-	}
-	n, err := rows.Where().Count()
+	n, err := handle.Count(ctx, backupFireRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -653,11 +651,7 @@ func restoreCountDigest(ctx context.Context, t *testing.T, cluster *harness.Clus
 	target, fresh := restoreTo(t, ctx, srcDir, name)
 	handle := offlineOpen(t, ctx, cluster, target, fresh)
 	defer handle.Close()
-	rows, err := db.TableOf[backupFireRecord](handle, "live_typed_records")
-	if err != nil {
-		t.Fatal(err)
-	}
-	n, err := rows.Where().Count()
+	n, err := handle.Count(ctx, backupFireRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -667,12 +661,8 @@ func restoreCountDigest(ctx context.Context, t *testing.T, cluster *harness.Clus
 // offlineDigest uses the same canonical unique-name digest as TypedNames.
 func offlineDigest(ctx context.Context, t *testing.T, handle *db.DB) string {
 	t.Helper()
-	rows, err := db.TableOf[backupFireRecord](handle, "live_typed_records")
-	if err != nil {
-		t.Fatal(err)
-	}
-	records, err := rows.Where().Find()
-	if err != nil {
+	var records []backupFireRecord
+	if err := handle.Find(ctx, &records); err != nil {
 		t.Fatal(err)
 	}
 	names := make([]string, 0, len(records))
@@ -704,12 +694,8 @@ func assertSubset(t *testing.T, cluster *harness.Cluster, srcDir, name string, f
 	target, fresh := restoreTo(t, ctx, srcDir, name)
 	handle := offlineOpen(t, ctx, cluster, target, fresh)
 	defer handle.Close()
-	rows, err := db.TableOf[backupFireRecord](handle, "live_typed_records")
-	if err != nil {
-		t.Fatal(err)
-	}
-	records, err := rows.Where().Find()
-	if err != nil {
+	var records []backupFireRecord
+	if err := handle.Find(ctx, &records); err != nil {
 		t.Fatal(err)
 	}
 	checked := 0

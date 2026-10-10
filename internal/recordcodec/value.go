@@ -1025,6 +1025,7 @@ func decodeValue(d *Descriptor, data []byte, dst reflect.Value, reg *CodecRegist
 			return ErrValue
 		}
 		if data[0] == 0 {
+			r.off = 1
 			return finish(nil)
 		}
 		if data[0] != 1 {
@@ -1053,6 +1054,7 @@ func decodeValue(d *Descriptor, data []byte, dst reflect.Value, reg *CodecRegist
 			return ErrValue
 		}
 		if data[0] == 0 {
+			r.off = 1
 			return finish(nil)
 		}
 		if data[0] != 1 {

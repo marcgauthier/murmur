@@ -1,4 +1,4 @@
-// Command advanced runs a three-node typed-record mesh, concurrent writes,
+// Command advanced runs a three-node record mesh, concurrent writes,
 // and a conflicting update that converges to one deterministic winner.
 //
 // Run it with:
@@ -59,17 +59,17 @@ func openMeshNode(ctx context.Context, dir string, id murmur.NodeID, dbid murmur
 	return db
 }
 
-func rowCount(table *murmur.RecordTable[note]) int {
-	n, err := table.Where().Count()
+func rowCount(db *murmur.DB) int {
+	n, err := db.Count(context.Background(), note{})
 	if err != nil {
 		log.Fatal(err)
 	}
 	return n
 }
 
-func orderedBodies(table *murmur.RecordTable[note]) string {
-	rows, err := table.Where().Find()
-	if err != nil {
+func orderedBodies(db *murmur.DB) string {
+	var rows []note
+	if err := db.Find(context.Background(), &rows); err != nil {
 		log.Fatal(err)
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Body < rows[j].Body })
@@ -80,17 +80,17 @@ func orderedBodies(table *murmur.RecordTable[note]) string {
 	return bodies
 }
 
-func waitConverged(tables []*murmur.RecordTable[note], want int, timeout time.Duration) {
+func waitConverged(dbs []*murmur.DB, want int, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ok := true
 		first := ""
-		for i, table := range tables {
-			if rowCount(table) != want {
+		for i, db := range dbs {
+			if rowCount(db) != want {
 				ok = false
 				break
 			}
-			bodies := orderedBodies(table)
+			bodies := orderedBodies(db)
 			if i == 0 {
 				first = bodies
 			} else if bodies != first {
@@ -103,8 +103,8 @@ func waitConverged(tables []*murmur.RecordTable[note], want int, timeout time.Du
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	for i, table := range tables {
-		fmt.Printf("node %d at timeout: count=%d\n", i+1, rowCount(table))
+	for i, db := range dbs {
+		fmt.Printf("node %d at timeout: count=%d\n", i+1, rowCount(db))
 	}
 	log.Fatalf("nodes did not converge on %d identical rows within %v", want, timeout)
 }
@@ -116,8 +116,11 @@ func main() {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(base)
-	definition, err := murmur.Define[note]("notes", 7, murmur.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+	definition, err := murmur.Model[note](murmur.ModelOptions{
+		Name: "notes", TableID: 7,
+		RecordOptions: murmur.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -135,7 +138,6 @@ func main() {
 		addrs[i] = fmt.Sprintf("127.0.0.1:%d", freePort())
 	}
 	dbs := make([]*murmur.DB, nodes)
-	tables := make([]*murmur.RecordTable[note], nodes)
 	for i := range idsByNode {
 		var peers []murmur.Peer
 		for j := range idsByNode {
@@ -149,52 +151,49 @@ func main() {
 		}
 		dbs[i] = openMeshNode(ctx, dir, idsByNode[i], dbid, definition, ca, addrs[i], peers)
 		defer dbs[i].Close()
-		tables[i], err = murmur.TableOf[note](dbs[i], "notes")
-		if err != nil {
-			log.Fatal(err)
-		}
 	}
 
 	var wg sync.WaitGroup
 	for i, db := range dbs {
-		table := tables[i]
 		wg.Add(1)
-		go func(i int, db *murmur.DB, table *murmur.RecordTable[note]) {
+		go func(i int, db *murmur.DB) {
 			defer wg.Done()
 			if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
 				batch := make([]*note, 10)
 				for r := range batch {
 					batch[r] = &note{ID: murmur.NewRowID(), Body: fmt.Sprintf("node%d-note%d", i+1, r)}
 				}
-				return table.InsertMany(tx, batch)
+				return tx.InsertMany(batch)
 			}); err != nil {
 				log.Fatal(err)
 			}
-		}(i, db, table)
+		}(i, db)
 	}
 	wg.Wait()
-	waitConverged(tables, 30, 60*time.Second)
-	fmt.Println("30 concurrent typed rows converged on all 3 nodes")
+	waitConverged(dbs, 30, 60*time.Second)
+	fmt.Println("30 concurrent rows converged on all 3 nodes")
 
-	rows, err := tables[0].Where().Find()
-	if err != nil || len(rows) == 0 {
+	var rows []note
+	if err := dbs[0].Find(ctx, &rows); err != nil || len(rows) == 0 {
 		log.Fatalf("select conflict target: rows=%d err=%v", len(rows), err)
 	}
 	targetID := rows[0].ID
 	for i, db := range dbs {
-		table := tables[i]
 		wg.Add(1)
-		go func(i int, db *murmur.DB, table *murmur.RecordTable[note]) {
+		go func(i int, db *murmur.DB) {
 			defer wg.Done()
 			if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
-				return table.Update(tx, targetID, func(value *note) error {
-					value.Body = fmt.Sprintf("winner-node%d", i+1)
-					return nil
-				})
+				var value note
+				value.ID = targetID
+				if err := tx.GetItem(&value); err != nil {
+					return err
+				}
+				value.Body = fmt.Sprintf("winner-node%d", i+1)
+				return tx.UpdateItem(&value)
 			}); err != nil {
 				log.Fatal(err)
 			}
-		}(i, db, table)
+		}(i, db)
 	}
 	wg.Wait()
 
@@ -202,9 +201,10 @@ func main() {
 	for {
 		bodies := make([]string, nodes)
 		converged := true
-		for i, table := range tables {
-			value, err := table.Get(targetID)
-			if err != nil {
+		for i, db := range dbs {
+			var value note
+			value.ID = targetID
+			if err := db.GetItem(ctx, &value); err != nil {
 				log.Fatal(err)
 			}
 			bodies[i] = value.Body

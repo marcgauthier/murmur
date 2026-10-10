@@ -75,7 +75,7 @@ func TestTwoNodeReplication(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
-	tableA, err := TableOf[facadeRecord](dbA, "records")
+	tableA, err := tableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestTwoNodeReplication(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbB.Close()
-	tableB, err := TableOf[facadeRecord](dbB, "records")
+	tableB, err := tableOf[facadeRecord](dbB, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestOfflineConflictConverges(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
-	tableA, err := TableOf[facadeRecord](dbA, "records")
+	tableA, err := tableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestOfflineConflictConverges(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbB.Close()
-	tableB, err := TableOf[facadeRecord](dbB, "records")
+	tableB, err := tableOf[facadeRecord](dbB, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestReplicationSchemaMismatchRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
-	tableA, err := TableOf[facadeRecord](dbA, "records")
+	tableA, err := tableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestReplicationSchemaMismatchRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbB.Close()
-	tableB, err := TableOf[facadeRecord](dbB, "records")
+	tableB, err := tableOf[facadeRecord](dbB, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestSnapshotJoinAfterLogGC(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
-	tableA, err := TableOf[facadeRecord](dbA, "records")
+	tableA, err := tableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +275,7 @@ func TestSnapshotJoinAfterLogGC(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbC.Close()
-	tableC, err := TableOf[facadeRecord](dbC, "records")
+	tableC, err := tableOf[facadeRecord](dbC, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +298,7 @@ func TestSnapshotJoinAfterLogGC(t *testing.T) {
 
 // waitForRecordNames waits for want typed rows and returns their names
 // sorted ascending, mirroring waitForRows' ORDER BY name.
-func waitForRecordNames(t *testing.T, table *RecordTable[facadeRecord], want int, timeout time.Duration) []string {
+func waitForRecordNames(t *testing.T, table *recordTable[facadeRecord], want int, timeout time.Duration) []string {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -333,7 +333,7 @@ func TestSnapshotTailRepairConcurrentWritesAndGC(t *testing.T) {
 	}
 	defer dbA.Close()
 	addrA := waitForAddr(t, dbA, 5*time.Second)
-	tableA, err := TableOf[facadeRecord](dbA, "records")
+	tableA, err := tableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +400,7 @@ func TestSnapshotTailRepairConcurrentWritesAndGC(t *testing.T) {
 	defer dbC.Close()
 
 	// Wait for C to catch up all 20 rows (snapshot + tail repair).
-	tableC, err := TableOf[facadeRecord](dbC, "records")
+	tableC, err := tableOf[facadeRecord](dbC, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -446,7 +446,7 @@ func TestBidirectionalBulkConverges(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
-	tableA, err := TableOf[facadeRecord](dbA, "records")
+	tableA, err := tableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,7 +458,7 @@ func TestBidirectionalBulkConverges(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbB.Close()
-	tableB, err := TableOf[facadeRecord](dbB, "records")
+	tableB, err := tableOf[facadeRecord](dbB, "records")
 	if err != nil {
 		t.Fatal(err)
 	}

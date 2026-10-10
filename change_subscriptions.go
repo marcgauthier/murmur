@@ -6,7 +6,7 @@ import (
 )
 
 // ChangeSubscription receives lightweight commit notifications without
-// materializing a query snapshot. Use typed RecordSubscription when row-level
+// materializing a query snapshot. Use typed recordSubscription when row-level
 // values or diffs are needed.
 type ChangeSubscription struct {
 	manager *subscriptionManager

@@ -77,64 +77,37 @@ func sealForInbox(t *testing.T, signer *SignerKey, recip *RecipientKey, stream s
 	return Artifact{Name: "test.spb", Data: sealed}
 }
 
+func scoreMap[T any](rows []T, fields func(*T) (*string, *int64)) map[string]int64 {
+	out := make(map[string]int64, len(rows))
+	for i := range rows {
+		name, score := fields(&rows[i])
+		key := ""
+		if name != nil {
+			key = *name
+		}
+		if score == nil {
+			out[key] = -1
+		} else {
+			out[key] = *score
+		}
+	}
+	return out
+}
+
 func queryNames(t *testing.T, database *db.DB) map[string]int64 {
 	t.Helper()
-	if table, err := db.TableOf[typedBridgeContactRecord](database, "contacts"); err == nil {
-		rows, err := table.Where().Find()
-		if err != nil {
-			t.Fatal(err)
-		}
-		out := make(map[string]int64, len(rows))
-		for _, row := range rows {
-			name := ""
-			if row.Name != nil {
-				name = *row.Name
-			}
-			if row.Score == nil {
-				out[name] = -1
-			} else {
-				out[name] = *row.Score
-			}
-		}
-		return out
+	ctx := context.Background()
+	var base []typedBridgeContactRecord
+	if err := database.Find(ctx, &base); err == nil {
+		return scoreMap(base, func(row *typedBridgeContactRecord) (*string, *int64) { return row.Name, row.Score })
 	}
-	if table, err := db.TableOf[typedBridgeContactExpanded](database, "contacts"); err == nil {
-		rows, err := table.Where().Find()
-		if err != nil {
-			t.Fatal(err)
-		}
-		out := make(map[string]int64, len(rows))
-		for _, row := range rows {
-			name := ""
-			if row.Name != nil {
-				name = *row.Name
-			}
-			if row.Score == nil {
-				out[name] = -1
-			} else {
-				out[name] = *row.Score
-			}
-		}
-		return out
+	var expanded []typedBridgeContactExpanded
+	if err := database.Find(ctx, &expanded); err == nil {
+		return scoreMap(expanded, func(row *typedBridgeContactExpanded) (*string, *int64) { return row.Name, row.Score })
 	}
-	if table, err := db.TableOf[typedBridgeContactRatioRecord](database, "contacts"); err == nil {
-		rows, err := table.Where().Find()
-		if err != nil {
-			t.Fatal(err)
-		}
-		out := make(map[string]int64, len(rows))
-		for _, row := range rows {
-			name := ""
-			if row.Name != nil {
-				name = *row.Name
-			}
-			if row.Score == nil {
-				out[name] = -1
-			} else {
-				out[name] = *row.Score
-			}
-		}
-		return out
+	var ratio []typedBridgeContactRatioRecord
+	if err := database.Find(ctx, &ratio); err == nil {
+		return scoreMap(ratio, func(row *typedBridgeContactRatioRecord) (*string, *int64) { return row.Name, row.Score })
 	}
 	t.Fatal("contacts table is not registered with a typed binding")
 	return nil

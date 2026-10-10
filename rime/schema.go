@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 	"unsafe"
 )
 
@@ -119,8 +120,24 @@ func parseTag(tag string) (dirs map[string]string, skip bool) {
 }
 
 func buildSchema(table string, typ reflect.Type) (*Schema, error) {
+	return buildSchemaPrimary(table, typ, "")
+}
+
+func buildSchemaPrimary(table string, typ reflect.Type, primary string) (*Schema, error) {
 	if typ.Kind() != reflect.Struct {
 		return nil, fmt.Errorf("%w: %s is %s, want struct", ErrBadSchema, typ, typ.Kind())
+	}
+	if primary == "" {
+		for i := 0; i < typ.NumField(); i++ {
+			f := typ.Field(i)
+			dirs, skip := parseTag(f.Tag.Get("rime"))
+			if _, ok := dirs["ID"]; ok && !skip && f.PkgPath == "" {
+				if primary != "" {
+					return nil, fmt.Errorf("%w: multiple ID fields", ErrBadSchema)
+				}
+				primary = f.Name
+			}
+		}
 	}
 	s := &Schema{table: table, typ: typ, byName: map[string]int{}, primary: -1}
 	for i := 0; i < typ.NumField(); i++ {
@@ -148,6 +165,12 @@ func buildSchema(table string, typ reflect.Type) (*Schema, error) {
 		}
 		if _, ok := dirs["primary"]; ok {
 			fm.primary = true
+		}
+		if primary != "" {
+			if fm.primary && f.Name != primary {
+				fm.hash = true
+			}
+			fm.primary = f.Name == primary
 		}
 		if _, ok := dirs["uuid5"]; ok {
 			fm.uuid5 = true
@@ -190,6 +213,9 @@ func buildSchema(table string, typ reflect.Type) (*Schema, error) {
 			}
 			s.primary = len(s.fields)
 		}
+		if _, duplicate := s.byName[fm.name]; duplicate {
+			return nil, fmt.Errorf("%w: duplicate logical field %s", ErrBadSchema, fm.name)
+		}
 		s.byName[fm.name] = len(s.fields)
 		s.fields = append(s.fields, fm)
 	}
@@ -222,8 +248,11 @@ func getter[T any](s *Schema, name string) (func(*T) any, reflect.Type, error) {
 		return nil, nil, fmt.Errorf("%w: table %s has no field %q", ErrBadSchema, s.table, name)
 	}
 	idx := s.fields[fi].index
+	if s.fields[fi].typ == reflect.TypeFor[time.Time]() {
+		return func(rec *T) any { return canonicalTime(recordStruct(rec).FieldByIndex(idx).Interface().(time.Time)) }, s.fields[fi].typ, nil
+	}
 	return func(rec *T) any {
-		v := reflect.ValueOf(rec).Elem().FieldByIndex(idx)
+		v := recordStruct(rec).FieldByIndex(idx)
 		return v.Interface()
 	}, s.fields[fi].typ, nil
 }
@@ -245,7 +274,7 @@ func typedGetter[T any, V any](s *Schema, name string) func(*T) V {
 	fm := s.fields[fi]
 	var zero V
 	want := reflect.TypeOf(zero)
-	if want == fm.typ {
+	if want == fm.typ && s.typ == reflect.TypeFor[T]() {
 		off := fm.offset
 		return func(rec *T) V {
 			return *(*V)(unsafe.Pointer(uintptr(unsafe.Pointer(rec)) + off))
@@ -282,7 +311,7 @@ func fieldOffset[T any, V any](s *Schema, name string) (off uintptr, ok bool) {
 	}
 	fm := s.fields[fi]
 	var zero V
-	if reflect.TypeOf(zero) != fm.typ {
+	if reflect.TypeOf(zero) != fm.typ || s.typ != reflect.TypeFor[T]() {
 		return 0, false
 	}
 	return fm.offset, true
@@ -334,7 +363,7 @@ func isNullField(v any, optional, zeroNull bool) bool {
 // applyDefaults fills absent optional fields. Non-optional zero values remain
 // present application data and are never replaced with a default.
 func applyDefaults[T any](s *Schema, rec *T) {
-	rv := reflect.ValueOf(rec).Elem()
+	rv := recordStruct(rec)
 	for _, fm := range s.fields {
 		if !fm.hasDef {
 			continue
@@ -396,7 +425,7 @@ func setDefaultValue(fv reflect.Value, value string) bool {
 // so index maintenance behaves exactly as before.
 func equalFuncFor[T any](fm fieldMeta) func(*T, *T) bool {
 	idx := fm.index
-	at := func(r *T) reflect.Value { return reflect.ValueOf(r).Elem().FieldByIndex(idx) }
+	at := func(r *T) reflect.Value { return recordStruct(r).FieldByIndex(idx) }
 	switch fm.typ.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return func(a, b *T) bool { return at(a).Int() == at(b).Int() }
@@ -414,4 +443,13 @@ func equalFuncFor[T any](fm fieldMeta) func(*T, *T) bool {
 	default:
 		return func(a, b *T) bool { return false }
 	}
+}
+
+// recordStruct unwraps the native record carried by runtime registrations.
+func recordStruct(record any) reflect.Value {
+	v := reflect.ValueOf(record)
+	for v.IsValid() && (v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface) {
+		v = v.Elem()
+	}
+	return v
 }

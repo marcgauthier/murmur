@@ -43,7 +43,7 @@ func gcTestConfig(t *testing.T, path string) Config {
 
 // gcInsert writes one record per transaction so each insert lands in its
 // own origin-log batch, mirroring the original per-statement commits.
-func gcInsert(t *testing.T, ctx context.Context, db *DB, table *RecordTable[facadeRecord], name string) {
+func gcInsert(t *testing.T, ctx context.Context, db *DB, table *recordTable[facadeRecord], name string) {
 	t.Helper()
 	tx, err := db.BeginTx(ctx)
 	if err != nil {
@@ -57,7 +57,7 @@ func gcInsert(t *testing.T, ctx context.Context, db *DB, table *RecordTable[faca
 	}
 }
 
-func gcRowCount(t *testing.T, table *RecordTable[facadeRecord]) int {
+func gcRowCount(t *testing.T, table *recordTable[facadeRecord]) int {
 	t.Helper()
 	n, err := table.Where().Count()
 	if err != nil {
@@ -78,7 +78,7 @@ func TestGCDrainsPastUnitCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestGCExpiredObligationReleasesHistory(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer db.Close()
-		table, err := TableOf[facadeRecord](db, "records")
+		table, err := tableOf[facadeRecord](db, "records")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -162,7 +162,7 @@ func TestGCExpiredObligationReleasesHistory(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer db.Close()
-		table, err := TableOf[facadeRecord](db, "records")
+		table, err := tableOf[facadeRecord](db, "records")
 		if err != nil {
 			t.Fatal(err)
 		}

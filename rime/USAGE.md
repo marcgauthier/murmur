@@ -29,7 +29,8 @@ discovery. The primary key is immutable after insertion. Common tags are:
 
 | Tag | Meaning |
 | --- | --- |
-| `primary` | Primary key (one required) |
+| `ID` | Physical row key; other primary tags become equality indexes |
+| `primary` | Primary key when no ID tag/override exists |
 | `uuid5` | Generate UUIDv5 when the primary value is zero |
 | `unique` | Enforce uniqueness |
 | `index` | Equality index |
@@ -42,7 +43,7 @@ discovery. The primary key is immutable after insertion. Common tags are:
 | `name=Column` | Logical field name override |
 | `-` | Ignore the field |
 
-Options: `WithTableName`, `WithTableShards`, `WithCompound`, `WithCheck`,
+Options: `WithPrimaryField`, `WithPrimaryKey`, `WithTableName`, `WithTableShards`, `WithCompound`, `WithCheck`,
 `WithForeignKey`, `WithTableForeignKeys`, and `WithCloner`. Database options
 include `WithShardCount`, `WithMaxResults`, `WithMaxScan`, `WithMaxMutations`,
 `WithMaxTxAge`, `WithGCInterval`, `WithEventQueueSize`,
@@ -62,6 +63,42 @@ are always present, so `0`, `false`, and `""` are data and are not replaced by
 defaults. Pointer fields also express absence; defaults apply only when the
 pointer is nil. The `nullable` tag retains its older zero-as-NULL behavior for
 existing RIME schemas.
+
+## Runtime registration and Murmur models
+
+`RegisterType(db, reflect.Type, options...)` returns `*Table[any]` using the same
+shards, MVCC, indexes, query planner and commit machinery as `Register[T]`.
+Runtime records use a `*any` carrier containing a native struct pointer:
+
+```go
+runtime, err := rime.RegisterType(db, reflect.TypeFor[Device]())
+if err != nil { return err }
+var item any = &Device{ID: "runtime-device", Site: "OTT"}
+err = runtime.Insert(&item)
+site := rime.FieldOf[any, string](runtime, "Site")
+rows, err := runtime.Where(site.Eq("OTT")).Find()
+// Each *any contains a *Device. Published records remain immutable.
+```
+
+`RegisterType` options are `TableOption[any]`, including
+`WithTableName[any]`, `WithCloner[any]`, checks, compounds and foreign-key
+options. `WithPrimaryField[T](name)` explicitly selects the physical key and
+makes other `primary` fields equality indexes. `WithPrimaryKey[T](accessor)`
+lets an adapter provide a canonical key representation; it must preserve
+identity deterministically. Prepared changes from runtime registrations expose
+native struct pointers, rather than their carriers.
+
+The `ID` tag selects the physical key; with it, a separate `primary` tag marks
+an equality index. Standalone RIME does not generate Murmur model IDs or enforce
+business-key immutability. Its existing `uuid5` tag generates from the table
+name and a process-local sequence; it is distinct from business-key derivation.
+
+For an encrypted application database, [Murmur's application API](../USAGE.md)
+registers `Models: []any{Device{}}` with an `ID ids.RowID` tagged `rime:"ID"`.
+Its optional separate business `primary` derives UUIDv5, and without a business
+key it generates UUIDv4. `Model[T]` provides automatic schema with typed handles;
+`Define[T]` provides explicit durable identities. These APIs keep persistence,
+replication, ID generation and local business-key rules in Murmur's adapter.
 
 ## Table handles, transactions, and contexts
 
@@ -107,7 +144,9 @@ d, err := devices.In(snapshot).Get("d1")
 `ReadTx`, `ReadTxContext`, and `ReadAt(commitID)` open pinned snapshots;
 `WriteTx` and `WriteTxContext` run an atomic callback. Callback errors abort.
 Close read transactions so history can be reclaimed. A transaction is
-single-goroutine-use. Concurrent writes to the same key may return
+single-goroutine-use. `Tx.Batch(operation, n, func(index int) error)` stages
+custom operation sequences atomically, restoring earlier writes on failure;
+errors return `*BatchError` with the failing index. Concurrent writes to the same key may return
 `ErrConflict`; retry the full transaction when appropriate. `Tx.Snapshot`,
 `Tx.Age`, `Tx.Context`, and `Tx.Grow` expose snapshot metadata/capacity.
 For host-managed lifetimes, `BeginTx(ctx)` returns an explicit write
@@ -195,6 +234,35 @@ Parameter count and types are checked at execution. Bool parameters and
 parameters inside `Between` are unsupported; express parameterized ranges with
 `Ge` and `Le`. Compiled query values support `In`, `WithContext`, `Limit`,
 `Offset`, `OrderByAsc`, and `OrderByDesc`.
+
+### Checked runtime fields and timestamps
+
+`DynamicFieldOf(table, name)` returns a `DynamicField[T]` and an error instead
+of panicking. It supports string, bool, numeric, and 16-byte identity fields,
+including named scalar types, plus exact `time.Time` fields. Values must have
+the field's registered Go type; coercion belongs to the calling adapter.
+
+```go
+// Requires LastSeen time.Time tagged rime:"ordered" in Device.
+at, err := rime.DynamicFieldOf(devices, "LastSeen")
+if err != nil { return err }
+predicate, err := at.Compare(">=", since)
+if err != nil { return err }
+rows, err := devices.Where(predicate).OrderByAsc(at).Find()
+```
+
+`Compare` accepts `=`, `!=`, `>`, `>=`, `<`, and `<=`; bool and identity fields
+allow equality only. `In(values...)` builds membership predicates. String
+fields support `StringMatch("STARTS WITH", pattern)`, `"ENDS WITH"`,
+`"CONTAINS"`, and `"LIKE"`, using the existing string semantics. These methods
+return `(Expr[T], error)` and preserve index-planner metadata. Dynamic fields
+also serve as `OrderField[T]` values. Existing typed constructors keep their
+exact type checks.
+
+Timestamp equality, membership, and ordering use wall-clock instants with UTC
+and monotonic-free query/index keys. `FieldOf[T, time.Time]` equality and
+membership use the same instant semantics. Hash, ordered, unique, and compound
+indexes recognize `time.Time`; application records keep their original values.
 
 ## Aggregates, groups, joins, and projection
 

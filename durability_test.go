@@ -61,7 +61,7 @@ func TestDurabilityPeriodicSync(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		_ = db.Close()
 		t.Fatal(err)
@@ -87,7 +87,7 @@ func TestDurabilityPeriodicSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err = TableOf[facadeRecord](db, "records")
+	table, err = tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestDurabilityPeriodicSyncFailureFailsClosed(t *testing.T) {
 		armed.Store(false)
 		_ = db.Close()
 	}()
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,9 +152,9 @@ func TestDurabilityAsyncTransactionsAndSync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
-		t.Fatalf("TableOf failed: %v", err)
+		t.Fatalf("tableOf failed: %v", err)
 	}
 
 	if db.DurabilityMode() != DurabilityAsync {
@@ -188,9 +188,9 @@ func TestDurabilityAsyncTransactionsAndSync(t *testing.T) {
 	}
 	defer db2.Close()
 
-	table2, err := TableOf[facadeRecord](db2, "records")
+	table2, err := tableOf[facadeRecord](db2, "records")
 	if err != nil {
-		t.Fatalf("TableOf failed: %v", err)
+		t.Fatalf("tableOf failed: %v", err)
 	}
 	got2, err := table2.Get(rowID)
 	if err != nil || got2.Name != "async_contact" {

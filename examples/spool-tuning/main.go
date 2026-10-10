@@ -1,5 +1,5 @@
-// Command spool-tuning demonstrates a custom Spool configuration and typed
-// record recovery after reopen.
+// Command spool-tuning demonstrates a custom Spool configuration and record
+// recovery after reopen.
 //
 // Run it with:
 //
@@ -32,8 +32,11 @@ func main() {
 	spoolCfg := murmur.DefaultSpoolConfig()
 	spoolCfg.TargetBlockBytes = 1 << 20
 	spoolCfg.Compression = murmur.CompressionNone
-	definition, err := murmur.Define[item]("items", 5, murmur.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+	definition, err := murmur.Model[item](murmur.ModelOptions{
+		Name: "items", TableID: 5,
+		RecordOptions: murmur.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -51,16 +54,12 @@ func main() {
 		return db
 	}
 	db := open()
-	items, err := murmur.TableOf[item](db, "items")
-	if err != nil {
-		log.Fatal(err)
-	}
 	if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
 		batch := make([]*item, 20)
 		for i := range batch {
 			batch[i] = &item{ID: murmur.NewRowID(), Body: fmt.Sprintf("item-%d", i)}
 		}
-		return items.InsertMany(tx, batch)
+		return tx.InsertMany(batch)
 	}); err != nil {
 		log.Fatal(err)
 	}
@@ -69,11 +68,7 @@ func main() {
 	}
 	db = open()
 	defer db.Close()
-	items, err = murmur.TableOf[item](db, "items")
-	if err != nil {
-		log.Fatal(err)
-	}
-	n, err := items.Where().Count()
+	n, err := db.Count(ctx, item{})
 	if err != nil {
 		log.Fatal(err)
 	}

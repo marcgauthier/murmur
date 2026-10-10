@@ -7,10 +7,11 @@ import (
 	"time"
 
 	"github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/q"
 )
 
 // BenchmarkQueryMaterialization measures point and range lookups against
-// the typed RIME materializer backing the replicated database.
+// the RIME materializer backing the replicated database.
 func BenchmarkQueryMaterialization(b *testing.B) {
 	for _, n := range datasetSizes(b) {
 		b.Run(sizeName(n), func(b *testing.B) {
@@ -25,11 +26,7 @@ func BenchmarkQueryMaterialization(b *testing.B) {
 				b.Fatal(err)
 			}
 			b.Cleanup(func() { _ = db.Close() })
-			contacts, err := murmur.TableOf[benchContact](db, "contacts")
-			if err != nil {
-				b.Fatal(err)
-			}
-			scoreField := murmur.NumericFieldOf[benchContact, int64](contacts, "Score")
+			ctx := context.Background()
 			rng := rand.New(rand.NewSource(21))
 			var lat latency
 			b.ReportAllocs()
@@ -37,15 +34,16 @@ func BenchmarkQueryMaterialization(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				start := time.Now()
 				if i%2 == 0 {
-					got, err := contacts.Get(tmpl.ids[rng.Intn(len(tmpl.ids))])
-					if err != nil {
+					var got benchContact
+					got.ID = tmpl.ids[rng.Intn(len(tmpl.ids))]
+					if err := db.GetItem(ctx, &got); err != nil {
 						b.Fatal(err)
 					}
 					_ = got
 				} else {
 					lo := int64((i * 131) % 900)
-					rows, err := contacts.Where(scoreField.Between(lo, lo+100)).Limit(100).Find()
-					if err != nil {
+					var rows []benchContact
+					if err := db.Query(benchContact{}, q.Between("Score", lo, lo+100)).Limit(100).FindInto(&rows); err != nil {
 						b.Fatal(err)
 					}
 					for range rows {

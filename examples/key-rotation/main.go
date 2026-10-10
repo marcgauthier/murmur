@@ -1,4 +1,4 @@
-// Command key-rotation shows data-key rotation on a live typed database.
+// Command key-rotation shows data-key rotation on a live database.
 //
 // Run it with:
 //
@@ -29,8 +29,11 @@ func main() {
 	}
 	defer os.RemoveAll(dir)
 
-	definition, err := murmur.Define[secret]("secrets", 3, murmur.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+	definition, err := murmur.Model[secret](murmur.ModelOptions{
+		Name: "secrets", TableID: 3,
+		RecordOptions: murmur.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -44,16 +47,12 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
-	secrets, err := murmur.TableOf[secret](db, "secrets")
-	if err != nil {
-		log.Fatal(err)
-	}
 	if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
 		rows := make([]*secret, 3)
 		for i := range rows {
 			rows[i] = &secret{ID: murmur.NewRowID(), Body: fmt.Sprintf("secret-%d", i)}
 		}
-		return secrets.InsertMany(tx, rows)
+		return tx.InsertMany(rows)
 	}); err != nil {
 		log.Fatal(err)
 	}
@@ -69,7 +68,7 @@ func main() {
 	if after.ActiveDataKeyID == before.ActiveDataKeyID {
 		log.Fatal("active data key did not change across rotation")
 	}
-	n, err := secrets.Where().Count()
+	n, err := db.Count(ctx, secret{})
 	if err != nil {
 		log.Fatal(err)
 	}

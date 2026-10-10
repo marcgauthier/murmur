@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ordered constrains ordered column types.
@@ -21,6 +22,8 @@ func cmpFor[V ordered]() func(a, b V) int { return cmp.Compare[V] }
 
 func lessAny[T comparable](a, b T) bool {
 	switch av := any(a).(type) {
+	case time.Time:
+		return canonicalTime(av).Before(canonicalTime(any(b).(time.Time)))
 	case string:
 		return av < any(b).(string)
 	case int:
@@ -35,7 +38,7 @@ func lessAny[T comparable](a, b T) bool {
 		bv := any(b).(UUID)
 		return bytes.Compare(av[:], bv[:]) < 0
 	}
-	return fmt.Sprintf("%v", a) < fmt.Sprintf("%v", b)
+	return compareOrdValues(a, b) < 0
 }
 
 func errNoField(table, name string) error {
@@ -203,7 +206,7 @@ func quote(v any) string {
 }
 
 func newPred[T any, V comparable](f Field[T, V], op predOp, v V) Expr[T] {
-	val := any(v)
+	val := normalizeIndexValue(v)
 	seq := paramSeqFor(val)
 	pi := &predInfo{field: f.name, op: op, vals: []any{val}, paramSeq: []int64{seq},
 		fetch: func(rec any) any { return any(f.get(rec.(*T))) }}
@@ -214,8 +217,16 @@ func newPred[T any, V comparable](f Field[T, V], op predOp, v V) Expr[T] {
 	switch op {
 	case opEq:
 		fn = func(rec *T) bool { return f.get(rec) == v }
+		if timestamp, ok := any(v).(time.Time); ok {
+			value := canonicalTime(timestamp)
+			fn = func(rec *T) bool { return canonicalTime(any(f.get(rec)).(time.Time)) == value }
+		}
 	case opNe:
 		fn = func(rec *T) bool { return f.get(rec) != v }
+		if timestamp, ok := any(v).(time.Time); ok {
+			value := canonicalTime(timestamp)
+			fn = func(rec *T) bool { return canonicalTime(any(f.get(rec)).(time.Time)) != value }
+		}
 	case opGt:
 		fn = func(rec *T) bool { return lessAny(v, f.get(rec)) }
 	case opGe:
@@ -231,6 +242,16 @@ func newPred[T any, V comparable](f Field[T, V], op predOp, v V) Expr[T] {
 	case opContains:
 		fn = func(rec *T) bool { return strings.Contains(any(f.get(rec)).(string), any(val).(string)) }
 	}
+	if timestamp, ok := any(v).(time.Time); ok && (op == opGe || op == opLe) {
+		value := canonicalTime(timestamp)
+		fn = func(rec *T) bool {
+			c := canonicalTime(any(f.get(rec)).(time.Time)).Compare(value)
+			if op == opGe {
+				return c >= 0
+			}
+			return c <= 0
+		}
+	}
 	return &expr[T]{k: kPred, fn: fn, desc: f.name + " " + op.String() + " " + quote(v), p: pi}
 }
 
@@ -240,10 +261,13 @@ func newPredMulti[T any, V comparable](f Field[T, V], op predOp, vs []V) Expr[T]
 	set := make(map[V]struct{}, len(vs))
 	var typ reflect.Type
 	for i, v := range vs {
-		vals[i] = any(v)
+		vals[i] = normalizeIndexValue(v)
 		seqs[i] = paramSeqFor(any(v))
 		if seqs[i] != 0 {
 			typ = reflect.TypeOf(v)
+		}
+		if timestamp, ok := any(v).(time.Time); ok {
+			v = any(canonicalTime(timestamp)).(V)
 		}
 		set[v] = struct{}{}
 	}
@@ -251,15 +275,19 @@ func newPredMulti[T any, V comparable](f Field[T, V], op predOp, vs []V) Expr[T]
 	for i, v := range vs {
 		names[i] = quote(v)
 	}
+	get := f.get
+	if reflect.TypeFor[V]() == reflect.TypeFor[time.Time]() {
+		get = func(rec *T) V { return any(canonicalTime(any(f.get(rec)).(time.Time))).(V) }
+	}
 	var fn func(*T) bool
 	if op == opIn {
 		fn = func(rec *T) bool {
-			_, ok := set[f.get(rec)]
+			_, ok := set[get(rec)]
 			return ok
 		}
 	} else {
 		fn = func(rec *T) bool {
-			_, ok := set[f.get(rec)]
+			_, ok := set[get(rec)]
 			return !ok
 		}
 	}
@@ -547,7 +575,7 @@ func rebuildPred[T any](e Expr[T], vals []any) Expr[T] {
 	case opIn, opNotIn:
 		set := make(map[any]struct{}, len(vals))
 		for _, v := range vals {
-			set[v] = struct{}{}
+			set[normalizeIndexValue(v)] = struct{}{}
 		}
 		neg := p.op == opNotIn
 		names := make([]string, len(vals))
@@ -557,7 +585,7 @@ func rebuildPred[T any](e Expr[T], vals []any) Expr[T] {
 		return &expr[T]{k: kPred, p: &predInfo{field: p.field, op: p.op, vals: vals, fetch: fetch},
 			desc: p.field + " " + p.op.String() + " (" + strings.Join(names, ", ") + ")",
 			fn: func(rec *T) bool {
-				_, ok := set[fetch(rec)]
+				_, ok := set[normalizeIndexValue(fetch(rec))]
 				return ok != neg
 			}}
 	}
@@ -568,9 +596,9 @@ func rebuildPred[T any](e Expr[T], vals []any) Expr[T] {
 func comparePred(op predOp, fv, v any) bool {
 	switch op {
 	case opEq:
-		return fv == v
+		return normalizeIndexValue(fv) == normalizeIndexValue(v)
 	case opNe:
-		return fv != v
+		return normalizeIndexValue(fv) != normalizeIndexValue(v)
 	case opGt:
 		return compareOrdValues(fv, v) > 0
 	case opGe:
@@ -603,6 +631,25 @@ func comparePred(op predOp, fv, v any) bool {
 // and UUIDs. Non-scalar or mismatched values fall back to formatted text,
 // which is deterministic but not semantically meaningful.
 func compareOrdValues(a, b any) int {
+	ar, br := reflect.ValueOf(a), reflect.ValueOf(b)
+	if ar.IsValid() && br.IsValid() {
+		signed := func(k reflect.Kind) bool { return k >= reflect.Int && k <= reflect.Int64 }
+		unsigned := func(k reflect.Kind) bool { return k >= reflect.Uint && k <= reflect.Uint64 }
+		if signed(ar.Kind()) && signed(br.Kind()) {
+			return cmp.Compare(ar.Int(), br.Int())
+		}
+		if unsigned(ar.Kind()) && unsigned(br.Kind()) {
+			return cmp.Compare(ar.Uint(), br.Uint())
+		}
+		if ar.Kind() == reflect.String && br.Kind() == reflect.String {
+			return strings.Compare(ar.String(), br.String())
+		}
+	}
+	if at, ok := a.(time.Time); ok {
+		if bt, ok := b.(time.Time); ok {
+			return canonicalTime(at).Compare(canonicalTime(bt))
+		}
+	}
 	if ar, aok := asFloat(a); aok {
 		if br, bok := asFloat(b); bok {
 			switch {

@@ -95,7 +95,7 @@ func TestOpenProgressDeletedTypedRowsAreNotMaterialized(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[facadeRecord](live, "records")
+	table, err := tableOf[facadeRecord](live, "records")
 	if err != nil {
 		live.Close()
 		t.Fatal(err)

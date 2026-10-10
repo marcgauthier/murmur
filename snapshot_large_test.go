@@ -24,7 +24,7 @@ func TestSnapshotLargeChunkedMergeEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbA.Close()
-	tableA, err := TableOf[facadeRecord](dbA, "records")
+	tableA, err := tableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestSnapshotLargeChunkedMergeEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dbB.Close()
-	tableB, err := TableOf[facadeRecord](dbB, "records")
+	tableB, err := tableOf[facadeRecord](dbB, "records")
 	if err != nil {
 		t.Fatal(err)
 	}

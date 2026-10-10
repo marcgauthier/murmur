@@ -12,9 +12,9 @@ import (
 	"github.com/marcgauthier/murmur/rime"
 )
 
-// RecordSubscriptionOptions controls bounded delivery for a typed query
+// recordSubscriptionOptions controls bounded delivery for a typed query
 // subscription.
-type RecordSubscriptionOptions struct {
+type recordSubscriptionOptions struct {
 	// BufferSize overrides the configured event channel capacity when positive.
 	BufferSize int
 	// EmitUnchanged requests an event when the query result is logically equal.
@@ -22,15 +22,15 @@ type RecordSubscriptionOptions struct {
 	// ResumeFrom requests the latest snapshot after this retained cursor. The
 	// token is bound to the database and materializer generation; a stale,
 	// future, or expired token returns ErrSubscriptionExpired.
-	ResumeFrom RecordSubscriptionCursor
+	ResumeFrom recordSubscriptionCursor
 }
 
-// RecordSubscriptionCursor is a process-local, generation-bound observer
+// recordSubscriptionCursor is a process-local, generation-bound observer
 // cursor. It can resume a subscription only while the same database open epoch
 // and materializer generation remain active. It is not a durable replication
 // position: closing and reopening the database invalidates the token, regardless
 // of the configured durability mode.
-type RecordSubscriptionCursor struct {
+type recordSubscriptionCursor struct {
 	// Database is the durable database identity.
 	Database ids.DBID
 	// Epoch distinguishes observer cursors from separate database opens.
@@ -41,46 +41,46 @@ type RecordSubscriptionCursor struct {
 	Sequence uint64
 }
 
-func (c RecordSubscriptionCursor) isZero() bool {
+func (c recordSubscriptionCursor) isZero() bool {
 	return c.Database.IsZero() && c.Epoch.IsZero() && c.Generation == 0 && c.Sequence == 0
 }
 
-// RecordChangeType identifies a row-level typed subscription diff.
-type RecordChangeType string
+// recordChangeType identifies a row-level typed subscription diff.
+type recordChangeType string
 
 const (
-	RecordAdded   RecordChangeType = "added"
-	RecordUpdated RecordChangeType = "updated"
-	RecordRemoved RecordChangeType = "removed"
+	RecordAdded   recordChangeType = "added"
+	RecordUpdated recordChangeType = "updated"
+	RecordRemoved recordChangeType = "removed"
 )
 
-// RecordSubscriptionChange is one canonical primary-key diff. Row is nil for
+// recordSubscriptionChange is one canonical primary-key diff. Row is nil for
 // removals and detached from the materializer for additions and updates.
-type RecordSubscriptionChange[T any] struct {
-	Type RecordChangeType
+type recordSubscriptionChange[T any] struct {
+	Type recordChangeType
 	Key  ids.RowID
 	Row  *T
 }
 
-// RecordSubscriptionEvent contains a detached typed query snapshot.
-type RecordSubscriptionEvent[T any] struct {
+// recordSubscriptionEvent contains a detached typed query snapshot.
+type recordSubscriptionEvent[T any] struct {
 	Type         SubscriptionEventType
 	Cursor       uint64
-	ResumeCursor RecordSubscriptionCursor
+	ResumeCursor recordSubscriptionCursor
 	Rows         []*T
-	Changes      []RecordSubscriptionChange[T]
+	Changes      []recordSubscriptionChange[T]
 	Err          error
 }
 
-// RecordSubscription tracks a typed table query until Close or context
+// recordSubscription tracks a typed table query until Close or context
 // cancellation. Query updates are coalesced by the database observer cursor.
-type RecordSubscription[T any] struct {
+type recordSubscription[T any] struct {
 	db          *DB
-	table       *RecordTable[T]
+	table       *recordTable[T]
 	exprs       []rime.Expr[T]
 	id          uint64
-	opts        RecordSubscriptionOptions
-	events      chan RecordSubscriptionEvent[T]
+	opts        recordSubscriptionOptions
+	events      chan recordSubscriptionEvent[T]
 	done        chan struct{}
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -89,7 +89,7 @@ type RecordSubscription[T any] struct {
 
 	mu       sync.Mutex
 	cursor   uint64
-	resume   RecordSubscriptionCursor
+	resume   recordSubscriptionCursor
 	closed   bool
 	lastRows []*T
 }
@@ -97,7 +97,7 @@ type RecordSubscription[T any] struct {
 // Subscribe creates an initial snapshot and then emits updates after durable
 // local or remote changes. The expression list is reapplied to the latest
 // materializer generation for every evaluation.
-func (t *RecordTable[T]) Subscribe(ctx context.Context, opts RecordSubscriptionOptions, exprs ...rime.Expr[T]) (*RecordSubscription[T], error) {
+func (t *recordTable[T]) Subscribe(ctx context.Context, opts recordSubscriptionOptions, exprs ...rime.Expr[T]) (*recordSubscription[T], error) {
 	if t == nil || t.db == nil {
 		return nil, rime.ErrBadView
 	}
@@ -139,8 +139,8 @@ func (t *RecordTable[T]) Subscribe(ctx context.Context, opts RecordSubscriptionO
 	}
 	subCtx, cancel := context.WithCancel(ctx)
 	stopManager := context.AfterFunc(m.ctx, cancel)
-	sub := &RecordSubscription[T]{
-		db: db, id: id, opts: opts, events: make(chan RecordSubscriptionEvent[T], bufSize),
+	sub := &recordSubscription[T]{
+		db: db, id: id, opts: opts, events: make(chan recordSubscriptionEvent[T], bufSize),
 		done: make(chan struct{}), ctx: subCtx, cancel: cancel, stopManager: stopManager,
 		table: t, exprs: append([]rime.Expr[T](nil), exprs...), wake: wake, cursor: cursor,
 	}
@@ -185,7 +185,7 @@ func (t *RecordTable[T]) Subscribe(ctx context.Context, opts RecordSubscriptionO
 		if !resume.isZero() {
 			eventType = EventUpdate
 		}
-		if err := sub.send(RecordSubscriptionEvent[T]{Type: eventType, Cursor: stableCursor.Sequence, ResumeCursor: stableCursor, Rows: initial}); err != nil {
+		if err := sub.send(recordSubscriptionEvent[T]{Type: eventType, Cursor: stableCursor.Sequence, ResumeCursor: stableCursor, Rows: initial}); err != nil {
 			m.mu.Lock()
 			delete(m.recordListeners, id)
 			m.mu.Unlock()
@@ -203,7 +203,7 @@ func (t *RecordTable[T]) Subscribe(ctx context.Context, opts RecordSubscriptionO
 }
 
 // Events returns the receive-only stream of initial and updated snapshots.
-func (s *RecordSubscription[T]) Events() <-chan RecordSubscriptionEvent[T] {
+func (s *recordSubscription[T]) Events() <-chan recordSubscriptionEvent[T] {
 	if s == nil {
 		return nil
 	}
@@ -211,7 +211,7 @@ func (s *RecordSubscription[T]) Events() <-chan RecordSubscriptionEvent[T] {
 }
 
 // Cursor returns the latest observer cursor evaluated by this subscription.
-func (s *RecordSubscription[T]) Cursor() uint64 {
+func (s *recordSubscription[T]) Cursor() uint64 {
 	if s == nil {
 		return 0
 	}
@@ -224,9 +224,9 @@ func (s *RecordSubscription[T]) Cursor() uint64 {
 // database open epoch. Callers may serialize it, but it is not valid after the
 // database closes or the materializer is rebuilt. It does not identify a
 // durable replication position.
-func (s *RecordSubscription[T]) ResumeCursor() RecordSubscriptionCursor {
+func (s *recordSubscription[T]) ResumeCursor() recordSubscriptionCursor {
 	if s == nil {
-		return RecordSubscriptionCursor{}
+		return recordSubscriptionCursor{}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -234,7 +234,7 @@ func (s *RecordSubscription[T]) ResumeCursor() RecordSubscriptionCursor {
 }
 
 // Close cancels the subscription and waits for its worker to release resources.
-func (s *RecordSubscription[T]) Close() error {
+func (s *recordSubscription[T]) Close() error {
 	if s == nil {
 		return nil
 	}
@@ -243,7 +243,7 @@ func (s *RecordSubscription[T]) Close() error {
 	return nil
 }
 
-func (s *RecordSubscription[T]) run() {
+func (s *recordSubscription[T]) run() {
 	m := s.db.subMgr
 	defer m.wg.Done()
 	defer close(s.done)
@@ -303,7 +303,7 @@ func (s *RecordSubscription[T]) run() {
 				s.sendReset(err)
 				return
 			}
-			if err := s.send(RecordSubscriptionEvent[T]{Type: EventUpdate, Cursor: cursor.Sequence, ResumeCursor: cursor, Rows: rows, Changes: changes}); err != nil {
+			if err := s.send(recordSubscriptionEvent[T]{Type: EventUpdate, Cursor: cursor.Sequence, ResumeCursor: cursor, Rows: rows, Changes: changes}); err != nil {
 				s.sendReset(err)
 				return
 			}
@@ -312,21 +312,21 @@ func (s *RecordSubscription[T]) run() {
 	}
 }
 
-func (s *RecordSubscription[T]) evaluateStable() ([]*T, RecordSubscriptionCursor, *rimeadapter.Table[T], error) {
+func (s *recordSubscription[T]) evaluateStable() ([]*T, recordSubscriptionCursor, *rimeadapter.Table[T], error) {
 	m := s.db.subMgr
 	if err := s.ctx.Err(); err != nil {
-		return nil, RecordSubscriptionCursor{}, nil, err
+		return nil, recordSubscriptionCursor{}, nil, err
 	}
 	// Commit publication and its observer cursor advance share applyMu. Pin a
 	// RIME snapshot while holding it, then evaluate without blocking writers.
 	s.db.applyMu.Lock()
-	readTx, err := s.db.ReadTxContext(s.ctx)
+	readTx, err := s.db.readTxContext(s.ctx)
 	if err != nil {
 		s.db.applyMu.Unlock()
-		return nil, RecordSubscriptionCursor{}, nil, err
+		return nil, recordSubscriptionCursor{}, nil, err
 	}
 	m.mu.RLock()
-	cursor := RecordSubscriptionCursor{
+	cursor := recordSubscriptionCursor{
 		Database: s.db.DBID(), Epoch: m.epoch, Generation: readTx.gen, Sequence: m.cursor,
 	}
 	m.mu.RUnlock()
@@ -334,20 +334,20 @@ func (s *RecordSubscription[T]) evaluateStable() ([]*T, RecordSubscriptionCursor
 	defer readTx.Close()
 	query, err := s.table.WhereReadTx(readTx, s.exprs...)
 	if err != nil {
-		return nil, RecordSubscriptionCursor{}, nil, err
+		return nil, recordSubscriptionCursor{}, nil, err
 	}
 	inner, ok := readTx.tables[s.table.name].(*rimeadapter.Table[T])
 	if !ok || inner == nil {
-		return nil, RecordSubscriptionCursor{}, nil, ErrUnsupportedSchema
+		return nil, recordSubscriptionCursor{}, nil, ErrUnsupportedSchema
 	}
 	rows, err := query.WithContext(s.ctx).Find()
 	if err != nil {
-		return nil, RecordSubscriptionCursor{}, nil, err
+		return nil, recordSubscriptionCursor{}, nil, err
 	}
 	return rows, cursor, inner, nil
 }
 
-func diffTypedRows[T any](oldRows, newRows []*T, table *rimeadapter.Table[T]) ([]RecordSubscriptionChange[T], error) {
+func diffTypedRows[T any](oldRows, newRows []*T, table *rimeadapter.Table[T]) ([]recordSubscriptionChange[T], error) {
 	oldByKey := make(map[ids.RowID]*T, len(oldRows))
 	newByKey := make(map[ids.RowID]*T, len(newRows))
 	for _, row := range oldRows {
@@ -364,11 +364,11 @@ func diffTypedRows[T any](oldRows, newRows []*T, table *rimeadapter.Table[T]) ([
 		}
 		newByKey[key] = row
 	}
-	changes := make([]RecordSubscriptionChange[T], 0)
+	changes := make([]recordSubscriptionChange[T], 0)
 	for key, row := range newByKey {
 		previous, exists := oldByKey[key]
 		if !exists {
-			changes = append(changes, RecordSubscriptionChange[T]{Type: RecordAdded, Key: key, Row: row})
+			changes = append(changes, recordSubscriptionChange[T]{Type: RecordAdded, Key: key, Row: row})
 			continue
 		}
 		equal, err := table.Equal(previous, row)
@@ -376,12 +376,12 @@ func diffTypedRows[T any](oldRows, newRows []*T, table *rimeadapter.Table[T]) ([
 			return nil, err
 		}
 		if !equal {
-			changes = append(changes, RecordSubscriptionChange[T]{Type: RecordUpdated, Key: key, Row: row})
+			changes = append(changes, recordSubscriptionChange[T]{Type: RecordUpdated, Key: key, Row: row})
 		}
 	}
 	for key := range oldByKey {
 		if _, exists := newByKey[key]; !exists {
-			changes = append(changes, RecordSubscriptionChange[T]{Type: RecordRemoved, Key: key})
+			changes = append(changes, recordSubscriptionChange[T]{Type: RecordRemoved, Key: key})
 		}
 	}
 	sort.Slice(changes, func(i, j int) bool { return bytes.Compare(changes[i].Key[:], changes[j].Key[:]) < 0 })
@@ -407,7 +407,7 @@ func cloneTypedRows[T any](rows []*T, clone func(*T) (*T, error)) ([]*T, error) 
 	return out, nil
 }
 
-func (s *RecordSubscription[T]) send(event RecordSubscriptionEvent[T]) error {
+func (s *recordSubscription[T]) send(event recordSubscriptionEvent[T]) error {
 	select {
 	case s.events <- event:
 		return nil
@@ -416,7 +416,7 @@ func (s *RecordSubscription[T]) send(event RecordSubscriptionEvent[T]) error {
 	}
 }
 
-func (s *RecordSubscription[T]) sendReset(err error) {
+func (s *recordSubscription[T]) sendReset(err error) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -427,14 +427,14 @@ func (s *RecordSubscription[T]) sendReset(err error) {
 	resume := s.resume
 	s.mu.Unlock()
 	select {
-	case s.events <- RecordSubscriptionEvent[T]{Type: EventReset, Cursor: cursor, ResumeCursor: resume, Err: err}:
+	case s.events <- recordSubscriptionEvent[T]{Type: EventReset, Cursor: cursor, ResumeCursor: resume, Err: err}:
 	default:
 		select {
 		case <-s.events:
 		default:
 		}
 		select {
-		case s.events <- RecordSubscriptionEvent[T]{Type: EventReset, Cursor: cursor, ResumeCursor: resume, Err: err}:
+		case s.events <- recordSubscriptionEvent[T]{Type: EventReset, Cursor: cursor, ResumeCursor: resume, Err: err}:
 		default:
 		}
 	}

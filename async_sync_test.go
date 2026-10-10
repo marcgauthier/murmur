@@ -59,7 +59,7 @@ func TestDurabilitySizeTriggeredSync(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		_ = db.Close()
 		t.Fatal(err)
@@ -97,7 +97,7 @@ func TestDurabilitySizeTriggeredSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err = TableOf[facadeRecord](db, "records")
+	table, err = tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestDurabilityTimeTriggerWithSizeSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}

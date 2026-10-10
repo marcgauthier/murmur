@@ -58,7 +58,7 @@ func TestDBStateStrings(t *testing.T) {
 func TestTypedTxAccessors(t *testing.T) {
 	ctx := context.Background()
 	db := openCoverageDB(t)
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestOpenWithSpoolCompression(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer db.Close()
-			table, err := TableOf[facadeRecord](db, "records")
+			table, err := tableOf[facadeRecord](db, "records")
 			if err != nil {
 				t.Fatal(err)
 			}

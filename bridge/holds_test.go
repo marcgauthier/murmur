@@ -77,7 +77,7 @@ func TestSchemaHoldOrderedRetry(t *testing.T) {
 	}
 	// The administrator's migration releases both bundles in order on the
 	// next drain, with no manual replay step.
-	if err := high.MigrateRecords(ctx, []db.TableDefinition{defineExpandedContact(t)}); err != nil {
+	if err := high.MigrateModels(ctx, []any{defineExpandedContact(t)}); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := im.Drain(ctx, inbox); err != nil || n != 2 {
@@ -129,19 +129,15 @@ func TestSchemaHoldMissingTable(t *testing.T) {
 		t.Fatalf("missing = %q", held.Missing)
 	}
 	// Deletes gate on the table too, so the delete cannot run first.
-	if err := high.MigrateRecords(ctx, []db.TableDefinition{defineBaseContact(t), defineTypedNope(t)}); err != nil {
+	if err := high.MigrateModels(ctx, []any{defineBaseContact(t), defineTypedNope(t)}); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := im.Drain(ctx, inbox); err != nil || n != 2 {
 		t.Fatalf("redrain = %d, %v", n, err)
 	}
 	// Put-then-delete in order leaves the table empty.
-	rows, err := db.TableOf[typedBridgeNopeRecord](high, "nope")
-	if err != nil {
-		t.Fatal(err)
-	}
-	values, err := rows.Where().Find()
-	if err != nil {
+	var values []typedBridgeNopeRecord
+	if err := high.Find(ctx, &values); err != nil {
 		t.Fatal(err)
 	}
 	if len(values) != 0 {
@@ -372,7 +368,7 @@ func TestSchemaHoldNullability(t *testing.T) {
 func TestSchemaHoldIntegerWidening(t *testing.T) {
 	ctx := context.Background()
 	high := openTypedContactDBAt(t, t.TempDir(), db.NewNodeID())
-	if err := high.MigrateRecords(ctx, []db.TableDefinition{defineContactRatio(t)}); err != nil {
+	if err := high.MigrateModels(ctx, []any{defineContactRatio(t)}); err != nil {
 		t.Fatal(err)
 	}
 	signer, recip, trust := inboxKeys(t, "s")

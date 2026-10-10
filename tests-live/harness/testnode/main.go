@@ -32,9 +32,18 @@ import (
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/metrics"
 	"github.com/marcgauthier/murmur/origin"
+	"github.com/marcgauthier/murmur/q"
 	"github.com/marcgauthier/murmur/schema"
 	"github.com/marcgauthier/murmur/spool"
 )
+
+// typedRecordV1Bound probes whether the V1 record binding is registered,
+// without reading any rows. Handlers use it to follow schema migrations
+// across the V1/V2 Go bindings.
+func typedRecordV1Bound(database *db.DB) bool {
+	_, err := database.Query(liveTypedRecord{}, q.Eq("Name", "probe")).Explain()
+	return err == nil
+}
 
 // NodeConfigFile represents the JSON configuration file for a node instance.
 type NodeConfigFile struct {
@@ -409,6 +418,7 @@ func (d *NodeDaemon) Start() error {
 	mux.HandleFunc("/v1/query", d.handleServiceQuery)
 	mux.HandleFunc("/v1/exec", d.handleServiceExec)
 	mux.HandleFunc("/v1/typed/insert", d.handleTypedInsert)
+	mux.HandleFunc("/v1/typed/models", d.handleModels)
 	mux.HandleFunc("/v1/typed/contention/insert", d.handleTypedContentionInsert)
 	mux.HandleFunc("/v1/typed/contention/insert-many", d.handleTypedContentionInsertMany)
 	mux.HandleFunc("/v1/typed/contention/update", d.handleTypedContentionUpdate)
@@ -599,21 +609,26 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 		}
 	}
 
-	// Configure native record schemas in this test-only typed mode.
+	// Configure native record schemas in this test-only record mode.
 	if d.cfg.TypedRecords {
 		var definition db.TableDefinition
 		var err error
+		mergePolicies := map[string]db.RecordMergePolicy{"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin}
 		if d.cfg.TypedSchemaVersion >= 2 {
-			definition, err = db.Define[liveTypedRecordV2]("live_typed_records", 901, db.RecordOptions{
-				PrimaryField:  "ID",
-				FieldIDs:      map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6, "Note": 7},
-				MergePolicies: map[string]db.RecordMergePolicy{"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin},
+			definition, err = db.Model[liveTypedRecordV2](db.ModelOptions{
+				Name: "live_typed_records", TableID: 901,
+				RecordOptions: db.RecordOptions{
+					FieldIDs:      map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6, "Note": 7},
+					MergePolicies: mergePolicies,
+				},
 			})
 		} else {
-			definition, err = db.Define[liveTypedRecord]("live_typed_records", 901, db.RecordOptions{
-				PrimaryField:  "ID",
-				FieldIDs:      map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
-				MergePolicies: map[string]db.RecordMergePolicy{"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin},
+			definition, err = db.Model[liveTypedRecord](db.ModelOptions{
+				Name: "live_typed_records", TableID: 901,
+				RecordOptions: db.RecordOptions{
+					FieldIDs:      map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
+					MergePolicies: mergePolicies,
+				},
 			})
 		}
 		if err != nil {
@@ -625,10 +640,13 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 		}
 		dbCfg.Schema = db.SchemaConfig{Version: 1}
 		dbCfg.Tables = []db.TableDefinition{definition, localDefinition}
+		dbCfg.Models = []any{liveModelDevice{}}
 		if d.cfg.TypedContention {
-			contentionDefinition, err := db.Define[liveContentionRecord]("live_typed_contention", 903, db.RecordOptions{
-				PrimaryField: "ID",
-				FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Phone": 3, "Score": 4},
+			contentionDefinition, err := db.Model[liveContentionRecord](db.ModelOptions{
+				Name: "live_typed_contention", TableID: 903,
+				RecordOptions: db.RecordOptions{
+					FieldIDs: map[string]uint32{"ID": 1, "Name": 2, "Phone": 3, "Score": 4},
+				},
 			})
 			if err != nil {
 				return nil, fmt.Errorf("define live typed contention schema: %w", err)
@@ -813,10 +831,12 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 }
 
 func liveTypedLocalDefinition() (db.TableDefinition, error) {
-	return db.Define[liveTypedLocalRecord]("live_node_local_records", 902, db.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2},
-		Scope:        db.TableScopeNodeLocal,
+	return db.Model[liveTypedLocalRecord](db.ModelOptions{
+		Name: "live_node_local_records", TableID: 902,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Name": 2},
+			Scope:    db.TableScopeNodeLocal,
+		},
 	})
 }
 
@@ -1098,31 +1118,28 @@ func (d *NodeDaemon) handleTypedInsert(w http.ResponseWriter, r *http.Request) {
 		rowID = ids.RowID(parsed)
 	}
 	var writeErr error
-	if table, err := db.TableOf[liveTypedRecord](database, "live_typed_records"); err == nil {
+	if typedRecordV1Bound(database) {
 		row := &liveTypedRecord{ID: rowID, Name: req.Name}
 		writeErr = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
-			if err := table.Insert(tx, row); err != nil {
+			if err := tx.InsertItem(row); err != nil {
 				return err
 			}
 			if req.Count != 0 {
-				return db.RecordCounterAdd(tx, table, row.ID, "Count", req.Count)
-			}
-			return nil
-		})
-	} else if table, bindErr := db.TableOf[liveTypedRecordV2](database, "live_typed_records"); bindErr == nil {
-		row := &liveTypedRecordV2{ID: rowID, Name: req.Name}
-		writeErr = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
-			if err := table.Insert(tx, row); err != nil {
-				return err
-			}
-			if req.Count != 0 {
-				return db.RecordCounterAdd(tx, table, row.ID, "Count", req.Count)
+				return tx.CounterAdd(row, "Count", req.Count)
 			}
 			return nil
 		})
 	} else {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		row := &liveTypedRecordV2{ID: rowID, Name: req.Name}
+		writeErr = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+			if err := tx.InsertItem(row); err != nil {
+				return err
+			}
+			if req.Count != 0 {
+				return tx.CounterAdd(row, "Count", req.Count)
+			}
+			return nil
+		})
 	}
 	if writeErr != nil {
 		http.Error(w, writeErr.Error(), http.StatusInternalServerError)
@@ -1152,13 +1169,8 @@ func (d *NodeDaemon) handleTypedContentionInsert(w http.ResponseWriter, r *http.
 		http.Error(w, "id must be a UUID", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 	row := &liveContentionRecord{ID: ids.RowID(parsed), Name: req.Name, Phone: req.Phone, Score: req.Score}
-	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error { return table.Insert(tx, row) }); err != nil {
+	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error { return tx.InsertItem(row) }); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1191,12 +1203,7 @@ func (d *NodeDaemon) handleTypedContentionInsertMany(w http.ResponseWriter, r *h
 		}
 		values = append(values, &liveContentionRecord{ID: ids.RowID(parsed), Name: item.Name, Phone: item.Phone, Score: item.Score})
 	}
-	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error { return table.InsertMany(tx, values) }); err != nil {
+	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error { return tx.InsertMany(values) }); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1222,29 +1229,26 @@ func (d *NodeDaemon) handleTypedContentionUpdate(w http.ResponseWriter, r *http.
 		http.Error(w, "id must be a UUID", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	var field string
+	var value any
+	switch req.Field {
+	case "name":
+		field, value = "Name", req.Value
+	case "phone":
+		field, value = "Phone", req.Value
+	case "score":
+		var score int64
+		if _, scanErr := fmt.Sscan(req.Value, &score); scanErr != nil {
+			http.Error(w, scanErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		field, value = "Score", score
+	default:
+		http.Error(w, fmt.Sprintf("unsupported contention field %q", req.Field), http.StatusInternalServerError)
 		return
 	}
 	err = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
-		return table.Update(tx, ids.RowID(parsed), func(row *liveContentionRecord) error {
-			switch req.Field {
-			case "name":
-				row.Name = req.Value
-			case "phone":
-				row.Phone = req.Value
-			case "score":
-				var score int64
-				if _, scanErr := fmt.Sscan(req.Value, &score); scanErr != nil {
-					return scanErr
-				}
-				row.Score = score
-			default:
-				return fmt.Errorf("unsupported contention field %q", req.Field)
-			}
-			return nil
-		})
+		return tx.Update(&liveContentionRecord{ID: ids.RowID(parsed)}, db.Set(field, value))
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1270,13 +1274,9 @@ func (d *NodeDaemon) handleTypedContentionRead(w http.ResponseWriter, r *http.Re
 		http.Error(w, "id must be a UUID", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	row, err := table.Get(ids.RowID(parsed))
-	if err != nil {
+	var row liveContentionRecord
+	row.ID = ids.RowID(parsed)
+	if err := database.GetItem(r.Context(), &row); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
@@ -1306,13 +1306,8 @@ func (d *NodeDaemon) handleTypedContentionDelete(w http.ResponseWriter, r *http.
 		http.Error(w, "id must be a UUID", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
-		return table.Delete(tx, ids.RowID(parsed))
+		return tx.DeleteItem(&liveContentionRecord{ID: ids.RowID(parsed)})
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1325,13 +1320,8 @@ func (d *NodeDaemon) handleTypedContentionAll(w http.ResponseWriter, r *http.Req
 	if database == nil {
 		return
 	}
-	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	rows, err := table.Where().Find()
-	if err != nil {
+	var rows []liveContentionRecord
+	if err := database.Find(r.Context(), &rows); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1360,12 +1350,7 @@ func (d *NodeDaemon) handleTypedContentionPrefixCount(w http.ResponseWriter, r *
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	count, err := table.Where(db.StringFieldOf[liveContentionRecord](table, "Name").StartsWith(req.Prefix)).Count()
+	count, err := database.Count(r.Context(), liveContentionRecord{}, q.StartsWith("Name", req.Prefix))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1379,13 +1364,8 @@ func (d *NodeDaemon) handleTypedContentionDigest(w http.ResponseWriter, r *http.
 	if database == nil {
 		return
 	}
-	table, err := db.TableOf[liveContentionRecord](database, "live_typed_contention")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	rows, err := table.Where().Find()
-	if err != nil {
+	var rows []liveContentionRecord
+	if err := database.Find(r.Context(), &rows); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1414,13 +1394,8 @@ func (d *NodeDaemon) handleTypedLocalInsert(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "name is required", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveTypedLocalRecord](database, "live_node_local_records")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 	row := &liveTypedLocalRecord{ID: ids.NewRowID(), Name: req.Name}
-	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error { return table.Insert(tx, row) }); err != nil {
+	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error { return tx.InsertItem(row) }); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1444,12 +1419,7 @@ func (d *NodeDaemon) handleTypedLocalCount(w http.ResponseWriter, r *http.Reques
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveTypedLocalRecord](database, "live_node_local_records")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	count, err := table.Where(db.FieldOf[liveTypedLocalRecord, string](table, "Name").Eq(req.Name)).Count()
+	count, err := database.Count(r.Context(), liveTypedLocalRecord{}, q.Eq("Name", req.Name))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1474,15 +1444,10 @@ func (d *NodeDaemon) handleTypedExplicitTx(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "name is required", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 	committed := &liveTypedRecord{ID: ids.NewRowID(), Name: req.Name}
 	tx, err := database.BeginTx(r.Context())
 	if err == nil {
-		err = table.Insert(tx, committed)
+		err = tx.InsertItem(committed)
 	}
 	if err == nil {
 		err = tx.Commit()
@@ -1496,7 +1461,7 @@ func (d *NodeDaemon) handleTypedExplicitTx(w http.ResponseWriter, r *http.Reques
 	rolledBack := &liveTypedRecord{ID: ids.NewRowID(), Name: req.Name + "-rolled-back"}
 	tx, err = database.BeginTx(r.Context())
 	if err == nil {
-		err = table.Insert(tx, rolledBack)
+		err = tx.InsertItem(rolledBack)
 	}
 	if err == nil {
 		err = tx.Rollback()
@@ -1520,14 +1485,16 @@ func (d *NodeDaemon) handleTypedMigrateV2(w http.ResponseWriter, r *http.Request
 	if database == nil {
 		return
 	}
-	definition, err := db.Define[liveTypedRecordV2]("live_typed_records", 901, db.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs: map[string]uint32{
-			"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6, "Note": 7,
-		},
-		MergePolicies: map[string]db.RecordMergePolicy{
-			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
-			"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+	definition, err := db.Model[liveTypedRecordV2](db.ModelOptions{
+		Name: "live_typed_records", TableID: 901,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{
+				"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6, "Note": 7,
+			},
+			MergePolicies: map[string]db.RecordMergePolicy{
+				"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
+				"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+			},
 		},
 	})
 	if err == nil {
@@ -1537,7 +1504,7 @@ func (d *NodeDaemon) handleTypedMigrateV2(w http.ResponseWriter, r *http.Request
 			err = installSchemaCrashForTest(database, d.cfg.TypedSchemaCrashPhase)
 		}
 		if err == nil {
-			err = database.MigrateRecords(r.Context(), []db.TableDefinition{definition, local})
+			err = database.MigrateModels(r.Context(), []any{definition, local, liveModelDevice{}})
 		}
 	}
 	if err != nil {
@@ -1557,21 +1524,23 @@ func (d *NodeDaemon) handleTypedMigrateRegion(w http.ResponseWriter, r *http.Req
 	if database == nil {
 		return
 	}
-	definition, err := db.Define[liveTypedRecordRegion]("live_typed_records", 901, db.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs: map[string]uint32{
-			"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6, "Region": 8,
-		},
-		MergePolicies: map[string]db.RecordMergePolicy{
-			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
-			"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+	definition, err := db.Model[liveTypedRecordRegion](db.ModelOptions{
+		Name: "live_typed_records", TableID: 901,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{
+				"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6, "Region": 8,
+			},
+			MergePolicies: map[string]db.RecordMergePolicy{
+				"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
+				"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+			},
 		},
 	})
 	if err == nil {
 		var local db.TableDefinition
 		local, err = liveTypedLocalDefinition()
 		if err == nil {
-			err = database.MigrateRecords(r.Context(), []db.TableDefinition{definition, local})
+			err = database.MigrateModels(r.Context(), []any{definition, local, liveModelDevice{}})
 		}
 	}
 	if err != nil {
@@ -1591,21 +1560,23 @@ func (d *NodeDaemon) handleTypedMigrateV4(w http.ResponseWriter, r *http.Request
 	if database == nil {
 		return
 	}
-	definition, err := db.Define[liveTypedRecordV4]("live_typed_records", 901, db.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs: map[string]uint32{
-			"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6, "Note": 7, "Region": 8,
-		},
-		MergePolicies: map[string]db.RecordMergePolicy{
-			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
-			"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+	definition, err := db.Model[liveTypedRecordV4](db.ModelOptions{
+		Name: "live_typed_records", TableID: 901,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{
+				"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6, "Note": 7, "Region": 8,
+			},
+			MergePolicies: map[string]db.RecordMergePolicy{
+				"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
+				"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+			},
 		},
 	})
 	if err == nil {
 		var local db.TableDefinition
 		local, err = liveTypedLocalDefinition()
 		if err == nil {
-			err = database.MigrateRecords(r.Context(), []db.TableDefinition{definition, local})
+			err = database.MigrateModels(r.Context(), []any{definition, local, liveModelDevice{}})
 		}
 	}
 	if err != nil {
@@ -1629,21 +1600,14 @@ func (d *NodeDaemon) handleTypedSetNote(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "name and note are required", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveTypedRecordV2](database, "live_typed_records")
-	if err != nil {
+	var row liveTypedRecordV2
+	if err := database.FindOne(r.Context(), &row, q.Eq("Name", req.Name)); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	row, err := table.Where(db.FieldOf[liveTypedRecordV2, string](table, "Name").Eq(req.Name)).First()
-	if err == nil {
-		err = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
-			return table.Update(tx, row.ID, func(value *liveTypedRecordV2) error {
-				value.Note = req.Note
-				return nil
-			})
-		})
-	}
-	if err != nil {
+	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+		return tx.Update(&liveTypedRecordV2{ID: row.ID}, db.Set("Note", req.Note))
+	}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1664,21 +1628,14 @@ func (d *NodeDaemon) handleTypedSetRegion(w http.ResponseWriter, r *http.Request
 		http.Error(w, "name and region are required", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveTypedRecordRegion](database, "live_typed_records")
-	if err != nil {
+	var row liveTypedRecordRegion
+	if err := database.FindOne(r.Context(), &row, q.Eq("Name", req.Name)); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	row, err := table.Where(db.FieldOf[liveTypedRecordRegion, string](table, "Name").Eq(req.Name)).First()
-	if err == nil {
-		err = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
-			return table.Update(tx, row.ID, func(value *liveTypedRecordRegion) error {
-				value.Region = req.Region
-				return nil
-			})
-		})
-	}
-	if err != nil {
+	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+		return tx.Update(&liveTypedRecordRegion{ID: row.ID}, db.Set("Region", req.Region))
+	}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1697,13 +1654,8 @@ func (d *NodeDaemon) handleTypedBranchValues(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "name is required", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveTypedRecordV4](database, "live_typed_records")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	row, err := table.Where(db.FieldOf[liveTypedRecordV4, string](table, "Name").Eq(req.Name)).First()
-	if err != nil {
+	var row liveTypedRecordV4
+	if err := database.FindOne(r.Context(), &row, q.Eq("Name", req.Name)); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1724,21 +1676,14 @@ func (d *NodeDaemon) handleTypedRename(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name and new_name are required", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
-	if err != nil {
+	var row liveTypedRecord
+	if err := database.FindOne(r.Context(), &row, q.Eq("Name", req.Name)); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	row, err := table.Where(db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name)).First()
-	if err == nil {
-		err = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
-			return table.Update(tx, row.ID, func(value *liveTypedRecord) error {
-				value.Name = req.NewName
-				return nil
-			})
-		})
-	}
-	if err != nil {
+	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+		return tx.Update(&liveTypedRecord{ID: row.ID}, db.Set("Name", req.NewName))
+	}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1758,13 +1703,8 @@ func (d *NodeDaemon) handleTypedNote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name is required", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveTypedRecordV2](database, "live_typed_records")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	row, err := table.Where(db.FieldOf[liveTypedRecordV2, string](table, "Name").Eq(req.Name)).First()
-	if err != nil {
+	var row liveTypedRecordV2
+	if err := database.FindOne(r.Context(), &row, q.Eq("Name", req.Name)); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1802,16 +1742,10 @@ func (d *NodeDaemon) handleTypedCount(w http.ResponseWriter, r *http.Request) {
 	}
 	count := 0
 	var err error
-	tableV1, errV1 := db.TableOf[liveTypedRecord](database, "live_typed_records")
-	if errV1 == nil {
-		count, err = tableV1.Where(db.FieldOf[liveTypedRecord, string](tableV1, "Name").Eq(req.Name)).Count()
+	if typedRecordV1Bound(database) {
+		count, err = database.Count(r.Context(), liveTypedRecord{}, q.Eq("Name", req.Name))
 	} else {
-		tableV2, err := db.TableOf[liveTypedRecordV2](database, "live_typed_records")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		count, err = tableV2.Where(db.FieldOf[liveTypedRecordV2, string](tableV2, "Name").Eq(req.Name)).Count()
+		count, err = database.Count(r.Context(), liveTypedRecordV2{}, q.Eq("Name", req.Name))
 	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1829,14 +1763,8 @@ func (d *NodeDaemon) handleTypedEnabledNames(w http.ResponseWriter, r *http.Requ
 	if database == nil {
 		return
 	}
-	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	rows, err := table.Where(db.NumericFieldOf[liveTypedRecord, int64](table, "Count").Gt(0)).
-		OrderByAsc(db.StringFieldOf[liveTypedRecord](table, "Name")).Find()
-	if err != nil {
+	var rows []liveTypedRecord
+	if err := database.Query(liveTypedRecord{}, q.Gt("Count", 0)).OrderBy("Name").FindInto(&rows); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1854,10 +1782,10 @@ func (d *NodeDaemon) handleTypedNames(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var names []string
-	if table, err := db.TableOf[liveTypedRecord](database, "live_typed_records"); err == nil {
-		rows, queryErr := table.Where().OrderByAsc(db.StringFieldOf[liveTypedRecord](table, "Name")).Find()
-		if queryErr != nil {
-			http.Error(w, queryErr.Error(), http.StatusInternalServerError)
+	if typedRecordV1Bound(database) {
+		var rows []liveTypedRecord
+		if err := database.Query(liveTypedRecord{}).OrderBy("Name").FindInto(&rows); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		names = make([]string, 0, len(rows))
@@ -1865,14 +1793,9 @@ func (d *NodeDaemon) handleTypedNames(w http.ResponseWriter, r *http.Request) {
 			names = append(names, row.Name)
 		}
 	} else {
-		table, tableErr := db.TableOf[liveTypedRecordV2](database, "live_typed_records")
-		if tableErr != nil {
-			http.Error(w, tableErr.Error(), http.StatusInternalServerError)
-			return
-		}
-		rows, queryErr := table.Where().OrderByAsc(db.StringFieldOf[liveTypedRecordV2](table, "Name")).Find()
-		if queryErr != nil {
-			http.Error(w, queryErr.Error(), http.StatusInternalServerError)
+		var rows []liveTypedRecordV2
+		if err := database.Query(liveTypedRecordV2{}).OrderBy("Name").FindInto(&rows); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		names = make([]string, 0, len(rows))
@@ -1903,12 +1826,7 @@ func (d *NodeDaemon) handleTypedWatch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name is required", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	sub, err := table.Subscribe(r.Context(), db.RecordSubscriptionOptions{BufferSize: 4}, db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name))
+	sub, err := database.Subscribe(r.Context(), liveTypedRecord{}, db.ItemSubscriptionOptions{BufferSize: 4}, q.Eq("Name", req.Name))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1964,18 +1882,13 @@ func (d *NodeDaemon) handleTypedCounterAdd(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "name and delta are required", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	row, err := table.Where(db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name)).First()
-	if err != nil {
+	var row liveTypedRecord
+	if err := database.FindOne(r.Context(), &row, q.Eq("Name", req.Name)); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
 	if err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
-		return db.RecordCounterAdd(tx, table, row.ID, "Count", req.Delta)
+		return tx.CounterAdd(&liveTypedRecord{ID: row.ID}, "Count", req.Delta)
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -2003,22 +1916,17 @@ func (d *NodeDaemon) handleTypedCounterValue(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var value int64
-	if table, err := db.TableOf[liveTypedRecord](database, "live_typed_records"); err == nil {
-		row, queryErr := table.Where(db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name)).First()
-		if queryErr != nil {
-			http.Error(w, queryErr.Error(), http.StatusNotFound)
+	if typedRecordV1Bound(database) {
+		var row liveTypedRecord
+		if err := database.FindOne(r.Context(), &row, q.Eq("Name", req.Name)); err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
 		value = row.Count
 	} else {
-		table, tableErr := db.TableOf[liveTypedRecordV2](database, "live_typed_records")
-		if tableErr != nil {
-			http.Error(w, tableErr.Error(), http.StatusInternalServerError)
-			return
-		}
-		row, queryErr := table.Where(db.FieldOf[liveTypedRecordV2, string](table, "Name").Eq(req.Name)).First()
-		if queryErr != nil {
-			http.Error(w, queryErr.Error(), http.StatusNotFound)
+		var row liveTypedRecordV2
+		if err := database.FindOne(r.Context(), &row, q.Eq("Name", req.Name)); err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
 		value = row.Count
@@ -2054,21 +1962,17 @@ func (d *NodeDaemon) handleTypedSetChange(w http.ResponseWriter, r *http.Request
 		http.Error(w, "name and value are required", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	row, err := table.Where(db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name)).First()
-	if err != nil {
+	var row liveTypedRecord
+	if err := database.FindOne(r.Context(), &row, q.Eq("Name", req.Name)); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	err = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+	err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+		key := &liveTypedRecord{ID: row.ID}
 		if add {
-			return db.RecordSetAdd(tx, table, row.ID, "Tags", req.Value)
+			return tx.SetAdd(key, "Tags", req.Value)
 		}
-		return db.RecordSetRemove(tx, table, row.ID, "Tags", req.Value)
+		return tx.SetRemove(key, "Tags", req.Value)
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -2096,13 +2000,8 @@ func (d *NodeDaemon) handleTypedSetValues(w http.ResponseWriter, r *http.Request
 		http.Error(w, "name is required", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	row, err := table.Where(db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name)).First()
-	if err != nil {
+	var row liveTypedRecord
+	if err := database.FindOne(r.Context(), &row, q.Eq("Name", req.Name)); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
@@ -2131,21 +2030,17 @@ func (d *NodeDaemon) handleTypedExtremaUpdate(w http.ResponseWriter, r *http.Req
 		http.Error(w, "name and extrema values are required", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	row, err := table.Where(db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name)).First()
-	if err != nil {
+	var row liveTypedRecord
+	if err := database.FindOne(r.Context(), &row, q.Eq("Name", req.Name)); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	err = database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
-		if err := db.RecordMax(tx, table, row.ID, "Peak", req.Peak); err != nil {
+	err := database.WriteTxContext(r.Context(), func(tx *db.Tx) error {
+		key := &liveTypedRecord{ID: row.ID}
+		if err := tx.Max(key, "Peak", req.Peak); err != nil {
 			return err
 		}
-		return db.RecordMin(tx, table, row.ID, "Floor", req.Floor)
+		return tx.Min(key, "Floor", req.Floor)
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -2173,13 +2068,8 @@ func (d *NodeDaemon) handleTypedExtremaValues(w http.ResponseWriter, r *http.Req
 		http.Error(w, "name is required", http.StatusBadRequest)
 		return
 	}
-	table, err := db.TableOf[liveTypedRecord](database, "live_typed_records")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	row, err := table.Where(db.FieldOf[liveTypedRecord, string](table, "Name").Eq(req.Name)).First()
-	if err != nil {
+	var row liveTypedRecord
+	if err := database.FindOne(r.Context(), &row, q.Eq("Name", req.Name)); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}

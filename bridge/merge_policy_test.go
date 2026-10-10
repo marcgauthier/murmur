@@ -19,11 +19,13 @@ func TestPolicyBundleReplayAcrossStreamsAndHighOwnership(t *testing.T) {
 			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax,
 		},
 	}
-	definition, err := db.Define[typedBridgeCRDTRecord]("items", 93, options)
+	definition, err := db.Model[typedBridgeCRDTRecord](db.ModelOptions{
+		Name: "items", TableID: 93, RecordOptions: options,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	open := func(databaseID db.DBID) (*db.DB, *db.RecordTable[typedBridgeCRDTRecord]) {
+	open := func(databaseID db.DBID) *db.DB {
 		node := db.NewNodeID()
 		cfg := db.Config{Path: t.TempDir(), NodeID: node, DBID: databaseID, OriginSigning: testidentity.Config(node),
 			Encryption: db.EncryptionConfig{Key: make([]byte, 32), KeyID: "test"}, Tables: []db.TableDefinition{definition}}
@@ -32,29 +34,26 @@ func TestPolicyBundleReplayAcrossStreamsAndHighOwnership(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { d.Close() })
-		table, err := db.TableOf[typedBridgeCRDTRecord](d, "items")
-		if err != nil {
-			t.Fatal(err)
-		}
-		return d, table
+		return d
 	}
-	low, lowTable := open(db.NewDBID())
-	high, highTable := open(db.NewDBID())
+	low := open(db.NewDBID())
+	high := open(db.NewDBID())
 	domain := low.DBID()
 	row := db.NewRowID()
+	key := &typedBridgeCRDTRecord{ID: row}
 	if err := low.WriteTxContext(ctx, func(tx *db.Tx) error {
-		return lowTable.Insert(tx, &typedBridgeCRDTRecord{ID: row, Peak: 10})
+		return tx.InsertItem(&typedBridgeCRDTRecord{ID: row, Peak: 10})
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := low.WriteTxContext(ctx, func(tx *db.Tx) error {
-		if err := db.RecordCounterAdd(tx, lowTable, row, "Count", 10); err != nil {
+		if err := tx.CounterAdd(key, "Count", 10); err != nil {
 			return err
 		}
-		if err := db.RecordCounterAdd(tx, lowTable, row, "Count", 2); err != nil {
+		if err := tx.CounterAdd(key, "Count", 2); err != nil {
 			return err
 		}
-		return db.RecordSetAdd(tx, lowTable, row, "Tags", "red")
+		return tx.SetAdd(key, "Tags", "red")
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -108,8 +107,9 @@ func TestPolicyBundleReplayAcrossStreamsAndHighOwnership(t *testing.T) {
 	}
 	check := func(count int64, tags []string, max int64) {
 		t.Helper()
-		got, err := highTable.Get(row)
-		if err != nil {
+		var got typedBridgeCRDTRecord
+		got.ID = row
+		if err := high.GetItem(ctx, &got); err != nil {
 			t.Fatal(err)
 		}
 		if got.Count != count || len(got.Tags) != len(tags) || got.Peak != max {
@@ -125,18 +125,18 @@ func TestPolicyBundleReplayAcrossStreamsAndHighOwnership(t *testing.T) {
 	deliver("other")
 	check(12, []string{"red"}, 10)
 	if err := high.WriteTxContext(ctx, func(tx *db.Tx) error {
-		if err := db.RecordCounterAdd(tx, highTable, row, "Count", 3); err != nil {
+		if err := tx.CounterAdd(key, "Count", 3); err != nil {
 			return err
 		}
-		if err := db.RecordSetAdd(tx, highTable, row, "Tags", "high"); err != nil {
+		if err := tx.SetAdd(key, "Tags", "high"); err != nil {
 			return err
 		}
-		return db.RecordMax(tx, highTable, row, "Peak", int64(5))
+		return tx.Max(key, "Peak", int64(5))
 	}); err != nil {
 		t.Fatal(err)
 	}
 	check(15, []string{"high", "red"}, 10)
-	peer, peerTable := open(high.DBID())
+	peer := open(high.DBID())
 	defer peer.Close()
 	last, err := high.ScanReplicationLog(ctx, high.NodeID(), 1, 100, 4<<20, func(batch *codec.MutationBatch) error {
 		return peer.ApplyRemote(ctx, batch)
@@ -144,8 +144,9 @@ func TestPolicyBundleReplayAcrossStreamsAndHighOwnership(t *testing.T) {
 	if err != nil || last == 0 {
 		t.Fatalf("replicate typed bridge ownership: last sequence=%d err=%v", last, err)
 	}
-	peerValue, err := peerTable.Get(row)
-	if err != nil || peerValue.Count != 15 || len(peerValue.Tags) != 2 || peerValue.Peak != 10 {
+	var peerValue typedBridgeCRDTRecord
+	peerValue.ID = row
+	if err := peer.GetItem(ctx, &peerValue); err != nil || peerValue.Count != 15 || len(peerValue.Tags) != 2 || peerValue.Peak != 10 {
 		t.Fatalf("replicated typed bridge row=%+v err=%v", peerValue, err)
 	}
 	rowPolicy, ok, err := peer.BridgeRowProvenance("items", row)
@@ -157,13 +158,13 @@ func TestPolicyBundleReplayAcrossStreamsAndHighOwnership(t *testing.T) {
 		t.Fatalf("replicated typed field provenance=%+v present=%v err=%v", fieldPolicy, ok, err)
 	}
 	if err := low.WriteTxContext(ctx, func(tx *db.Tx) error {
-		if err := db.RecordCounterAdd(tx, lowTable, row, "Count", 8); err != nil {
+		if err := tx.CounterAdd(key, "Count", 8); err != nil {
 			return err
 		}
-		if err := db.RecordSetRemove(tx, lowTable, row, "Tags", "red"); err != nil {
+		if err := tx.SetRemove(key, "Tags", "red"); err != nil {
 			return err
 		}
-		return db.RecordMax(tx, lowTable, row, "Peak", int64(20))
+		return tx.Max(key, "Peak", int64(20))
 	}); err != nil {
 		t.Fatal(err)
 	}

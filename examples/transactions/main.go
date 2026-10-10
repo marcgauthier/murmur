@@ -31,17 +31,11 @@ func main() {
 	}
 	defer os.RemoveAll(dir)
 
-	definition, err := murmur.Define[ledgerEntry]("ledger", 18, murmur.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Entry": 2},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
 	db, err := murmur.Open(ctx, demoidentity.Configure(murmur.Config{
 		Path:   dir,
 		NodeID: murmur.NewNodeID(),
 		Schema: murmur.SchemaConfig{Version: 1},
-		Tables: []murmur.TableDefinition{definition},
+		Models: []any{ledgerEntry{}},
 		Spool:  murmur.DefaultSpoolConfig(),
 		Encryption: murmur.EncryptionConfig{
 			Key: []byte("0123456789abcdef0123456789abcdef"), KeyID: "transactions-key",
@@ -51,12 +45,8 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
-	ledger, err := murmur.TableOf[ledgerEntry](db, "ledger")
-	if err != nil {
-		log.Fatal(err)
-	}
 	count := func() int {
-		n, err := ledger.Where().Count()
+		n, err := db.Count(ctx, ledgerEntry{})
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -64,13 +54,13 @@ func main() {
 	}
 
 	// The callback commits all three records together.
-	if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
+	if err := db.Transaction(ctx, func(tx *murmur.Tx) error {
 		entries := []*ledgerEntry{
-			{ID: murmur.NewRowID(), Entry: "debit"},
-			{ID: murmur.NewRowID(), Entry: "credit"},
-			{ID: murmur.NewRowID(), Entry: "fee"},
+			{Entry: "debit"},
+			{Entry: "credit"},
+			{Entry: "fee"},
 		}
-		return ledger.InsertMany(tx, entries)
+		return tx.InsertMany(entries)
 	}); err != nil {
 		log.Fatal(err)
 	}
@@ -78,8 +68,8 @@ func main() {
 
 	// Returning an error aborts every staged write in the callback.
 	rollback := errors.New("demonstration rollback")
-	err = db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
-		if err := ledger.Insert(tx, &ledgerEntry{ID: murmur.NewRowID(), Entry: "abandoned"}); err != nil {
+	err = db.Transaction(ctx, func(tx *murmur.Tx) error {
+		if err := tx.InsertItem(&ledgerEntry{Entry: "abandoned"}); err != nil {
 			return err
 		}
 		return rollback

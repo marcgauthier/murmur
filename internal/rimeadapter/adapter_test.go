@@ -215,8 +215,8 @@ func TestDurableWritePublishesAndRollbackHasNoEffect(t *testing.T) {
 	}
 	row = updated
 	primaryAfter, primaryOK, err := store.GetCell(77, row.ID, 1)
-	if err != nil || !primaryOK || primaryBefore.Version != primaryAfter.Version {
-		t.Fatalf("unchanged primary field was rewritten: before=%#v after=%#v err=%v", primaryBefore, primaryAfter, err)
+	if err != nil || !primaryOK || !primaryBefore.Value.Equal(primaryAfter.Value) || primaryBefore.Version == primaryAfter.Version {
+		t.Fatalf("immutable primary field was not retained and re-emitted: before=%#v after=%#v err=%v", primaryBefore, primaryAfter, err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)

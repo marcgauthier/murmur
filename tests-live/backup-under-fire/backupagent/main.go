@@ -43,9 +43,12 @@ type backupAgentRecord struct {
 }
 
 func recordDefinition() (db.TableDefinition, error) {
-	return db.Define[backupAgentRecord]("live_typed_records", 901, db.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
-		MergePolicies: map[string]db.RecordMergePolicy{"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin},
+	return db.Model[backupAgentRecord](db.ModelOptions{
+		Name: "live_typed_records", TableID: 901,
+		RecordOptions: db.RecordOptions{
+			FieldIDs:      map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
+			MergePolicies: map[string]db.RecordMergePolicy{"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin},
+		},
 	})
 }
 
@@ -249,12 +252,7 @@ func oneLine(s string) string {
 }
 
 func countRows(ctx context.Context, handle *db.DB) int {
-	_ = ctx
-	rows, err := db.TableOf[backupAgentRecord](handle, "live_typed_records")
-	if err != nil {
-		return -1
-	}
-	n, err := rows.Where().Count()
+	n, err := handle.Count(ctx, backupAgentRecord{})
 	if err != nil {
 		return -1
 	}

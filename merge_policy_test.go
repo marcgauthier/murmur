@@ -25,7 +25,7 @@ type mergeTransactionRecord struct {
 // behavior is exercised through RIME APIs in this file and records_crdt_test.go.
 func TestTypedMergePolicyTransaction(t *testing.T) {
 	ctx := context.Background()
-	definition, err := Define[mergeTransactionRecord]("merge_items", 102, RecordOptions{
+	definition, err := define[mergeTransactionRecord]("merge_items", 102, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Count": 2, "Tags": 3, "Max": 4, "Min": 5},
 		MergePolicies: map[string]RecordMergePolicy{
@@ -45,7 +45,7 @@ func TestTypedMergePolicyTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[mergeTransactionRecord](d, "merge_items")
+	table, err := tableOf[mergeTransactionRecord](d, "merge_items")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,23 +55,23 @@ func TestTypedMergePolicyTransaction(t *testing.T) {
 			return err
 		}
 		for _, delta := range []int64{5, 7, -3} {
-			if err := RecordCounterAdd(tx, table, row, "Count", delta); err != nil {
+			if err := recordCounterAdd(tx, table, row, "Count", delta); err != nil {
 				return err
 			}
 		}
-		if err := RecordSetAdd(tx, table, row, "Tags", "red"); err != nil {
+		if err := recordSetAdd(tx, table, row, "Tags", "red"); err != nil {
 			return err
 		}
-		if err := RecordSetAdd(tx, table, row, "Tags", "one"); err != nil {
+		if err := recordSetAdd(tx, table, row, "Tags", "one"); err != nil {
 			return err
 		}
-		if err := RecordSetRemove(tx, table, row, "Tags", "red"); err != nil {
+		if err := recordSetRemove(tx, table, row, "Tags", "red"); err != nil {
 			return err
 		}
-		if err := RecordMax(tx, table, row, "Max", int64(2)); err != nil {
+		if err := recordMax(tx, table, row, "Max", int64(2)); err != nil {
 			return err
 		}
-		return RecordMin(tx, table, row, "Min", float64(8))
+		return recordMin(tx, table, row, "Min", float64(8))
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestTypedMergePolicyTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	table, err = TableOf[mergeTransactionRecord](d, "merge_items")
+	table, err = tableOf[mergeTransactionRecord](d, "merge_items")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestTypedMergePolicyTransaction(t *testing.T) {
 }
 func TestMergePolicyRemoteConvergence(t *testing.T) {
 	ctx := context.Background()
-	definition, err := Define[mergeConvergenceRecord]("merge_rows", 101, RecordOptions{
+	definition, err := define[mergeConvergenceRecord]("merge_rows", 101, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Count": 2, "Tags": 3},
 		MergePolicies: map[string]RecordMergePolicy{
@@ -136,11 +136,11 @@ func TestMergePolicyRemoteConvergence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Close()
-	aTable, err := TableOf[mergeConvergenceRecord](a, "merge_rows")
+	aTable, err := tableOf[mergeConvergenceRecord](a, "merge_rows")
 	if err != nil {
 		t.Fatal(err)
 	}
-	bTable, err := TableOf[mergeConvergenceRecord](b, "merge_rows")
+	bTable, err := tableOf[mergeConvergenceRecord](b, "merge_rows")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,22 +161,22 @@ func TestMergePolicyRemoteConvergence(t *testing.T) {
 	forward(a, b, cfg.NodeID, 1)
 	for _, write := range []struct {
 		db    *DB
-		table *RecordTable[mergeConvergenceRecord]
+		table *recordTable[mergeConvergenceRecord]
 		inc   int64
 		tag   string
 	}{{a, aTable, 1, "red"}, {b, bTable, 2, "blue"}} {
 		if err := write.db.WriteTxContext(ctx, func(tx *Tx) error {
-			if err := RecordCounterAdd(tx, write.table, row, "Count", write.inc); err != nil {
+			if err := recordCounterAdd(tx, write.table, row, "Count", write.inc); err != nil {
 				return err
 			}
-			return RecordSetAdd(tx, write.table, row, "Tags", write.tag)
+			return recordSetAdd(tx, write.table, row, "Tags", write.tag)
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	forward(a, b, cfg.NodeID, 2)
 	forward(b, a, other.NodeID, 1)
-	for _, table := range []*RecordTable[mergeConvergenceRecord]{aTable, bTable} {
+	for _, table := range []*recordTable[mergeConvergenceRecord]{aTable, bTable} {
 		got, err := table.Get(row)
 		if err != nil || got.Count != 3 || !equalStringSet(got.Tags, []string{"blue", "red"}) {
 			t.Fatalf("converged typed merge record=%+v err=%v", got, err)
@@ -186,7 +186,7 @@ func TestMergePolicyRemoteConvergence(t *testing.T) {
 
 func TestTypedMergePolicyConcurrentWriters(t *testing.T) {
 	ctx := context.Background()
-	definition, err := Define[mergeTransactionRecord]("merge_items", 102, RecordOptions{
+	definition, err := define[mergeTransactionRecord]("merge_items", 102, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Count": 2, "Tags": 3, "Max": 4, "Min": 5},
 		MergePolicies: map[string]RecordMergePolicy{
@@ -207,7 +207,7 @@ func TestTypedMergePolicyConcurrentWriters(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	table, err := TableOf[mergeTransactionRecord](d, "merge_items")
+	table, err := tableOf[mergeTransactionRecord](d, "merge_items")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,10 +228,10 @@ func TestTypedMergePolicyConcurrentWriters(t *testing.T) {
 			for i := 0; i < iterations; i++ {
 				for attempt := 0; attempt < 100; attempt++ {
 					err := d.WriteTxContext(ctx, func(tx *Tx) error {
-						if err := RecordCounterAdd(tx, table, row, "Count", 1); err != nil {
+						if err := recordCounterAdd(tx, table, row, "Count", 1); err != nil {
 							return err
 						}
-						return RecordSetAdd(tx, table, row, "Tags", fmt.Sprintf("%d/%d", w, i))
+						return recordSetAdd(tx, table, row, "Tags", fmt.Sprintf("%d/%d", w, i))
 					})
 					if err == nil {
 						break

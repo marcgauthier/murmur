@@ -22,9 +22,11 @@ type writerBenchRow struct {
 }
 
 func mustWriterBenchTables() []murmur.TableDefinition {
-	definition, err := murmur.Define[writerBenchRow]("writer_bench", 93, murmur.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs:     map[string]uint32{"ID": 1, "Val": 2},
+	definition, err := murmur.Model[writerBenchRow](murmur.ModelOptions{
+		Name: "writer_bench", TableID: 93,
+		RecordOptions: murmur.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Val": 2},
+		},
 	})
 	if err != nil {
 		panic(err)
@@ -69,11 +71,6 @@ func runLocalWriterThroughput(t *testing.T, durability murmur.DurabilityConfig) 
 					_ = db.Close()
 				}
 			}()
-			table, err := murmur.TableOf[writerBenchRow](db, "writer_bench")
-			if err != nil {
-				t.Fatal(err)
-			}
-
 			type result struct {
 				writes int
 				err    error
@@ -97,7 +94,7 @@ func runLocalWriterThroughput(t *testing.T, durability murmur.DurabilityConfig) 
 							results <- result{writes: writes, err: fmt.Errorf("writer %d: %w", worker+1, err)}
 							return
 						}
-						if err := table.Insert(tx, &writerBenchRow{ID: id, Val: "writer-throughput"}); err != nil {
+						if err := tx.InsertItem(&writerBenchRow{ID: id, Val: "writer-throughput"}); err != nil {
 							results <- result{writes: writes, err: fmt.Errorf("writer %d: %w", worker+1, err)}
 							return
 						}
@@ -144,11 +141,7 @@ func runLocalWriterThroughput(t *testing.T, durability murmur.DurabilityConfig) 
 			if err != nil {
 				t.Fatalf("reopen after writes: %v", err)
 			}
-			table, err = murmur.TableOf[writerBenchRow](db, "writer_bench")
-			if err != nil {
-				t.Fatal(err)
-			}
-			count, err := table.Where().Count()
+			count, err := db.Count(ctx, writerBenchRow{})
 			if err != nil {
 				t.Fatal(err)
 			}

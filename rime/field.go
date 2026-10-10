@@ -3,6 +3,7 @@ package rime
 import (
 	"fmt"
 	"reflect"
+	"time"
 )
 
 // OrderField exposes ordering for ORDER BY. Implemented by all field handles.
@@ -124,6 +125,9 @@ func (f Field[T, V]) orderCmp(a, b *T) int {
 	av, bv := f.get(a), f.get(b)
 	if av == bv {
 		return 0
+	}
+	if timestamp, ok := any(av).(time.Time); ok {
+		return canonicalTime(timestamp).Compare(canonicalTime(any(bv).(time.Time)))
 	}
 	if lessAny(av, bv) {
 		return -1

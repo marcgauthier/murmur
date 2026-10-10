@@ -19,7 +19,7 @@ func BenchmarkSnapshotSeed(b *testing.B) {
 
 	cfgA := replConfig(b.TempDir(), nodeA, dbid, creds[nodeA], nil)
 	cfgA.Schema.Tables = nil
-	definition, err := Define[facadeRecord]("records", 71, RecordOptions{
+	definition, err := define[facadeRecord]("records", 71, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2},
 	})
@@ -32,7 +32,7 @@ func BenchmarkSnapshotSeed(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer dbA.Close()
-	tableA, err := TableOf[facadeRecord](dbA, "records")
+	tableA, err := tableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func BenchmarkSnapshotSeed(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer dbC.Close()
-	tableC, err := TableOf[facadeRecord](dbC, "records")
+	tableC, err := tableOf[facadeRecord](dbC, "records")
 	if err != nil {
 		b.Fatal(err)
 	}

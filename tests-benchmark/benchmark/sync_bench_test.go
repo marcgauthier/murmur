@@ -47,13 +47,9 @@ func BenchmarkRebuild(b *testing.B) {
 				b.Fatal(err)
 			}
 			defer db.Close()
-			contacts, err := murmur.TableOf[benchContact](db, "contacts")
-			if err != nil {
-				b.Fatal(err)
-			}
 			// Time to first query.
 			qstart := time.Now()
-			count, err := contacts.Where().Count()
+			count, err := db.Count(context.Background(), benchContact{})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -153,11 +149,7 @@ func BenchmarkReplicationSync(b *testing.B) {
 
 func countContacts(b *testing.B, db *murmur.DB) int {
 	b.Helper()
-	contacts, err := murmur.TableOf[benchContact](db, "contacts")
-	if err != nil {
-		b.Fatal(err)
-	}
-	n, err := contacts.Where().Count()
+	n, err := db.Count(context.Background(), benchContact{})
 	if err != nil {
 		b.Fatal(err)
 	}

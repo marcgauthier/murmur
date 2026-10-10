@@ -39,10 +39,10 @@ func freePort() int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-func waitCount(table *murmur.RecordTable[note], want int, timeout time.Duration) {
+func waitCount(db *murmur.DB, want int, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if n, err := table.Where().Count(); err == nil && n == want {
+		if n, err := db.Count(context.Background(), note{}); err == nil && n == want {
 			return
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -57,8 +57,11 @@ func main() {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(base)
-	definition, err := murmur.Define[note]("notes", 12, murmur.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+	definition, err := murmur.Model[note](murmur.ModelOptions{
+		Name: "notes", TableID: 12,
+		RecordOptions: murmur.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Body": 2},
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -118,22 +121,14 @@ func main() {
 	node1 := open(0)
 	node2 := open(1)
 	defer node1.Close()
-	table1, err := murmur.TableOf[note](node1, "notes")
-	if err != nil {
-		log.Fatal(err)
-	}
-	table2, err := murmur.TableOf[note](node2, "notes")
-	if err != nil {
-		log.Fatal(err)
-	}
 
 	id := murmur.NewRowID()
 	if err := node1.WriteTxContext(ctx, func(tx *murmur.Tx) error {
-		return table1.Insert(tx, &note{ID: id, Body: "seed"})
+		return tx.InsertItem(&note{ID: id, Body: "seed"})
 	}); err != nil {
 		log.Fatal(err)
 	}
-	waitCount(table2, 1, 30*time.Second)
+	waitCount(node2, 1, 30*time.Second)
 	fmt.Println("seed converged; stopping node 2")
 	if err := node2.Close(); err != nil {
 		log.Fatal(err)
@@ -142,7 +137,7 @@ func main() {
 	for r := 0; r < 30; r++ {
 		id := murmur.NewRowID()
 		if err := node1.WriteTxContext(ctx, func(tx *murmur.Tx) error {
-			return table1.Insert(tx, &note{ID: id, Body: fmt.Sprintf("fresh-%d", r)})
+			return tx.InsertItem(&note{ID: id, Body: fmt.Sprintf("fresh-%d", r)})
 		}); err != nil {
 			log.Fatal(err)
 		}
@@ -152,11 +147,7 @@ func main() {
 
 	node2 = open(1)
 	defer node2.Close()
-	table2, err = murmur.TableOf[note](node2, "notes")
-	if err != nil {
-		log.Fatal(err)
-	}
-	waitCount(table2, 31, 90*time.Second)
+	waitCount(node2, 31, 90*time.Second)
 	got := node2.Metrics().SnapshotAppliesCompleted
 	fmt.Printf("node 2 rejoined with %d rows; snapshot applies completed: %d\n", 31, got)
 	if got < 1 {

@@ -71,7 +71,9 @@ worker. `Table[T]` owns schema/accessor metadata, storage shards, indexes,
 constraints, hooks, event subscriptions and the plan cache. Internal `innerTable`
 methods let a transaction operate across different record types.
 
-`Tx` owns one pinned snapshot and private mutation state. It is used by one
+`Tx` owns one pinned snapshot and private mutation state. `Tx.Batch` reuses
+the operation savepoint, including restoration of earlier superseded flags
+when later operations fail. It is used by one
 goroutine; sharing a transaction concurrently is unsupported. The database and
 its tables support multiple goroutines with separate transactions. Query
 builder methods return independent values, so query values can be branched and
@@ -130,6 +132,20 @@ uses the standard library's SHA-1 implementation.
 
 Sources: [schema.go](schema.go), [field.go](field.go), [uuid.go](uuid.go),
 [table.go](table.go).
+
+### Runtime registration
+
+`RegisterType` accepts a `reflect.Type` and reuses the generic registration
+initializer with a `Table[any]` carrier. Its `*any` records contain native struct
+pointers; field/default/validation accessors unwrap carriers, and prepared
+changes unwrap them before adapter capture. Typed registrations retain their
+native offset loads. Runtime field handles use compiled reflective accessors,
+with the same normalized hash/ordered indexes and planner metadata. Carrier
+cloning uses the declared generic type, retaining an independent native record.
+`WithPrimaryField` selects physical identity separately from other primary-tag
+indexes; `WithPrimaryKey` supplies a deterministic canonical key accessor.
+Murmur's [model adapter](../architecture/model-api.md) owns durable schema and
+UUID generation, while RIME continues to import only standard-library packages.
 
 ## 4. Storage, immutable records and version chains
 
@@ -775,3 +791,14 @@ Persistence, replication, nested views, additional result filtering, historical
 view reads and incremental joins/aggregates are outside this implementation.
 Sources: [view.go](view.go), [tx.go](tx.go), [executor.go](executor.go),
 [join.go](join.go), [aggregate.go](aggregate.go).
+
+## Checked runtime fields and timestamp keys
+
+`DynamicFieldOf` compiles checked scalar/timestamp accessors and builds ordinary
+expressions with field/operator metadata. Named scalars retain native value
+types for hash/compound keys and use kind-specific comparators for ranges and
+sorting. String predicates use existing prefix planning and wildcard matching.
+Typed scalar accessors retain their direct-load path. `time.Time` index
+extractors and query keys remove monotonic data and normalize to UTC; equality
+and ordering compare wall-clock instants. Unique and compound timestamp indexes
+use the same keys. Normalization does not mutate stored record fields.

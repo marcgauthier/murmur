@@ -34,8 +34,8 @@ func cloneForUpdate[T any](clone func(*T) *T, src *T) *T {
 	if clone != nil {
 		return clone(src)
 	}
-	dst := reflect.New(reflect.TypeOf(*src))
-	cloneValue(dst.Elem(), reflect.ValueOf(*src), make(map[cloneVisit]reflect.Value))
+	dst := reflect.New(reflect.TypeFor[T]())
+	cloneValue(dst.Elem(), reflect.ValueOf(src).Elem(), make(map[cloneVisit]reflect.Value))
 	return dst.Interface().(*T)
 }
 

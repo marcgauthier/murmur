@@ -8,3 +8,5 @@ must grant nothing to group/other (0600 files, 0700 dirs).
 Harness-minted material (`node.key`) and operator-owned paths are
 audit-logged, never asserted, since no product change can alter
 fixture-chosen modes.
+The audit records the node, data, log, and TLS directories plus configuration,
+log, and certificate files exposed by the current harness.

@@ -16,6 +16,7 @@ import (
 	"github.com/marcgauthier/murmur"
 	"github.com/marcgauthier/murmur/examples/internal/demoidentity"
 	"github.com/marcgauthier/murmur/ids"
+	"github.com/marcgauthier/murmur/q"
 )
 
 type document struct {
@@ -30,8 +31,11 @@ func main() {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	definition, err := murmur.Define[document]("documents", 13, murmur.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Title": 2},
+	definition, err := murmur.Model[document](murmur.ModelOptions{
+		Name: "documents", TableID: 13,
+		RecordOptions: murmur.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Title": 2},
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -45,23 +49,18 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
-	documents, err := murmur.TableOf[document](db, "documents")
-	if err != nil {
-		log.Fatal(err)
-	}
 	titles := []string{"replication basics", "replication recovery", "encrypted storage"}
 	if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
 		rows := make([]*document, len(titles))
 		for i, title := range titles {
 			rows[i] = &document{ID: murmur.NewRowID(), Title: title}
 		}
-		return documents.InsertMany(tx, rows)
+		return tx.InsertMany(rows)
 	}); err != nil {
 		log.Fatal(err)
 	}
-	title := murmur.StringFieldOf[document](documents, "Title")
-	matches, err := documents.Where(title.StartsWith("replication")).OrderByAsc(murmur.FieldOf[document, string](documents, "Title")).Find()
-	if err != nil {
+	var matches []document
+	if err := db.Query(document{}, q.StartsWith("Title", "replication")).OrderBy("Title").FindInto(&matches); err != nil {
 		log.Fatal(err)
 	}
 	for _, match := range matches {

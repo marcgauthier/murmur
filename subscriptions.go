@@ -21,7 +21,7 @@ const (
 
 // subscriptionManager owns process-local observer cursors and wakes typed
 // record subscriptions after local writes, remote applies, or materializer
-// rebuilds. Query evaluation belongs to RecordSubscription, not this manager.
+// rebuilds. Query evaluation belongs to recordSubscription, not this manager.
 type subscriptionManager struct {
 	cfg    SubscriptionConfig
 	ctx    context.Context

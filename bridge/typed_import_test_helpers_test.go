@@ -24,22 +24,18 @@ func openTypedContactDBAt(t *testing.T, dir string, node db.NodeID) *db.DB {
 
 func insertTypedContact(t *testing.T, database *db.DB, id ids.RowID, name string, score int64) {
 	t.Helper()
-	table, err := db.TableOf[typedBridgeContactRecord](database, "contacts")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.WriteTxContext(context.Background(), func(tx *db.Tx) error {
-		return table.Insert(tx, &typedBridgeContactRecord{ID: id, Name: &name, Score: &score})
-	}); err != nil {
+	if err := database.InsertItem(context.Background(), &typedBridgeContactRecord{ID: id, Name: &name, Score: &score}); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func defineExpandedContact(t *testing.T) db.TableDefinition {
 	t.Helper()
-	definition, err := db.Define[typedBridgeContactExpanded]("contacts", 90, db.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Score": 3, "Email": 4},
+	definition, err := db.Model[typedBridgeContactExpanded](db.ModelOptions{
+		Name: "contacts", TableID: 90,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Name": 2, "Score": 3, "Email": 4},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -49,9 +45,11 @@ func defineExpandedContact(t *testing.T) db.TableDefinition {
 
 func defineBaseContact(t *testing.T) db.TableDefinition {
 	t.Helper()
-	definition, err := db.Define[typedBridgeContactRecord]("contacts", 90, db.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Score": 3},
+	definition, err := db.Model[typedBridgeContactRecord](db.ModelOptions{
+		Name: "contacts", TableID: 90,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Name": 2, "Score": 3},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -61,9 +59,11 @@ func defineBaseContact(t *testing.T) db.TableDefinition {
 
 func defineTypedNope(t *testing.T) db.TableDefinition {
 	t.Helper()
-	definition, err := db.Define[typedBridgeNopeRecord]("nope", 91, db.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs:     map[string]uint32{"ID": 1, "C": 2},
+	definition, err := db.Model[typedBridgeNopeRecord](db.ModelOptions{
+		Name: "nope", TableID: 91,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "C": 2},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -73,10 +73,12 @@ func defineTypedNope(t *testing.T) db.TableDefinition {
 
 func defineContactRatio(t *testing.T) db.TableDefinition {
 	t.Helper()
-	definition, err := db.Define[typedBridgeContactRatioRecord]("contacts", 90, db.RecordOptions{
-		PrimaryField:  "ID",
-		FieldIDs:      map[string]uint32{"ID": 1, "Name": 2, "Score": 3, "Ratio": 4},
-		MergePolicies: map[string]db.RecordMergePolicy{"Ratio": db.RecordMergeMax},
+	definition, err := db.Model[typedBridgeContactRatioRecord](db.ModelOptions{
+		Name: "contacts", TableID: 90,
+		RecordOptions: db.RecordOptions{
+			FieldIDs:      map[string]uint32{"ID": 1, "Name": 2, "Score": 3, "Ratio": 4},
+			MergePolicies: map[string]db.RecordMergePolicy{"Ratio": db.RecordMergeMax},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -265,45 +267,26 @@ func encodeTypedContactsBatches(t *testing.T, batches []Batch) []Batch {
 
 func typedContactValue(t *testing.T, database *db.DB, key ids.RowID) (*typedBridgeContactRecord, bool) {
 	t.Helper()
-	table, err := db.TableOf[typedBridgeContactRecord](database, "contacts")
-	if err != nil {
+	value := typedBridgeContactRecord{ID: key}
+	if err := database.GetItem(context.Background(), &value); err != nil {
+		if errors.Is(err, rime.ErrNotFound) {
+			return nil, false
+		}
 		t.Fatal(err)
 	}
-	value, err := table.Get(key)
-	if errors.Is(err, rime.ErrNotFound) {
-		return nil, false
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	return value, true
+	return &value, true
 }
 
 func typedContactInsert(t *testing.T, database *db.DB, key ids.RowID, name string, score int64) {
 	t.Helper()
-	table, err := db.TableOf[typedBridgeContactRecord](database, "contacts")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.WriteTxContext(context.Background(), func(tx *db.Tx) error {
-		return table.Insert(tx, &typedBridgeContactRecord{ID: key, Name: &name, Score: &score})
-	}); err != nil {
+	if err := database.InsertItem(context.Background(), &typedBridgeContactRecord{ID: key, Name: &name, Score: &score}); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func typedContactSetName(t *testing.T, database *db.DB, key ids.RowID, name string) {
 	t.Helper()
-	table, err := db.TableOf[typedBridgeContactRecord](database, "contacts")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.WriteTxContext(context.Background(), func(tx *db.Tx) error {
-		return table.Update(tx, key, func(value *typedBridgeContactRecord) error {
-			value.Name = &name
-			return nil
-		})
-	}); err != nil {
+	if err := database.Update(context.Background(), &typedBridgeContactRecord{ID: key}, db.Set("Name", &name)); err != nil {
 		t.Fatal(err)
 	}
 }

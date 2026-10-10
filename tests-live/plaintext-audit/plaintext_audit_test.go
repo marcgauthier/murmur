@@ -35,12 +35,14 @@ type auditTypedRecord struct {
 
 func typedDefinition(t *testing.T) db.TableDefinition {
 	t.Helper()
-	definition, err := db.Define[auditTypedRecord]("live_typed_records", 901, db.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
-		MergePolicies: map[string]db.RecordMergePolicy{
-			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
-			"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+	definition, err := db.Model[auditTypedRecord](db.ModelOptions{
+		Name: "live_typed_records", TableID: 901,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
+			MergePolicies: map[string]db.RecordMergePolicy{
+				"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
+				"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+			},
 		},
 	})
 	if err != nil {

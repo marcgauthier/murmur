@@ -505,13 +505,17 @@ func scrapeMetrics(t *testing.T, apiAddr string) string {
 	return string(raw)
 }
 
+type ruRow struct {
+	ID ids.RowID `rime:"primary"`
+}
+
 func offlineConfig(t *testing.T, dataDir string, cluster *harness.Cluster, nodeID string) db.Config {
 	t.Helper()
-	typed, err := db.Define[struct {
-		ID ids.RowID `rime:"primary"`
-	}]("ru_rows", 1, db.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs:     map[string]uint32{"ID": 1},
+	typed, err := db.Model[ruRow](db.ModelOptions{
+		Name: "ru_rows", TableID: 1,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)

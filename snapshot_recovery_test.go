@@ -17,7 +17,7 @@ type snapshotRecord struct {
 
 func snapshotRecordDefinition(t *testing.T) TableDefinition {
 	t.Helper()
-	definition, err := Define[snapshotRecord]("contacts", 1, RecordOptions{
+	definition, err := define[snapshotRecord]("contacts", 1, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Phone": 3},
 	})
@@ -37,7 +37,7 @@ func snapshotReplConfig(t *testing.T, path string, node NodeID, dbid DBID, tls *
 
 func waitForTypedSnapshotRows(t testing.TB, db *DB, want int, timeout time.Duration) []*snapshotRecord {
 	t.Helper()
-	table, err := TableOf[snapshotRecord](db, "contacts")
+	table, err := tableOf[snapshotRecord](db, "contacts")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func waitForTypedSnapshotRows(t testing.TB, db *DB, want int, timeout time.Durat
 	return nil
 }
 
-func writeSnapshotRecord(t testing.TB, db *DB, table *RecordTable[snapshotRecord], value *snapshotRecord) {
+func writeSnapshotRecord(t testing.TB, db *DB, table *recordTable[snapshotRecord], value *snapshotRecord) {
 	t.Helper()
 	if err := db.WriteTxContext(context.Background(), func(tx *Tx) error {
 		return table.Insert(tx, value)
@@ -85,7 +85,7 @@ func TestSnapshotRestartServesPublishedRows(t *testing.T) {
 	}
 	defer dbA.Close()
 	addrA := waitForAddr(t, dbA, 5*time.Second)
-	tableA, err := TableOf[snapshotRecord](dbA, "contacts")
+	tableA, err := tableOf[snapshotRecord](dbA, "contacts")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestSnapshotRestartServesPublishedRows(t *testing.T) {
 		t.Fatalf("reopened generation = %d, want %d", gen2, gen)
 	}
 	// And C replicates normally after the restart: write on C, read on A.
-	tableC, err := TableOf[snapshotRecord](dbC, "contacts")
+	tableC, err := tableOf[snapshotRecord](dbC, "contacts")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func TestSnapshotSlowTransferSustainedWritesAndAggressiveGC(t *testing.T) {
 	}
 	defer dbA.Close()
 	addrA := waitForAddr(t, dbA, 5*time.Second)
-	tableA, err := TableOf[snapshotRecord](dbA, "contacts")
+	tableA, err := tableOf[snapshotRecord](dbA, "contacts")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func TestSnapshotSlowTransferSustainedWritesAndAggressiveGC(t *testing.T) {
 		<-writerDone
 		t.Fatal(err)
 	}
-	tableC, err := TableOf[snapshotRecord](dbC, "contacts")
+	tableC, err := tableOf[snapshotRecord](dbC, "contacts")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +276,7 @@ func TestSnapshotTransferInterruptedBySourceAndReceiverRestarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	addrA := waitForAddr(t, dbA, 5*time.Second)
-	tableA, err := TableOf[snapshotRecord](dbA, "contacts")
+	tableA, err := tableOf[snapshotRecord](dbA, "contacts")
 	if err != nil {
 		t.Fatal(err)
 	}

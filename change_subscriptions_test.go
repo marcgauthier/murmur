@@ -17,7 +17,7 @@ func TestChangeSubscriptionSignalsTypedCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sub.Close()
-	table, err := TableOf[testContactRecord](db, "contacts")
+	table, err := tableOf[testContactRecord](db, "contacts")
 	if err != nil {
 		t.Fatal(err)
 	}

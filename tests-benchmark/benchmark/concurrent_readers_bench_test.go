@@ -12,9 +12,10 @@ import (
 	"time"
 
 	"github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/q"
 )
 
-// Concurrent-reader query benchmarks against the in-memory typed materializer.
+// Concurrent-reader query benchmarks against the in-memory materializer.
 //
 // Every case opens the shared dataset template and rebuilds its in-memory
 // RIME view. N reader goroutines issue queries concurrently behind a start
@@ -47,29 +48,18 @@ func readerCounts() []int {
 	return []int{1, 2, 4, 8, 16, 32}
 }
 
-// benchHandles resolves the typed tables once per benchmark so measured
-// queries pay no handle-lookup overhead.
+// benchHandles carries the database so measured queries share one handle.
 type benchHandles struct {
-	contacts *murmur.RecordTable[benchContact]
-	orders   *murmur.RecordTable[benchOrder]
+	db *murmur.DB
 }
 
 func openBenchHandles(b testing.TB, db *murmur.DB) *benchHandles {
 	b.Helper()
-	contacts, err := murmur.TableOf[benchContact](db, "contacts")
-	if err != nil {
-		b.Fatal(err)
-	}
-	orders, err := murmur.TableOf[benchOrder](db, "orders")
-	if err != nil {
-		b.Fatal(err)
-	}
-	return &benchHandles{contacts: contacts, orders: orders}
+	return &benchHandles{db: db}
 }
 
-// openTypedMemoryDB copies the n-row template to a fresh directory,
-// opens it, and resolves the typed tables.
-func openTypedMemoryDB(b testing.TB, n int) (*murmur.DB, *benchHandles, []murmur.RowID) {
+// openMemoryDB copies the n-row template to a fresh directory and opens it.
+func openMemoryDB(b testing.TB, n int) (*murmur.DB, *benchHandles, []murmur.RowID) {
 	b.Helper()
 	tmpl := templateFor(b, n)
 	dest := b.TempDir()
@@ -89,19 +79,19 @@ func openTypedMemoryDB(b testing.TB, n int) (*murmur.DB, *benchHandles, []murmur
 type readerQuery func(ctx context.Context, tables *benchHandles, ids []murmur.RowID, rng *rand.Rand, i int) (int, error)
 
 func pkLookupQuery(ctx context.Context, tables *benchHandles, ids []murmur.RowID, rng *rand.Rand, _ int) (int, error) {
-	got, err := tables.contacts.Get(ids[rng.Intn(len(ids))])
-	if err != nil {
+	var got benchContact
+	got.ID = ids[rng.Intn(len(ids))]
+	if err := tables.db.GetItem(ctx, &got); err != nil {
 		return 0, err
 	}
 	_ = got
 	return 1, nil
 }
 
-func rangeLookupQuery(ctx context.Context, tables *benchHandles, _ []murmur.RowID, _ *rand.Rand, i int) (int, error) {
+func rangeLookupQuery(_ context.Context, tables *benchHandles, _ []murmur.RowID, _ *rand.Rand, i int) (int, error) {
 	lo := int64((i * 131) % 900)
-	scoreField := murmur.NumericFieldOf[benchContact, int64](tables.contacts, "Score")
-	rows, err := tables.contacts.Where(scoreField.Between(lo, lo+100)).Limit(100).Find()
-	if err != nil {
+	var rows []benchContact
+	if err := tables.db.Query(benchContact{}, q.Between("Score", lo, lo+100)).Limit(100).FindInto(&rows); err != nil {
 		return 0, err
 	}
 	return len(rows), nil
@@ -118,9 +108,8 @@ func mixedLookupQuery(ctx context.Context, tables *benchHandles, ids []murmur.Ro
 // indexed equality probe, the cheapest query shape in the suite.
 func indexedEqualityQuery(n int) readerQuery {
 	return func(ctx context.Context, tables *benchHandles, _ []murmur.RowID, _ *rand.Rand, i int) (int, error) {
-		nameField := murmur.FieldOf[benchContact, string](tables.contacts, "Name")
-		rows, err := tables.contacts.Where(nameField.Eq(fmt.Sprintf("ann smith %d", (i*7919)%n))).Find()
-		if err != nil {
+		var rows []benchContact
+		if err := tables.db.Find(ctx, &rows, q.Eq("Name", fmt.Sprintf("ann smith %d", (i*7919)%n))); err != nil {
 			return 0, err
 		}
 		return len(rows), nil
@@ -128,12 +117,12 @@ func indexedEqualityQuery(n int) readerQuery {
 }
 
 // runConcurrentReaders drives b.N queries from readers goroutines against
-// the in-memory typed store and reports per-query latency percentiles
+// the in-memory store and reports per-query latency percentiles
 // plus wall-clock throughput. When expectedRows >= 0 every query must scan
 // exactly that many rows.
 func runConcurrentReaders(b *testing.B, n, readers int, q readerQuery, expectedRows int) {
 	b.Helper()
-	db, tables, ids := openTypedMemoryDB(b, n)
+	db, tables, ids := openMemoryDB(b, n)
 	_ = db
 	ctx := context.Background()
 	b.ReportMetric(float64(readers), "readers")
@@ -247,7 +236,7 @@ type readerResult struct {
 }
 
 // TestConcurrentReaderThroughput measures sustained multi-reader query
-// rate against the in-memory typed store over a fixed wall-clock window
+// rate against the in-memory store over a fixed wall-clock window
 // (MURMUR_READ_BENCH_SECONDS, default 10). Readers alternate point and range
 // lookups on a 10K-row store; every point lookup must return exactly one row.
 func TestConcurrentReaderThroughput(t *testing.T) {
@@ -262,7 +251,7 @@ func TestConcurrentReaderThroughput(t *testing.T) {
 	const rows = 10_000
 	for _, readers := range readerCounts() {
 		t.Run(fmt.Sprintf("%d_readers", readers), func(t *testing.T) {
-			db, tables, ids := openTypedMemoryDB(t, rows)
+			db, tables, ids := openMemoryDB(t, rows)
 			_ = db
 			ctx := context.Background()
 			startGate := make(chan struct{})

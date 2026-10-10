@@ -17,7 +17,7 @@ import (
 	"github.com/marcgauthier/murmur/state"
 )
 
-func startTypedGroupWrites(db *DB, table *RecordTable[testContactRecord], count int) <-chan error {
+func startTypedGroupWrites(db *DB, table *recordTable[testContactRecord], count int) <-chan error {
 	results := make(chan error, count)
 	for i := 0; i < count; i++ {
 		go func(i int) {
@@ -32,7 +32,7 @@ func startTypedGroupWrites(db *DB, table *RecordTable[testContactRecord], count 
 
 func typedContactCount(t *testing.T, db *DB) int {
 	t.Helper()
-	table, err := TableOf[testContactRecord](db, "contacts")
+	table, err := tableOf[testContactRecord](db, "contacts")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestGroupCommitSharedFsyncFailureFailsEveryMember(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.grouper.maxDelay = time.Hour
-	table, err := TableOf[testContactRecord](db, "contacts")
+	table, err := tableOf[testContactRecord](db, "contacts")
 	if err != nil {
 		_ = db.Close()
 		t.Fatal(err)
@@ -146,7 +146,7 @@ func TestGroupCommitCrashBeforeSpoolCommit(t *testing.T) {
 			}
 			return nil
 		}}
-		table, err := TableOf[testContactRecord](db, "contacts")
+		table, err := tableOf[testContactRecord](db, "contacts")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -196,7 +196,7 @@ func TestGroupCommitCloseWhileGroupPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.grouper.maxDelay = time.Hour
-	table, err := TableOf[testContactRecord](db, "contacts")
+	table, err := tableOf[testContactRecord](db, "contacts")
 	if err != nil {
 		_ = db.Close()
 		t.Fatal(err)

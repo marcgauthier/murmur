@@ -18,9 +18,7 @@ type metricsContact struct {
 
 func TestJSONHandlerLiveDB(t *testing.T) {
 	ctx := context.Background()
-	definition, err := murmur.Define[metricsContact]("contacts", 1, murmur.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Name": 2},
-	})
+	definition, err := murmur.Model[metricsContact]()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,13 +35,7 @@ func TestJSONHandlerLiveDB(t *testing.T) {
 	}
 	defer db.Close()
 	id := murmur.NewRowID()
-	if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
-		table, err := murmur.TableOf[metricsContact](db, "contacts")
-		if err != nil {
-			return err
-		}
-		return table.Insert(tx, &metricsContact{ID: id, Name: "ann"})
-	}); err != nil {
+	if err := db.InsertItem(ctx, &metricsContact{ID: id, Name: "ann"}); err != nil {
 		t.Fatal(err)
 	}
 

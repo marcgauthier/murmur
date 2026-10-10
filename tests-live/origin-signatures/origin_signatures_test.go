@@ -37,19 +37,24 @@ type signedLocalRecord struct {
 }
 
 func signedTableDefinitions() ([]db.TableDefinition, error) {
-	replicated, err := db.Define[signedRecord]("live_typed_records", 901, db.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
-		MergePolicies: map[string]db.RecordMergePolicy{
-			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
-			"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+	replicated, err := db.Model[signedRecord](db.ModelOptions{
+		Name: "live_typed_records", TableID: 901,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
+			MergePolicies: map[string]db.RecordMergePolicy{
+				"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
+				"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+			},
 		},
 	})
 	if err != nil {
 		return nil, err
 	}
-	local, err := db.Define[signedLocalRecord]("live_node_local_records", 902, db.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Name": 2}, Scope: db.TableScopeNodeLocal,
+	local, err := db.Model[signedLocalRecord](db.ModelOptions{
+		Name: "live_node_local_records", TableID: 902,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Name": 2}, Scope: db.TableScopeNodeLocal,
+		},
 	})
 	if err != nil {
 		return nil, err

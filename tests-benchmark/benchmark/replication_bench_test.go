@@ -105,10 +105,6 @@ func BenchmarkReplicationThroughput(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer dbB.Close()
-	contactsA, err := murmur.TableOf[benchContact](dbA, "contacts")
-	if err != nil {
-		b.Fatal(err)
-	}
 	waitConnected(b, dbB, 10)
 	before := dbB.Status().Replication
 	b.ResetTimer()
@@ -118,7 +114,7 @@ func BenchmarkReplicationThroughput(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if err := contactsA.Insert(tx, &benchContact{
+		if err := tx.InsertItem(&benchContact{
 			ID: murmur.NewRowID(), Name: fmt.Sprintf("t %d", i),
 			Phone: fmt.Sprintf("555-%04d", i), Score: int64(i % 1000),
 		}); err != nil {

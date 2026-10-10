@@ -133,11 +133,11 @@ func TestAckDeadlineRenewalOnlyOnAdvance(t *testing.T) {
 	nodeA, _, dbA, dbB := openPairForMembership(t, nil)
 	defer dbA.Close()
 	defer dbB.Close()
-	tableA, err := TableOf[facadeRecord](dbA, "records")
+	tableA, err := tableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tableB, err := TableOf[facadeRecord](dbB, "records")
+	tableB, err := tableOf[facadeRecord](dbB, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,11 +187,11 @@ func TestGCRetentionDeadlineIndependentOfLastSeen(t *testing.T) {
 	})
 	defer dbA.Close()
 	defer dbB.Close()
-	tableA, err := TableOf[facadeRecord](dbA, "records")
+	tableA, err := tableOf[facadeRecord](dbA, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tableB, err := TableOf[facadeRecord](dbB, "records")
+	tableB, err := tableOf[facadeRecord](dbB, "records")
 	if err != nil {
 		t.Fatal(err)
 	}

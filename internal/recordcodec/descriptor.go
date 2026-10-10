@@ -282,7 +282,7 @@ func compileType(typ reflect.Type, path string, depth int, opts CompileOptions, 
 		seen := make(map[uint32]bool)
 		for i := 0; i < typ.NumField(); i++ {
 			f := typ.Field(i)
-			if f.PkgPath != "" || f.Tag.Get("murmur") == "-" {
+			if f.PkgPath != "" || f.Tag.Get("murmur") == "-" || ignoredRIMEField(f.Tag.Get("rime")) {
 				continue
 			}
 			fieldPath := childPath(path, f.Name)
@@ -394,3 +394,12 @@ func validMergeType(policy MergePolicy, descriptor *Descriptor) bool {
 // StableFieldIDKey returns the path key used by Compile. Go field paths are
 // registration inputs only; encoded manifests contain the resulting numeric IDs.
 func StableFieldIDKey(path ...string) string { return strings.Join(path, ".") }
+
+func ignoredRIMEField(tag string) bool {
+	for _, part := range strings.Split(tag, ",") {
+		if strings.TrimSpace(part) == "-" {
+			return true
+		}
+	}
+	return false
+}

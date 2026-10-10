@@ -45,3 +45,13 @@ probes are also rejected or treated as opaque object keys; none escape into the
 filesystem.
 
 Run with `bash tests-live/run.sh typed-records`.
+
+The model application scenario registers a reflection-based `Config.Models`
+collection on both nodes, uses generated UUIDv5 identity and the item API, and
+checks indexed queries, atomic batch insertion, partial updates, peer restart,
+explicit `MigrateModels`, deletion propagation and tombstone recovery.
+
+`TestModelReadShortcutsRichPredicatesAndAssignmentsReplicate` exercises
+model-inferred reads, `Set` updates, named string predicates, inclusive ranges,
+negative membership, and timestamp comparisons across zones on separate
+QUIC/TLS nodes, then verifies those results after restarting a peer.

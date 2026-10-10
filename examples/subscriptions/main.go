@@ -1,4 +1,4 @@
-// Command subscriptions shows a typed query subscription receiving an initial
+// Command subscriptions shows a query subscription receiving an initial
 // snapshot and an update after a durable record batch.
 //
 // Run it with:
@@ -31,8 +31,11 @@ func main() {
 	}
 	defer os.RemoveAll(dir)
 
-	definition, err := murmur.Define[task]("tasks", 19, murmur.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Title": 2},
+	definition, err := murmur.Model[task](murmur.ModelOptions{
+		Name: "tasks", TableID: 19,
+		RecordOptions: murmur.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Title": 2},
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -51,11 +54,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
-	tasks, err := murmur.TableOf[task](db, "tasks")
-	if err != nil {
-		log.Fatal(err)
-	}
-	sub, err := tasks.Subscribe(ctx, murmur.RecordSubscriptionOptions{})
+	sub, err := db.Subscribe(ctx, task{}, murmur.ItemSubscriptionOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -64,7 +63,7 @@ func main() {
 	fmt.Printf("event type=%s cursor=%d rows=%d\n", initial.Type, initial.Cursor, len(initial.Rows))
 
 	if err := db.WriteTxContext(ctx, func(tx *murmur.Tx) error {
-		return tasks.InsertMany(tx, []*task{
+		return tx.InsertMany([]*task{
 			{ID: murmur.NewRowID(), Title: "first"},
 			{ID: murmur.NewRowID(), Title: "second"},
 		})
@@ -77,7 +76,7 @@ func main() {
 		fmt.Printf("event type=%s cursor=%d rows=%d\n", update.Type, update.Cursor, len(update.Rows))
 		if len(update.Rows) == 2 {
 			for _, row := range update.Rows {
-				fmt.Printf("  row: %s\n", row.Title)
+				fmt.Printf("  row: %s\n", row.(*task).Title)
 			}
 			fmt.Printf("subscription cursor now %d\n", sub.Cursor())
 			return
@@ -88,7 +87,7 @@ func main() {
 	}
 }
 
-func receive(sub *murmur.RecordSubscription[task], timeout time.Duration) murmur.RecordSubscriptionEvent[task] {
+func receive(sub *murmur.ItemSubscription, timeout time.Duration) murmur.ItemSubscriptionEvent {
 	if timeout <= 0 {
 		log.Fatal("timed out waiting for subscription event")
 	}
@@ -106,5 +105,5 @@ func receive(sub *murmur.RecordSubscription[task], timeout time.Duration) murmur
 	case <-timer.C:
 		log.Fatal("timed out waiting for subscription event")
 	}
-	return murmur.RecordSubscriptionEvent[task]{}
+	return murmur.ItemSubscriptionEvent{}
 }

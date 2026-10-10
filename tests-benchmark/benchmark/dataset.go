@@ -47,16 +47,20 @@ type benchOrder struct {
 // mustBenchTables returns the compiled benchmark table definitions.
 // Definition failures are programmer errors, so it panics.
 func mustBenchTables() []murmur.TableDefinition {
-	contacts, err := murmur.Define[benchContact]("contacts", 91, murmur.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Phone": 3, "Score": 4},
+	contacts, err := murmur.Model[benchContact](murmur.ModelOptions{
+		Name: "contacts", TableID: 91,
+		RecordOptions: murmur.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Name": 2, "Phone": 3, "Score": 4},
+		},
 	})
 	if err != nil {
 		panic(err)
 	}
-	orders, err := murmur.Define[benchOrder]("orders", 92, murmur.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs:     map[string]uint32{"ID": 1, "ContactID": 2, "Amount": 3},
+	orders, err := murmur.Model[benchOrder](murmur.ModelOptions{
+		Name: "orders", TableID: 92,
+		RecordOptions: murmur.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "ContactID": 2, "Amount": 3},
+		},
 	})
 	if err != nil {
 		panic(err)
@@ -132,14 +136,6 @@ func openBenchDB(b *testing.B, path string) *murmur.DB {
 func populate(b testing.TB, db *murmur.DB, n int) []murmur.RowID {
 	b.Helper()
 	ctx := context.Background()
-	contacts, err := murmur.TableOf[benchContact](db, "contacts")
-	if err != nil {
-		b.Fatal(err)
-	}
-	orders, err := murmur.TableOf[benchOrder](db, "orders")
-	if err != nil {
-		b.Fatal(err)
-	}
 	rng := rand.New(rand.NewSource(42))
 	ids := make([]murmur.RowID, 0, n)
 	const perTx = 5000
@@ -157,13 +153,13 @@ func populate(b testing.TB, db *murmur.DB, n int) []murmur.RowID {
 			ids = append(ids, id)
 			name := fmt.Sprintf("%s %s %d", firstNames[i%len(firstNames)], lastNames[(i/len(firstNames))%len(lastNames)], i)
 			phone := fmt.Sprintf("555-%04d", i%10000)
-			if err := contacts.Insert(tx, &benchContact{
+			if err := tx.InsertItem(&benchContact{
 				ID: id, Name: name, Phone: phone, Score: int64(rng.Intn(1000)),
 			}); err != nil {
 				b.Fatal(err)
 			}
 			for o := 0; o < 2; o++ {
-				if err := orders.Insert(tx, &benchOrder{
+				if err := tx.InsertItem(&benchOrder{
 					ID: murmur.NewRowID(), ContactID: id, Amount: int64(rng.Intn(500)),
 				}); err != nil {
 					b.Fatal(err)

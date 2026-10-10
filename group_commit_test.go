@@ -96,7 +96,7 @@ func TestGroupCommitConcurrentWriters(t *testing.T) {
 	const writers = 8
 	const perWriter = 25
 	total := writers * perWriter
-	table, err := TableOf[testContactRecord](db, "contacts")
+	table, err := tableOf[testContactRecord](db, "contacts")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestGroupCommitConcurrentWriters(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err = TableOf[testContactRecord](db, "contacts")
+	table, err = tableOf[testContactRecord](db, "contacts")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestGroupCommitDisabledCommitsAlone(t *testing.T) {
 		t.Fatal("group commit enabled despite negative MaxDelay")
 	}
 	id := ids.NewRowID()
-	table, err := TableOf[testContactRecord](db, "contacts")
+	table, err := tableOf[testContactRecord](db, "contacts")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestGroupCommitContendedRowConverges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[testContactRecord](db, "contacts")
+	table, err := tableOf[testContactRecord](db, "contacts")
 	if err != nil {
 		_ = db.Close()
 		t.Fatal(err)
@@ -272,7 +272,7 @@ func TestGroupCommitContendedRowConverges(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err = TableOf[testContactRecord](db, "contacts")
+	table, err = tableOf[testContactRecord](db, "contacts")
 	if err != nil {
 		t.Fatal(err)
 	}

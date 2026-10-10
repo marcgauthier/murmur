@@ -465,7 +465,7 @@ func TestCoordinatorCoversMutationPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}

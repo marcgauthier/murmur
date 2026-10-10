@@ -4,7 +4,7 @@ This document tracks the implementation state of the rich Go record schema
 described in [the migration plan](migration-plan.md#4-record-schema-encoding-and-evolution).
 The production cutover has removed the legacy SQL engine. The typed facade
 provides
-available through `Define[T]`, `Config.Tables`, `TableOf[T]`, and
+available through `Config.Models`, `Model[T]`, `Define[T]`, `Config.Tables`, `TableOf[T]`, and
 `DB.WriteTxContext`; typed mode disables SQL entry points. `Open` binds the
 compiled definitions to a private RIME database, rebuilds it from encrypted
 Spool on open and after completed snapshots, and routes local and accepted
@@ -56,6 +56,9 @@ transaction/import fallback has been removed.
 primary field and stable field IDs. The replicated primary key must be a
 16-byte array. Every exported persisted field, including fields in nested
 structs, requires a nonzero ID supplied separately from Go declaration order.
+`Model[T]` and runtime model exemplars generate these identities; `Define[T]`
+keeps explicit IDs. See [automatic models](model-api.md) for derivation and
+legacy overrides. Both `murmur:"-"` and `rime:"-"` exclude persisted fields.
 The compiler retains Go field names only as local bindings; IDs and value kinds
 are the durable identities.
 
@@ -132,3 +135,8 @@ descriptors still fail closed.
 Sources: [descriptor.go](../internal/recordcodec/descriptor.go),
 [RIME presence types](../rime/optional.go), and
 [the migration plan](migration-plan.md#4-record-schema-encoding-and-evolution).
+
+Nil slice and map decoders now consume their absence tag before checking
+trailing bytes, matching pointer/Optional and byte-slice handling. This changes
+no encoded bytes; it allows existing canonical nil collections to survive
+updates and reopen while retaining trailing-byte rejection.

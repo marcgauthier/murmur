@@ -44,7 +44,7 @@ func TestDiskFullFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestDiskFullFailsClosed(t *testing.T) {
 	if st := db2.Status().State; st != StateReady {
 		t.Fatalf("reopened state = %s, want ready", st)
 	}
-	table2, err := TableOf[facadeRecord](db2, "records")
+	table2, err := tableOf[facadeRecord](db2, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestLegacyAckPeersAdmitted(t *testing.T) {
 	}
 	defer db.Close()
 
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}

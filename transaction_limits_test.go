@@ -49,7 +49,7 @@ func TestTypedTransactionMaxTransactionBytesEnforced(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}

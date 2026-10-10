@@ -46,19 +46,24 @@ type permissionLocalRecord struct {
 }
 
 func tableDefinitions() ([]db.TableDefinition, error) {
-	replicated, err := db.Define[permissionRecord]("live_typed_records", 901, db.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
-		MergePolicies: map[string]db.RecordMergePolicy{
-			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
-			"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+	replicated, err := db.Model[permissionRecord](db.ModelOptions{
+		Name: "live_typed_records", TableID: 901,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
+			MergePolicies: map[string]db.RecordMergePolicy{
+				"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
+				"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+			},
 		},
 	})
 	if err != nil {
 		return nil, err
 	}
-	local, err := db.Define[permissionLocalRecord]("live_node_local_records", 902, db.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Name": 2}, Scope: db.TableScopeNodeLocal,
+	local, err := db.Model[permissionLocalRecord](db.ModelOptions{
+		Name: "live_node_local_records", TableID: 902,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Name": 2}, Scope: db.TableScopeNodeLocal,
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -201,7 +206,7 @@ func logModeTable(t *testing.T, cluster *harness.Cluster) {
 	t.Helper()
 	for i, node := range cluster.Nodes {
 		for _, p := range []string{
-			node.Dir, node.DataDir, node.LogsDir, node.SchemaDir,
+			node.Dir, node.DataDir, node.LogsDir,
 			node.TLSDir, node.ConfigFile, node.LogFile,
 			filepath.Join(node.TLSDir, "ca.crt"),
 			filepath.Join(node.TLSDir, "node.crt"),

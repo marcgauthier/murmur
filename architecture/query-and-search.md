@@ -23,6 +23,11 @@ Support three classes of local index:
 
 Declare indexes with the RIME table schema for equality, range, sort, and join
 workloads. RIME compiles those declarations into its local index structures.
+The simple item API exposes comparisons, string predicates, inclusive ranges,
+and membership while preserving these plans. Named scalars and `time.Time`
+queries use checked runtime fields; timestamp index and predicate keys share
+UTC, monotonic-free instant semantics. See [model API](model-api.md) for the
+adapter behavior and [application usage](../USAGE.md) for syntax.
 
 ### FTS
 

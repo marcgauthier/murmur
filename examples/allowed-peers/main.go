@@ -35,18 +35,18 @@ func freePort() int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-func count(table *murmur.RecordTable[note]) int {
-	n, err := table.Where().Count()
+func count(db *murmur.DB) int {
+	n, err := db.Count(context.Background(), note{})
 	if err != nil {
 		log.Fatal(err)
 	}
 	return n
 }
 
-func waitCount(table *murmur.RecordTable[note], want int, timeout time.Duration) {
+func waitCount(db *murmur.DB, want int, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if count(table) == want {
+		if count(db) == want {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -69,14 +69,16 @@ func main() {
 	dbid := murmur.NewDBID()
 
 	const nodes = 3
-	definition, err := murmur.Define[note]("notes", 9, murmur.RecordOptions{PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Body": 2}})
+	definition, err := murmur.Model[note](murmur.ModelOptions{
+		Name: "notes", TableID: 9,
+		RecordOptions: murmur.RecordOptions{FieldIDs: map[string]uint32{"ID": 1, "Body": 2}},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	ids := make([]murmur.NodeID, nodes)
 	addrs := make([]string, nodes)
 	dbs := make([]*murmur.DB, nodes)
-	tables := make([]*murmur.RecordTable[note], nodes)
 	for i := range ids {
 		ids[i] = murmur.NewNodeID()
 		addrs[i] = fmt.Sprintf("127.0.0.1:%d", freePort())
@@ -126,37 +128,33 @@ func main() {
 			log.Fatal(err)
 		}
 		defer dbs[i].Close()
-		tables[i], err = murmur.TableOf[note](dbs[i], "notes")
-		if err != nil {
-			log.Fatal(err)
-		}
 	}
 
 	for r := 0; r < 2; r++ {
 		if err := dbs[0].WriteTxContext(ctx, func(tx *murmur.Tx) error {
-			return tables[0].Insert(tx, &note{ID: murmur.NewRowID(), Body: fmt.Sprintf("mesh-%d", r)})
+			return tx.InsertItem(&note{ID: murmur.NewRowID(), Body: fmt.Sprintf("mesh-%d", r)})
 		}); err != nil {
 			log.Fatal(err)
 		}
 	}
-	waitCount(tables[1], 2, 30*time.Second)
+	waitCount(dbs[1], 2, 30*time.Second)
 
 	// Negative checks need a settle margin: isolation means node 3
 	// holds nothing after the mesh has long converged.
 	time.Sleep(3 * time.Second)
-	if got := count(tables[2]); got != 0 {
+	if got := count(dbs[2]); got != 0 {
 		log.Fatalf("node 3 received %d mesh rows despite the allow-list", got)
 	}
 	fmt.Println("mesh converged on nodes 1-2; node 3 received nothing")
 
 	id := murmur.NewRowID()
 	if err := dbs[2].WriteTxContext(ctx, func(tx *murmur.Tx) error {
-		return tables[2].Insert(tx, &note{ID: id, Body: "stranded"})
+		return tx.InsertItem(&note{ID: id, Body: "stranded"})
 	}); err != nil {
 		log.Fatal(err)
 	}
 	time.Sleep(3 * time.Second)
-	if got := count(tables[0]); got != 2 {
+	if got := count(dbs[0]); got != 2 {
 		log.Fatalf("node 1 holds %d rows, want 2 (node 3 leaked in)", got)
 	}
 	fmt.Println("node 3's write stayed stranded; allow-list holds both directions")

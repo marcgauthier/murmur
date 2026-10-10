@@ -19,7 +19,7 @@ func TestBridgeLogSource(t *testing.T) {
 	}
 	defer db.Close()
 
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestBridgeSchema(t *testing.T) {
 	}
 	defer db.Close()
 
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestBridgeLogSourceProtectResume(t *testing.T) {
 	}
 	defer db.Close()
 
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}

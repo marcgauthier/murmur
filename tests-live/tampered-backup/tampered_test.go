@@ -40,9 +40,12 @@ type tamperedTypedRecord struct {
 
 func typedDefinition(t *testing.T) db.TableDefinition {
 	t.Helper()
-	definition, err := db.Define[tamperedTypedRecord]("live_typed_records", 901, db.RecordOptions{
-		PrimaryField: "ID", FieldIDs: map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
-		MergePolicies: map[string]db.RecordMergePolicy{"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin},
+	definition, err := db.Model[tamperedTypedRecord](db.ModelOptions{
+		Name: "live_typed_records", TableID: 901,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6},
+			MergePolicies: map[string]db.RecordMergePolicy{"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet, "Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -328,24 +331,14 @@ func openNodeDir(t *testing.T, ctx context.Context, cluster *harness.Cluster, no
 
 func countRows(ctx context.Context, t *testing.T, handle *db.DB) (int, error) {
 	t.Helper()
-	_ = ctx
-	rows, err := db.TableOf[tamperedTypedRecord](handle, "live_typed_records")
-	if err != nil {
-		return 0, err
-	}
-	return rows.Where().Count()
+	return handle.Count(ctx, tamperedTypedRecord{})
 }
 
 // offlineDigest uses the same canonical unique-name digest as TypedNames.
 func offlineDigest(ctx context.Context, t *testing.T, handle *db.DB) string {
 	t.Helper()
-	_ = ctx
-	rows, err := db.TableOf[tamperedTypedRecord](handle, "live_typed_records")
-	if err != nil {
-		t.Fatal(err)
-	}
-	records, err := rows.Where().Find()
-	if err != nil {
+	var records []tamperedTypedRecord
+	if err := handle.Find(ctx, &records); err != nil {
 		t.Fatal(err)
 	}
 	names := make([]string, 0, len(records))

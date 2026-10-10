@@ -60,12 +60,8 @@ func BenchmarkStartupComponents(b *testing.B) {
 				b.Fatal(err)
 			}
 			defer db.Close()
-			contacts, err := murmur.TableOf[benchContact](db, "contacts")
-			if err != nil {
-				b.Fatal(err)
-			}
 			qstart := time.Now()
-			count, err := contacts.Where().Count()
+			count, err := db.Count(ctx, benchContact{})
 			if err != nil {
 				b.Fatal(err)
 			}

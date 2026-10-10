@@ -162,11 +162,13 @@ func envScale(t *testing.T) int {
 func runCell(t *testing.T, ctx context.Context, mode compMode, prof trafficProfile, scale int, seed int64) cellResult {
 	t.Helper()
 	dir := t.TempDir()
-	definition, err := db.Define[compressionRecord](prof.name, 401, db.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs: map[string]uint32{
-			"ID": 1, "Code": 2, "Qty": 3, "Price": 4, "Title": 5,
-			"Body": 6, "Tags": 7, "Kind": 8, "Payload": 9, "Data": 10,
+	definition, err := db.Model[compressionRecord](db.ModelOptions{
+		Name: prof.name, TableID: 401,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{
+				"ID": 1, "Code": 2, "Qty": 3, "Price": 4, "Title": 5,
+				"Body": 6, "Tags": 7, "Kind": 8, "Payload": 9, "Data": 10,
+			},
 		},
 	})
 	if err != nil {
@@ -190,11 +192,6 @@ func runCell(t *testing.T, ctx context.Context, mode compMode, prof trafficProfi
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := db.TableOf[compressionRecord](database, prof.name)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	rows := prof.rows * scale
 	rng := rand.New(rand.NewSource(seed))
 	rowIDs := make([]ids.RowID, 0, rows)
@@ -225,7 +222,7 @@ func runCell(t *testing.T, ctx context.Context, mode compMode, prof trafficProfi
 			fmt.Fprintf(hash, "%x", id[:])
 		}
 		if err := database.WriteTxContext(ctx, func(tx *db.Tx) error {
-			return table.InsertMany(tx, values)
+			return tx.InsertMany(values)
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -239,10 +236,13 @@ func runCell(t *testing.T, ctx context.Context, mode compMode, prof trafficProfi
 			}
 			if err := database.WriteTxContext(ctx, func(tx *db.Tx) error {
 				for i := base; i < end; i += 10 {
-					if err := table.Update(tx, rowIDs[i], func(record *compressionRecord) error {
-						prof.update(rng, record)
-						return nil
-					}); err != nil {
+					var record compressionRecord
+					record.ID = rowIDs[i]
+					if err := tx.GetItem(&record); err != nil {
+						return err
+					}
+					prof.update(rng, &record)
+					if err := tx.UpdateItem(&record); err != nil {
 						return err
 					}
 				}
@@ -254,7 +254,7 @@ func runCell(t *testing.T, ctx context.Context, mode compMode, prof trafficProfi
 	}
 	writeDur := time.Since(start)
 
-	count, err := table.Where().Count()
+	count, err := database.Count(ctx, compressionRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}

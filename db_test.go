@@ -47,7 +47,7 @@ const testKeyID = "test-key"
 
 func testConfig(path string) Config {
 	node := NewNodeID()
-	contacts, err := Define[testContactRecord]("contacts", 1, RecordOptions{
+	contacts, err := define[testContactRecord]("contacts", 1, RecordOptions{
 		PrimaryField: "ID",
 		FieldIDs:     map[string]uint32{"ID": 1, "Name": 2, "Phone": 3, "Score": 4},
 	})
@@ -126,7 +126,7 @@ func TestTypedLocalWriteReopenRebuild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestTypedLocalWriteReopenRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db2.Close()
-	table2, err := TableOf[facadeRecord](db2, "records")
+	table2, err := tableOf[facadeRecord](db2, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,7 @@ func TestTypedExplicitTxCoalescing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +247,7 @@ func TestTypedDeleteAndResurrect(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestTypedOversizeValueRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +326,7 @@ func TestEncryptedOpenWrongKeyFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := ids.NewRowID()
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +340,7 @@ func TestEncryptedOpenWrongKeyFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table, err = TableOf[facadeRecord](db2, "records")
+	table, err = tableOf[facadeRecord](db2, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +370,7 @@ func TestRotateStorageKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	id1 := ids.NewRowID()
-	table, err := TableOf[facadeRecord](db, "records")
+	table, err := tableOf[facadeRecord](db, "records")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -424,7 +424,7 @@ func TestRotateStorageKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table2, err := TableOf[facadeRecord](db2, "records")
+	table2, err := tableOf[facadeRecord](db2, "records")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -45,6 +46,9 @@ type DB struct {
 	recordAdapter     *rimeadapter.Adapter
 	recordTables      map[string]any
 	recordDefinitions []TableDefinition // guarded by recordMu; runtime Go bindings for the durable typed schema
+	itemMu            sync.RWMutex
+	itemBindings      map[reflect.Type]*itemBinding
+	itemAmbiguous     map[reflect.Type][]string
 	retiredRecordDBs  []*rime.DB
 	repl              *replication.Manager
 	subMgr            *subscriptionManager
@@ -269,6 +273,12 @@ func Open(ctx context.Context, cfg Config) (result *DB, openErr error) {
 				return nil, regErr
 			}
 			db.recordTables[strings.ToLower(definition.name)] = table
+		}
+		if err := db.registerItemBindings(); err != nil {
+			db.closeRecordDB()
+			db.closeStore()
+			db.cancel()
+			return nil, err
 		}
 	}
 	db.setState(StateRebuilding)

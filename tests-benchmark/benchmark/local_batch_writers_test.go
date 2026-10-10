@@ -53,11 +53,6 @@ func TestLocalTransactionBatchThroughput(t *testing.T) {
 							_ = db.Close()
 						}
 					}()
-					table, err := murmur.TableOf[writerBenchRow](db, "writer_bench")
-					if err != nil {
-						t.Fatal(err)
-					}
-
 					type result struct {
 						worker int
 						txns   int
@@ -84,7 +79,7 @@ func TestLocalTransactionBatchThroughput(t *testing.T) {
 									var id murmur.RowID
 									binary.BigEndian.PutUint64(id[:8], uint64(worker+1))
 									binary.BigEndian.PutUint64(id[8:], uint64(sequence))
-									if err := table.Insert(tx, &writerBenchRow{ID: id, Val: "writer-throughput"}); err != nil {
+									if err := tx.InsertItem(&writerBenchRow{ID: id, Val: "writer-throughput"}); err != nil {
 										_ = tx.Rollback()
 										results <- result{worker: worker, txns: txns, err: err}
 										return
@@ -138,11 +133,7 @@ func TestLocalTransactionBatchThroughput(t *testing.T) {
 					if err != nil {
 						t.Fatalf("reopen after writes: %v", err)
 					}
-					table, err = murmur.TableOf[writerBenchRow](db, "writer_bench")
-					if err != nil {
-						t.Fatal(err)
-					}
-					count, err := table.Where().Count()
+					count, err := db.Count(ctx, writerBenchRow{})
 					if err != nil {
 						t.Fatal(err)
 					}

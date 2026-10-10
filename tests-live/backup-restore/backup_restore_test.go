@@ -29,6 +29,7 @@ import (
 	"github.com/marcgauthier/murmur/backup"
 	"github.com/marcgauthier/murmur/ids"
 	"github.com/marcgauthier/murmur/origin"
+	"github.com/marcgauthier/murmur/q"
 	"github.com/marcgauthier/murmur/tests-live/harness"
 )
 
@@ -151,14 +152,16 @@ type liveTypedBackupRecord struct {
 
 func typedBackupDefinition(t *testing.T) db.TableDefinition {
 	t.Helper()
-	definition, err := db.Define[liveTypedBackupRecord]("live_typed_records", 901, db.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs: map[string]uint32{
-			"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6,
-		},
-		MergePolicies: map[string]db.RecordMergePolicy{
-			"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
-			"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+	definition, err := db.Model[liveTypedBackupRecord](db.ModelOptions{
+		Name: "live_typed_records", TableID: 901,
+		RecordOptions: db.RecordOptions{
+			FieldIDs: map[string]uint32{
+				"ID": 1, "Name": 2, "Count": 3, "Tags": 4, "Peak": 5, "Floor": 6,
+			},
+			MergePolicies: map[string]db.RecordMergePolicy{
+				"Count": db.RecordMergeCounter, "Tags": db.RecordMergeORSet,
+				"Peak": db.RecordMergeMax, "Floor": db.RecordMergeMin,
+			},
 		},
 	})
 	if err != nil {
@@ -195,12 +198,8 @@ func TestTypedBackupRestoreRoundTripLive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open typed live node: %v", err)
 	}
-	rows, err := db.TableOf[liveTypedBackupRecord](app, "live_typed_records")
-	if err != nil {
-		t.Fatal(err)
-	}
-	want, err := rows.Where(db.FieldOf[liveTypedBackupRecord, string](rows, "Name").Eq("encrypted-live-backup")).First()
-	if err != nil {
+	var want liveTypedBackupRecord
+	if err := app.FindOne(context.Background(), &want, q.Eq("Name", "encrypted-live-backup")); err != nil {
 		t.Fatal(err)
 	}
 	backupDir := t.TempDir()
@@ -242,12 +241,9 @@ func TestTypedBackupRestoreRoundTripLive(t *testing.T) {
 		t.Fatalf("open restored typed backup under fresh identity: %v", err)
 	}
 	defer clone.Close()
-	clonedRows, err := db.TableOf[liveTypedBackupRecord](clone, "live_typed_records")
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := clonedRows.Get(want.ID)
-	if err != nil || got.ID != want.ID || got.Name != want.Name || got.Count != want.Count || len(got.Tags) != len(want.Tags) || got.Peak != want.Peak || got.Floor != want.Floor {
+	var got liveTypedBackupRecord
+	got.ID = want.ID
+	if err := clone.GetItem(context.Background(), &got); err != nil || got.ID != want.ID || got.Name != want.Name || got.Count != want.Count || len(got.Tags) != len(want.Tags) || got.Peak != want.Peak || got.Floor != want.Floor {
 		t.Fatalf("restored typed record = %+v, %v; want %+v", got, err, want)
 	}
 }

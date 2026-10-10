@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/marcgauthier/murmur"
+	"github.com/marcgauthier/murmur/q"
 )
 
 // perfTier selects the matrix size. Short test mode (-short) forces smoke
@@ -352,11 +353,7 @@ func perfStoreCells(t *testing.T, rep *perfReport, n int) {
 		}
 		openWall := time.Since(start)
 		// First query proves the materialization is usable.
-		contacts, err := murmur.TableOf[benchContact](db, "contacts")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := contacts.Where().Count(); err != nil {
+		if _, err := db.Count(ctx, benchContact{}); err != nil {
 			t.Fatal(err)
 		}
 		disk := dirSizeBytes(dest)
@@ -373,17 +370,15 @@ func perfStoreCells(t *testing.T, rep *perfReport, n int) {
 	// Point lookups.
 	func() {
 		db, ids := openTemplateDB(t, n)
-		contacts, err := murmur.TableOf[benchContact](db, "contacts")
-		if err != nil {
-			t.Fatal(err)
-		}
 		rng := rand.New(rand.NewSource(7))
 		const ops = 10000
 		var lat perfLat
 		start := time.Now()
 		for i := 0; i < ops; i++ {
 			op := time.Now()
-			if _, err := contacts.Get(ids[rng.Intn(len(ids))]); err != nil {
+			var got benchContact
+			got.ID = ids[rng.Intn(len(ids))]
+			if err := db.GetItem(ctx, &got); err != nil {
 				t.Fatal(err)
 			}
 			lat.record(time.Since(op))
@@ -401,19 +396,14 @@ func perfStoreCells(t *testing.T, rep *perfReport, n int) {
 	// Capped indexed ranges.
 	func() {
 		db, _ := openTemplateDB(t, n)
-		contacts, err := murmur.TableOf[benchContact](db, "contacts")
-		if err != nil {
-			t.Fatal(err)
-		}
-		scoreField := murmur.NumericFieldOf[benchContact, int64](contacts, "Score")
 		const ops = 1000
 		var lat perfLat
 		start := time.Now()
 		for i := 0; i < ops; i++ {
 			lo := int64((i * 131) % 900)
 			op := time.Now()
-			rows, err := contacts.Where(scoreField.Between(lo, lo+100)).Limit(100).Find()
-			if err != nil {
+			var rows []benchContact
+			if err := db.Query(benchContact{}, q.Between("Score", lo, lo+100)).Limit(100).FindInto(&rows); err != nil {
 				t.Fatal(err)
 			}
 			for range rows {
@@ -433,10 +423,6 @@ func perfStoreCells(t *testing.T, rep *perfReport, n int) {
 	// Single-cell synchronous updates.
 	func() {
 		db, ids := openTemplateDB(t, n)
-		contacts, err := murmur.TableOf[benchContact](db, "contacts")
-		if err != nil {
-			t.Fatal(err)
-		}
 		rng := rand.New(rand.NewSource(11))
 		const ops = 300
 		var lat perfLat
@@ -448,10 +434,7 @@ func perfStoreCells(t *testing.T, rep *perfReport, n int) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := contacts.Update(tx, ids[rng.Intn(len(ids))], func(c *benchContact) error {
-				c.Score = score
-				return nil
-			}); err != nil {
+			if err := tx.Update(&benchContact{ID: ids[rng.Intn(len(ids))]}, murmur.Set("Score", score)); err != nil {
 				t.Fatal(err)
 			}
 			if err := tx.Commit(); err != nil {
@@ -486,10 +469,6 @@ func perfTxCells(t *testing.T, rep *perfReport, tier string) {
 	}
 	for _, bsize := range batches {
 		db, _ := openTemplateDB(t, n)
-		contacts, err := murmur.TableOf[benchContact](db, "contacts")
-		if err != nil {
-			t.Fatal(err)
-		}
 		ops := 200
 		switch {
 		case bsize >= 1000:
@@ -506,7 +485,7 @@ func perfTxCells(t *testing.T, rep *perfReport, tier string) {
 				t.Fatal(err)
 			}
 			for r := 0; r < bsize; r++ {
-				if err := contacts.Insert(tx, &benchContact{
+				if err := tx.InsertItem(&benchContact{
 					ID: murmur.NewRowID(), Name: fmt.Sprintf("tx-%d-%d", i, r),
 					Phone: "555-0000", Score: int64(r),
 				}); err != nil {
@@ -564,11 +543,7 @@ func perfCipherCells(t *testing.T, rep *perfReport, tier string) {
 			t.Fatal(err)
 		}
 		openWall := time.Since(start)
-		contacts, err := murmur.TableOf[benchContact](db2, "contacts")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := contacts.Where().Count(); err != nil {
+		if _, err := db2.Count(ctx, benchContact{}); err != nil {
 			t.Fatal(err)
 		}
 		_ = db2.Close()

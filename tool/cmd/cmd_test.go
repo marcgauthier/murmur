@@ -48,9 +48,11 @@ func bindTypedInitSchema(t *testing.T, dataDir string) {
 	if err := registry.Add(nodeID, privateKey.Public().(ed25519.PublicKey)); err != nil {
 		t.Fatal(err)
 	}
-	definition, err := murmur.Define[initBindingRecord]("items", 1, murmur.RecordOptions{
-		PrimaryField: "ID",
-		FieldIDs:     map[string]uint32{"ID": 1, "Value": 2},
+	definition, err := murmur.Model[initBindingRecord](murmur.ModelOptions{
+		Name: "items", TableID: 1,
+		RecordOptions: murmur.RecordOptions{
+			FieldIDs: map[string]uint32{"ID": 1, "Value": 2},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -67,13 +69,13 @@ func bindTypedInitSchema(t *testing.T, dataDir string) {
 		OriginSigning: murmur.OriginSigningConfig{PrivateKey: privateKey, TrustedKeys: registry},
 	})
 	if err != nil {
-		t.Fatalf("first typed application open: %v", err)
+		t.Fatalf("first application open: %v", err)
 	}
-	if _, err := murmur.TableOf[initBindingRecord](db, "items"); err != nil {
-		t.Fatalf("bind typed table: %v", err)
+	if _, err := db.Count(context.Background(), initBindingRecord{}); err != nil {
+		t.Fatalf("bind model table: %v", err)
 	}
 	if err := db.Close(); err != nil {
-		t.Fatalf("close typed database: %v", err)
+		t.Fatalf("close database: %v", err)
 	}
 	store, err := openOfflineStore(dataDir, GlobalOptions{})
 	if err != nil {
