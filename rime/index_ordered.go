@@ -1,12 +1,18 @@
 package rime
 
-import "cmp"
+import (
+	"cmp"
 
-// orderedIdx is a dependency-free AVL tree of distinct field values. Each
-// value owns an insertion-ordered key bucket; byKey locates entries directly.
-// The owning indexSet lock guards the tree, buckets, and key directory.
-// Updates never scan or shift the full index: value-tree work is O(log D),
-// where D is distinct values, and bucket insertion/removal is O(1).
+	"github.com/tidwall/btree"
+)
+
+// orderedIdx is a B-tree of distinct field values. Each value owns an
+// insertion-ordered key bucket; byKey locates entries directly. The
+// owning indexSet lock guards the tree, buckets, and key directory.
+// Updates never scan or shift the full index: value-tree work is
+// O(log D), where D is distinct values, and bucket insertion/removal
+// is O(1). The B-tree uses no internal locks; the index lock serializes
+// all access.
 type orderedEntry struct {
 	val any
 	key any
@@ -14,21 +20,20 @@ type orderedEntry struct {
 
 type orderedItem struct {
 	key        any
-	owner      *orderedNode
+	owner      *orderedBucket
 	prev, next *orderedItem
 }
 
-type orderedNode struct {
+type orderedBucket struct {
 	val         any
-	left, right *orderedNode
-	height      int
 	first, last *orderedItem
+	count       int
 }
 
 type orderedIdx struct {
 	cmp       func(a, b any) int
 	kind      keyKind
-	root      *orderedNode
+	tree      *btree.BTreeG[*orderedBucket]
 	byKey     map[any]*orderedItem
 	byKeyHint int
 }
@@ -41,49 +46,29 @@ func unboxI64(v any) int64   { return v.(int64) }
 func unboxU64(v any) uint64  { return v.(uint64) }
 func unboxF64(v any) float64 { return v.(float64) }
 
-// orderedInsertOrFind descends with native comparisons, boxing the new value
-// only when a genuinely new tree node is created.
-func orderedInsertOrFind[K cmp.Ordered](o *orderedIdx, n *orderedNode, v K, unbox func(any) K) (*orderedNode, *orderedNode) {
-	if n == nil {
-		node := &orderedNode{val: v, height: 1}
-		return node, node
-	}
-	switch c := cmp.Compare(v, unbox(n.val)); {
-	case c < 0:
-		var bucket *orderedNode
-		n.left, bucket = orderedInsertOrFind(o, n.left, v, unbox)
-		return orderedBalance(n), bucket
-	case c > 0:
-		var bucket *orderedNode
-		n.right, bucket = orderedInsertOrFind(o, n.right, v, unbox)
-		return orderedBalance(n), bucket
+// less orders buckets using native comparisons for typed kinds and the
+// compiled comparator for open kinds (timestamps, UUIDs), preserving
+// existing comparison and normalization rules.
+func (o *orderedIdx) less(a, b *orderedBucket) bool {
+	switch o.kind {
+	case kString:
+		return unboxStr(a.val) < unboxStr(b.val)
+	case kInt64:
+		return unboxI64(a.val) < unboxI64(b.val)
+	case kUint64:
+		return unboxU64(a.val) < unboxU64(b.val)
+	case kFloat64:
+		return unboxF64(a.val) < unboxF64(b.val)
 	default:
-		return n, n
+		return o.cmp(a.val, b.val) < 0
 	}
 }
 
-func orderedDeleteVal[K cmp.Ordered](o *orderedIdx, n *orderedNode, v K, unbox func(any) K) *orderedNode {
-	if n == nil {
-		return nil
-	}
-	switch c := cmp.Compare(v, unbox(n.val)); {
-	case c < 0:
-		n.left = orderedDeleteVal(o, n.left, v, unbox)
-	case c > 0:
-		n.right = orderedDeleteVal(o, n.right, v, unbox)
-	default:
-		if n.left == nil {
-			return n.right
-		}
-		if n.right == nil {
-			return n.left
-		}
-		successor, right := orderedDetachMin(n.right)
-		successor.left = n.left
-		successor.right = right
-		n = successor
-	}
-	return orderedBalance(n)
+// find locates the bucket for val. The probe is stack-allocated and
+// never retained, so lookups do not heap-allocate.
+func (o *orderedIdx) find(val any) (*orderedBucket, bool) {
+	probe := orderedBucket{val: val}
+	return o.tree.Get(&probe)
 }
 
 // orderedUnlink detaches key's item from its bucket. It reports whether the
@@ -100,10 +85,11 @@ func orderedUnlink(item *orderedItem) (emptied bool) {
 	} else {
 		item.next.prev = item.prev
 	}
-	return bucket.first == nil
+	bucket.count--
+	return bucket.count == 0
 }
 
-func orderedLink(item, last *orderedItem, bucket *orderedNode) {
+func orderedLink(item, last *orderedItem, bucket *orderedBucket) {
 	item.owner = bucket
 	item.prev = last
 	item.next = nil
@@ -113,6 +99,7 @@ func orderedLink(item, last *orderedItem, bucket *orderedNode) {
 		last.next = item
 	}
 	bucket.last = item
+	bucket.count++
 }
 
 // orderedAdd indexes key under v with no allocation when the bucket exists.
@@ -123,8 +110,12 @@ func orderedAdd[K cmp.Ordered](o *orderedIdx, key any, v K, unbox func(any) K) {
 		}
 		orderedRemove(o, key, unbox(existing.owner.val), unbox)
 	}
-	var bucket *orderedNode
-	o.root, bucket = orderedInsertOrFind(o, o.root, v, unbox)
+	probe := orderedBucket{val: v}
+	bucket, ok := o.tree.Get(&probe)
+	if !ok {
+		bucket = &orderedBucket{val: v}
+		o.tree.Set(bucket)
+	}
 	item := &orderedItem{key: key}
 	orderedLink(item, bucket.last, bucket)
 	o.byKey[key] = item
@@ -137,8 +128,9 @@ func orderedRemove[K cmp.Ordered](o *orderedIdx, key any, v K, unbox func(any) K
 	if item == nil || unbox(item.owner.val) != v {
 		return
 	}
+	bucket := item.owner
 	if orderedUnlink(item) {
-		o.root = orderedDeleteVal(o, o.root, v, unbox)
+		o.tree.Delete(bucket)
 	}
 	delete(o.byKey, key)
 }
@@ -155,16 +147,25 @@ func orderedReplace[K cmp.Ordered](o *orderedIdx, key any, oldV, newV K, unbox f
 	if oldV == newV {
 		return // same bucket; keep insertion order
 	}
+	oldBucket := item.owner
 	if orderedUnlink(item) {
-		o.root = orderedDeleteVal(o, o.root, oldV, unbox)
+		o.tree.Delete(oldBucket)
 	}
-	var nb *orderedNode
-	o.root, nb = orderedInsertOrFind(o, o.root, newV, unbox)
+	probe := orderedBucket{val: newV}
+	nb, ok := o.tree.Get(&probe)
+	if !ok {
+		nb = &orderedBucket{val: newV}
+		o.tree.Set(nb)
+	}
 	orderedLink(item, nb.last, nb)
 }
 
 func newOrderedIdx(c func(a, b any) int) *orderedIdx {
-	return &orderedIdx{cmp: c, byKey: make(map[any]*orderedItem, 8), byKeyHint: 8}
+	o := &orderedIdx{cmp: c, byKey: make(map[any]*orderedItem, 8), byKeyHint: 8}
+	// NoLocks: the owning indexSet lock guards every access. Degree 0
+	// selects Tidwall's default degree of 32.
+	o.tree = btree.NewBTreeGOptions[*orderedBucket](o.less, btree.Options{NoLocks: true})
+	return o
 }
 
 func (o *orderedIdx) refreshByKeyHint() {
@@ -177,182 +178,82 @@ func (o *orderedIdx) refreshByKeyHint() {
 	}
 }
 func (o *orderedIdx) len() int { return len(o.byKey) }
-func orderedHeight(n *orderedNode) int {
-	if n == nil {
+
+// distinct returns the number of distinct indexed values.
+func (o *orderedIdx) distinct() int {
+	if o.tree == nil {
 		return 0
 	}
-	return n.height
-}
-func orderedFixHeight(n *orderedNode) {
-	n.height = 1 + max(orderedHeight(n.left), orderedHeight(n.right))
-}
-func orderedRotateLeft(n *orderedNode) *orderedNode {
-	r := n.right
-	n.right = r.left
-	r.left = n
-	orderedFixHeight(n)
-	orderedFixHeight(r)
-	return r
-}
-func orderedRotateRight(n *orderedNode) *orderedNode {
-	l := n.left
-	n.left = l.right
-	l.right = n
-	orderedFixHeight(n)
-	orderedFixHeight(l)
-	return l
-}
-func orderedBalance(n *orderedNode) *orderedNode {
-	if n == nil {
-		return nil
-	}
-	orderedFixHeight(n)
-	balance := orderedHeight(n.left) - orderedHeight(n.right)
-	if balance > 1 {
-		if orderedHeight(n.left.left) < orderedHeight(n.left.right) {
-			n.left = orderedRotateLeft(n.left)
-		}
-		return orderedRotateRight(n)
-	}
-	if balance < -1 {
-		if orderedHeight(n.right.right) < orderedHeight(n.right.left) {
-			n.right = orderedRotateRight(n.right)
-		}
-		return orderedRotateLeft(n)
-	}
-	return n
-}
-func (o *orderedIdx) insert(n *orderedNode, val any) (*orderedNode, *orderedNode) {
-	if n == nil {
-		node := &orderedNode{val: val, height: 1}
-		return node, node
-	}
-	var bucket *orderedNode
-	switch c := o.cmp(val, n.val); {
-	case c < 0:
-		n.left, bucket = o.insert(n.left, val)
-	case c > 0:
-		n.right, bucket = o.insert(n.right, val)
-	default:
-		return n, n
-	}
-	return orderedBalance(n), bucket
+	return o.tree.Len()
 }
 
-// insertPrepared inserts a caller-owned node when val is new. Managed
-// publication constructs that node before durable commit, keeping AVL node
-// allocation out of the post-durability section.
-func (o *orderedIdx) insertPrepared(n *orderedNode, val any, prepared *orderedNode) (*orderedNode, *orderedNode) {
-	if n == nil {
-		prepared.val = val
-		prepared.height = 1
-		prepared.left, prepared.right = nil, nil
-		prepared.first, prepared.last = nil, nil
-		return prepared, prepared
+// applyPrepared applies one managed bucket/directory edit using buckets
+// resolved during preparation. It performs no B-tree insertion,
+// deletion, or splitting; the candidate tree topology was prebuilt
+// before durability and is installed separately. It allocates nothing.
+func (o *orderedIdx) applyPrepared(effect orderedIndexEffect, key any) {
+	if effect.hasOld && effect.hasNew && effect.oldBucket != nil && effect.oldBucket == effect.newBucket {
+		return // same bucket; keep insertion order
 	}
-	var bucket *orderedNode
-	switch c := o.cmp(val, n.val); {
-	case c < 0:
-		n.left, bucket = o.insertPrepared(n.left, val, prepared)
-	case c > 0:
-		n.right, bucket = o.insertPrepared(n.right, val, prepared)
-	default:
-		return n, n
-	}
-	return orderedBalance(n), bucket
-}
-
-func (o *orderedIdx) addPrepared(val, key any, node *orderedNode, preparedItem *orderedItem) {
-	if existing := o.byKey[key]; existing != nil {
-		if o.cmp(existing.owner.val, val) == 0 {
+	if effect.hasOld && effect.hasNew {
+		item := o.byKey[key]
+		if item == nil {
+			nb := effect.newBucket
+			if nb == nil {
+				panic("rime: missing prepared ordered bucket")
+			}
+			o.applyAddPrepared(nb, effect.item, key)
 			return
 		}
-		o.replacePrepared(existing.owner.val, val, key, node, preparedItem)
+		orderedUnlink(item)
+		nb := effect.newBucket
+		if nb == nil {
+			panic("rime: missing prepared ordered bucket")
+		}
+		orderedLink(item, nb.last, nb)
 		return
 	}
-	var bucket *orderedNode
-	o.root, bucket = o.insertPrepared(o.root, val, node)
-	item := preparedItem
-	item.key = key
-	item.owner = bucket
-	item.prev, item.next = bucket.last, nil
-	if bucket.last == nil {
-		bucket.first = item
-	} else {
-		bucket.last.next = item
+	if effect.hasOld {
+		item := o.byKey[key]
+		if item == nil {
+			return
+		}
+		orderedUnlink(item)
+		delete(o.byKey, key)
+		return
 	}
-	bucket.last = item
+	if effect.hasNew {
+		if existing := o.byKey[key]; existing != nil {
+			// Key already indexed (stacked insert after delete
+			// resolved live): move it into the prepared bucket.
+			orderedUnlink(existing)
+			nb := effect.newBucket
+			if nb == nil {
+				panic("rime: missing prepared ordered bucket")
+			}
+			orderedLink(existing, nb.last, nb)
+			return
+		}
+		nb := effect.newBucket
+		if nb == nil {
+			panic("rime: missing prepared ordered bucket")
+		}
+		o.applyAddPrepared(nb, effect.item, key)
+	}
+}
+
+func (o *orderedIdx) applyAddPrepared(bucket *orderedBucket, item *orderedItem, key any) {
+	if bucket == nil || item == nil {
+		panic("rime: missing prepared ordered bucket or item")
+	}
+	item.key = key
+	item.owner = nil
+	item.prev, item.next = nil, nil
+	orderedLink(item, bucket.last, bucket)
 	o.byKey[key] = item
 	o.refreshByKeyHint()
 }
 
-func (o *orderedIdx) replacePrepared(old, val, key any, node *orderedNode, preparedItem *orderedItem) {
-	item := o.byKey[key]
-	if item == nil || o.cmp(item.owner.val, old) != 0 {
-		o.remove(old, key)
-		o.addPrepared(val, key, node, preparedItem)
-		return
-	}
-	if o.cmp(old, val) == 0 {
-		return
-	}
-	bucket := item.owner
-	if item.prev == nil {
-		bucket.first = item.next
-	} else {
-		item.prev.next = item.next
-	}
-	if item.next == nil {
-		bucket.last = item.prev
-	} else {
-		item.next.prev = item.prev
-	}
-	if bucket.first == nil {
-		o.root = o.deleteNode(o.root, bucket.val)
-	}
-	var next *orderedNode
-	o.root, next = o.insertPrepared(o.root, val, node)
-	item.owner, item.prev, item.next = next, next.last, nil
-	if next.last == nil {
-		next.first = item
-	} else {
-		next.last.next = item
-	}
-	next.last = item
-}
-func orderedDetachMin(n *orderedNode) (*orderedNode, *orderedNode) {
-	if n.left == nil {
-		return n, n.right
-	}
-	var smallest *orderedNode
-	smallest, n.left = orderedDetachMin(n.left)
-	return smallest, orderedBalance(n)
-}
-func (o *orderedIdx) deleteNode(n *orderedNode, val any) *orderedNode {
-	if n == nil {
-		return nil
-	}
-	switch c := o.cmp(val, n.val); {
-	case c < 0:
-		n.left = o.deleteNode(n.left, val)
-	case c > 0:
-		n.right = o.deleteNode(n.right, val)
-	default:
-		if n.left == nil {
-			return n.right
-		}
-		if n.right == nil {
-			return n.left
-		}
-		// Move the successor node itself rather than copying its value/bucket;
-		// directory items retain the same owner pointer through rotations.
-		successor, right := orderedDetachMin(n.right)
-		successor.left = n.left
-		successor.right = right
-		n = successor
-	}
-	return orderedBalance(n)
-}
 func (o *orderedIdx) add(val, key any) {
 	if existing := o.byKey[key]; existing != nil {
 		if o.cmp(existing.owner.val, val) == 0 {
@@ -360,15 +261,13 @@ func (o *orderedIdx) add(val, key any) {
 		}
 		o.remove(existing.owner.val, key)
 	}
-	var bucket *orderedNode
-	o.root, bucket = o.insert(o.root, val)
-	item := &orderedItem{key: key, owner: bucket, prev: bucket.last}
-	if bucket.last == nil {
-		bucket.first = item
-	} else {
-		bucket.last.next = item
+	bucket, ok := o.find(val)
+	if !ok {
+		bucket = &orderedBucket{val: val}
+		o.tree.Set(bucket)
 	}
-	bucket.last = item
+	item := &orderedItem{key: key}
+	orderedLink(item, bucket.last, bucket)
 	o.byKey[key] = item
 	o.refreshByKeyHint()
 }
@@ -387,31 +286,16 @@ func (o *orderedIdx) replace(old, val, key any) {
 	if o.cmp(old, val) == 0 {
 		return // same bucket; keep insertion order
 	}
-	bucket := item.owner
-	if item.prev == nil {
-		bucket.first = item.next
-	} else {
-		item.prev.next = item.next
+	oldBucket := item.owner
+	if orderedUnlink(item) {
+		o.tree.Delete(oldBucket)
 	}
-	if item.next == nil {
-		bucket.last = item.prev
-	} else {
-		item.next.prev = item.prev
+	nb, ok := o.find(val)
+	if !ok {
+		nb = &orderedBucket{val: val}
+		o.tree.Set(nb)
 	}
-	if bucket.first == nil {
-		o.root = o.deleteNode(o.root, bucket.val)
-	}
-	var nb *orderedNode
-	o.root, nb = o.insert(o.root, val)
-	item.owner = nb
-	item.prev = nb.last
-	item.next = nil
-	if nb.last == nil {
-		nb.first = item
-	} else {
-		nb.last.next = item
-	}
-	nb.last = item
+	orderedLink(item, nb.last, nb)
 }
 func (o *orderedIdx) remove(val, key any) {
 	item := o.byKey[key]
@@ -419,26 +303,76 @@ func (o *orderedIdx) remove(val, key any) {
 		return
 	}
 	bucket := item.owner
-	if item.prev == nil {
-		bucket.first = item.next
-	} else {
-		item.prev.next = item.next
-	}
-	if item.next == nil {
-		bucket.last = item.prev
-	} else {
-		item.next.prev = item.prev
+	if orderedUnlink(item) {
+		o.tree.Delete(bucket)
 	}
 	delete(o.byKey, key)
-	if bucket.first == nil {
-		o.root = o.deleteNode(o.root, bucket.val)
+}
+
+// normalizeBound converts a query bound to the field's storage kind.
+// Mismatched types report ok=false (a lookup miss), never panic.
+func (o *orderedIdx) normalizeBound(v any) (any, bool) {
+	if v == nil {
+		return nil, true
+	}
+	switch o.kind {
+	case kString:
+		s, ok := normStr(v)
+		if !ok {
+			return nil, false
+		}
+		return s, true
+	case kInt64:
+		i, ok := normI64(v)
+		if !ok {
+			return nil, false
+		}
+		return i, true
+	case kUint64:
+		u, ok := normU64(v)
+		if !ok {
+			return nil, false
+		}
+		return u, true
+	case kFloat64:
+		f, ok := normF64(v)
+		if !ok {
+			return nil, false
+		}
+		return f, true
+	default:
+		return v, true
 	}
 }
 
-// rangeKeys visits only the bounded subtree and matched key buckets.
+// compareBucket orders a stored bucket value against a normalized bound.
+func (o *orderedIdx) compareBucket(bucketVal, bound any) int {
+	switch o.kind {
+	case kString:
+		return cmp.Compare(unboxStr(bucketVal), bound.(string))
+	case kInt64:
+		return cmp.Compare(unboxI64(bucketVal), bound.(int64))
+	case kUint64:
+		return cmp.Compare(unboxU64(bucketVal), bound.(uint64))
+	case kFloat64:
+		return cmp.Compare(unboxF64(bucketVal), bound.(float64))
+	default:
+		return o.cmp(bucketVal, bound)
+	}
+}
+
+// rangeKeys visits only the bounded values and matched key buckets.
 // Duplicate values retain insertion order; descending traversal reverses it.
 func (o *orderedIdx) rangeKeys(lo, hi any, loOpen, hiOpen, desc bool, limit int) []any {
 	if limit == 0 {
+		return nil
+	}
+	nlo, ok := o.normalizeBound(lo)
+	if !ok {
+		return nil
+	}
+	nhi, ok := o.normalizeBound(hi)
+	if !ok {
 		return nil
 	}
 	capacity := min(o.len(), 64)
@@ -446,63 +380,86 @@ func (o *orderedIdx) rangeKeys(lo, hi any, loOpen, hiOpen, desc bool, limit int)
 		capacity = min(capacity, limit)
 	}
 	out := make([]any, 0, capacity)
-	var visit func(*orderedNode) bool
-	visit = func(n *orderedNode) bool {
-		if n == nil {
-			return false
-		}
-		if lo != nil {
-			c := o.cmp(n.val, lo)
-			if c < 0 || (c == 0 && loOpen) {
-				return visit(n.right)
-			}
-		}
-		if hi != nil {
-			c := o.cmp(n.val, hi)
-			if c > 0 || (c == 0 && hiOpen) {
-				return visit(n.left)
-			}
-		}
-		first, second := n.left, n.right
-		item := n.first
+	if o.tree == nil || o.tree.Len() == 0 {
+		return out
+	}
+	appendBucket := func(bucket *orderedBucket) bool {
 		if desc {
-			first, second = n.right, n.left
-			item = n.last
-		}
-		if visit(first) {
+			for item := bucket.last; item != nil; item = item.prev {
+				out = append(out, item.key)
+				if limit >= 0 && len(out) >= limit {
+					return false
+				}
+			}
 			return true
 		}
-		for item != nil {
+		for item := bucket.first; item != nil; item = item.next {
 			out = append(out, item.key)
 			if limit >= 0 && len(out) >= limit {
-				return true
-			}
-			if desc {
-				item = item.prev
-			} else {
-				item = item.next
+				return false
 			}
 		}
-		return visit(second)
+		return true
 	}
-	visit(o.root)
+	if !desc {
+		visit := func(bucket *orderedBucket) bool {
+			if nhi != nil {
+				if c := o.compareBucket(bucket.val, nhi); c > 0 || (c == 0 && hiOpen) {
+					return false
+				}
+			}
+			if nlo != nil {
+				if c := o.compareBucket(bucket.val, nlo); c == 0 && loOpen {
+					return true
+				}
+			}
+			return appendBucket(bucket)
+		}
+		if nlo != nil {
+			probe := orderedBucket{val: nlo}
+			o.tree.Ascend(&probe, visit)
+		} else {
+			o.tree.Scan(visit)
+		}
+		return out
+	}
+	visit := func(bucket *orderedBucket) bool {
+		if nlo != nil {
+			if c := o.compareBucket(bucket.val, nlo); c < 0 || (c == 0 && loOpen) {
+				return false
+			}
+		}
+		if nhi != nil {
+			if c := o.compareBucket(bucket.val, nhi); c == 0 && hiOpen {
+				return true
+			}
+		}
+		return appendBucket(bucket)
+	}
+	if nhi != nil {
+		probe := orderedBucket{val: nhi}
+		o.tree.Descend(&probe, visit)
+	} else {
+		o.tree.Reverse(visit)
+	}
 	return out
 }
 func (o *orderedIdx) extreme(wantMax bool) (orderedEntry, bool) {
-	n := o.root
-	if n == nil {
+	if o.tree == nil || o.tree.Len() == 0 {
 		return orderedEntry{}, false
 	}
 	if wantMax {
-		for n.right != nil {
-			n = n.right
+		bucket, ok := o.tree.Max()
+		if !ok || bucket.last == nil {
+			return orderedEntry{}, false
 		}
-		return orderedEntry{val: n.val, key: n.last.key}, true
+		return orderedEntry{val: bucket.val, key: bucket.last.key}, true
 	}
-	for n.left != nil {
-		n = n.left
+	bucket, ok := o.tree.Min()
+	if !ok || bucket.first == nil {
+		return orderedEntry{}, false
 	}
-	return orderedEntry{val: n.val, key: n.first.key}, true
+	return orderedEntry{val: bucket.val, key: bucket.first.key}, true
 }
 func (ix *indexSet) orderedRange(field string, lo, hi any, loOpen, hiOpen, desc bool, limit int) []any {
 	ix.mu.RLock()

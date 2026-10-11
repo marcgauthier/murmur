@@ -31,7 +31,8 @@ RIME stores native Go records and provides relational operations through typed
 functions. Its goal is fast local access with concurrent readers and writers,
 repeatable snapshots, indexed queries and atomic transactions across tables.
 It avoids query parsing, record serialization, a network hop and disk I/O on the
-core execution path. The engine imports only the Go standard library.
+core execution path. The engine imports only the Go standard library plus the
+explicitly approved `github.com/tidwall/btree` ordered-index B-tree.
 
 These choices remove substantial work, but do not guarantee that every operation
 beats all alternatives or scales linearly with CPU count. Record allocation, reflected
@@ -284,8 +285,10 @@ before adding new ones in the existing map. Changed compound-index key
 projections are also prepared before durability. This avoids copying index
 maps for ordinary inserts and moves compound-key extraction and tracked
 unique-map growth out of publication. Managed ordered-index writes
-now prebuild AVL nodes and directory entries, and replace the directory map
-only when a transaction crosses its tracked growth threshold. Managed prefix
+prebuild B-tree buckets, directory items, and the candidate B-tree topology,
+and replace the directory map only when a transaction crosses its tracked
+growth threshold. Publication applies bucket/directory edits and installs the
+completed tree with no B-tree insertion, deletion, or splitting. Managed prefix
 and compound preparation creates path-only nodes and reserves record-key maps
 before durability; abort prunes empty paths, while publication adds record
 keys and defers pruning old paths until every write is installed. Managed hash
@@ -407,7 +410,7 @@ version chains, not the index bundle itself.
 | Unique | `field value -> primary key` map | Expected O(1) equality and ownership checks |
 | Hash | `field value -> set of primary keys` | Expected O(1) bucket seek, plus matched keys |
 | Compound | Nested native-value maps, one level per field, with key sets at leaves | Equality on all indexed fields; no compound string encoding |
-| Ordered | AVL tree of distinct values, linked key buckets, key directory | O(log D) add/remove, pruned range traversal; D is distinct values |
+| Ordered | B-tree (`github.com/tidwall/btree`) of distinct values, linked key buckets, key directory | O(log D) add/remove, pruned range traversal; D is distinct values |
 | Prefix | Byte trie with descendant key sets at every node | O(prefix length + output) lookup, with extra memory per string prefix |
 | Trigram | Packed-uint32 trigram to key-slice postings per string field | Similarity candidate generation; scoring verifies from rows |
 
@@ -416,12 +419,13 @@ indexes match conjunctions covering all of their fields; they do not supply a
 Ordered left-prefix range index. Prefix indexing is byte-oriented;
 `LIKE` filtering also treats `_` as one byte rather than Unicode collation.
 
-The ordered index balances value nodes, keeps duplicate-value keys in insertion
-order and locates an existing key through its directory. Removal does not scan
-or shift all entries. An update whose ordered value changes removes its old
-entry and adds the new entry; unchanged values retain their position. Descending
-traversal reverses buckets. Without explicit secondary ordering, duplicate-value
-order should not be used as an application pagination guarantee.
+The ordered index stores distinct values in a B-tree, keeps duplicate-value
+keys in insertion order and locates an existing key through its directory.
+Removal does not scan or shift all entries. An update whose ordered value
+changes removes its old entry and adds the new entry; unchanged values retain
+their position. Descending traversal reverses buckets. Without explicit
+secondary ordering, duplicate-value order should not be used as an application
+pagination guarantee.
 
 Commit removes/replaces entries only for changed indexed fields. Field comparison
 fast paths avoid boxing unchanged values first. Hash reference counts and index
@@ -712,7 +716,7 @@ Sources: [stats.go](stats.go), [db.go](db.go), [executor.go](executor.go).
 | Immutable MVCC chains | Reader/writer mutation of the same record | Full retained-chain copy on append |
 | Single-write commit path and lazy staged map | General transaction maps and usual per-row commit closures | Global commit serialization and record allocation |
 | Unchanged-field comparison | Removing/readding unchanged index entries | Changed-field extraction and index maintenance |
-| AVL ordered index | Linear removal/search/shifting in the former sorted slice | Node/bucket allocation, tree traversal and table index lock |
+| B-tree ordered index | Linear removal/search/shifting in the former sorted slice | Bucket allocation, tree traversal and table index lock |
 | Selective planning and bounded cache | Repeated candidate construction on unchanged tables | Historical fallback, invalidation and shard-count estimates |
 | Scoped pooled candidate maps | Repeated temporary key-set allocation | Pool misses, clearing and cache ownership constraints |
 | Batched writes | A separate transaction/commit for every row | Longer atomic publication sections |
@@ -748,7 +752,7 @@ versioned indexes and chunked history are not current features.
 | [aggregate.go](aggregate.go), [join.go](join.go), [projection.go](projection.go) | Relational operators |
 | [constraint.go](constraint.go), [hook.go](hook.go), [event.go](event.go) | Validation and callback integration |
 | [qualification_test.go](qualification_test.go), [qualification_internal_test.go](qualification_internal_test.go), [qualification_events_test.go](qualification_events_test.go), [qualification_live_test.go](qualification_live_test.go), [qualification_fuzz_test.go](qualification_fuzz_test.go) | Models, publication barriers, lifecycle, races and live invariants |
-| [index_ordered_test.go](index_ordered_test.go) | AVL model and mutation complexity checks |
+| [index_ordered_test.go](index_ordered_test.go) | B-tree model and mutation complexity checks |
 | [qualification_bench_test.go](qualification_bench_test.go), [freeze_bench_test.go](freeze_bench_test.go), [write_profile_test.go](write_profile_test.go) | Size benchmarks, acceptance matrix and profiling |
 
 The [qualification runbook](../architecture/rime-testing.md) defines race/model

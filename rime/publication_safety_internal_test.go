@@ -307,6 +307,7 @@ func TestManagedPrepareGrowsOrderedDirectoryAtCapacityThreshold(t *testing.T) {
 		}
 	}
 	oldMap := row.idx.ordered["Value"].byKey
+	oldTree := row.idx.ordered["Value"].tree
 	tx, err := db.BeginTx(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -329,12 +330,28 @@ func TestManagedPrepareGrowsOrderedDirectoryAtCapacityThreshold(t *testing.T) {
 	if len(prepared[0].values) != 8 || len(oldMap) != 8 {
 		t.Fatal("replacement ordered directory was not privately prebuilt")
 	}
+	if prepared[0].tree == nil {
+		t.Fatal("prepared ordered tree candidate is missing")
+	}
+	if prepared[0].tree.Len() != 9 {
+		t.Fatalf("prepared ordered tree distinct=%d, want candidate with 9", prepared[0].tree.Len())
+	}
+	row.idx.mu.RLock()
+	liveDistinct := row.idx.ordered["Value"].distinct()
+	liveTree := row.idx.ordered["Value"].tree
+	row.idx.mu.RUnlock()
+	if liveDistinct != 8 || liveTree != oldTree {
+		t.Fatal("live ordered tree changed before publish")
+	}
 	if err := token.Publish(); err != nil {
 		t.Fatal(err)
 	}
 	index := row.idx.ordered["Value"]
 	if index.len() != 9 || index.byKeyHint < 9 {
 		t.Fatalf("published ordered directory len=%d hint=%d", index.len(), index.byKeyHint)
+	}
+	if index.distinct() != 9 {
+		t.Fatalf("published ordered tree distinct=%d, want 9", index.distinct())
 	}
 }
 
@@ -363,20 +380,25 @@ func TestManagedPrepareBuildsOrderedIndexObjectsBeforePublish(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer token.Abort()
-	if len(token.orderedMaps) != 0 {
-		t.Fatalf("ordinary ordered write prepared directory replacement: %d", len(token.orderedMaps))
+	if len(token.orderedMaps) != 1 {
+		t.Fatalf("ordinary ordered write prepared maps = %d, want 1 tree candidate", len(token.orderedMaps))
+	}
+	prepared := token.orderedMaps[0].rows.([]preparedOrderedMap)
+	if len(prepared) != 1 || prepared[0].values != nil || prepared[0].tree == nil || prepared[0].tree.Len() != 1 {
+		t.Fatalf("prepared ordered candidate = %+v, want tree with 1 distinct and no directory replacement", prepared)
 	}
 	for i, pending := range tx.pending {
 		effects := pending.preparedIndexEffects.(managedIndexEffects).ordered
-		if len(effects) != 1 || effects[0].node == nil || effects[0].item == nil {
-			t.Fatalf("pending %d ordered effects = %+v, want prebuilt node and item", i, effects)
+		if len(effects) != 1 || effects[0].bucket == nil || effects[0].item == nil || effects[0].newBucket == nil {
+			t.Fatalf("pending %d ordered effects = %+v, want prebuilt bucket, item, and resolved bucket", i, effects)
 		}
 	}
 	row.idx.mu.RLock()
 	before := row.idx.ordered["Value"].len()
+	liveDistinct := row.idx.ordered["Value"].distinct()
 	row.idx.mu.RUnlock()
-	if before != 0 {
-		t.Fatalf("ordered index visible before publish has %d keys", before)
+	if before != 0 || liveDistinct != 0 {
+		t.Fatalf("ordered index visible before publish has %d keys %d distinct", before, liveDistinct)
 	}
 	if err := token.Publish(); err != nil {
 		t.Fatal(err)
@@ -384,9 +406,13 @@ func TestManagedPrepareBuildsOrderedIndexObjectsBeforePublish(t *testing.T) {
 	row.idx.mu.RLock()
 	index := row.idx.ordered["Value"]
 	indexed := index.byKey["a"]
+	distinct := index.distinct()
 	row.idx.mu.RUnlock()
 	if indexed == nil || indexed.owner.val != int64(2) {
 		t.Fatalf("published ordered entry = %+v, want value 2", indexed)
+	}
+	if distinct != 1 || indexed.owner.count != 1 {
+		t.Fatalf("published ordered tree distinct=%d bucket count=%d, want 1/1", distinct, indexed.owner.count)
 	}
 	if err := row.Insert(&pubSafetyOrderedRow{ID: "b", Value: 3}); err != nil {
 		t.Fatalf("standalone insert after managed publication: %v", err)

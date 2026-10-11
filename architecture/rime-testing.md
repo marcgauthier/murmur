@@ -45,9 +45,10 @@ The qualification suite adds:
   transaction and after commit, rollback, and GC. Point/indexed/full reads,
   exact ordering with pagination, joins, aggregates, group-by, hook streams,
   bulk writes, and cancellation must match the model exactly.
-- Ordered-index AVL balance, key-directory and duplicate-bucket consistency,
-  randomized ranges/deletions against an independent model, and comparator
-  counts at 8,192 rows to detect quadratic mutation regressions.
+- Ordered-index B-tree ordering, key-directory and duplicate-bucket
+  consistency, randomized ranges/deletions against an independent model,
+  and comparator counts at 8,192 rows to detect quadratic mutation
+  regressions.
 - Deep-copy isolation for slices, maps and nested pointers, including caller
   mutation and rollback; transaction ownership, closure, and read-only writes.
 - Cancellation before execution, during scanning and projection, and before

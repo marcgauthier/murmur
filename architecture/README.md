@@ -39,7 +39,7 @@ soaks remain. The query materialization is in-memory only.
 | [Transactions and prepared changes](transactions.md) | Change capture, transaction coalescing, commit/apply ordering, and idempotency. | 8, 9, 15, 16, 17, 18, 19, 49, 81 |
 | [Merge policies](merge-policies.md) | Distributed counters, typed observed-remove sets, numeric extrema, API, bridge and upgrade contract. | New topic |
 | [Conflict resolution](conflict-resolution.md) | Mutation model, HLC/LWW ordering, tombstones, and conflict examples. | 10, 11, 12, 82 |
-| [Storage and materialization](storage.md) | Spool persistence layout, in-memory radix tree state, startup/rebuild, caching, compaction, and a log-GC example. | 13, 14, 20, 21, 22, 25, 47, 83 |
+| [Storage and materialization](storage.md) | Spool persistence layout, in-memory B-tree state, startup/rebuild, caching, compaction, and a log-GC example. | 13, 14, 20, 21, 22, 25, 47, 83 |
 | [Spool persistence](../spool/README.md) | Embedded write-optimized persistence package serving as the sole on-disk storage backend with AES-256-GCM encryption. | Separate document: 1–44 |
 | [Origin signatures](origin-signatures.md) | Ed25519 transaction identities, origin trust, snapshots and strict migration. | New topic |
 | [Membership and transport](membership-and-transport.md) | SWIM/memberlist over QUIC, discovery, authentication, and IP/CIDR admission. | 26, 27 |

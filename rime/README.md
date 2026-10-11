@@ -11,4 +11,5 @@ RIME does not provide disk persistence, encryption, or replication.
 
 Start with the [usage and syntax reference](USAGE.md). For implementation
 details and concurrency guarantees, see [ARCHITECTURE.md](ARCHITECTURE.md).
-RIME uses only Go's standard library.
+RIME uses only Go's standard library plus the approved Tidwall B-tree for
+ordered indexes.

@@ -14,35 +14,40 @@ func TestOrderedIndexModel(t *testing.T) {
 	model := map[int]entry{}
 	sequence := 0
 	rng := rand.New(rand.NewSource(91))
-	var verify func(*orderedNode) (int, int)
-	verify = func(n *orderedNode) (int, int) {
-		if n == nil {
-			return 0, 0
+	verify := func() (int, int) {
+		distinct := make(map[int]bool)
+		for _, e := range model {
+			distinct[e.value] = true
 		}
-		lh, lc := verify(n.left)
-		rh, rc := verify(n.right)
-		if lh-rh > 1 || rh-lh > 1 || n.height != 1+max(lh, rh) {
-			t.Fatalf("unbalanced tree at value %v: heights %d/%d stored %d", n.val, lh, rh, n.height)
-		}
-		if n.left != nil && o.cmp(n.left.val, n.val) >= 0 {
-			t.Fatal("left ordering violation")
-		}
-		if n.right != nil && o.cmp(n.right.val, n.val) <= 0 {
-			t.Fatal("right ordering violation")
+		if o.distinct() != len(distinct) {
+			t.Fatalf("distinct=%d want %d", o.distinct(), len(distinct))
 		}
 		count := 0
-		var prior *orderedItem
-		for item := n.first; item != nil; item = item.next {
-			if item.owner != n || item.prev != prior || o.byKey[item.key] != item {
-				t.Fatal("bucket directory corrupt")
+		var prev *int
+		var prevBucket *orderedBucket
+		o.tree.Scan(func(bucket *orderedBucket) bool {
+			v := bucket.val.(int)
+			if prev != nil && (v <= *prev || o.cmp(bucket.val, prevBucket.val) <= 0) {
+				t.Fatal("tree ordering violation")
 			}
-			prior = item
-			count++
-		}
-		if count == 0 || prior != n.last {
-			t.Fatal("empty/broken value bucket")
-		}
-		return n.height, lc + rc + count
+			cp := v
+			prev, prevBucket = &cp, bucket
+			listed := 0
+			var prior *orderedItem
+			for item := bucket.first; item != nil; item = item.next {
+				if item.owner != bucket || item.prev != prior || o.byKey[item.key] != item {
+					t.Fatal("bucket directory corrupt")
+				}
+				prior = item
+				listed++
+			}
+			if listed == 0 || prior != bucket.last || bucket.count != listed {
+				t.Fatal("empty/broken value bucket")
+			}
+			count += listed
+			return true
+		})
+		return o.distinct(), count
 	}
 	for step := 0; step < 5000; step++ {
 		key, value := rng.Intn(256), rng.Intn(81)-40
@@ -62,7 +67,7 @@ func TestOrderedIndexModel(t *testing.T) {
 				o.remove(value, key)
 			}
 		}
-		_, count := verify(o.root)
+		_, count := verify()
 		if count != len(model) || o.len() != len(model) {
 			t.Fatalf("step %d count=%d/%d want %d", step, count, o.len(), len(model))
 		}
@@ -118,7 +123,7 @@ func TestOrderedIndexModel(t *testing.T) {
 	for key, e := range model {
 		o.remove(e.value, key)
 	}
-	if o.root != nil || o.len() != 0 {
+	if o.distinct() != 0 || o.len() != 0 {
 		t.Fatal("empty index retains tree or directory")
 	}
 }
@@ -137,10 +142,10 @@ func TestOrderedIndexMutationScaling(t *testing.T) {
 			for key := n - 1; key >= 0; key-- {
 				o.remove(key%distinct, key)
 			}
-			if comparisons > n*40 {
+			if comparisons > n*60 {
 				t.Fatalf("mutations did %d comparisons for %d rows: expected O(n log n)", comparisons, n)
 			}
-			if o.root != nil || o.len() != 0 {
+			if o.distinct() != 0 || o.len() != 0 {
 				t.Fatal("mutations leaked entries")
 			}
 		})

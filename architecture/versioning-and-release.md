@@ -119,7 +119,7 @@ The codebase maintains explicit pins in `go.mod`:
 | Component | Pinned Version / Source | Rationale / Capability |
 |---|---|---|
 | **Go Toolchain** | `1.26.0` (`go.mod` directive) | Primary runtime, compiler, and standard library |
-| **Immutable Radix** | `github.com/hashicorp/go-immutable-radix v1.3.1` | In-memory authoritative state store and snapshots |
+| **Tidwall B-tree** | `github.com/tidwall/btree v1.8.2` | In-memory authoritative state generations, snapshots, and RIME ordered indexes |
 | **Memberlist** | `github.com/hashicorp/memberlist v0.7.0` | SWIM cluster membership and gossip |
 | **quic-go** | `github.com/quic-go/quic-go v0.63.0` | QUIC transport, mTLS connection multiplexing, DATAGRAM capabilities |
 | **Google UUID** | `github.com/google/uuid v1.6.0` | 128-bit identity serialization for nodes, transactions, and snapshots |
@@ -129,10 +129,11 @@ The codebase maintains explicit pins in `go.mod`:
 Before publishing release binaries, container images, or vendored amalgamations, maintain compliance with constituent open-source licenses:
 
 1. **Mozilla Public License 2.0 (MPL-2.0)**:
-   - `github.com/hashicorp/go-immutable-radix` (HashiCorp immutable radix tree library)
    - `github.com/hashicorp/memberlist` (HashiCorp SWIM membership library)
+   - `github.com/hashicorp/go-immutable-radix` (retained transitively via memberlist/go-metrics; no longer used directly)
    - *Requirement*: Distribute MPL-2.0 notice. If source files are modified, modifications must remain available under MPL-2.0.
 2. **MIT License**:
+   - `github.com/tidwall/btree` (Tidwall B-tree for state and ordered indexes)
    - `github.com/quic-go/quic-go` (QUIC implementation)
    - `github.com/google/uuid` (UUID library)
    - *Requirement*: Preserve copyright and permission notice in binary distributions.

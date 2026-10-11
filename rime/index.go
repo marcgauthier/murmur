@@ -768,14 +768,7 @@ func onCommit[T any](t *Table[T], oldHead *T, p *pendingWrite, directUnique bool
 	if len(ix.ordered) > 0 {
 		if effects, ok := p.preparedIndexEffects.(managedIndexEffects); ok {
 			for _, effect := range effects.ordered {
-				switch {
-				case effect.hasOld && effect.hasNew:
-					effect.index.replacePrepared(effect.old, effect.new, p.key, effect.node, effect.item)
-				case effect.hasOld:
-					effect.index.remove(effect.old, p.key)
-				case effect.hasNew:
-					effect.index.addPrepared(effect.new, p.key, effect.node, effect.item)
-				}
+				effect.index.applyPrepared(effect, p.key)
 			}
 		} else {
 			for field, o := range ix.ordered {

@@ -2,7 +2,8 @@
 
 RIME is Murmur's separate native-Go in-memory relational engine. It exposes
 relational operations through typed Go functions and executes no SQL text.
-The core uses only the standard library and has no SQLite dependency. Murmur's
+The core uses only the standard library plus the approved Tidwall B-tree for
+ordered indexes, and has no SQLite dependency. Murmur's
 typed-record integration projects authoritative Spool state into RIME through
 the storage-owned `state.Reader` contract. RIME is the only managed query
 materializer in production.

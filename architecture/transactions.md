@@ -71,7 +71,7 @@ snapshot publication, typed callback writes drain and new callbacks wait until
 the rebuilt RIME generation is installed, so a snapshot cannot invalidate a
 staged callback's generation.
 
-The state store maintains an in-memory Radix tree representing current authoritative state. Serialize the entire read/merge/write operation for all local, remote, metadata, acknowledgement, and GC mutations through one state-store writer coordinator. Transactions can read their own pending writes before persistence. Independent readers use pinned Radix tree snapshots; with synchronous group commit ([Section 16](#16-durable-first-typed-commit-ordering)), one synced Spool commit carries a whole group of local transactions instead of one; the serialization requirement is unchanged.
+The state store maintains an in-memory B-tree generation representing current authoritative state. Serialize the entire read/merge/write operation for all local, remote, metadata, acknowledgement, and GC mutations through one state-store writer coordinator. Transactions can read their own pending writes before persistence. Independent readers use pinned B-tree snapshots; with synchronous group commit ([Section 16](#16-durable-first-typed-commit-ordering)), one synced Spool commit carries a whole group of local transactions instead of one; the serialization requirement is unchanged.
 
 This is one of the most important correctness requirements.
 

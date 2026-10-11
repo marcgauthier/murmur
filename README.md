@@ -48,7 +48,7 @@ The implementation leans on existing Go packages instead of reinventing them. Fo
 
 | Concern | Package |
 |---|---|
-| In-memory immutable radix tree state store & snapshots | `github.com/hashicorp/go-immutable-radix` |
+| In-memory B-tree state generations, snapshots & RIME ordered indexes | `github.com/tidwall/btree` |
 | At-rest AEADs (AES-GCM; ChaCha20-Poly1305, XChaCha20) | Go stdlib `crypto/aes`, `golang.org/x/crypto` |
 | QUIC transport with TLS 1.3 | `github.com/quic-go/quic-go` |
 | SWIM membership discovery & transport | `github.com/hashicorp/memberlist` |
@@ -68,8 +68,9 @@ previous release before opening a fresh directory. Remote snapshots require
 separately trusted source nodes. See [origin signatures](architecture/origin-signatures.md)
 for provisioning, restore and security boundaries.
 
-The [`rime/`](architecture/rime.md) package is a zero-dependency in-memory MVCC
-relational engine with a native Go API (no SQL parsing). Murmur uses it as its
+The [`rime/`](architecture/rime.md) package is an in-memory MVCC
+relational engine with a native Go API (no SQL parsing). Its sole external
+dependency is the approved Tidwall B-tree for ordered indexes. Murmur uses it as its
 managed query materializer. It supports
 [maintained Go query views](rime/USAGE.md#maintained-query-views) with cached
 results, incremental filters, and synchronous complex-query reevaluation. Its
@@ -300,7 +301,7 @@ MURMUR/                   managed Go API (db.go, records.go, config.go, ...)
   crdt/                  HLC clock, version comparison, LWW merge
   codec/                 binary value / mutation-batch / snapshot encodings
   schema/                stable table/column registry + validation
-  state/                 Spool-backed authoritative store with in-memory radix tree (commit, log, GC, snapshot)
+  state/                 Spool-backed authoritative store with in-memory B-tree (commit, log, GC, snapshot)
   replication/           framed QUIC protocol + peer manager (batches, acks, snapshot)
   plumtree/              bounded eager/lazy dissemination state machine
   overload/              bounded global/per-peer accounting and token-bucket primitives
@@ -308,7 +309,7 @@ MURMUR/                   managed Go API (db.go, records.go, config.go, ...)
   crypto/                at-rest encryption: AEAD ciphers, key provider interfaces
   spool/                 embedded write-optimized persistence engine for database state
   objectstore/           encrypted storage for uploaded file contents (optional file APIs)
-  rime/                  zero-dependency in-memory MVCC relational engine (native Go API, no SQL)
+  rime/                  in-memory MVCC relational engine (native Go API, no SQL; Tidwall B-tree ordered indexes)
   ids/                   128-bit identity types
   metrics/               JSON metrics HTTP handler over DB.Status
   bridge/                one-way Low-to-High logical replication roles and transfer types

@@ -134,7 +134,7 @@ For an online, zero-downtime backup of a large dataset, executing a raw Key-Valu
 - **Fail-Closed Verification:** Validates Spool container headers and encrypted keys format. Restoring into a non-empty directory without `Overwrite=true` is rejected.
 - **Autonomous Query Store Rebuild:** When `murmur.Open` is invoked with the master key:
   1. Spool authenticates and unwraps data keys from `keys.enc`.
-  2. Spool loads validated state records into the in-memory Radix tree.
+  2. Spool loads validated state records into the in-memory B-tree.
   3. The managed RIME adapter scans authoritative state and reconstructs the in-memory typed query store.
   4. Validate the restore identity policy below, rebuild the query store, then admit writable QUIC replication.
 

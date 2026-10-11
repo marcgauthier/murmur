@@ -1,11 +1,13 @@
 // Package rime implements RIME — Rapid In-Memory Engine.
 //
-// RIME is a zero-dependency, pure-Go, in-memory relational engine built
-// around native immutable Go objects, copy-on-write updates, sharded
-// concurrent storage, MVCC transactions, specialized indexes, and
-// function-based queries. See USAGE.md for the public syntax reference.
-// RIME performs no record serialization and
-// requires no CGO or query parsing.
+// RIME is a pure-Go, in-memory relational engine built around native
+// immutable Go objects, copy-on-write updates, sharded concurrent
+// storage, MVCC transactions, specialized indexes, and function-based
+// queries. See USAGE.md for the public syntax reference. RIME performs
+// no record serialization and requires no CGO or query parsing. Its
+// sole external dependency is the explicitly approved
+// github.com/tidwall/btree ordered-index B-tree; all other code uses
+// only the Go standard library.
 //
 // The primary optimization hierarchy is:
 //

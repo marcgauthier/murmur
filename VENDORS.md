@@ -13,7 +13,7 @@ These packages are directly imported and utilized by the Murmur database, storag
 
 | Package | Version | Publisher / Organization | Country of Origin | License | Description / Role |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `github.com/hashicorp/go-immutable-radix` | `v1.3.1` | HashiCorp, Inc. / IBM | United States | MPL-2.0 | Immutable Radix tree implementing the in-memory authoritative state store, snapshots, and point/range reads. |
+| `github.com/tidwall/btree` | `v1.8.2` | Josh Baker (Tidwall) | United States | MIT | Generic B-tree implementing state generations (copy-on-write snapshots, point/range reads) and RIME ordered indexes (distinct-value tree with duplicate buckets). |
 | `github.com/quic-go/quic-go` | `v0.63.0` | Marten Seemann & quic-go contributors | Germany | MIT | High-performance QUIC protocol transport for encrypted, low-latency inter-node replication. |
 | `github.com/hashicorp/memberlist` | `v0.7.0` | HashiCorp, Inc. / IBM | United States | MPL-2.0 | Gossip protocol for cluster membership, node state dissemination, and failure detection. |
 | `github.com/hashicorp/golang-lru/v2` | `v2.0.7` | HashiCorp, Inc. / IBM | United States | MPL-2.0 | High-throughput in-memory LRU, 2Q, and ARC cache implementations for query and block caching. |
@@ -31,6 +31,7 @@ These packages are required dependencies of our direct libraries (such as Member
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `github.com/google/btree` | `v1.1.3` | Google LLC | United States | Apache-2.0 | Memberlist (In-memory B-Tree data structures) |
 | `github.com/hashicorp/errwrap` | `v1.1.0` | HashiCorp, Inc. / IBM | United States | MPL-2.0 | Memberlist (Error wrapping utilities) |
+| `github.com/hashicorp/go-immutable-radix` | `v1.3.1` | HashiCorp, Inc. / IBM | United States | MPL-2.0 | Memberlist via go-metrics (retained transitively; no longer used directly) |
 | `github.com/hashicorp/go-metrics` | `v0.7.0` | HashiCorp, Inc. / IBM | United States | MPL-2.0 | Memberlist (Gossip metrics gathering) |
 | `github.com/hashicorp/go-msgpack/v2` | `v2.1.5` | HashiCorp, Inc. / IBM | United States | BSD-2-Clause | Memberlist (MessagePack network serialization) |
 | `github.com/hashicorp/go-multierror` | `v1.1.1` | HashiCorp, Inc. / IBM | United States | MPL-2.0 | Memberlist (Aggregated error management) |

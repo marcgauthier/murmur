@@ -1,12 +1,12 @@
 # Storage and materialization
 
-Spool layout, in-memory radix tree, startup/rebuild, caching, compaction, and a log-GC example.
+Spool layout, in-memory B-tree, startup/rebuild, caching, compaction, and a log-GC example.
 
 [Architecture index](README.md) · [Project README](../README.md)
 
 ## Contents
 
-- [13. Spool and In-Memory Radix Store as the Durable Source of Truth](#13-spool-and-in-memory-radix-store-as-the-durable-source-of-truth)
+- [13. Spool and In-Memory B-tree Store as the Durable Source of Truth](#13-spool-and-in-memory-b-tree-store-as-the-durable-source-of-truth)
 - [14. Storage Key Layout](#14-storage-key-layout)
 - [20. Materialization Generation](#20-materialization-generation)
 - [21. Startup](#21-startup)
@@ -17,9 +17,9 @@ Spool layout, in-memory radix tree, startup/rebuild, caching, compaction, and a 
 
 ---
 
-## 13. Spool and In-Memory Radix Store as the Durable Source of Truth
+## 13. Spool and In-Memory B-tree Store as the Durable Source of Truth
 
-Authoritative state is held in-memory using an immutable Radix Tree (`github.com/hashicorp/go-immutable-radix`) and persisted to disk via Spool (`spool/`).
+Authoritative state is held in-memory using a B-tree (`github.com/tidwall/btree`) generation published atomically after each Spool commit, and persisted to disk via Spool (`spool/`).
 
 The store maintains four distinct classes of information:
 
@@ -134,12 +134,12 @@ encoded MutationBatch
 
 Used for idempotent retry.
 
-### In-Memory Radix Tree & Ordered Scans
+### In-Memory B-tree & Ordered Scans
 
-The state store maintains an immutable Radix Tree in memory:
+The state store maintains a B-tree generation in memory:
 - Bytewise lexicographical key ordering is preserved.
-- Provides point lookups, bounded prefix and range iteration, and snapshot roots.
-- Pinned immutable roots allow row reconstruction, log serving, snapshot export, and query-materializer rebuild without holding writer locks.
+- Provides point lookups, bounded prefix and range iteration, and snapshot generations.
+- Each batch copies the published generation, mutates its private tree, and publishes only after Spool acknowledgement. Pinned immutable generations allow row reconstruction, log serving, snapshot export, and query-materializer rebuild without holding writer locks.
 
 ---
 
@@ -188,7 +188,7 @@ Startup sequence:
 2. Reject legacy Pebble and Badger directories; resolve wrapping key and authenticate keyring/context.
 3. Open Spool with AES-256-GCM encryption and configure background workers.
 4. Validate database format version and physical compatibility.
-5. Load records into in-memory Radix tree root; apply deletion markers.
+5. Load records into a private in-memory B-tree generation; apply deletion markers.
 6. Enforce fresh-identity/reseed policy before writable networking.
 7. Validate typed record descriptors and compatibility with persisted metadata under Section 6.
 8. Bind typed record descriptors, rebuild a private RIME database and install it atomically.
@@ -208,13 +208,13 @@ Only scan current state plus row tombstones.
 
 ## 22. Query Materializer Rebuild
 
-Rebuild operates from a pinned immutable Radix snapshot. Databases load into a
+Rebuild operates from a pinned immutable B-tree snapshot. Databases load into a
 private RIME generation and switch only after it is complete.
 
 For each replicated table:
 
 ```text
-Radix prefix scan
+B-tree prefix scan
       |
       v
 assemble rows
@@ -248,7 +248,7 @@ index-build time
 
 ## 25. Memory Management and Caching
 
-The current state and causal history live in the Radix tree. RIME maintains its own query records, indexes, and MVCC history; measure both resident copies.
+The current state and causal history live in the B-tree. RIME maintains its own query records, indexes, and MVCC history; measure both resident copies.
 
 Expose memory usage in `DB.Status().SpoolMemBytes` and `DB.Status().SpoolDiskBytes`. RIME owns its query indexes and MVCC history; Spool owns durable state and replication history.
 

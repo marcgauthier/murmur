@@ -145,7 +145,8 @@ updates, removing per-row field maps, and avoiding index rescans in tombstone GC
 
 The earlier sorted-slice removal used a linear search and shifted entries on
 every mutation. A 10K-row CPU profile attributed about 58% of sampled CPU
-cumulatively to ordered-index removal. The new model test verifies AVL balance,
+cumulatively to ordered-index removal. The model test introduced then verified
+AVL balance (now B-tree ordering after the AVL to Tidwall B-tree migration),
 key-directory consistency, duplicates, ranges, limits and extremes against an
 independent model. A comparator-count test covers insertion/deletion at 8,192
 rows with both 60 and 8,192 distinct values to catch quadratic regressions

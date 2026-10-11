@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"sync"
 	"sync/atomic"
+
+	"github.com/tidwall/btree"
 )
 
 // TableOption configures a table at registration.
@@ -711,13 +713,15 @@ type compoundIndexEffect struct {
 }
 
 type orderedIndexEffect struct {
-	index  *orderedIdx
-	old    any
-	new    any
-	hasOld bool
-	hasNew bool
-	node   *orderedNode
-	item   *orderedItem
+	index     *orderedIdx
+	old       any
+	new       any
+	hasOld    bool
+	hasNew    bool
+	bucket    *orderedBucket
+	item      *orderedItem
+	oldBucket *orderedBucket
+	newBucket *orderedBucket
 }
 
 type prefixIndexEffect struct {
@@ -751,10 +755,16 @@ type preparedOrderedMap struct {
 	index  *orderedIdx
 	values map[any]*orderedItem
 	hint   int
+	tree   *btree.BTreeG[*orderedBucket]
 }
 
 func (t *Table[T]) prepareOrderedMaps(writes []*pendingWrite) any {
+	type effectRef struct {
+		pending *pendingWrite
+		pos     int
+	}
 	counts := make(map[*orderedIdx]map[any]bool)
+	ordered := make(map[*orderedIdx][]effectRef)
 	t.idx.mu.Lock()
 	defer t.idx.mu.Unlock()
 	for _, pending := range writes {
@@ -762,7 +772,8 @@ func (t *Table[T]) prepareOrderedMaps(writes []*pendingWrite) any {
 		if !ok {
 			continue
 		}
-		for _, effect := range effects.ordered {
+		for i := range effects.ordered {
+			effect := &effects.ordered[i]
 			if effect.index == nil {
 				continue
 			}
@@ -782,6 +793,7 @@ func (t *Table[T]) prepareOrderedMaps(writes []*pendingWrite) any {
 				isPresent = true
 			}
 			present[pending.key] = isPresent
+			ordered[effect.index] = append(ordered[effect.index], effectRef{pending: pending, pos: i})
 		}
 	}
 	if len(counts) == 0 {
@@ -789,6 +801,74 @@ func (t *Table[T]) prepareOrderedMaps(writes []*pendingWrite) any {
 	}
 	prepared := make([]preparedOrderedMap, 0, len(counts))
 	for index, finalRows := range counts {
+		refs := ordered[index]
+		var candidate *btree.BTreeG[*orderedBucket]
+		if len(refs) > 0 && index.tree != nil {
+			candidate = index.tree.Copy()
+			projectedSizes := make(map[*orderedBucket]int)
+			getProjected := func(b *orderedBucket) int {
+				if p, ok := projectedSizes[b]; ok {
+					return p
+				}
+				return b.count
+			}
+			topologyChanged := false
+			for _, ref := range refs {
+				pe, ok := ref.pending.preparedIndexEffects.(managedIndexEffects)
+				if !ok || ref.pos >= len(pe.ordered) {
+					continue
+				}
+				eff := &pe.ordered[ref.pos]
+				if eff.index != index {
+					continue
+				}
+				if eff.hasOld && eff.hasNew && index.cmp(eff.old, eff.new) == 0 {
+					probe := orderedBucket{val: eff.old}
+					if b, ok := candidate.Get(&probe); ok {
+						eff.oldBucket = b
+						eff.newBucket = b
+					}
+					continue
+				}
+				if eff.hasOld {
+					probe := orderedBucket{val: eff.old}
+					if b, ok := candidate.Get(&probe); ok {
+						if p := getProjected(b); p > 0 {
+							projectedSizes[b] = p - 1
+						}
+					}
+				}
+				if eff.hasNew {
+					probe := orderedBucket{val: eff.new}
+					if b, ok := candidate.Get(&probe); ok {
+						projectedSizes[b] = getProjected(b) + 1
+						eff.newBucket = b
+					} else {
+						nb := eff.bucket
+						if nb == nil {
+							nb = &orderedBucket{}
+							eff.bucket = nb
+						}
+						nb.val = eff.new
+						nb.first, nb.last, nb.count = nil, nil, 0
+						candidate.Set(nb)
+						topologyChanged = true
+						projectedSizes[nb] = 1
+						eff.newBucket = nb
+					}
+				}
+			}
+			for b, final := range projectedSizes {
+				if final == 0 {
+					if _, ok := candidate.Delete(b); ok {
+						topologyChanged = true
+					}
+				}
+			}
+			if !topologyChanged {
+				candidate = nil
+			}
+		}
 		// Account for keys touched by this transaction that are being removed.
 		// Build the final cardinality from the old directory and the final
 		// presence of each touched key rather than copying on every mutation.
@@ -832,8 +912,12 @@ func (t *Table[T]) prepareOrderedMaps(writes []*pendingWrite) any {
 		for _, key := range reserved {
 			delete(target, key)
 		}
+		var values map[any]*orderedItem
 		if replaced {
-			prepared = append(prepared, preparedOrderedMap{index: index, values: target, hint: hint})
+			values = target
+		}
+		if values != nil || candidate != nil {
+			prepared = append(prepared, preparedOrderedMap{index: index, values: values, hint: hint, tree: candidate})
 		}
 	}
 	if len(prepared) == 0 {
@@ -853,8 +937,27 @@ func (t *Table[T]) installPreparedOrderedMaps(value any) {
 	t.idx.mu.Lock()
 	defer t.idx.mu.Unlock()
 	for _, item := range prepared {
-		item.index.byKey = item.values
-		item.index.byKeyHint = item.hint
+		if item.values != nil {
+			item.index.byKey = item.values
+			item.index.byKeyHint = item.hint
+		}
+	}
+}
+
+func (t *Table[T]) installPreparedOrderedTrees(value any) {
+	prepared, ok := value.([]preparedOrderedMap)
+	if !ok {
+		panic("rime: invalid prepared ordered maps")
+	}
+	if len(prepared) == 0 {
+		return
+	}
+	t.idx.mu.Lock()
+	defer t.idx.mu.Unlock()
+	for _, item := range prepared {
+		if item.tree != nil {
+			item.index.tree = item.tree
+		}
 	}
 }
 
@@ -919,7 +1022,7 @@ func (t *Table[T]) prepareIndexEffects(p *pendingWrite, reserve int) any {
 		}
 		if next != nil {
 			effect.new = t.orderedIndexValue(field, next)
-			effect.node = &orderedNode{}
+			effect.bucket = &orderedBucket{}
 			effect.item = &orderedItem{}
 		}
 		prepared.ordered = append(prepared.ordered, effect)

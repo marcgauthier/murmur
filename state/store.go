@@ -106,10 +106,10 @@ type retentionLease struct {
 }
 
 // Store is the Spool-backed authoritative state. Current state lives in
-// an in-memory radix tree; all read-modify-write commits serialize on
-// one writer mutex, build a candidate root, persist the mutations
-// through one atomic Spool commit, and publish the root only after
-// Spool acknowledges it. Multi-key reads use pinned immutable roots.
+// an in-memory B-tree generation; all read-modify-write commits serialize on
+// one writer mutex, build a candidate tree through copy-on-write, persist the
+// mutations through one atomic Spool commit, and publish the generation only
+// after Spool acknowledges it. Multi-key reads use pinned immutable generations.
 type Store struct {
 	policyMergeAttempts atomic.Uint64
 	policyMergeNanos    atomic.Uint64
@@ -214,7 +214,7 @@ func Open(path string, nodeID ids.NodeID, dbID ids.DBID, opt Options) (*Store, e
 		}
 	}
 	mem := newMemStore()
-	txn := mem.load().Txn()
+	loader := newKVTree()
 	sp, err := spool.OpenAndLoad(spopt, func(records []spool.Record) error {
 		for i := range records {
 			r := &records[i]
@@ -224,14 +224,14 @@ func Open(path string, nodeID ids.NodeID, dbID ids.DBID, opt Options) (*Store, e
 			if r.Deleted {
 				continue
 			}
-			txn.Insert(append([]byte(nil), r.Key...), append([]byte(nil), r.Value...))
+			loader.Set(kvItem{k: append([]byte(nil), r.Key...), v: append([]byte(nil), r.Value...)})
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("state: open spool: %w", err)
 	}
-	mem.publish(txn.Commit())
+	mem.publish(loader)
 	s := &Store{
 		spool:                       sp,
 		mem:                         mem,
@@ -634,7 +634,7 @@ func (s *Store) noteTerminal(op string, err error) error {
 }
 
 // commitBatch persists a batch through one atomic Spool commit and
-// publishes the candidate root only after Spool acknowledges it.
+// publishes the candidate generation only after Spool acknowledges it.
 // Async publication follows acceptance; synchronous publication follows
 // durable acknowledgement. A failed commit publishes nothing and, when
 // the failure is terminal, fails the store closed.

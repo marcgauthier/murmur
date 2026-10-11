@@ -562,7 +562,6 @@ func (p *PreparedTx) install() (afters []commitAfter, err error) {
 	for _, maps := range p.orderedMaps {
 		maps.table.installPreparedOrderedMaps(maps.rows)
 	}
-	p.orderedMaps = nil
 	afters = p.afters[:0]
 	for _, w := range tx.pending {
 		if w.apply != nil {
@@ -586,6 +585,10 @@ func (p *PreparedTx) install() (afters []commitAfter, err error) {
 			w.table.finishPreparedIndexEffects(tx.pending)
 		}
 	}
+	for _, maps := range p.orderedMaps {
+		maps.table.installPreparedOrderedTrees(maps.rows)
+	}
+	p.orderedMaps = nil
 	for _, prepared := range p.uniqueMaps {
 		prepared.table.installPreparedUniqueClaims(prepared.maps)
 	}

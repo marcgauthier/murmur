@@ -120,6 +120,7 @@ type innerTable interface {
 	installPreparedHashIndexes(any)
 	prepareOrderedMaps([]*pendingWrite) any
 	installPreparedOrderedMaps(any)
+	installPreparedOrderedTrees(any)
 	prepareUniqueClaims(map[string]map[any]any) any
 	installPreparedUniqueClaims(any)
 	createIndex(field string, kind IndexKind) error

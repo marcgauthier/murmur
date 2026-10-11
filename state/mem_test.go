@@ -152,8 +152,91 @@ func TestMemSnapshotIsolation(t *testing.T) {
 	}
 }
 
+// TestMemBatchIteratorIsolation requires batch iterators to pin their
+// view: mutations after iterator creation must not affect it, while a
+// fresh iterator sees the new pending state.
+func TestMemBatchIteratorIsolation(t *testing.T) {
+	m := newMemStore()
+	b := m.newBatch()
+	if err := b.Set([]byte("a"), []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	it, err := b.NewIter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	// Mutate the batch after iterator creation.
+	if err := b.Set([]byte("b"), []byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Delete([]byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	var pinned []string
+	for it.First(); it.Valid(); it.Next() {
+		pinned = append(pinned, string(it.Key()))
+	}
+	if len(pinned) != 1 || pinned[0] != "a" {
+		t.Fatalf("pinned batch iter = %q, want [a]", pinned)
+	}
+	fresh, err := b.NewIter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	var got []string
+	for fresh.First(); fresh.Valid(); fresh.Next() {
+		got = append(got, string(fresh.Key()))
+	}
+	if len(got) != 1 || got[0] != "b" {
+		t.Fatalf("fresh batch iter = %q, want [b]", got)
+	}
+}
+
+// TestMemStoreBinaryEmptyValues requires binary keys, empty values,
+// overwrites, and repeated seeks to behave across generations.
+func TestMemStoreBinaryEmptyValues(t *testing.T) {
+	m := newMemStore()
+	b := m.newBatch()
+	if err := b.Set([]byte{0x00, 0xff, 0x01}, []byte{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Set([]byte("k"), []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	m.publish(b.candidate())
+	b2 := m.newBatch()
+	if err := b2.Set([]byte("k"), []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	m.publish(b2.candidate())
+	got, err := m.get([]byte{0x00, 0xff, 0x01})
+	if err != nil || len(got) != 0 {
+		t.Fatalf("binary empty value = %q, %v; want empty", got, err)
+	}
+	got, err = m.get([]byte("k"))
+	if err != nil || string(got) != "v2" {
+		t.Fatalf("overwrite k = %q, %v; want v2", got, err)
+	}
+	it, err := m.newIter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	if !it.SeekGE([]byte("k")) || string(it.Key()) != "k" {
+		t.Fatalf("SeekGE(k) = %q valid=%v", it.Key(), it.Valid())
+	}
+	if !it.SeekGE([]byte("k")) || string(it.Key()) != "k" {
+		t.Fatalf("repeated SeekGE(k) = %q valid=%v", it.Key(), it.Valid())
+	}
+	if !it.SeekGE([]byte{0x00}) || string(it.Key()) != string([]byte{0x00, 0xff, 0x01}) {
+		t.Fatalf("SeekGE binary = %q", it.Key())
+	}
+}
+
 // TestMemStoreEmpty requires empty-tree reads to report not-found and
-// invalid iteration instead of panicking on a nil radix root.
+// invalid iteration instead of panicking on an empty generation.
 func TestMemStoreEmpty(t *testing.T) {
 	m := newMemStore()
 	if _, err := m.get([]byte("k")); !errors.Is(err, errNotFound) {

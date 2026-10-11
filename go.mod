@@ -4,9 +4,9 @@ go 1.26.6
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/hashicorp/go-immutable-radix v1.3.1
 	github.com/hashicorp/memberlist v0.7.0
 	github.com/quic-go/quic-go v0.63.0
+	github.com/tidwall/btree v1.8.2
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sys v0.48.0
 )
@@ -14,6 +14,7 @@ require (
 require (
 	github.com/google/btree v1.1.3 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
+	github.com/hashicorp/go-immutable-radix v1.3.1 // indirect
 	github.com/hashicorp/go-metrics v0.7.0 // indirect
 	github.com/hashicorp/go-msgpack/v2 v2.1.5 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
