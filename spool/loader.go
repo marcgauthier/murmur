@@ -1,6 +1,7 @@
 package spool
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +19,21 @@ import (
 // buffer: copy to retain. A non-nil return aborts the load with that
 // error.
 type LoadFunc func([]Record) error
+
+// ReplayProgress reports segment replay advancement during open. Files
+// and bytes track member segments; Records counts validated record
+// visits. Pass two re-validates winner blocks, so Records and
+// BytesDone accumulate across passes and can exceed the stored
+// totals. Calls are serialized. BytesTotal is the sum of member
+// segment sizes at scan start.
+type ReplayProgress struct {
+	Pass       int // 1 = validate/index, 2 = winner delivery (OpenAndLoad only)
+	FilesTotal int
+	FilesDone  int
+	BytesTotal int64
+	BytesDone  int64
+	Records    uint64
+}
 
 // LoadOptions configures a standalone offline load.
 type LoadOptions struct {
@@ -77,6 +93,50 @@ type loader struct {
 	ring *keyring // nil when unencrypted
 	comp *compressor
 	ctx  [16]byte // database context binding block AAD
+	// replay, when non-nil, receives per-block and per-file advancement.
+	// Only the open path sets it; standalone and maintenance scans skip it.
+	replay *replayTracker
+	// tornTailID, when non-zero, names the one member whose
+	// unparseable tail may truncate (the active segment: the only
+	// file a crash can catch mid-append). Every other member fails
+	// closed on framing errors, as do all scans that leave this zero.
+	tornTailID uint64
+}
+
+// replayTracker accumulates scan advancement for Options.OnReplayProgress.
+type replayTracker struct {
+	cb         func(ReplayProgress)
+	pass       int
+	filesTotal int
+	filesDone  int
+	bytesTotal int64
+	bytesDone  int64
+	records    uint64
+}
+
+func (l *loader) noteReplay(records uint64, bytes int64) {
+	t := l.replay
+	if t == nil {
+		return
+	}
+	t.records += records
+	t.bytesDone += bytes
+	t.cb(ReplayProgress{Pass: t.pass, FilesTotal: t.filesTotal, FilesDone: t.filesDone, BytesTotal: t.bytesTotal, BytesDone: t.bytesDone, Records: t.records})
+}
+
+func (l *loader) noteReplayFile() {
+	t := l.replay
+	if t == nil {
+		return
+	}
+	t.filesDone++
+	t.cb(ReplayProgress{Pass: t.pass, FilesTotal: t.filesTotal, FilesDone: t.filesDone, BytesTotal: t.bytesTotal, BytesDone: t.bytesDone, Records: t.records})
+}
+
+func (l *loader) setReplayPass(pass int) {
+	if l.replay != nil {
+		l.replay.pass = pass
+	}
 }
 
 // openLoader reads the manifest and key container without locking,
@@ -142,10 +202,14 @@ type assembledGroup struct {
 // group atomically), so assembly is strict: a data block opening a
 // new group while another is open, or a completion closing the wrong
 // group, is corruption. A trailing group without its completion is
-// an incomplete tail and is discarded as a whole. It returns the
-// complete groups in file order, the valid end, and the highest
-// block sequence among complete frames.
-func assembleFile(f *os.File, size int64, id uint64) (groups []*assembledGroup, validEnd int64, maxBlock uint64, discarded uint64, err error) {
+// an incomplete tail and is discarded as a whole. When tornTailOK
+// (the active segment: the only file a crash can catch mid-append),
+// unparseable bytes that no valid frame follows are a torn tail and
+// truncate to the last valid end; unparseable bytes followed by
+// more valid frames are genuine corruption and fail closed. It
+// returns the complete groups in file order, the valid end, and the
+// highest block sequence among complete frames.
+func assembleFile(f *os.File, size int64, id uint64, tornTailOK bool) (groups []*assembledGroup, validEnd int64, maxBlock uint64, discarded uint64, err error) {
 	var offs []int64
 	var off int64
 	for off < size {
@@ -154,7 +218,23 @@ func assembleFile(f *os.File, size int64, id uint64) (groups []*assembledGroup, 
 			break
 		}
 		if rerr != nil {
-			return nil, off, 0, 0, fmt.Errorf("spool: segment %d offset %d: %w", id, off, rerr)
+			// Sealed files never take appends: any framing
+			// failure there is genuine corruption.
+			if !tornTailOK {
+				return nil, off, 0, 0, fmt.Errorf("spool: segment %d offset %d: %w", id, off, rerr)
+			}
+			roff, ok, rserr := resyncFrame(f, off, size)
+			if rserr != nil {
+				return nil, off, 0, 0, fmt.Errorf("spool: segment %d offset %d: %w (resync failed: %v)", id, off, rerr, rserr)
+			}
+			if ok {
+				return nil, off, 0, 0, fmt.Errorf("spool: segment %d offset %d: %w (next valid frame at %d)", id, off, rerr, roff)
+			}
+			// Torn tail: nothing valid follows, so the crash
+			// interrupted this append. Truncate to the last
+			// valid frame end; the caller cuts the file.
+			discarded = 1
+			break
 		}
 		offs = append(offs, off)
 		off = next
@@ -209,6 +289,60 @@ func assembleFile(f *os.File, size int64, id uint64) (groups []*assembledGroup, 
 		discarded = 1
 	}
 	return groups, validEnd, maxBlock, discarded, nil
+}
+
+// resyncFrame scans [from,size) for the next offset holding a
+// structurally valid block header (magic, version, CRC). It reports
+// the first hit so framing failures can tell a torn tail (nothing
+// valid follows) from mid-file corruption (valid frames follow).
+// Candidates filter on magic and version before the CRC check, so
+// random data scans at memchr speed; only the recovery path pays
+// for the scan. A read failure fails closed: the tail cannot be
+// proven torn when it cannot even be read.
+func resyncFrame(f *os.File, from, size int64) (int64, bool, error) {
+	if size-from < int64(blockHeaderLen) {
+		return 0, false, nil
+	}
+	const chunkSize = 1 << 20
+	var carry []byte
+	for pos := from; pos < size; {
+		end := pos + int64(chunkSize)
+		if end > size {
+			end = size
+		}
+		chunk := make([]byte, end-pos)
+		n, rerr := f.ReadAt(chunk, pos)
+		if rerr != nil {
+			return 0, false, fmt.Errorf("spool: resync read at %d: %w", pos, rerr)
+		}
+		chunk = chunk[:n]
+		buf := chunk
+		bufPos := pos
+		if len(carry) > 0 {
+			buf = append(carry, chunk...)
+			bufPos = pos - int64(len(carry))
+			carry = nil
+		}
+		limit := int64(len(buf)) - int64(blockHeaderLen)
+		for i := int64(0); i <= limit; i++ {
+			if buf[i] != blockMagic[0] || string(buf[i:i+4]) != blockMagic {
+				continue
+			}
+			if binary.LittleEndian.Uint16(buf[i+4:i+6]) != blockVersion {
+				continue
+			}
+			if _, perr := parseBlockHeader(buf[i : i+int64(blockHeaderLen)]); perr == nil {
+				return bufPos + i, true, nil
+			}
+		}
+		if tail := int64(len(buf)); tail >= int64(blockHeaderLen) {
+			carry = append(carry[:0], buf[tail-int64(blockHeaderLen)+1:]...)
+		} else {
+			carry = append(carry[:0], buf...)
+		}
+		pos = end
+	}
+	return 0, false, nil
 }
 
 // validatedRecords holds one decrypted data block with its records.
@@ -304,7 +438,7 @@ func (l *loader) visitValidatedFile(id uint64, visit func(r Record, loc Location
 	if err != nil {
 		return 0, 0, 0, 0, fmt.Errorf("spool: stat segment %d: %w", id, err)
 	}
-	groups, validEnd, _, discarded, err := assembleFile(f, st.Size(), id)
+	groups, validEnd, _, discarded, err := assembleFile(f, st.Size(), id, l.tornTailID != 0 && id == l.tornTailID)
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
@@ -338,6 +472,16 @@ func (l *loader) visitValidatedFile(id uint64, visit func(r Record, loc Location
 				}
 			}
 		}
+		var groupRecords uint64
+		var groupBytes int64
+		for _, b := range blocks {
+			groupRecords += uint64(len(b.recs))
+		}
+		for _, fb := range g.data {
+			groupBytes += int64(len(fb.sealed))
+		}
+		groupBytes += int64(len(g.completion.sealed))
+		l.noteReplay(groupRecords, groupBytes)
 	}
 	return maxBlock, maxGroup, validEnd, discarded, nil
 }
@@ -363,6 +507,7 @@ func (l *loader) scanAll(members []uint64, fn LoadFunc, idx *index, fs *fileStat
 	if idx == nil {
 		standalone = make(map[string]winnerLoc)
 	}
+	l.setReplayPass(1)
 	for _, id := range members {
 		mb, mg, end, disc, verr := l.visitValidatedFile(id, func(r Record, loc Location) error {
 			if idx != nil {
@@ -387,10 +532,12 @@ func (l *loader) scanAll(members []uint64, fn LoadFunc, idx *index, fs *fileStat
 		if verr != nil {
 			return maxBlock, maxGroup, ends, discarded, verr
 		}
+		l.noteReplayFile()
 	}
 	if fn == nil {
 		return maxBlock, maxGroup, ends, discarded, nil
 	}
+	l.setReplayPass(2)
 	winners := standalone
 	if idx != nil {
 		winners = idx.snapshotWinners()
@@ -451,6 +598,16 @@ func OpenAndLoad(opts Options, fn LoadFunc) (*Store, error) {
 // and group ids, per-file valid ends, and discarded tail groups.
 func (s *Store) rebuild(fn LoadFunc, ids []uint64) (uint64, uint64, map[uint64]int64, uint64, error) {
 	l := &loader{dir: s.dir, man: s.man, ring: s.ring, comp: s.comp, ctx: s.ctx}
+	if cb := s.opts.OnReplayProgress; cb != nil {
+		l.replay = &replayTracker{cb: cb, pass: 1, filesTotal: len(ids), bytesTotal: segmentBytesTotal(s.dir, ids)}
+	}
+	// The highest member is the append target: only its tail may
+	// truncate as torn. Sealed members fail closed on any damage.
+	for _, id := range ids {
+		if id > l.tornTailID {
+			l.tornTailID = id
+		}
+	}
 	maxBlock, maxGroup, ends, discarded, err := l.scanAll(ids, fn, s.idx, s.fstats)
 	if err != nil {
 		return 0, 0, nil, 0, err
@@ -495,6 +652,19 @@ func (s *Store) truncateActive(id uint64, validEnd int64) error {
 		return fmt.Errorf("spool: sync truncated segment: %w", err)
 	}
 	return nil
+}
+
+// segmentBytesTotal sums member segment sizes for replay totals. Files
+// that vanish mid-scan contribute zero; the scan itself reports real
+// errors when it reaches them.
+func segmentBytesTotal(dir string, members []uint64) int64 {
+	var total int64
+	for _, id := range members {
+		if st, err := os.Stat(filepath.Join(dir, segmentsDirName, segmentFileName(id))); err == nil {
+			total += st.Size()
+		}
+	}
+	return total
 }
 
 // openPayload authenticates, decrypts and decompresses one sealed

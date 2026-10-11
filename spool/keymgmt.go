@@ -130,7 +130,7 @@ func (s *Store) scanKeyReferences() ([]KeyReference, error) {
 			f.Close()
 			return nil, fmt.Errorf("spool: reference scan stats segment %d: %w", id, err)
 		}
-		groups, _, _, _, err := assembleFile(f, st.Size(), id)
+		groups, _, _, _, err := assembleFile(f, st.Size(), id, false)
 		f.Close()
 		if err != nil {
 			return nil, fmt.Errorf("spool: reference scan assembles segment %d: %w", id, err)

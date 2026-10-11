@@ -218,6 +218,10 @@ type Options struct {
 	// outside internal locks. The store rejects further mutating
 	// operations after it fires; reopen to recover.
 	OnStorageError func(error)
+	// OnReplayProgress, when non-nil, receives segment replay
+	// advancement during open. Calls are serialized and run outside
+	// internal locks. Nil disables reporting entirely.
+	OnReplayProgress func(ReplayProgress)
 	// CompactionThreshold in (0,1] marks sealed segments with
 	// live/total records at or below it eligible for compaction.
 	// Default 0.20.
@@ -405,6 +409,7 @@ func (o Options) normalized() (Options, error) {
 		d.MaxSegmentSize = o.MaxSegmentSize
 	}
 	d.OnStorageError = o.OnStorageError
+	d.OnReplayProgress = o.OnReplayProgress
 	if o.MaxPendingBytes != 0 {
 		d.MaxPendingBytes = o.MaxPendingBytes
 	}

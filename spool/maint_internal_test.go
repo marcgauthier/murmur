@@ -740,7 +740,7 @@ func TestCompletionDigestMismatchAlone(t *testing.T) {
 		f.Close()
 		t.Fatalf("stat: %v", err)
 	}
-	groups, _, _, _, err := assembleFile(f, stt.Size(), 1)
+	groups, _, _, _, err := assembleFile(f, stt.Size(), 1, false)
 	f.Close()
 	if err != nil {
 		t.Fatalf("assemble: %v", err)

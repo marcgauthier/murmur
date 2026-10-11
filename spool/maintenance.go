@@ -490,7 +490,7 @@ func stageSegmentFile(env maintEnv, id uint64, keyID uint32, key [32]byte, readC
 		f.Close()
 		return nil, fmt.Errorf("spool: stage stats segment %d: %w", id, err)
 	}
-	groups, _, _, _, err := assembleFile(f, st.Size(), id)
+	groups, _, _, _, err := assembleFile(f, st.Size(), id, false)
 	f.Close()
 	if err != nil {
 		return nil, fmt.Errorf("spool: stage assembles segment %d: %w", id, err)
@@ -682,7 +682,7 @@ func verifyStagedFile(env maintEnv, stagedName string, id uint64, sealCtx [16]by
 		f.Close()
 		return fmt.Errorf("spool: verify stats staged segment %d: %w", id, err)
 	}
-	groups, _, _, _, err := assembleFile(f, st.Size(), id)
+	groups, _, _, _, err := assembleFile(f, st.Size(), id, false)
 	f.Close()
 	if err != nil {
 		return fmt.Errorf("spool: verify assembles staged segment %d: %w", id, err)

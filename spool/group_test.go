@@ -72,7 +72,7 @@ func TestGroupsNeverSplitAcrossSegments(t *testing.T) {
 			t.Fatalf("open: %v", err)
 		}
 		fi, _ := f.Stat()
-		groups, _, _, _, err := assembleFile(f, fi.Size(), id)
+		groups, _, _, _, err := assembleFile(f, fi.Size(), id, false)
 		f.Close()
 		if err != nil {
 			t.Fatalf("assemble %d: %v", id, err)
