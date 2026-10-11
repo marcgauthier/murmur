@@ -149,6 +149,12 @@ func TestSchedulerDualServiceAttribution(t *testing.T) {
 	if st.Remote.DualServiceNanos == 0 {
 		t.Fatal("remote grant between backlogged classes recorded no dual service")
 	}
+	if st.Remote.DualGrants != 1 {
+		t.Fatalf("remote dual grants = %d, want 1", st.Remote.DualGrants)
+	}
+	if st.Local.DualGrants != 0 {
+		t.Fatalf("local dual grants = %d, want 0", st.Local.DualGrants)
+	}
 	if st.Local.DualServiceNanos != 0 {
 		t.Fatalf("local grants with empty remote queue recorded %d dual nanos", st.Local.DualServiceNanos)
 	}

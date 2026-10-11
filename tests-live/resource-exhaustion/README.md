@@ -21,7 +21,7 @@ MURMUR_RX_SLOW_RATE=8192 go test \
 |---|---|---|
 | `TestNearOOMSurvivesAndConverges` | 16 MiB block cache + `GOMEMLIMIT` (default 128 MiB) + 2 KiB churn + 8 MiB burst | Victim stays alive, responsive, exactly converged |
 | `TestFDExhaustionFailClosed` | `prlimit` RLIMIT_NOFILE squeeze + held idle TLS connections until a probe write observably fails | Process alive, restart recovers to exact convergence (linux-only, skips without `prlimit`) |
-| `TestStalledCompactionStaysCorrect` | Automatic compactions disabled + 1 MiB memtables | SST pile-up proves the stall; exact convergence under stall; debt drains after re-enable |
+| `TestStalledCompactionStaysCorrect` | 1 MiB segments + hourly reclaim ticks (stalled reclamation) + fixed-key update churn | Sealed `.spool` pile-up proves the stall; exact convergence under stall; fully-dead segments drain after re-enable |
 | `TestSlowPeerConvergesWithoutWedge` | Userspace UDP throttle proxies, both directions (default 256 KiB/s, no privileges), byte-count proof the data crossed them | Slow node makes steady progress (90 s without progress = wedge = FAIL), then converges; direct re-peer heals |
 | `TestHugeTransactionsAtDefaultBudgets` | 8 MiB accept (byte-exact both nodes), 20 MiB reject (`too large`, no partial row), 20 x 512 KiB load | Exact convergence, writer healthy after rejection |
 

@@ -57,7 +57,7 @@ func TestNearOOMSurvivesAndConverges(t *testing.T) {
 		SpoolByNode: map[int]*harness.SpoolOptions{
 			// 16x less cache than default; the victim must serve
 			// churn far larger than its hot set.
-			1: {CacheBytes: 16 << 20, MemTableBytes: 1 << 20},
+			1: {CacheBytes: 16 << 20},
 		},
 		NodeEnv: map[int][]string{
 			1: {"GOMEMLIMIT=" + memLimit},

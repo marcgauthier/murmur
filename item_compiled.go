@@ -126,7 +126,7 @@ func (cq *ItemCompiledQuery) collect(matcher q.Matcher) error {
 			}
 		}
 		return nil
-	case q.StringMatcher:
+	case q.StringMatcher, q.NullMatcher:
 		return nil
 	case q.AndMatcher:
 		for _, child := range m.Matchers {
@@ -222,7 +222,7 @@ func (cq *ItemCompiledQuery) substitute(matcher q.Matcher, args []any) (q.Matche
 		}
 		m.Values = values
 		return m, nil
-	case q.StringMatcher:
+	case q.StringMatcher, q.NullMatcher:
 		return m, nil
 	case q.AndMatcher:
 		kids := make([]q.Matcher, len(m.Matchers))

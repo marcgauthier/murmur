@@ -121,7 +121,7 @@ directory and a private `MURMUR_BIN` path. Ephemeral ports need no isolation:
 the harness coordinates them across processes (and checkouts) with
 claim files under `${TMPDIR:-/tmp}/spedsql-portclaims` (4h TTL).
 
-Daemon scenarios spin up discrete node instances (e.g. `./node1`, `./node2`, `./node3`, `./node4`) running the internal test fixture binary (`tests-live/harness/testnode`) with isolated Spool storage, certificates, log files (`node.log`), and HTTPS service/admin endpoints. API requests use a CA-signed client certificate; only `GET /healthz` permits a client without a certificate. Encrypted nodes start with `await-unlock = true` and receive their encryption key through the HTTPS Remote Unlock API (`/v1/admin/unlock`).
+Daemon scenarios spin up discrete node instances (e.g. `./node1`, `./node2`, `./node3`, `./node4`) running the internal test fixture binary (`tests-live/harness/testnode`) with isolated Spool storage, certificates, log files (`node.log`), and HTTPS service/admin endpoints. API requests use a CA-signed client certificate; only `GET /healthz` permits a client without a certificate. Encrypted nodes start with `await-unlock = true` and receive their encryption key through the HTTPS Remote Unlock API (`/v1/admin/unlock`). Unlocks poll `/v1/admin/open-progress` while the database replays: advancing counters wait out slow opens, frozen counters fail fast as stalled (`MURMUR_LIVE_UNLOCK_STALL_SECONDS`, default 120) under an overall cap (`MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`, default 1800).
 
 Successful runtime directories under `tests-live/runtime/` are automatically removed. Failures are preserved under `tests-live/failures/<timestamp>-<scenario>/` with full node directories and log files for inspection.
 

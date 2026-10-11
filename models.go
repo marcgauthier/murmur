@@ -33,6 +33,21 @@ func Model[T any](options ...ModelOptions) (TableDefinition, error) {
 	return defineType[T](typ, opts.Name, opts.TableID, opts.RecordOptions, identity)
 }
 
+// ModelFor compiles a runtime struct exemplar with explicit model options.
+// It uses the same model identities and item API as Model, without compiling
+// a separate storage implementation for every application model type.
+func ModelFor(model any, options ...ModelOptions) (TableDefinition, error) {
+	typ := reflect.TypeOf(model)
+	if typ != nil && typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	opts, identity, err := modelOptions(typ, options)
+	if err != nil {
+		return TableDefinition{}, err
+	}
+	return defineType[any](typ, opts.Name, opts.TableID, opts.RecordOptions, identity)
+}
+
 type modelIdentity struct {
 	typ      reflect.Type
 	name     string

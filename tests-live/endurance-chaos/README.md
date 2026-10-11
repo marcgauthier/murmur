@@ -55,6 +55,8 @@ overhead; `run.sh` sizes it automatically (76h ceiling).
 | `MURMUR_ENDURANCE_DISK_MB` | 128 | Filler size per hold (auto-reduced to leave 1 GiB free) |
 | `MURMUR_ENDURANCE_DISK_HOLD_SECONDS` | 60 | Filler hold length per cycle |
 | `MURMUR_ENDURANCE_SKEW_SECONDS` | 120 | Clock-skew window length (+5 min on the last node, once per run) |
+| `MURMUR_LIVE_UNLOCK_STALL_SECONDS` | 120 | Unlock fails fast only after this long with frozen open progress |
+| `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS` | 1800 | Overall cap per unlock, however slowly progress advances |
 
 ## Fault mix
 

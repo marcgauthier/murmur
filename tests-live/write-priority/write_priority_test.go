@@ -47,17 +47,20 @@ func TestLocalWritePriority(t *testing.T) {
 	dualBefore := dualService(t, cluster)
 	deadline := time.Now().Add(writeFor)
 
-	// Sixteen writers per node with disjoint key ranges; the daemon's
-	// typed service surface issues one transaction each.
-	// Deep queues maximize dual contention (both classes backlogged,
-	// where the 90/10 policy binds) so the policy is actually
-	// exercised, including under `-race` on a loaded box, where each
+	// Writers per node with disjoint key ranges; the daemon's typed
+	// service surface issues one transaction each. Writers must
+	// saturate the microsecond-commit scheduler: sparse writers drain
+	// between arrivals, so neither class backlogs and no dual
+	// contention forms. Dense writers overdrive the scheduler into
+	// persistent backlog on both classes, where the 90/10 policy
+	// binds, including under `-race` on a loaded box, where each
 	// synchronous driver loop runs several times slower.
+	const writers = 256
 	var wg sync.WaitGroup
-	errCh := make(chan error, 32)
+	errCh := make(chan error, 1024)
 	var written atomic.Int64
 	for node := 0; node < 2; node++ {
-		for worker := 0; worker < 16; worker++ {
+		for worker := 0; worker < writers; worker++ {
 			wg.Add(1)
 			go func(node, worker int) {
 				defer wg.Done()
@@ -105,16 +108,17 @@ func TestLocalWritePriority(t *testing.T) {
 	local := dualAfter.local - dualBefore.local
 	remote := dualAfter.remote - dualBefore.remote
 	// Vacuity gate: the policy assertion needs proven dual contention
-	// (service granted while both classes waited). Near-zero dual mass
-	// means the queues never overlapped and there is no policy decision
-	// to measure — fail loudly instead of asserting on borrowing.
-	t.Logf("dual-contention writer service: local=%.3fs replication=%.3fs share=%.3f",
+	// (grants chosen while both classes waited). Grants, not service
+	// seconds, are the policy decisions: microsecond local holds keep
+	// dual service near zero even under real overlap, while hold-time
+	// asymmetry can never hide a contested decision.
+	t.Logf("dual-contention writer grants: local=%.0f replication=%.0f share=%.3f",
 		local, remote, remote/(local+remote))
-	if local+remote < 1.0 {
-		t.Fatalf("only %.3fs of dual-contention service, want >= 1s to measure the 90/10 policy", local+remote)
+	if local+remote < 100 {
+		t.Fatalf("only %.0f dual-contention grants, want >= 100 to measure the 90/10 policy", local+remote)
 	}
 	if share := remote / (local + remote); share > 0.25 {
-		t.Fatalf("replication occupied %.1f%% of dual-contention writer service time", share*100)
+		t.Fatalf("replication won %.1f%% of dual-contention writer grants", share*100)
 	}
 
 	// Convergence: identical row counts and identical hashes.
@@ -143,10 +147,10 @@ func stateOf(t *testing.T, cluster *harness.Cluster, idx int) (int, [32]byte) {
 	return len(rows), sha256.Sum256([]byte(fmt.Sprintf("%v", rows)))
 }
 
-// dualCounters sums dual-contention service seconds (granted while the
-// other interactive class waited) by scheduler class across both
-// daemons. Values render as float64 text (scientific notation at the
-// extremes), so ParseFloat, not ParseUint.
+// dualCounters sums dual-contention grants (chosen while the other
+// interactive class waited) by scheduler class across both daemons.
+// Values render as float64 text (scientific notation at the extremes),
+// so ParseFloat, not ParseUint.
 type dualCounters struct {
 	local  float64
 	remote float64
@@ -171,7 +175,7 @@ func dualService(t *testing.T, cluster *harness.Cluster) (out dualCounters) {
 			t.Fatal("decode metrics JSON")
 		}
 		for _, sample := range samples {
-			if sample.Name != "spedsql_sched_dual_service_seconds_total" {
+			if sample.Name != "spedsql_sched_dual_grants_total" {
 				continue
 			}
 			switch sample.Labels["class"] {

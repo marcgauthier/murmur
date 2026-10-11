@@ -8,10 +8,11 @@ API and on-disk format change.
 
 ### Breaking changes
 
-- SQL execution, query, and schema APIs have been removed. Applications define
-  records with `Define[T]`, provide the definitions through `Config.Tables`, and
-  access them through Murmur's typed table and query APIs. See the [RIME usage
-  reference](rime/USAGE.md) and [project README](README.md) for examples.
+- SQL execution, query, and schema APIs have been removed. Applications register
+  models with `Models: []any{Device{}}`, optionally configure names and durable
+  identities with `Model[T]`, and access them through Murmur's item and query
+  APIs. See the [application usage guide](USAGE.md) and [project
+  README](README.md) for examples.
 - SQLite, its driver, SQL CLI commands, and SQLite-specific build tags are no
   longer part of the production module. The normal storage build works with
   `CGO_ENABLED=0`.
@@ -21,7 +22,7 @@ API and on-disk format change.
 - Format-5 SQL-era stores and legacy Pebble directories fail closed. This
   release does not convert them in place, and the new restore engine rejects
   legacy backups. Use the previous release to export legacy data, define the
-  corresponding typed tables, and import into a fresh data directory.
+  corresponding tables, and import into a fresh data directory.
 
 There is no dual-engine mode or SQL fallback. Historical SQLite comparisons are
 isolated under `tests-benchmark/` and excluded from production builds.

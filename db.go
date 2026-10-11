@@ -208,6 +208,10 @@ func Open(ctx context.Context, cfg Config) (result *DB, openErr error) {
 		db.cancel()
 		return nil, err
 	}
+	progress.phase(OpenReplaying)
+	if progress != nil {
+		spoolOpt.OnReplayProgress = func(p spool.ReplayProgress) { progress.replay(p) }
+	}
 	store, err := state.Open(dataPath, cfg.NodeID, cfg.DBID, state.Options{
 		OriginSigning:            cfg.OriginSigning,
 		SnapshotAtomicMergeBytes: cfg.Replication.SnapshotAtomicMergeBytes,

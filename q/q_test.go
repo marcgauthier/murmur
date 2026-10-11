@@ -41,6 +41,52 @@ func TestMatcherShapes(t *testing.T) {
 	if !ok || not.Matcher == nil {
 		t.Fatalf("Not = %#v", not)
 	}
+	fold, ok := EqFold("Name", "a").(StringMatcher)
+	if !ok || fold.Op != OpEqFold {
+		t.Fatalf("EqFold = %#v", fold)
+	}
+	containsFold, ok := ContainsFold("Name", "a").(StringMatcher)
+	if !ok || containsFold.Op != OpContainsFold {
+		t.Fatalf("ContainsFold = %#v", containsFold)
+	}
+	null, ok := IsNull("Name").(NullMatcher)
+	if !ok || null.Field != "Name" || null.Not {
+		t.Fatalf("IsNull = %#v", null)
+	}
+	notNull, ok := IsNotNull("Name").(NullMatcher)
+	if !ok || !notNull.Not {
+		t.Fatalf("IsNotNull = %#v", notNull)
+	}
+	var _ Matcher = Comparison{}
+	var _ Matcher = InMatcher{}
+	var _ Matcher = StringMatcher{}
+	var _ Matcher = NullMatcher{}
+	var _ Matcher = AndMatcher{}
+	var _ Matcher = OrMatcher{}
+	var _ Matcher = NotMatcher{}
+}
+
+func TestOpStrings(t *testing.T) {
+	for op, want := range map[Op]string{
+		OpEq: "=", OpNe: "!=", OpGt: ">", OpGte: ">=", OpLt: "<", OpLte: "<=",
+	} {
+		if got := op.String(); got != want {
+			t.Fatalf("Op(%d) = %q, want %q", int(op), got, want)
+		}
+	}
+	if got := Op(99).String(); got != "?" {
+		t.Fatalf("Op(99) = %q, want ?", got)
+	}
+	for op, want := range map[AggOp]string{
+		OpCount: "COUNT", OpSum: "SUM", OpAvg: "AVG", OpMin: "MIN", OpMax: "MAX",
+	} {
+		if got := op.String(); got != want {
+			t.Fatalf("AggOp(%d) = %q, want %q", int(op), got, want)
+		}
+	}
+	if got := AggOp(99).String(); got != "?" {
+		t.Fatalf("AggOp(99) = %q, want ?", got)
+	}
 }
 
 func TestParam(t *testing.T) {

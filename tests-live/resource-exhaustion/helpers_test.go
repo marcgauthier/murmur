@@ -113,17 +113,17 @@ func waitDigests(t *testing.T, cluster *harness.Cluster, nodes []int, timeout ti
 	return ""
 }
 
-// countSSTs counts segment and data files under dir (recursive), an observable
-// proxy for compaction debt: a node with stalled compactions accumulates
-// segment tables while a healthy node folds them away.
-func countSSTs(t *testing.T, dir string) int {
+// countSegments counts encrypted Spool segment files under dir (recursive),
+// an observable proxy for compaction debt: a node with stalled reclamation
+// accumulates sealed segments while a healthy node deletes fully-dead ones.
+func countSegments(t *testing.T, dir string) int {
 	t.Helper()
 	n := 0
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
-		if !d.IsDir() && (strings.HasSuffix(d.Name(), ".seg") || strings.HasSuffix(d.Name(), ".sst")) {
+		if !d.IsDir() && strings.HasSuffix(d.Name(), ".spool") {
 			n++
 		}
 		return nil

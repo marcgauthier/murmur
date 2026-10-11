@@ -395,6 +395,28 @@ with its operation and input index and preserves preceding successful writes
 inside an explicit transaction. Empty batches are no-ops. Transactions are
 single-goroutine-use.
 
+## Durability
+
+By default every acknowledged write is synced to disk. Applications that
+accept a short loss window after a crash can opt into scheduled syncs:
+
+```go
+cfg.Durability = murmur.DurabilityConfig{
+    Mode:             murmur.DurabilityAsync,
+    SyncInterval:     10 * time.Second, // periodic time trigger
+    MaxUnsyncedBytes: 10 << 20,         // 10 MB volume trigger
+}
+```
+
+`SyncInterval` schedules a Spool sync about that often; `MaxUnsyncedBytes`
+fires a sync once roughly that many bytes have been written without one.
+When both are set, whichever trigger is reached first fires. Both are valid
+only with `DurabilityAsync`; zero keeps manual `db.Sync` behavior, plus a
+final sync on graceful close. `Metrics().PeriodicSyncs` and
+`PeriodicSyncFailures` report scheduled sync results. See [durability
+modes](architecture/transactions.md#17-durability-modes) for the full
+contract.
+
 ## Model options and explicit migrations
 
 Use `Model[T]` when you need name/identity overrides:

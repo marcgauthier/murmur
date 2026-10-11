@@ -146,8 +146,11 @@ type expr[T any] struct {
 func (e *expr[T]) test(rec *T) bool { return e.fn(rec) }
 func (e *expr[T]) describe() string { return e.desc }
 func (e *expr[T]) kind() exprKind   { return e.k }
-func (e *expr[T]) pred() *predInfo  { return e.p }
-func (e *expr[T]) kids() []Expr[T]  { return e.kid }
+
+// pred reports the planner-visible leaf form, or nil for opaque
+// predicates (nullable/folded matchers) that only full scans evaluate.
+func (e *expr[T]) pred() *predInfo { return e.p }
+func (e *expr[T]) kids() []Expr[T] { return e.kid }
 
 // And combines predicates conjunctively.
 func And[T any](exprs ...Expr[T]) Expr[T] {
@@ -418,6 +421,9 @@ func (t *Table[T]) Compile(exprs ...Expr[T]) *Compiled[T] {
 	walk = func(e Expr[T]) {
 		if e.kind() == kPred {
 			p := e.pred()
+			if p == nil {
+				return
+			}
 			for i, s := range p.paramSeq {
 				if s != 0 {
 					ty := p.paramTyp
@@ -535,6 +541,9 @@ func (c *Compiled[T]) bind(args []any) ([]Expr[T], error) {
 			}
 		}
 		p := e.pred()
+		if p == nil {
+			return e, nil
+		}
 		hasParam := false
 		for _, s := range p.paramSeq {
 			if s != 0 {

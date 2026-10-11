@@ -513,11 +513,17 @@ var (
 // itemComparableType reports whether a field type supports item equality,
 // membership, and ordering expressions.
 func itemComparableType(typ reflect.Type) bool {
+	if typ.Kind() == reflect.Pointer {
+		return itemComparableType(typ.Elem())
+	}
 	return itemOrderedType(typ) || typ.Kind() == reflect.Bool || isItemRowIDType(typ)
 }
 
 // itemOrderedType includes named scalar types and exact time.Time timestamps.
 func itemOrderedType(typ reflect.Type) bool {
+	if typ.Kind() == reflect.Pointer {
+		return itemOrderedType(typ.Elem())
+	}
 	return typ == reflect.TypeFor[time.Time]() || typ.Kind() == reflect.String || isItemNumericKind(typ.Kind())
 }
 
@@ -543,6 +549,21 @@ func coerceItemValue(fieldType reflect.Type, value any) (reflect.Value, error) {
 		return reflect.Zero(fieldType), nil
 	}
 	actual := reflect.ValueOf(value)
+	if fieldType.Kind() == reflect.Pointer && actual.Type() != fieldType {
+		if actual.Kind() == reflect.Pointer {
+			if actual.IsNil() {
+				return reflect.Zero(fieldType), nil
+			}
+			value = actual.Elem().Interface()
+		}
+		converted, err := coerceItemValue(fieldType.Elem(), value)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		out := reflect.New(fieldType.Elem())
+		out.Elem().Set(converted)
+		return out, nil
+	}
 	if actual.Type() == fieldType {
 		return actual, nil
 	}
@@ -935,6 +956,7 @@ func requireItemPointer(binding *itemBinding, item any) error {
 type itemOrder struct {
 	field string
 	desc  bool
+	fold  bool
 }
 
 // itemQuerySpec carries a fully built item query to the typed executor.
@@ -1022,6 +1044,28 @@ func (iq *ItemQuery) OrderBy(field string) *ItemQuery { return iq.order(field, f
 // OrderByDescending appends a descending sort key over a struct field name.
 func (iq *ItemQuery) OrderByDescending(field string) *ItemQuery {
 	return iq.order(field, true)
+}
+
+// OrderByFold orders text case-insensitively, with NULL values first.
+func (iq *ItemQuery) OrderByFold(field string) *ItemQuery { return iq.orderFold(field, false) }
+
+// OrderByFoldDescending orders text case-insensitively in descending order.
+func (iq *ItemQuery) OrderByFoldDescending(field string) *ItemQuery { return iq.orderFold(field, true) }
+func (iq *ItemQuery) orderFold(field string, desc bool) *ItemQuery {
+	out := iq.order(field, desc)
+	if out.err != nil || out.binding == nil {
+		return out
+	}
+	typ := out.binding.fields[field]
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	if typ.Kind() != reflect.String {
+		out.err = fmt.Errorf("murmur: field %q is not text", field)
+		return out
+	}
+	out.orders[len(out.orders)-1].fold = true
+	return out
 }
 
 func (iq *ItemQuery) order(field string, desc bool) *ItemQuery {
@@ -1204,15 +1248,23 @@ func (b *itemBinding) validateMatcher(matcher q.Matcher) error {
 		return err
 	}
 	switch m := matcher.(type) {
+	case q.NullMatcher:
+		if _, ok := b.fields[m.Field]; !ok {
+			return fmt.Errorf("murmur: unknown field %q for %s", m.Field, b.goType)
+		}
+		return nil
 	case q.StringMatcher:
 		typ, ok := b.fields[m.Field]
 		if !ok {
 			return fmt.Errorf("murmur: unknown field %q for %s", m.Field, b.goType)
 		}
+		for typ.Kind() == reflect.Pointer {
+			typ = typ.Elem()
+		}
 		if typ.Kind() != reflect.String {
 			return fmt.Errorf("murmur: field %q is not a string", m.Field)
 		}
-		if m.Op > q.OpLike {
+		if m.Op > q.OpContainsFold {
 			return fmt.Errorf("murmur: invalid string operator for field %q", m.Field)
 		}
 		return nil
@@ -1387,12 +1439,25 @@ func translateItemSpec[T any](inner *rimeadapter.Table[T], spec *itemQuerySpec) 
 	}
 	orders := make([]rime.OrderField[T], 0, len(spec.orders))
 	for _, order := range spec.orders {
+		if order.fold {
+			dynamic, err := rimeadapter.DynamicFieldOf(inner, spec.binding.logical[order.field])
+			if err != nil {
+				return nil, nil, err
+			}
+			folded, err := dynamic.FoldOrder()
+			if err != nil {
+				return nil, nil, err
+			}
+			orders = append(orders, folded)
+			continue
+		}
 		field, err := translateItemOrder[T](inner, spec.binding, order.field)
 		if err != nil {
 			return nil, nil, err
 		}
 		orders = append(orders, field)
 	}
+
 	return exprs, orders, nil
 }
 
@@ -1404,13 +1469,19 @@ func translateItemMatcher[T any](inner *rimeadapter.Table[T], binding *itemBindi
 		return nil, err
 	}
 	switch m := matcher.(type) {
+	case q.NullMatcher:
+		field, err := rimeadapter.DynamicFieldOf(inner, binding.logical[m.Field])
+		if err != nil {
+			return nil, err
+		}
+		return field.Null(m.Not), nil
 	case q.StringMatcher:
 		field, err := rimeadapter.DynamicFieldOf(inner, binding.logical[m.Field])
 		if err != nil {
 			return nil, err
 		}
-		names := []string{"STARTS WITH", "ENDS WITH", "CONTAINS", "LIKE"}
-		if m.Op > q.OpLike {
+		names := []string{"STARTS WITH", "ENDS WITH", "CONTAINS", "LIKE", "EQUAL FOLD", "CONTAINS FOLD"}
+		if m.Op > q.OpContainsFold {
 			return nil, fmt.Errorf("murmur: invalid string operator")
 		}
 		return field.StringMatch(names[m.Op], m.Pattern)

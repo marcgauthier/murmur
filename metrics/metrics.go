@@ -278,6 +278,7 @@ func Export(st murmur.Status) Response {
 		add("sched_wait_seconds_total", nanosSeconds(cl.stats.WaitNanos), label...)
 		add("sched_service_seconds_total", nanosSeconds(cl.stats.ServiceNanos), label...)
 		add("sched_dual_service_seconds_total", nanosSeconds(cl.stats.DualServiceNanos), label...)
+		add("sched_dual_grants_total", float64(cl.stats.DualGrants), label...)
 		add("sched_waiters", float64(cl.stats.Waiters), label...)
 		add("sched_oldest_wait_seconds", nanosSeconds(cl.stats.OldestWaitNanos), label...)
 	}

@@ -119,42 +119,41 @@ flowchart TD
 
 ### 3.1. Murmur is the application entry point
 
-Expose Murmur-owned typed table/query handles that delegate execution to RIME.
-Do not expose a writable raw RIME database/table or return raw `rime.Query`
-objects: those objects also support mutation and could bypass persistence.
-Fields and expression values may reuse RIME types where they carry no mutation
-capability. Wrap reads and writes that need database/transaction lifecycle checks.
+Keep the RIME-backed typed table/query machinery inside Murmur's private
+engine layer. Do not expose a writable raw RIME database/table or return raw
+`rime.Query` objects: those objects also support mutation and could bypass
+persistence. Fields and expression values may reuse RIME types where they carry
+no mutation capability. Wrap reads and writes that need database/transaction
+lifecycle checks.
 
-Implement these proposed API families; exact signatures belong in compile-time
-API fixtures before implementation:
+The shipped API families are:
 
-- `Define[T](name, tableID, options...) (TableDefinition, error)` compiles record
-  metadata; `Config.Tables []TableDefinition` supplies definitions before `Open`.
-  Definitions carry explicit stable field IDs, primary key, merge policies,
-  indexes, codec identities and field-presence/default metadata.
-- `TableOf[T](db, name) (*Table[T], error)` retrieves a typed handle only if the
-  registered type matches. Use generic functions rather than generic methods.
-- Tables provide `Get`, `Insert`, `Save`, `Update`, `Delete`, batch variants and
-  `Where`; query wrappers provide filtering, ordering, pagination, compiled
-  parameters, `Find`, `First`, `Count`, aggregates and query mutations. Provide
-  context-aware variants and typed join/projection helpers.
+- `Config.Models: []any{Device{}}` registers models with automatic stable
+  identities. `Model[T](ModelOptions...) (TableDefinition, error)` overrides
+  names and durable identities, and `Config.Tables []TableDefinition` supplies
+  definitions before `Open`. Definitions carry explicit stable field IDs,
+  primary key, merge policies, indexes, codec identities and
+  field-presence/default metadata.
+- The generic item API serves every registered struct through one function per
+  operation, without per-table handles: `InsertItem`, `GetItem`, `SaveItem`,
+  `UpdateFields`, `DeleteItem`, batch variants, `DB.Query` with `q` matchers,
+  compiled parameters, aggregates/group-by, joins, and subscriptions. The typed
+  table/query handles exist only as the private engine layer.
 - `DB.WriteTxContext(ctx, func(*Tx) error)` is the preferred write API. Also
   provide `BeginTx(ctx)`, `Tx.Commit()` and `Tx.Rollback()` for existing host
   lifecycle needs. Every write passes through the same coordinator. Nil write
   transactions create implicit Murmur transactions, never raw RIME auto-commits.
-- `DB.ReadTxContext`, `ReadAt`, snapshot IDs and read-handle closure pin RIME
-  versions. Murmur checks closed/failed/maintenance states on every entry point.
+- Read snapshots stay inside the engine: joins and subscriptions pin local RIME
+  versions and release them promptly. Murmur checks closed/failed/maintenance
+  states on every entry point.
 - Retain `Open`, `Close`, `Sync`, status, diagnostics, peer configuration,
   encryption and backup APIs with Go-schema equivalents. Remove SQL statement
   caches, SQL preparation/results, SQL DDL configuration and the SQL driver.
 
-As-built note: the typed table/query handles shipped as Murmur's private
-engine layer instead of the public surface. Applications use the generic item
-API (`Config.Models`, `Model[T]`, item CRUD, `DB.Query`, `DB.Subscribe`);
-`Define[T]`, `TableOf[T]`, `RecordTable`, `RecordQuery`, `RecordTx`, and the
-`DB.ReadTxContext`/`ReadAt` snapshot entry points are no longer exported. The
-ownership rules above still hold: no writable raw RIME tables and no raw
-`rime.Query` objects escape the facade.
+Deviation record: the typed table/query handles were originally planned as the
+public surface and shipped as the private engine layer instead. The ownership
+rules above still hold: no writable raw RIME tables and no raw `rime.Query`
+objects escape the facade.
 
 Published pointers remain immutable. Readers may share them; applications needing
 mutable output use an explicit clone helper. Query builders and write transactions

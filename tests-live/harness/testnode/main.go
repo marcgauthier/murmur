@@ -104,10 +104,12 @@ type LimitsConfigFile struct {
 
 // SpoolConfigFile carries optional Spool storage overrides.
 type SpoolConfigFile struct {
-	TargetBlockBytes int   `json:"target_block_bytes,omitempty"`
-	MaxBlockBytes    int   `json:"max_block_bytes,omitempty"`
-	MaxPendingBytes  int64 `json:"max_pending_bytes,omitempty"`
-	CacheBytes       int64 `json:"cache_bytes,omitempty"`
+	TargetBlockBytes       int   `json:"target_block_bytes,omitempty"`
+	MaxBlockBytes          int   `json:"max_block_bytes,omitempty"`
+	MaxPendingBytes        int64 `json:"max_pending_bytes,omitempty"`
+	CacheBytes             int64 `json:"cache_bytes,omitempty"`
+	MaxSegmentSizeBytes    int64 `json:"max_segment_size_bytes,omitempty"`
+	ReclaimIntervalSeconds int64 `json:"reclaim_interval_seconds,omitempty"`
 }
 
 type PeerConfig struct {
@@ -268,6 +270,31 @@ type NodeDaemon struct {
 	database        *db.DB
 	httpServer      *http.Server
 	bridge          *bridgeRuntime
+	// openMu guards open independently of mu: openDatabase holds mu for
+	// the whole open, so the progress endpoint must not need it.
+	openMu sync.Mutex
+	open   daemonOpenState
+}
+
+// daemonOpenState is the last open attempt's progress. Counters advance
+// while the database replays; a frozen snapshot means the open is wedged,
+// a moving one means it is slow. Only OpenReady/OpenFailed are terminal.
+type daemonOpenState struct {
+	opening          bool
+	started          time.Time
+	updated          time.Time
+	phase            string
+	processed        uint64
+	inserted         uint64
+	skipped          uint64
+	table            string
+	replayFilesTotal int
+	replayFilesDone  int
+	replayBytesTotal int64
+	replayBytesDone  int64
+	replayRecords    uint64
+	done             bool
+	openErr          string
 }
 
 type liveTypedRecord struct {
@@ -406,6 +433,7 @@ func (d *NodeDaemon) Start() error {
 	// The daemon API is protected by the verified client certificate on this
 	// listener. /healthz is the sole HTTPS route that permits no client cert.
 	mux.HandleFunc("/v1/admin/unlock", d.handleAdminUnlock)
+	mux.HandleFunc("/v1/admin/open-progress", d.handleAdminOpenProgress)
 	mux.HandleFunc("/v1/admin/status", d.handleAdminStatus)
 	mux.HandleFunc("/v1/admin/gc", d.handleAdminGC)
 	mux.HandleFunc("/v1/admin/lock", d.handleAdminLock)
@@ -754,6 +782,12 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 		if sc.MaxPendingBytes > 0 {
 			dbCfg.Spool.MaxPendingBytes = sc.MaxPendingBytes
 		}
+		if sc.MaxSegmentSizeBytes > 0 {
+			dbCfg.Spool.MaxSegmentSize = sc.MaxSegmentSizeBytes
+		}
+		if sc.ReclaimIntervalSeconds > 0 {
+			dbCfg.Spool.ReclaimInterval = time.Duration(sc.ReclaimIntervalSeconds) * time.Second
+		}
 	}
 
 	// Configure initial peers
@@ -799,7 +833,10 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 	if d.originMigration {
 		return nil, db.MigrateOriginBaseline(ctx, dbCfg)
 	}
+	dbCfg.OnOpenProgress = d.recordOpenProgress
+	d.openBegin()
 	instance, err := db.Open(ctx, dbCfg)
+	d.openEnd(err)
 	if err != nil {
 		return nil, fmt.Errorf("db.Open: %w", err)
 	}
@@ -828,6 +865,76 @@ func (d *NodeDaemon) openDatabase(ctx context.Context, key []byte, keyID string)
 
 	log.Printf("[MURMUR] Database unlocked and online. NodeID: %s", instance.NodeID())
 	return instance, nil
+}
+
+func (d *NodeDaemon) openBegin() {
+	now := time.Now()
+	d.openMu.Lock()
+	d.open = daemonOpenState{opening: true, started: now, updated: now, phase: string(db.OpenOpening)}
+	d.openMu.Unlock()
+}
+
+func (d *NodeDaemon) recordOpenProgress(p db.OpenProgress) {
+	d.openMu.Lock()
+	d.open.phase = string(p.Phase)
+	d.open.processed = p.ProcessedItems
+	d.open.inserted = p.RowsInserted
+	d.open.skipped = p.RowsSkipped
+	d.open.table = p.CurrentTable
+	d.open.replayFilesTotal = p.ReplayFilesTotal
+	d.open.replayFilesDone = p.ReplayFilesDone
+	d.open.replayBytesTotal = p.ReplayBytesTotal
+	d.open.replayBytesDone = p.ReplayBytesDone
+	d.open.replayRecords = p.ReplayRecords
+	d.open.updated = time.Now()
+	d.openMu.Unlock()
+}
+
+func (d *NodeDaemon) openEnd(openErr error) {
+	d.openMu.Lock()
+	d.open.opening = false
+	d.open.done = true
+	d.open.updated = time.Now()
+	if openErr != nil {
+		d.open.openErr = openErr.Error()
+		d.open.phase = string(db.OpenFailed)
+	} else {
+		d.open.phase = string(db.OpenReady)
+	}
+	d.openMu.Unlock()
+}
+
+// handleAdminOpenProgress reports the last open attempt without taking d.mu,
+// so it stays responsive while openDatabase holds d.mu for the whole open.
+func (d *NodeDaemon) handleAdminOpenProgress(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	d.openMu.Lock()
+	st := d.open
+	d.openMu.Unlock()
+	var elapsed float64
+	if !st.started.IsZero() {
+		elapsed = time.Since(st.started).Seconds()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"opening":            st.opening,
+		"done":               st.done,
+		"phase":              st.phase,
+		"processed_items":    st.processed,
+		"rows_inserted":      st.inserted,
+		"rows_skipped":       st.skipped,
+		"current_table":      st.table,
+		"replay_files_total": st.replayFilesTotal,
+		"replay_files_done":  st.replayFilesDone,
+		"replay_bytes_total": st.replayBytesTotal,
+		"replay_bytes_done":  st.replayBytesDone,
+		"replay_records":     st.replayRecords,
+		"elapsed_s":          elapsed,
+		"error":              st.openErr,
+	})
 }
 
 func liveTypedLocalDefinition() (db.TableDefinition, error) {

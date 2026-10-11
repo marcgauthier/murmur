@@ -139,6 +139,8 @@ const (
 	OpEndsWith
 	OpContains
 	OpLike
+	OpEqFold
+	OpContainsFold
 )
 
 // StartsWith matches a string prefix and can use a prefix index.
@@ -152,6 +154,22 @@ func Contains(field, substring string) Matcher { return StringMatcher{field, sub
 
 // Like matches RIME's byte-oriented % and _ wildcard patterns.
 func Like(field, pattern string) Matcher { return StringMatcher{field, pattern, OpLike} }
+
+// EqFold matches string equality using Unicode case folding.
+func EqFold(field, value string) Matcher { return StringMatcher{field, value, OpEqFold} }
+
+// ContainsFold matches a substring after Unicode lowercasing.
+func ContainsFold(field, value string) Matcher { return StringMatcher{field, value, OpContainsFold} }
+
+// NullMatcher distinguishes an absent value from a present zero value.
+type NullMatcher struct {
+	Field string
+	Not   bool
+}
+
+func (NullMatcher) isMatcher()       {}
+func IsNull(field string) Matcher    { return NullMatcher{Field: field} }
+func IsNotNull(field string) Matcher { return NullMatcher{Field: field, Not: true} }
 
 // And combines matchers conjunctively. Zero children match everything.
 func And(filters ...Matcher) Matcher {

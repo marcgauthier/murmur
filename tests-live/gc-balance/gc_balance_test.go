@@ -39,8 +39,10 @@ func TestLogGCKeepsUpWithChurn(t *testing.T) {
 	})
 
 	const keys = 200
+	// Keys are 1-based: the all-zero ID is the API's unset sentinel and
+	// cannot be stored or updated by explicit ID.
 	for i := 0; i < keys; i++ {
-		id := fmt.Sprintf("%032x", i)
+		id := fmt.Sprintf("%032x", i+1)
 		if err := cluster.TypedContentionInsert(0, harness.TypedContentionRow{ID: id, Name: "v-0"}); err != nil {
 			t.Fatalf("seed %d: %v", i, err)
 		}
@@ -67,7 +69,7 @@ func TestLogGCKeepsUpWithChurn(t *testing.T) {
 				round := 1
 				for lo := w * keys / updaters; !stopped.Load(); round++ {
 					for i := lo; i < lo+keys/updaters && !stopped.Load(); i++ {
-						id := fmt.Sprintf("%032x", i)
+						id := fmt.Sprintf("%032x", i+1)
 						if err := cluster.TypedContentionUpdate(0, id, "name", fmt.Sprintf("v-%d-%d", w, round)); err != nil {
 							updateErrs.Add(1)
 						}
@@ -169,7 +171,7 @@ func TestLogGCKeepsUpWithChurn(t *testing.T) {
 	}
 
 	// End-to-end update flow: a follower must observe a churned value.
-	waitValueChanged(t, cluster, fmt.Sprintf("%032x", 0), "v-0", 30*time.Second)
+	waitValueChanged(t, cluster, fmt.Sprintf("%032x", 1), "v-0", 30*time.Second)
 
 	// No data loss: exact key set with identical digests everywhere.
 	// Counts never change for fixed-key updates, so convergence means

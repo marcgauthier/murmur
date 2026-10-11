@@ -160,7 +160,11 @@ type writerScheduler struct {
 	// dualServiceNanos is service granted while the other interactive
 	// class had waiters (the share policy bound the decision).
 	dualServiceNanos [3]uint64
-	service          [2]uint64 // normalized-debt accounting: local, remote
+	// dualGrants counts grants made while the other interactive class
+	// had waiters: the per-decision form of the dual measurement,
+	// independent of class hold-time asymmetry.
+	dualGrants [3]uint64
+	service    [2]uint64 // normalized-debt accounting: local, remote
 }
 
 func newWriterScheduler(cfg WriterSchedulingConfig) *writerScheduler {
@@ -307,6 +311,9 @@ func (s *writerScheduler) grantNextLocked() {
 	// classes, so the share policy bound the decision. Maintenance
 	// grants (idle or reserve) are never dual-marked.
 	w.dual = (class == WriterLocal && remoteQ) || (class == WriterRemote && localQ)
+	if w.dual {
+		s.dualGrants[class]++
+	}
 	s.active = w
 	s.acquisitions[class]++
 	s.waitNanos[class] += uint64(time.Since(w.enqueue).Nanoseconds())
@@ -346,8 +353,11 @@ type SchedulerClassStats struct {
 	// DualServiceNanos is service granted while the other interactive
 	// class had waiters (the share policy bound the decision).
 	DualServiceNanos uint64
-	Waiters          int
-	OldestWaitNanos  uint64
+	// DualGrants counts grants made while the other interactive class
+	// had waiters.
+	DualGrants      uint64
+	Waiters         int
+	OldestWaitNanos uint64
 }
 
 // SchedulerSnapshot is the coordinator diagnostics snapshot.
@@ -373,6 +383,7 @@ func (s *writerScheduler) Snapshot() SchedulerSnapshot {
 			WaitNanos:        s.waitNanos[class],
 			ServiceNanos:     s.serviceNanos[class],
 			DualServiceNanos: s.dualServiceNanos[class],
+			DualGrants:       s.dualGrants[class],
 			Waiters:          len(s.queues[class]),
 		}
 		for _, w := range s.queues[class] {

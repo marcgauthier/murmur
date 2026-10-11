@@ -60,11 +60,16 @@ snapshots. Routine updates coalesce every 250 ms; phase transitions and one
 terminal event are preserved. Callbacks are serialized and run outside store and
 engine locks. They must return promptly and must not wait for `Open` to return.
 
-Typed RIME opens report opening, rebuilding, finalizing, and ready. Failures or
-cancellation report a terminal failed or cancelled phase. `Elapsed` covers the
-whole startup; `PhaseElapsed` covers the current phase. The terminal snapshot is
-retained in `DB.Status().OpenProgress` with frozen clocks. Disabled reporting
-returns nil.
+Typed RIME opens report opening, replaying, rebuilding, finalizing, and ready.
+Failures or cancellation report a terminal failed or cancelled phase. `Elapsed`
+covers the whole startup; `PhaseElapsed` covers the current phase. The terminal
+snapshot is retained in `DB.Status().OpenProgress` with frozen clocks. Disabled
+reporting returns nil. During the replaying phase the `Replay*` counters track
+segment replay: files done/total and bytes done/total over the member segment
+size sum, plus validated record visits. The loader's second pass re-validates
+winner blocks, so `ReplayRecords` and `ReplayBytesDone` accumulate across
+passes and can exceed the stored totals; they prove the open is advancing,
+not how much remains.
 
 Progress uses the reconstruction scan without a preliminary scan or durable
 counters. `ProcessedItems` counts cells visited in registered tables, including

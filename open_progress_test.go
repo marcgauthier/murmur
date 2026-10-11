@@ -38,7 +38,7 @@ func TestOpenProgressEmptyAndDisabled(t *testing.T) {
 		if p == nil || p.Phase != OpenReady || p.TotalItemsKnown || p.TotalItems != 0 || p.PercentComplete != 0 || p.EstimateKnown {
 			t.Fatalf("empty terminal snapshot: %+v", p)
 		}
-		want := []OpenPhase{OpenOpening, OpenRebuilding, OpenFinalizing, OpenReady}
+		want := []OpenPhase{OpenOpening, OpenReplaying, OpenRebuilding, OpenFinalizing, OpenReady}
 		var phases []OpenPhase
 		for _, p := range events {
 			if len(phases) == 0 || phases[len(phases)-1] != p.Phase {
@@ -130,6 +130,68 @@ func TestOpenProgressDeletedTypedRowsAreNotMaterialized(t *testing.T) {
 	p := live.Status().OpenProgress
 	if p.TotalItemsKnown || p.TotalItems != 0 || p.ProcessedItems != expected || p.RowsInserted != 2 || p.RowsSkipped != 0 {
 		t.Fatalf("progress=%+v expected cells=%d", p, expected)
+	}
+}
+
+// TestOpenProgressReplayCounters proves reopening a database with rows
+// streams segment replay advancement: the replaying phase fires and the
+// terminal snapshot carries files/bytes/records totals.
+func TestOpenProgressReplayCounters(t *testing.T) {
+	cfg := testConfig(t.TempDir())
+	cfg.Schema.Tables = nil
+	cfg.Tables = []TableDefinition{recordDefinition(t)}
+	live, err := openSignedFixture(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	table, err := tableOf[facadeRecord](live, "records")
+	if err != nil {
+		live.Close()
+		t.Fatal(err)
+	}
+	if err := live.WriteTxContext(context.Background(), func(tx *Tx) error {
+		for i := 0; i < 50; i++ {
+			if err := table.Insert(tx, &facadeRecord{ID: NewRowID(), Name: fmt.Sprintf("row-%d", i)}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		live.Close()
+		t.Fatal(err)
+	}
+	if err := live.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var events []OpenProgress
+	cfg.OnOpenProgress = func(p OpenProgress) { events = append(events, p) }
+	live, err = openSignedFixture(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	var replaying *OpenProgress
+	for i := range events {
+		if events[i].Phase == OpenReplaying {
+			replaying = &events[i]
+			break
+		}
+	}
+	if replaying == nil {
+		t.Fatalf("no replaying phase in %d events", len(events))
+	}
+	p := live.Status().OpenProgress
+	if p.Phase != OpenReady {
+		t.Fatalf("terminal phase = %v", p.Phase)
+	}
+	if p.ReplayFilesTotal == 0 || p.ReplayFilesDone != p.ReplayFilesTotal {
+		t.Fatalf("replay files = %d/%d", p.ReplayFilesDone, p.ReplayFilesTotal)
+	}
+	if p.ReplayBytesTotal == 0 || p.ReplayBytesDone == 0 {
+		t.Fatalf("replay bytes = %d/%d", p.ReplayBytesDone, p.ReplayBytesTotal)
+	}
+	if p.ReplayRecords == 0 {
+		t.Fatalf("replay records = 0")
 	}
 }
 

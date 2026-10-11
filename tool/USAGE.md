@@ -18,6 +18,7 @@ The `murmur` CLI provides database initialization, durable-state inspection and 
    - [`keys` - Key Registry & Cryptographic State](#keys---key-registry--cryptographic-state)
    - [`doctor` - Automated System Health Check](#doctor---automated-system-health-check)
    - [`bench` - Typed Storage and Cipher Microbenchmarks](#bench---typed-storage-and-cipher-microbenchmarks)
+   - [`benchmark-speed` - Full-Scale 10-Table Speed and Storage Profiler](#benchmark-speed---full-scale-10-table-speed-and-storage-profiler)
 5. [Cluster & Replication Operations](#5-cluster--replication-operations)
    - [`status` - Node Liveness & Runtime Status](#status---node-liveness--runtime-status)
    - [`cluster` - Cluster Membership & Topology](#cluster---cluster-membership--topology)
@@ -169,6 +170,25 @@ murmur bench
 
 # Run benchmark for a shorter interval
 murmur bench --duration=500ms --json
+```
+
+### `benchmark-speed` - Full-Scale 10-Table Speed and Storage Profiler
+
+Performs an end-to-end performance and storage benchmark against 10 distinct typed tables (Users, Devices, Orders, Products, Invoices, Payments, Logs, Events, Metrics, Sessions) with encrypted disk persistence and zero replication. Evaluates single unbatched writes vs. batch sizes of 10, 100, and 1,000 across inserts, updates, and deletes, executes point lookups, indexed filters, scans, and table counts, and profiles total disk space and average bytes per record.
+
+```bash
+# Run standard 10 tables x 100,000 records benchmark (1,000,000 total records)
+murmur benchmark-speed --tables=10 --rows-per-table=100000
+
+# Quick smoke test (10 tables x 1,000 records)
+murmur benchmark-speed --quick
+
+# Asynchronous durability mode with 1-second sync interval
+murmur benchmark-speed --durability=async --sync-interval=1s
+
+# Output structured JSON or Markdown report
+murmur benchmark-speed --json
+murmur benchmark-speed --markdown
 ```
 
 ---

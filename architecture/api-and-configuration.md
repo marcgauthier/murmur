@@ -90,8 +90,10 @@ API. `DB.Subscribe` is the managed subscription surface.
 `Open` is blocked. `OpenProgress` contains `Phase`, `StartedAt`, `Elapsed`,
 `PhaseElapsed`, `CountedItems`, `TotalItems`, `ProcessedItems`, `TotalItemsKnown`,
 `PercentComplete`, `EstimatedRemaining`, `EstimateKnown`, `CurrentTable`,
-`RowsInserted`, `RowsSkipped`, and terminal `Error`. `OpenPhase` values are
-`OpenOpening`, `OpenRebuilding`, `OpenIndexing`, `OpenFinalizing`,
+`RowsInserted`, `RowsSkipped`, the `ReplayFilesTotal`, `ReplayFilesDone`,
+`ReplayBytesTotal`, `ReplayBytesDone`, and `ReplayRecords` segment-replay
+counters, and terminal `Error`. `OpenPhase` values are
+`OpenOpening`, `OpenReplaying`, `OpenRebuilding`, `OpenIndexing`, `OpenFinalizing`,
 `OpenReady`, `OpenFailed`, and `OpenCancelled`. Only `OpenReady` signals success.
 `Status.OpenProgress *OpenProgress` returns a copy of the retained startup
 snapshot, or nil when reporting was disabled. Callbacks are excluded from JSON

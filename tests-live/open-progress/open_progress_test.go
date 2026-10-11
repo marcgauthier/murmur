@@ -255,7 +255,7 @@ func TestOpenProgressChild(t *testing.T) {
 		t.Fatalf("terminal phase=%v", lastEvent.Phase)
 	}
 	if role == "reload" {
-		wanted := []db.OpenPhase{db.OpenOpening, db.OpenRebuilding, db.OpenFinalizing, db.OpenReady}
+		wanted := []db.OpenPhase{db.OpenOpening, db.OpenReplaying, db.OpenRebuilding, db.OpenFinalizing, db.OpenReady}
 		if len(phases) != len(wanted) {
 			t.Fatalf("phases=%v", phases)
 		}
@@ -494,7 +494,7 @@ func TestOpenProgressChildExtra(t *testing.T) {
 				phases = append(phases, ev.Phase)
 			}
 		}
-		want := []db.OpenPhase{db.OpenOpening, db.OpenRebuilding, db.OpenFinalizing, db.OpenReady}
+		want := []db.OpenPhase{db.OpenOpening, db.OpenReplaying, db.OpenRebuilding, db.OpenFinalizing, db.OpenReady}
 		if len(phases) != len(want) {
 			t.Fatalf("empty-db phases=%v want=%v", phases, want)
 		}

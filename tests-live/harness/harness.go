@@ -2,6 +2,7 @@ package harness
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
@@ -168,23 +169,27 @@ type LimitsOptions struct {
 // sizing and buffer control). Zero values select production
 // defaults; per-node entries replace the cluster-wide section.
 type SpoolOptions struct {
-	TargetBlockBytes            int
-	MaxBlockBytes               int
-	MaxPendingBytes             int64
-	CacheBytes                  int64
-	MemTableBytes               uint64
-	MemTableCount               int
-	MaxOpenFiles                int
-	MaxConcurrentCompactions    int
-	DisableAutomaticCompactions bool
+	TargetBlockBytes       int
+	MaxBlockBytes          int
+	MaxPendingBytes        int64
+	CacheBytes             int64
+	MaxSegmentSizeBytes    int64
+	ReclaimIntervalSeconds int64
 }
 
 var liveHTTPClient = &http.Client{Timeout: 15 * time.Second}
 
-// Unlocking can reopen and rebuild an existing encrypted database. Give that
-// single request enough time to finish rather than timing it out and issuing
-// overlapping unlock requests while the first open is still in progress.
-var unlockHTTPClient = &http.Client{Timeout: 60 * time.Second}
+// Unlocking reopens and rebuilds an existing encrypted database, whose cost
+// grows with the spool: the request carries no client timeout of its own.
+// waitUnlock governs it with an overall cap plus a progress watchdog that
+// fails only on stalled (frozen) opens, never on slow (advancing) ones.
+// Only one unlock attempt is ever in flight: overlapping unlocks would race
+// the first open still in progress.
+var unlockLongClient = &http.Client{}
+
+// progressPollClient reads open-progress snapshots; each poll carries its
+// own short timeout so a wedged daemon cannot stall the watchdog.
+var progressPollClient = &http.Client{}
 
 type liveAPITransport struct {
 	mu       sync.RWMutex
@@ -486,15 +491,12 @@ func NewCluster(t *testing.T, opts ClusterOptions) *Cluster {
 		}
 		if spoolOpts != nil {
 			cfgJSON["spool"] = map[string]any{
-				"target_block_bytes":            spoolOpts.TargetBlockBytes,
-				"max_block_bytes":               spoolOpts.MaxBlockBytes,
-				"max_pending_bytes":             spoolOpts.MaxPendingBytes,
-				"cache_bytes":                   spoolOpts.CacheBytes,
-				"memtable_bytes":                spoolOpts.MemTableBytes,
-				"memtable_count":                spoolOpts.MemTableCount,
-				"max_open_files":                spoolOpts.MaxOpenFiles,
-				"max_concurrent_compactions":    spoolOpts.MaxConcurrentCompactions,
-				"disable_automatic_compactions": spoolOpts.DisableAutomaticCompactions,
+				"target_block_bytes":       spoolOpts.TargetBlockBytes,
+				"max_block_bytes":          spoolOpts.MaxBlockBytes,
+				"max_pending_bytes":        spoolOpts.MaxPendingBytes,
+				"cache_bytes":              spoolOpts.CacheBytes,
+				"max_segment_size_bytes":   spoolOpts.MaxSegmentSizeBytes,
+				"reclaim_interval_seconds": spoolOpts.ReclaimIntervalSeconds,
 			}
 		}
 		if opts.Files != nil {
@@ -798,24 +800,186 @@ func (c *Cluster) UnlockNodeWithKeyID(idx int, keyID, keyHex string) {
 	})
 
 	url := fmt.Sprintf("https://%s/v1/admin/unlock", node.APIAddr)
-	deadline := time.Now().Add(60 * time.Second)
-	var lastFailure string
-	for time.Now().Before(deadline) {
-		resp, err := unlockHTTPClient.Post(url, "application/json", bytes.NewReader(payload))
-		if err == nil {
-			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
-				_ = resp.Body.Close()
-				return
-			}
-			b, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			lastFailure = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
-		} else {
-			lastFailure = err.Error()
+	// Open cost grows with the spool, so the overall cap is generous and
+	// the stall window is the real guard: frozen progress fails fast,
+	// advancing progress waits.
+	stall := EnvSeconds("MURMUR_LIVE_UNLOCK_STALL_SECONDS", 120)
+	overall := EnvSeconds("MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS", 1800)
+	ctx, cancel := context.WithTimeout(context.Background(), overall)
+	defer cancel()
+	attempt := func(ctx context.Context) (bool, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+		if err != nil {
+			return false, err
 		}
-		time.Sleep(50 * time.Millisecond)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := unlockLongClient.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			// Transport failure: the daemon is still starting.
+			// Retry; any HTTP response is definitive.
+			return true, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+			return false, nil
+		}
+		b, _ := io.ReadAll(resp.Body)
+		return false, fmt.Errorf("unlock rejected: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
-	c.T.Fatalf("failed to unlock node %s at %s within timeout; last error: %s", node.Label, url, lastFailure)
+	progressURL := strings.Replace(url, "/v1/admin/unlock", "/v1/admin/open-progress", 1)
+	poll := func(ctx context.Context) (nodeOpenProgress, bool, error) {
+		pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(pollCtx, http.MethodGet, progressURL, nil)
+		if err != nil {
+			return nodeOpenProgress{}, false, err
+		}
+		resp, err := progressPollClient.Do(req)
+		if err != nil {
+			return nodeOpenProgress{}, false, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			return nodeOpenProgress{}, false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		}
+		var state nodeOpenProgress
+		if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+			return nodeOpenProgress{}, false, err
+		}
+		return state, true, nil
+	}
+	if err := waitUnlock(ctx, overall, attempt, poll, stall, time.Second, 30*time.Second, c.T.Logf); err != nil {
+		c.T.Fatalf("failed to unlock node %s at %s: %v", node.Label, url, err)
+	}
+}
+
+// nodeOpenProgress mirrors the testnode /v1/admin/open-progress payload.
+type nodeOpenProgress struct {
+	Opening          bool    `json:"opening"`
+	Done             bool    `json:"done"`
+	Phase            string  `json:"phase"`
+	ProcessedItems   uint64  `json:"processed_items"`
+	RowsInserted     uint64  `json:"rows_inserted"`
+	RowsSkipped      uint64  `json:"rows_skipped"`
+	CurrentTable     string  `json:"current_table"`
+	ReplayFilesTotal int     `json:"replay_files_total"`
+	ReplayFilesDone  int     `json:"replay_files_done"`
+	ReplayBytesTotal int64   `json:"replay_bytes_total"`
+	ReplayBytesDone  int64   `json:"replay_bytes_done"`
+	ReplayRecords    uint64  `json:"replay_records"`
+	ElapsedSeconds   float64 `json:"elapsed_s"`
+	Error            string  `json:"error"`
+}
+
+// signature covers every field that moves while an open makes progress.
+// Elapsed time is excluded: it advances even when the open is wedged.
+func (p nodeOpenProgress) signature() string {
+	return fmt.Sprintf("%t|%t|%s|%d|%d|%d|%s|%d|%d|%d|%d|%d|%s",
+		p.Opening, p.Done, p.Phase, p.ProcessedItems, p.RowsInserted, p.RowsSkipped, p.CurrentTable,
+		p.ReplayFilesTotal, p.ReplayFilesDone, p.ReplayBytesTotal, p.ReplayBytesDone, p.ReplayRecords, p.Error)
+}
+
+func (p nodeOpenProgress) describe() string {
+	if p.Error != "" {
+		return fmt.Sprintf("phase=%s error=%q elapsed=%.0fs", p.Phase, p.Error, p.ElapsedSeconds)
+	}
+	replay := ""
+	if p.ReplayFilesTotal > 0 {
+		replay = fmt.Sprintf(" replay=%d/%dfiles %d/%dbytes %drec",
+			p.ReplayFilesDone, p.ReplayFilesTotal, p.ReplayBytesDone, p.ReplayBytesTotal, p.ReplayRecords)
+	}
+	return fmt.Sprintf("phase=%s processed=%d inserted=%d skipped=%d table=%q%s elapsed=%.0fs",
+		p.Phase, p.ProcessedItems, p.RowsInserted, p.RowsSkipped, p.CurrentTable, replay, p.ElapsedSeconds)
+}
+
+// unlockAttempt performs one unlock POST. Retryable transport failures mean
+// the daemon is still starting; any HTTP response is definitive.
+type unlockAttempt func(ctx context.Context) (retryable bool, err error)
+
+// progressPoll reads one open-progress snapshot. ok=false means the daemon
+// is unreachable right now, which neither advances nor stalls the clock.
+type progressPoll func(ctx context.Context) (state nodeOpenProgress, ok bool, err error)
+
+// waitUnlock posts unlock until it succeeds or fails definitively while a
+// watchdog polls open progress. Frozen progress for stall fails fast with
+// the last snapshot; moving progress waits until ctx (overall cap).
+func waitUnlock(ctx context.Context, overall time.Duration, attempt unlockAttempt, poll progressPoll, stall, pollEvery, statusEvery time.Duration, logf func(string, ...any)) error {
+	type attemptResult struct {
+		retryable bool
+		err       error
+	}
+	attemptCh := make(chan attemptResult, 1)
+	launch := func() {
+		go func() {
+			retryable, err := attempt(ctx)
+			attemptCh <- attemptResult{retryable: retryable, err: err}
+		}()
+	}
+	launch()
+	pollTick := time.NewTicker(pollEvery)
+	defer pollTick.Stop()
+	start := time.Now()
+	lastAdvance := start
+	lastLog := start
+	var last nodeOpenProgress
+	haveLast := false
+	var lastPollErr error
+	describeLast := func() string {
+		if haveLast {
+			return last.describe()
+		}
+		if lastPollErr != nil {
+			return fmt.Sprintf("no snapshot yet (%v)", lastPollErr)
+		}
+		return "no snapshot yet (daemon starting)"
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			// A success racing the deadline still counts.
+			select {
+			case r := <-attemptCh:
+				if !r.retryable {
+					return r.err
+				}
+			default:
+			}
+			return fmt.Errorf("unlock did not complete within %s; last progress: %s", overall, describeLast())
+		case r := <-attemptCh:
+			if !r.retryable {
+				return r.err
+			}
+			// Transport failure while the daemon starts; relaunch
+			// after a pause. Only one attempt is ever in flight.
+			select {
+			case <-ctx.Done():
+			case <-time.After(500 * time.Millisecond):
+				launch()
+			}
+		case now := <-pollTick.C:
+			state, ok, err := poll(ctx)
+			if ok {
+				if !haveLast || state.signature() != last.signature() {
+					last, haveLast = state, true
+					lastAdvance = now
+				}
+				lastPollErr = nil
+			} else if err != nil {
+				lastPollErr = err
+			}
+			if now.Sub(lastAdvance) > stall {
+				return fmt.Errorf("unlock stalled: no open progress for %s; last: %s", stall, describeLast())
+			}
+			if now.Sub(lastLog) >= statusEvery {
+				lastLog = now
+				logf("unlock waiting (%.0fs): %s", now.Sub(start).Seconds(), describeLast())
+			}
+		}
+	}
 }
 
 func (c *Cluster) WaitNodeReady(idx int) {

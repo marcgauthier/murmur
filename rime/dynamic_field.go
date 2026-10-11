@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"time"
 )
 
@@ -12,11 +13,12 @@ import (
 // Values must have the registered Go type. Typed Field constructors retain
 // their existing exact type checks.
 type DynamicField[T any] struct {
-	table *Table[T]
-	name  string
-	typ   reflect.Type
-	get   func(*T) any
-	cmp   func(any, any) int
+	table    *Table[T]
+	name     string
+	typ      reflect.Type
+	get      func(*T) any
+	cmp      func(any, any) int
+	nullable bool
 }
 
 // DynamicFieldOf builds a runtime field without panicking on invalid schemas.
@@ -30,6 +32,23 @@ func DynamicFieldOf[T any](table *Table[T], name string) (DynamicField[T], error
 	get, typ, err := getter[T](table.sch, name)
 	if err != nil {
 		return field, err
+	}
+	nullable := typ.Kind() == reflect.Pointer
+	if nullable {
+		original := get
+		get = func(rec *T) any {
+			value := reflect.ValueOf(original(rec))
+			for value.Kind() == reflect.Pointer {
+				if value.IsNil() {
+					return nil
+				}
+				value = value.Elem()
+			}
+			return normalizeIndexValue(value.Interface())
+		}
+		for typ.Kind() == reflect.Pointer {
+			typ = typ.Elem()
+		}
 	}
 	cmp, err := comparatorFor(typ)
 	if typ.Kind() == reflect.Bool {
@@ -59,7 +78,20 @@ func DynamicFieldOf[T any](table *Table[T], name string) (DynamicField[T], error
 	if err != nil {
 		return field, fmt.Errorf("%w: unsupported dynamic field %s.%s (%s)", ErrBadSchema, table.name, name, typ)
 	}
-	return DynamicField[T]{table, name, typ, get, cmp}, nil
+	baseCompare := cmp
+	cmp = func(a, b any) int {
+		if a == nil {
+			if b == nil {
+				return 0
+			}
+			return -1
+		}
+		if b == nil {
+			return 1
+		}
+		return baseCompare(a, b)
+	}
+	return DynamicField[T]{table: table, name: name, typ: typ, get: get, cmp: cmp, nullable: nullable}, nil
 }
 
 func canonicalTime(t time.Time) time.Time { return t.Round(0).UTC() }
@@ -74,6 +106,22 @@ func normalizeIndexValue(value any) any {
 }
 
 func (f DynamicField[T]) operand(value any) (any, error) {
+	if value != nil {
+		reflected := reflect.ValueOf(value)
+		for reflected.Kind() == reflect.Pointer {
+			if reflected.IsNil() {
+				value = nil
+				break
+			}
+			reflected = reflected.Elem()
+		}
+		if value != nil {
+			value = reflected.Interface()
+		}
+	}
+	if f.nullable && value == nil {
+		return nil, nil
+	}
 	if f.get == nil || reflect.TypeOf(value) != f.typ {
 		return nil, fmt.Errorf("%w: field %s requires %s, got %T", ErrBadSchema, f.name, f.typ, value)
 	}
@@ -110,6 +158,15 @@ func (f DynamicField[T]) Compare(operator string, value any) (Expr[T], error) {
 	fetch := func(rec any) any { return f.get(rec.(*T)) }
 	fn := func(rec *T) bool {
 		current := f.get(rec)
+		if current == nil || value == nil {
+			if op == opEq {
+				return current == nil && value == nil
+			}
+			if op == opNe {
+				return (current == nil) != (value == nil)
+			}
+			return false
+		}
 		if op == opEq {
 			return current == value
 		}
@@ -133,7 +190,11 @@ func (f DynamicField[T]) Compare(operator string, value any) (Expr[T], error) {
 			return c <= 0
 		}
 	}
-	return &expr[T]{k: kPred, fn: fn, desc: f.name + " " + op.String() + " " + quote(value), p: &predInfo{field: f.name, op: op, vals: []any{value}, fetch: fetch}}, nil
+	predicate := &predInfo{field: f.name, op: op, vals: []any{value}, fetch: fetch}
+	if f.nullable {
+		predicate = nil
+	} // Pointer indexes cannot identify dereferenced values.
+	return &expr[T]{k: kPred, fn: fn, desc: f.name + " " + op.String() + " " + quote(value), p: predicate}, nil
 }
 
 // In matches any of the supplied values, all of the registered Go type.
@@ -149,6 +210,17 @@ func (f DynamicField[T]) In(values ...any) (Expr[T], error) {
 	if f.get == nil {
 		return nil, fmt.Errorf("%w: uninitialized dynamic field", ErrBadSchema)
 	}
+	if f.nullable {
+		return &expr[T]{k: kPred, desc: f.name + " IN", fn: func(rec *T) bool {
+			actual := f.get(rec)
+			for _, value := range operands {
+				if actual == value {
+					return true
+				}
+			}
+			return false
+		}}, nil
+	}
 	return newPredMulti(Field[T, any]{tbl: f.table, name: f.name, get: f.get}, opIn, operands), nil
 }
 
@@ -157,6 +229,36 @@ func (f DynamicField[T]) In(values ...any) (Expr[T], error) {
 func (f DynamicField[T]) StringMatch(operator, pattern string) (Expr[T], error) {
 	if f.typ == nil || f.typ.Kind() != reflect.String {
 		return nil, fmt.Errorf("%w: field %s is not a string", ErrBadSchema, f.name)
+	}
+	if f.nullable || operator == "EQUAL FOLD" || operator == "CONTAINS FOLD" {
+		match := func(rec *T) bool {
+			actual := f.get(rec)
+			if actual == nil {
+				return false
+			}
+			value := reflect.ValueOf(actual).String()
+			switch operator {
+			case "EQUAL FOLD":
+				return strings.EqualFold(value, pattern)
+			case "CONTAINS FOLD":
+				return strings.Contains(strings.ToLower(value), strings.ToLower(pattern))
+			case "STARTS WITH":
+				return strings.HasPrefix(value, pattern)
+			case "ENDS WITH":
+				return strings.HasSuffix(value, pattern)
+			case "CONTAINS":
+				return strings.Contains(value, pattern)
+			case "LIKE":
+				return likeMatch(value, pattern)
+			}
+			return false
+		}
+		switch operator {
+		case "EQUAL FOLD", "CONTAINS FOLD", "STARTS WITH", "ENDS WITH", "CONTAINS", "LIKE":
+		default:
+			return nil, fmt.Errorf("%w: invalid string comparison %q", ErrBadSchema, operator)
+		}
+		return &expr[T]{k: kPred, fn: match, desc: f.name + " " + operator + " " + quote(pattern)}, nil
 	}
 	field := StringField[T]{Field: Field[T, string]{tbl: f.table, name: f.name, get: func(rec *T) string { return reflect.ValueOf(f.get(rec)).String() }}}
 	switch operator {
@@ -175,3 +277,35 @@ func (f DynamicField[T]) StringMatch(operator, pattern string) (Expr[T], error) 
 func (f DynamicField[T]) orderName() string      { return f.name }
 func (f DynamicField[T]) orderCmp(a, b *T) int   { return f.cmp(f.get(a), f.get(b)) }
 func (f DynamicField[T]) orderLess(a, b *T) bool { return f.orderCmp(a, b) < 0 }
+
+// Null matches absence without conflating a present zero value with NULL.
+func (f DynamicField[T]) Null(not bool) Expr[T] {
+	return &expr[T]{k: kPred, desc: f.name + " NULL", fn: func(rec *T) bool {
+		absent := f.nullable && f.get(rec) == nil
+		if not {
+			return !absent
+		}
+		return absent
+	}}
+}
+
+// FoldOrder returns a native case-insensitive text sort field.
+func (f DynamicField[T]) FoldOrder() (DynamicField[T], error) {
+	if f.typ.Kind() != reflect.String {
+		return f, fmt.Errorf("%w: field %s is not text", ErrBadSchema, f.name)
+	}
+	f.name += " (fold)"
+	f.cmp = func(a, b any) int {
+		if a == nil {
+			if b == nil {
+				return 0
+			}
+			return -1
+		}
+		if b == nil {
+			return 1
+		}
+		return strings.Compare(strings.ToLower(reflect.ValueOf(a).String()), strings.ToLower(reflect.ValueOf(b).String()))
+	}
+	return f, nil
+}

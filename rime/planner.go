@@ -77,6 +77,9 @@ func choosePlan[T any](q *Query[T], snap TxID) *plan[T] {
 			used[e] = true
 		case kPred:
 			pi := e.pred()
+			if pi == nil {
+				break
+			}
 			if pi.op == opEq && len(pi.paramSeq) == 0 || pi.op == opEq && allLiteral(pi) {
 				if prev, ok := eq[pi.field]; ok && prev != pi.vals[0] {
 					p.empty = true
@@ -110,7 +113,7 @@ func choosePlan[T any](q *Query[T], snap TxID) *plan[T] {
 			for _, f := range fields {
 				p.predicates = append(p.predicates, f+" = "+quote(eq[f]))
 				for _, e := range conj {
-					if e.kind() == kPred && e.pred().op == opEq && e.pred().field == f {
+					if e.kind() == kPred && e.pred() != nil && e.pred().op == opEq && e.pred().field == f {
 						used[e] = true
 					}
 				}
@@ -142,7 +145,7 @@ func choosePlan[T any](q *Query[T], snap TxID) *plan[T] {
 		p.index = bestField
 		p.predicates = append(p.predicates, bestField+" = "+quote(eq[bestField]))
 		for _, e := range conj {
-			if e.kind() == kPred && e.pred().op == opEq && e.pred().field == bestField {
+			if e.kind() == kPred && e.pred() != nil && e.pred().op == opEq && e.pred().field == bestField {
 				used[e] = true
 			}
 		}
@@ -157,7 +160,7 @@ func choosePlan[T any](q *Query[T], snap TxID) *plan[T] {
 	}
 	// 4. IN list on an indexed field.
 	for _, e := range conj {
-		if e.kind() != kPred || e.pred().op != opIn || !allLiteral(e.pred()) {
+		if e.kind() != kPred || e.pred() == nil || e.pred().op != opIn || !allLiteral(e.pred()) {
 			continue
 		}
 		f := e.pred().field
@@ -226,6 +229,9 @@ func choosePlan[T any](q *Query[T], snap TxID) *plan[T] {
 }
 
 func allLiteral(pi *predInfo) bool {
+	if pi == nil {
+		return false
+	}
 	for _, s := range pi.paramSeq {
 		if s != 0 {
 			return false

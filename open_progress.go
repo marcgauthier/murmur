@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/marcgauthier/murmur/spool"
 )
 
 // OpenPhase identifies startup work. Only OpenReady means queries are available.
@@ -15,6 +17,7 @@ const (
 	OpenOpening OpenPhase = "opening"
 	// OpenCounting is retained for compatibility; startup no longer emits it.
 	OpenCounting   OpenPhase = "counting"
+	OpenReplaying  OpenPhase = "replaying"
 	OpenRebuilding OpenPhase = "rebuilding"
 	OpenIndexing   OpenPhase = "indexing"
 	OpenFinalizing OpenPhase = "finalizing"
@@ -44,7 +47,17 @@ type OpenProgress struct {
 	CurrentTable       string
 	RowsInserted       uint64
 	RowsSkipped        uint64
-	Error              error
+	// Replay counters track segment replay during the replaying phase.
+	// ReplayRecords counts validated record visits; the loader's second
+	// pass re-validates winner blocks, so Records and BytesDone
+	// accumulate across passes and can exceed the stored totals.
+	// BytesTotal is the member segment size sum.
+	ReplayFilesTotal int
+	ReplayFilesDone  int
+	ReplayBytesTotal int64
+	ReplayBytesDone  int64
+	ReplayRecords    uint64
+	Error            error
 }
 
 // openProgressReporter keeps user callbacks away from storage/materializer locks. Only
@@ -128,6 +141,19 @@ func (r *openProgressReporter) materializerProgress(currentTable string, rowsIns
 	r.progress.CurrentTable = currentTable
 	r.progress.RowsInserted = rowsInserted
 	r.progress.RowsSkipped = rowsSkipped
+	r.mu.Unlock()
+}
+
+func (r *openProgressReporter) replay(p spool.ReplayProgress) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.progress.ReplayFilesTotal = p.FilesTotal
+	r.progress.ReplayFilesDone = p.FilesDone
+	r.progress.ReplayBytesTotal = p.BytesTotal
+	r.progress.ReplayBytesDone = p.BytesDone
+	r.progress.ReplayRecords = p.Records
 	r.mu.Unlock()
 }
 
