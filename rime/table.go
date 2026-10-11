@@ -733,11 +733,18 @@ type hashIndexEffect struct {
 	hasOld, hasNew bool
 }
 
+type trigramIndexEffect struct {
+	index          *trigramIdx
+	old, new       []uint32
+	hasOld, hasNew bool
+}
+
 type managedIndexEffects struct {
 	compound []compoundIndexEffect
 	ordered  []orderedIndexEffect
 	prefix   []prefixIndexEffect
 	hash     []hashIndexEffect
+	trigram  []trigramIndexEffect
 }
 
 type preparedOrderedMap struct {
@@ -855,7 +862,7 @@ func (t *Table[T]) installPreparedOrderedMaps(value any) {
 // the write durable. Index mutation itself remains in the ordered publish
 // section, while this potentially allocating projection work happens first.
 func (t *Table[T]) prepareIndexEffects(p *pendingWrite, reserve int) any {
-	if len(t.idx.comp) == 0 && len(t.idx.ordered) == 0 && len(t.idx.prefix) == 0 && len(t.idx.hashFields) == 0 {
+	if len(t.idx.comp) == 0 && len(t.idx.ordered) == 0 && len(t.idx.prefix) == 0 && len(t.idx.hashFields) == 0 && len(t.idx.trigram) == 0 {
 		return nil
 	}
 	var old *T
@@ -871,6 +878,7 @@ func (t *Table[T]) prepareIndexEffects(p *pendingWrite, reserve int) any {
 		ordered:  make([]orderedIndexEffect, 0, len(t.idx.orderedFields)),
 		prefix:   make([]prefixIndexEffect, 0, len(t.idx.prefix)),
 		hash:     make([]hashIndexEffect, 0, len(t.idx.hashFields)),
+		trigram:  make([]trigramIndexEffect, 0, len(t.idx.trigramFields)),
 	}
 	for _, field := range t.idx.hashFields {
 		if old != nil && next != nil && t.equals[field](old, next) {
@@ -948,7 +956,23 @@ func (t *Table[T]) prepareIndexEffects(p *pendingWrite, reserve int) any {
 		}
 		prepared.compound = append(prepared.compound, effect)
 	}
-	if len(prepared.ordered) == 0 && len(prepared.compound) == 0 && len(prepared.prefix) == 0 && len(prepared.hash) == 0 {
+	for _, field := range t.idx.trigramFields {
+		if old != nil && next != nil && t.equals[field](old, next) {
+			continue
+		}
+		effect := trigramIndexEffect{index: t.idx.trigram[field], hasOld: old != nil, hasNew: next != nil}
+		if old != nil {
+			effect.old = extractTrigrams(t.keyStr[field](old))
+		}
+		if next != nil {
+			effect.new = extractTrigrams(t.keyStr[field](next))
+			t.idx.mu.Lock()
+			effect.index.store.prepare(effect.new, reserve)
+			t.idx.mu.Unlock()
+		}
+		prepared.trigram = append(prepared.trigram, effect)
+	}
+	if len(prepared.ordered) == 0 && len(prepared.compound) == 0 && len(prepared.prefix) == 0 && len(prepared.hash) == 0 && len(prepared.trigram) == 0 {
 		// A typed empty slice distinguishes "prepared and unchanged" from
 		// the nil sentinel used by standalone commits that have no prepared
 		// index effects.
@@ -1017,6 +1041,11 @@ func (t *Table[T]) abortPreparedIndexEffects(writes []*pendingWrite) {
 		for _, effect := range effects.compound {
 			if effect.newValues != nil {
 				effect.index.prune(effect.newValues)
+			}
+		}
+		for _, effect := range effects.trigram {
+			if effect.hasNew {
+				effect.index.store.prune(effect.new)
 			}
 		}
 	}

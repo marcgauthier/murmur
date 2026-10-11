@@ -297,6 +297,44 @@ for _, row := range outer {
 `Left` and `Right` hold detached `*T` pointers for their models; `Right` is
 `nil` for unmatched left rows. Duplicate keys fan out into one row per pair.
 
+## Trigram search
+
+Tag a string field `rime:"trigram"` for ranked full-text search over it, or
+add the index later without touching the model:
+
+```go
+type Article struct {
+    ID    ids.RowID `rime:"ID"`
+    Title string    `rime:"trigram"`
+    Site  string    `rime:"index"`
+}
+// Include Article{} in Config.Models before using it.
+
+hits, err := db.SearchTrigram(ctx, Article{}, "Title", "databse",
+    murmur.TrigramSimilar, murmur.TrigramOptions{})
+if err != nil { return err }
+for _, h := range hits {
+    var article Article
+    article.ID = h.Key.(ids.RowID)
+    if err := db.GetItem(ctx, &article); err != nil { return err }
+    fmt.Println(article.Title, h.Score) // best first
+}
+
+// Without the tag:
+err = db.CreateIndex(ctx, "Article", "Title", murmur.IndexTrigram)
+```
+
+`TrigramContains` matches substrings (score 1.0); `TrigramSimilar` ranks by
+word-level similarity with a 0.3 default threshold; `TrigramFuzzy` tolerates
+up to 2 edits per word, ranked by total edits. Multi-word queries require
+every query word to match. Matching is case-insensitive with collapsed
+whitespace; an empty query matches nothing and `Limit` caps ranked hits.
+
+Trigram indexes are local derived state: every replica builds its own from
+replicated rows, and index declarations never enter the replicated schema
+manifest — adding or dropping one never requires migration. Commits maintain
+postings and reopening rebuilds them from current state.
+
 ## Compiled item queries
 
 Prepare a query once and bind values per execution with `q.Param()`
@@ -469,8 +507,9 @@ become stale after a rebuild; build fresh queries for the new model set.
   query object (`ItemQuery` has no mutation methods).
 - Missing single-row reads report `rime.ErrNotFound`; check with
   `errors.Is`.
-- There is no SQL layer and no full-text ranking: prefix/suffix/
-  substring/`LIKE` matching is literal string matching only.
+- There is no SQL layer. Prefix/suffix/substring/`LIKE` matching is
+  literal string matching only; ranked full-text search uses trigram
+  indexes (see Trigram search above).
 - Reactive live queries use `db.Subscribe`, which streams an
   initial snapshot plus row diffs; see
   [examples/subscriptions](examples/subscriptions/main.go) and

@@ -36,6 +36,7 @@ discovery. The primary key is immutable after insertion. Common tags are:
 | `index` | Equality index |
 | `ordered` | Range, ordering and extrema index |
 | `prefix` | Prefix index for strings |
+| `trigram` | Trigram similarity index for strings |
 | `nullable` | Legacy scalar zero-value NULL behavior |
 | `notnull` | Require a pointer or `Optional[T]` field to be present |
 | `default=value` | Fill an absent pointer or `Optional[T]` on insert/save |
@@ -263,6 +264,52 @@ Timestamp equality, membership, and ordering use wall-clock instants with UTC
 and monotonic-free query/index keys. `FieldOf[T, time.Time]` equality and
 membership use the same instant semantics. Hash, ordered, unique, and compound
 indexes recognize `time.Time`; application records keep their original values.
+
+## Trigram similarity search
+
+Tag a string field `rime:"trigram"` to build an in-memory similarity index
+for it, or add one to a table registered without the tag:
+
+```go
+type Article struct {
+	ID    string `rime:"primary"`
+	Title string `rime:"trigram"`
+}
+
+articles, err := rime.Register[Article](db)
+if err != nil { return err }
+// Without the tag: err = db.CreateIndex("Article", "Title", rime.IndexTrigram)
+
+hits, err := articles.SearchTrigram("Title", "databse", rime.TrigramSimilar, rime.TrigramOptions{})
+if err != nil { return err }
+for _, h := range hits {
+	fmt.Println(h.Key, h.Score) // best first
+}
+```
+
+`SearchTrigram(field, query, mode, opts)` returns ranked `TrigramHit{Key,
+Score, Edits}` values. Modes:
+
+- `TrigramContains` matches values containing the query as a substring
+  (score 1.0, key-ordered). Queries under 3 characters use a filtered scan.
+- `TrigramSimilar` ranks by word-level trigram Jaccard similarity: every
+  query word must reach `Options.Threshold` (default 0.3) and the score is
+  the mean of the per-word bests.
+- `TrigramFuzzy` matches values whose words fall within `Options.MaxEdits`
+  (default 2) of every query word, ranked by total edits ascending, then
+  mean similarity descending.
+
+Multi-word queries use AND semantics: a document matching only some query
+words is excluded. Matching folds ASCII case and collapses whitespace
+identically at index, candidate, and verify time, and is otherwise
+byte-oriented with no Unicode collation. An empty query matches nothing;
+`Options.Limit` caps hits after ranking.
+
+The index lives only in memory: commits maintain it, deletes clean it, and
+bulk loads populate it through the normal write path. `DB.CreateIndex`
+builds one over existing rows while serializing with commits; re-creating
+an existing index rebuilds it idempotently. The query planner never consults
+trigram indexes; ranked search is available only through this explicit API.
 
 ## Aggregates, groups, joins, and projection
 

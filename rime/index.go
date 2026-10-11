@@ -594,12 +594,14 @@ type indexSet struct {
 	ordered map[string]*orderedIdx
 	prefix  map[string]*trieIdx
 	comp    map[string]*compoundIdx
+	trigram map[string]*trigramIdx
 
 	// kind metadata for stats/planner
 	hashFields    []string
 	uniqueFields  []string
 	orderedFields []string
 	prefixFields  []string
+	trigramFields []string
 	compoundOrder []string
 }
 
@@ -625,6 +627,7 @@ func buildIndexes(sch *Schema) (*indexSet, error) {
 		ordered:     map[string]*orderedIdx{},
 		prefix:      map[string]*trieIdx{},
 		comp:        map[string]*compoundIdx{},
+		trigram:     map[string]*trigramIdx{},
 	}
 	pk := sch.fields[sch.primary].name
 	for _, fm := range sch.fields {
@@ -685,6 +688,13 @@ func buildIndexes(sch *Schema) (*indexSet, error) {
 		if fm.prefix && fm.typ.Kind() == reflect.String {
 			ix.prefix[fm.name] = newTrieIdx()
 			ix.prefixFields = append(ix.prefixFields, fm.name)
+		}
+		if fm.trigram {
+			if fm.typ.Kind() != reflect.String {
+				return nil, fmt.Errorf("%w: trigram index on %s requires a string field, got %s", ErrBadSchema, fm.name, fm.typ)
+			}
+			ix.trigram[fm.name] = newTrigramIdx()
+			ix.trigramFields = append(ix.trigramFields, fm.name)
 		}
 	}
 	for _, cd := range sch.compound {
@@ -797,6 +807,31 @@ func onCommit[T any](t *Table[T], oldHead *T, p *pendingWrite, directUnique bool
 				}
 				if next != nil {
 					trie.add(ex(next), p.key)
+				}
+			}
+		}
+	}
+	if len(ix.trigram) > 0 {
+		if effects, ok := p.preparedIndexEffects.(managedIndexEffects); ok {
+			for _, effect := range effects.trigram {
+				if effect.hasOld {
+					effect.index.store.remove(effect.old, p.key)
+				}
+				if effect.hasNew {
+					effect.index.store.addPrepared(effect.new, p.key)
+				}
+			}
+		} else {
+			for field, index := range ix.trigram {
+				if oldHead != nil && next != nil && t.equals[field](oldHead, next) {
+					continue
+				}
+				ex := t.keyStr[field]
+				if oldHead != nil {
+					index.remove(ex(oldHead), p.key)
+				}
+				if next != nil {
+					index.add(ex(next), p.key)
 				}
 			}
 		}
@@ -1043,6 +1078,13 @@ func (ix *indexSet) indexStats() (entries int64, perIndex map[string]IndexStat) 
 		combos := c.comboCount()
 		perIndex[name] = IndexStat{Name: name, Kind: "compound", Entries: c.total,
 			Cardinality: combos, Selectivity: selectivity(combos, c.total)}
+	}
+	for f, tg := range ix.trigram {
+		n := tg.store.refs()
+		entries += n
+		card := int64(tg.store.terms())
+		perIndex[f] = IndexStat{Name: f, Kind: "trigram", Entries: n,
+			Cardinality: card, Selectivity: selectivity(card, n)}
 	}
 	return entries, perIndex
 }

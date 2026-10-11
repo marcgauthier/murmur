@@ -698,6 +698,22 @@ func (t *Table[T]) Compile(exprs ...rime.Expr[T]) *rime.Compiled[T] {
 	return t.inner.Compile(exprs...)
 }
 
+// SearchTrigram searches field's trigram index on the latest published
+// state. The adapter must be healthy; the search itself pins snapshots and
+// verifies candidates, so concurrent commits only delay it.
+func (t *Table[T]) SearchTrigram(field, query string, mode rime.TrigramMode, opts rime.TrigramOptions) ([]rime.TrigramHit, error) {
+	if t == nil || t.adapter == nil || t.inner == nil {
+		return nil, errors.New("rimeadapter: nil table")
+	}
+	t.adapter.mu.Lock()
+	broken := t.adapter.broken
+	t.adapter.mu.Unlock()
+	if broken != nil {
+		return nil, fmt.Errorf("%w: %v", ErrMaterializer, broken)
+	}
+	return t.inner.SearchTrigram(field, query, mode, opts)
+}
+
 // WhereTx builds a query bound to an active adapter transaction, including
 // its staged overlay.
 func (t *Table[T]) WhereTx(tx *Tx, exprs ...rime.Expr[T]) (*rime.Query[T], error) {

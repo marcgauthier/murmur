@@ -32,7 +32,10 @@ adapter behavior and [application usage](../USAGE.md) for syntax.
 ### FTS
 
 The former SQLite FTS5 integration was removed with the SQL materializer. Native
-full-text indexing is not currently part of the managed query API.
+full-text indexing is provided by RIME trigram indexes: declare them with a
+`rime:"trigram"` struct tag or `DB.CreateIndex`, and search them with the
+explicit ranked `SearchTrigram` API (contains, similar, and fuzzy modes).
+See [application usage](../USAGE.md) and [RIME usage](../rime/USAGE.md).
 
 FTS structures are local derived data and are never replicated directly.
 
@@ -68,6 +71,9 @@ Options:
 - Full rebuild during startup.
 
 Prefer package-managed FTS maintenance for tables declared in schema metadata.
+RIME trigram indexes implement this option: commits maintain postings on both
+the direct and managed paths, startup rebuilds them from current state, and
+the query planner never reads them.
 
 Do not replicate FTS internal mutations.
 

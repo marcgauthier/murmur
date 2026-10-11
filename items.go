@@ -43,6 +43,7 @@ type itemOps struct {
 	grouped    func(db *DB, spec *itemQuerySpec, fields []string, aggs []q.Aggregate) ([]ItemGroupRow, error)
 	rowEqual   func(db *DB, name string, a, b any) (bool, error)
 	rowClone   func(db *DB, name string, row any) (any, error)
+	search     func(db *DB, name, field, query string, mode rime.TrigramMode, opts rime.TrigramOptions) ([]rime.TrigramHit, error)
 }
 
 // newItemOps builds type-erased bindings for the table registered as name.
@@ -246,6 +247,13 @@ func newItemOps[T any](name string) *itemOps {
 				return nil, err
 			}
 			return inner.Clone(record)
+		},
+		search: func(db *DB, name, field, query string, mode rime.TrigramMode, opts rime.TrigramOptions) ([]rime.TrigramHit, error) {
+			table, err := tableOf[T](db, name)
+			if err != nil {
+				return nil, err
+			}
+			return table.SearchTrigram(field, query, mode, opts)
 		},
 	}
 }

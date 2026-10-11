@@ -122,6 +122,7 @@ type innerTable interface {
 	installPreparedOrderedMaps(any)
 	prepareUniqueClaims(map[string]map[any]any) any
 	installPreparedUniqueClaims(any)
+	createIndex(field string, kind IndexKind) error
 	prepareShardRows(shard int, keys []any) any
 	installPreparedShardRows(shard int, rows any)
 	applyPending(commit TxID, p *pendingWrite) pendingEffect

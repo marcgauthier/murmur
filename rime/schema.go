@@ -17,6 +17,7 @@ import (
 //	index          non-unique hash index
 //	ordered        ordered index (range, ORDER BY, MIN/MAX)
 //	prefix         prefix/trie index for string fields
+//	trigram        trigram similarity index for string fields
 //	nullable       legacy scalar zero-value NULL behavior
 //	notnull        require an optional field to be present
 //	default=X      applied on insert/save when a pointer/Optional field is absent
@@ -68,6 +69,7 @@ type fieldMeta struct {
 	hash     bool
 	ordered  bool
 	prefix   bool
+	trigram  bool
 	nullable bool
 	notNull  bool
 	optional bool
@@ -187,6 +189,9 @@ func buildSchemaPrimary(table string, typ reflect.Type, primary string) (*Schema
 		}
 		if _, ok := dirs["prefix"]; ok {
 			fm.prefix = true
+		}
+		if _, ok := dirs["trigram"]; ok {
+			fm.trigram = true
 		}
 		if _, ok := dirs["nullable"]; ok {
 			fm.nullable = true

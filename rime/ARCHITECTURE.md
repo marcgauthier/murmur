@@ -409,6 +409,7 @@ version chains, not the index bundle itself.
 | Compound | Nested native-value maps, one level per field, with key sets at leaves | Equality on all indexed fields; no compound string encoding |
 | Ordered | AVL tree of distinct values, linked key buckets, key directory | O(log D) add/remove, pruned range traversal; D is distinct values |
 | Prefix | Byte trie with descendant key sets at every node | O(prefix length + output) lookup, with extra memory per string prefix |
+| Trigram | Packed-uint32 trigram to key-slice postings per string field | Similarity candidate generation; scoring verifies from rows |
 
 Primary/unique fields currently have both unique and hash maps. Compound
 indexes match conjunctions covering all of their fields; they do not supply a
@@ -428,6 +429,22 @@ cardinality information support selectivity estimates. Deletion removes live
 index entries at commit; later tombstone reclamation does not scan every index
 for each deleted key.
 
+Trigram indexes store the union of full-field unpadded trigrams (which power
+substring containment, including cross-word triples) and per-word padded
+trigrams (which power word similarity) in one postings map keyed by the 3
+bytes packed into a uint32. Values normalize once (ASCII lowercase fold,
+whitespace collapse) and post each key a single time per trigram. Maintenance
+follows the prefix pattern in both commit paths: direct add/remove in
+`onCommit` plus prepared trigram effects with abort pruning for managed
+commits. `DB.CreateIndex` scans rows under `commitMu` and installs under the
+index lock, so no commit can prepare effects without the new index and
+publish after it; re-creating an index rebuilds it idempotently. Search pins
+a retained snapshot, grabs candidates while the snapshot is provably latest
+under `viewMu`, then verifies and ranks without holding locks; generation
+mismatches retry boundedly, then fall back to a filtered scan. Pure
+extraction, similarity, and edit-distance helpers live in the
+standard-library-only `rime/trigram` subpackage.
+
 For multi-write commits, unique indexes publish the final validated ownership
 claims after row installation. This avoids an intermediate mutation accidentally
 erasing another row's final owner. General validation permits two touched rows
@@ -435,7 +452,8 @@ to swap unique values while still rejecting a duplicate final state.
 
 Sources: [index.go](index.go), [index_hash.go](index_hash.go),
 [index_unique.go](index_unique.go), [index_compound.go](index_compound.go),
-[index_ordered.go](index_ordered.go), [index_prefix.go](index_prefix.go).
+[index_ordered.go](index_ordered.go), [index_prefix.go](index_prefix.go),
+[index_trigram.go](index_trigram.go), [trigram](trigram/trigram.go).
 
 ## 9. Query planning and execution
 
@@ -457,7 +475,10 @@ selective equality, IN/eligible OR unions, ordered ranges, prefix lookups,
 ordered scans and finally full scans. It estimates equality choices before
 building the winning candidate set. Contradictory equality predicates and false
 expressions can produce an empty plan. `Explain` describes the selected strategy,
-index, candidate estimate, filters, ordering and limits.
+index, candidate estimate, filters, ordering and limits. The planner never
+consults trigram indexes; ranked similarity is available only through the
+explicit `SearchTrigram` API, which applies the same fresh-or-scan discipline
+with bounded retries instead of plan choice.
 
 ### 9.2. Cache and temporary ownership
 
