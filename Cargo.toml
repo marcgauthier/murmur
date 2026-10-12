@@ -1,0 +1,25 @@
+[package]
+name = "sqlite-session"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+replication = ["dep:murmur-replication"]
+
+[dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled", "load_extension", "session", "hooks"] }
+
+murmur-spool = { path = "spool" }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+blake3 = "1"
+zeroize = "1"
+zstd = "0.13"
+rand = "0.8"
+thiserror = "2"
+murmur-replication = { path = "replication", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+rcgen = "=0.13.2"

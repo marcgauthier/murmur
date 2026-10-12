@@ -1,44 +1,44 @@
-# Repository guidance
+# Architecture guidance
 
-## Main goal of Murmur-SQL
-Create a very fast local sql database with encryption at rest on disk via KV store and that replicated quickly via QUIC with TLS, The code must work, it must be tested with live test not just test for code. 
+The design is an SQLITE in memory database that has background functions that provide data persistance with compression and encryption and data replication via masterless peer-to-peer. Keep this in mind when developping, it's SQLITE in memory (with some limitation) first and the replication and persistance is done in the background.
 
 
-## Keep documentation current
+Keep the SQLite crate lightweight and focused on local database operations.
+Replication and conflict resolution belong in a separate background task;
+they must not add blocking work or heavyweight dependencies to the SQLite
+operation path. Keep the boundary between SQLite and that task small.
 
-- When behavior, public APIs, configuration, schema rules, replication, storage,
-  recovery, security, or operational requirements change, update the affected
-  documents in `architecture/` as part of the same change.
-- Update `README.md` when setup, usage examples, repository layout, or implementation
-  status changes. Keep examples accurate and distinguish implemented behavior from
-  planned capabilities.
-- Use `architecture/README.md` as the documentation index. Add or update its links
-  when documents are added, renamed, moved, or reorganized.
-- Keep architecture documents focused on their topics. Cross-reference related
-  documents instead of duplicating requirements or recreating a root monolith.
-- Preserve numbered section identities when possible; if a section is renamed or
-  moved, update affected cross-references and table-of-contents links.
-- Before finishing documentation changes, check that relative links and section
-  anchors resolve, Markdown fences are balanced, and no obsolete document paths
-  remain in active references.
 
-## RIME usage documentation
+Use exactly one in-memory SQLite database. Application writes must execute only
+application SQL, transaction control, and SQLite session capture. Do not add CRDT
+metadata tables, generated triggers, or metadata SQL to that database.
 
-- When an AI agent changes code in a way that affects RIME's Go syntax, public
-  API, or user-visible behavior, update `rime/USAGE.md` in the same change.
-- Keep examples and function/feature syntax accurate; document new APIs and
-  remove or mark obsolete forms. Check links, anchors, and examples before
-  finishing.
-- `rime/USAGE.md` is the complete syntax reference; `rime/README.md` remains
-  the short introduction.
+Spool is the authoritative store for conflict versions and tombstones. Background
+workers read and update those Spool records directly; do not maintain a separate
+Rust metadata database or a second SQLite replica. Transient batch buffers and
+Spool's existing key/location index are permitted.
 
-## Vendor dependencies policy
+Assign a batch's writing time when its changeset is collected from SQLite, before
+queueing it. Preserve that timestamp across worker delays and storage retries.
 
-- Whenever a new external dependency or package is imported or added to `go.mod`, it **must** be immediately documented in `VENDORS.md`.
-- Each entry in `VENDORS.md` must include:
-  - Package import path and version.
-  - Organization or company behind the package (or the individual developer/publisher if independent).
-  - Country of origin of the entity/maintainer.
-  - License type.
-  - Purpose or role of the package in the codebase.
-- Maintainers and agents must verify that `VENDORS.md` is updated in the same pull request or changeset that introduces any new dependency.
+Maintain a file VENDORS.md that list all of the external package/crate that are dependencies.  I want to see the name of the company and author and country of orgin for the company if there is one otherwise the author. 
+Keep Spool point reads small: default to 64 KiB independently compressed and
+authenticated blocks, with oversized individual records isolated. Large atomic
+commits must span blocks. Keep a byte-bounded hot block cache inside Spool, with
+configurable capacity, eviction and decoded-buffer wiping. Cache data is disposable
+and must never become a separate authoritative metadata store.
+
+Table replication is controlled by `Database::set_replication` / `SetReplication`.
+Persist the node-local map keyed by stable table IDs at `00/schema/replication`,
+atomically with schema events. Missing entries mean enabled. Preserve settings
+through migrations and recovery. Filter row data, tombstones and table CRDT
+records in background outgoing and incoming paths; keep local persistence intact.
+Do not check these settings on ordinary application SQL writes.
+
+Replication retention runs in background workers and persists peer ACKs, peer
+retirement, persistence-time ages, snapshot coverage and duplicate floors in
+Spool. Enforce both minimum age and minimum log count, protect unretired peers
+within the offline window and pending High/Low exports. Publish a durable
+snapshot boundary before atomically deleting logs/receipts and advancing floors.
+Keep CRDT tombstones. Recheck retained heads on the serialized Spool worker so
+cleanup cannot overwrite newer appends. Never add retention SQL to SQLite.

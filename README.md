@@ -1,472 +1,407 @@
-# MURMUR-SQL
+<img src="murmur-sql.png" alt="murmur-sql logo" width="400">
 
-<p align="center">
-  <img src="murmur-sql.png" alt="MURMUR-SQL logo" width="600"/>
-</p>
+# sqlite-session
 
-A murmuration is a flock of starlings wheeling across the sky as
-one: no bird leads, each one simply watches its neighbors and adjusts,
-and from those small local reactions emerges a single shape that holds
-together even as birds drift apart and rejoin. Murmur-SQL is built on
-that pattern. Every node is a fully writable database that keeps
-working offline, exchanges only change deltas with the peers it can
-currently reach, and converges with the rest of the flock without a
-leader — so a cluster that is sometimes partitioned, sometimes
-disconnected, still acts in unison and heals into one consistent
-shape whenever its nodes talk again.
+One in-memory SQLite database with SQLite session capture, encrypted background
+persistence in Murmur Spool, and per-column last-writer-wins conflict metadata.
 
-Murmur is a security-focused embedded Go database. RIME provides the in-memory
-typed query engine, Spool provides encrypted persistence, and replication is
-masterless. Applications register models through `Config.Models`. Use `Model[T]`
-with `ModelOptions` to override collection names and durable schema IDs.
+```rust
+use sqlite_session::{Database, Migration, OpenMode, Options};
 
-- **Typed records and queries** through RIME
-- **Durable state** in Spool (authoritative; RIME materialization rebuilds from it)
-- **Masterless multi-writer replication** over QUIC with mutual TLS
-- **Offline writes** on every node, per-column last-writer-wins via hybrid
-  logical clock (per-field last-writer-wins cell model)
-- **Encrypted storage** with multiple cipher options, storage-key rotation, snapshots for new or stale nodes, replication-log garbage collection
-- **Cross-domain unidirectional airgap**: allow data to transfer from a low domain flock to a high domain flock
+let db = Database::open("./data", [7u8; 32], Options {
+    mode: OpenMode::CreateNew,
+    ..Options::default()
+})?;
+db.migrate(Migration::new(
+    "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+))?;
+db.transaction(|sql| {
+    sql.execute("INSERT INTO items VALUES(1, 'hello')", [])?;
+    Ok(())
+})?;
+db.flush()?; // Wait for a durable checkpoint.
+db.close()?;
+# Ok::<(), sqlite_session::Error>(())
+```
 
-Typed RIME peers reconcile remote tombstones idempotently, including when a
-delete arrives before the corresponding row. The SQLite engine, SQL application API, driver dependency, and CGO build tags
-have been removed from the production module. RIME is the only managed query
-materializer and Spool is authoritative. Migration qualification remains in
-progress; see [the migration plan](architecture/migration-plan.md#8-implementation-milestones)
-for the remaining fault, replication, and release gates. The breaking API and
-format changes are listed in [release notes](RELEASE_NOTES.md).
+Reopen with `OpenMode::Existing` (the default) and the same application-provided
+32-byte key. An incorrect key returns `Error::WrongKey` before storage is changed.
+`CreateNew` requires a new storage directory; it never replaces an existing one.
+Passphrase derivation and alternate encryption ciphers are not implemented.
 
-The architecture and implementation documentation is in [architecture/](architecture/README.md) folder, split into smaller topic documents.  Start with the [architecture overview](architecture/overview.md).
+## Write path
 
-The [Spool package](spool/README.md) implements the persistence backend for database state
-engine for fast concurrent buffered writes (append/update/delete, flush,
-full startup load, background compaction; no disk `Get`) with AES-256-GCM encryption.
+Application transactions execute SQL on the sole SQLite connection. SQLite's
+session extension records their changes. There are no CRDT tables, triggers, or
+metadata statements on that connection, and no second SQLite database.
 
-## Reused packages
+At a collection boundary, the crate extracts the committed changeset, assigns
+its collection-time HLC version, starts a fresh session, and queues the batch.
+Extraction requires a brief pause on the connection. The background worker then:
 
-The implementation leans on existing Go packages instead of reinventing them. For a complete software bill of materials with vendor organizations, publisher details, countries of origin, and licenses, see [VENDORS.md](VENDORS.md).
+1. Iterates the changeset to find row keys and changed columns.
+2. Reads existing versions and tombstones from Spool.
+3. Commits the changeset, updated metadata, and clock in one atomic Spool group, using Zstd compression followed by AES-256-GCM encryption.
 
-| Concern | Package |
-|---|---|
-| In-memory B-tree state generations, snapshots & RIME ordered indexes | `github.com/tidwall/btree` |
-| At-rest AEADs (AES-GCM; ChaCha20-Poly1305, XChaCha20) | Go stdlib `crypto/aes`, `golang.org/x/crypto` |
-| QUIC transport with TLS 1.3 | `github.com/quic-go/quic-go` |
-| SWIM membership discovery & transport | `github.com/hashicorp/memberlist` |
-| Node/row/tx/cluster IDs | `github.com/google/uuid` |
-| Snapshot/wire compression | Standard library `compress/flate` (deflate) + pluggable `compression.Codec` |
-| mTLS PKI, structured logging | stdlib (`crypto/x509`, `log/slog`) |
+All changes within an extracted batch share a version. The version is assigned
+before queueing; a delayed or retried worker keeps that original version. The logical counter prevents clock regression and the node ID provides a tie-break.
+Spool is the authoritative metadata store. Rust holds transient record payloads while processing a batch, plus a small clock watermark; it maintains no separate metadata map or SQL replica. Spool's existing memory index stores key locations,
+not metadata values. Spool also has a bounded cache of frequently read blocks;
+this is disposable cached data, and Spool remains authoritative.
 
-Key delivery is the hosting process's responsibility: the process obtains the
-encryption key (local config, KMS, or its own HTTP listener) and passes key
-material to `Open` directly or through a `KeyProvider`. Murmur provides no
-HTTP unlock endpoint. See
-[runtime and diagnostics](architecture/runtime-and-diagnostics.md#optional-service-adapter).
+Transactions acknowledge **in-memory commit**, not disk durability. Call `flush`
+when durability is required. The default five-second collection schedule gives an approximate loss window; busy callbacks or slow storage can extend it.
 
-Replication uses Ed25519 origin signatures and protocol 6. Fresh Spool stores
-use format 6; format-5 SQL-era stores fail closed and must be exported by the
-previous release before opening a fresh directory. Remote snapshots require
-separately trusted source nodes. See [origin signatures](architecture/origin-signatures.md)
-for provisioning, restore and security boundaries.
+## Settings at open
 
-The [`rime/`](architecture/rime.md) package is an in-memory MVCC
-relational engine with a native Go API (no SQL parsing). Its sole external
-dependency is the approved Tidwall B-tree for ordered indexes. Murmur uses it as its
-managed query materializer. It supports
-[maintained Go query views](rime/USAGE.md#maintained-query-views) with cached
-results, incremental filters, and synchronous complex-query reevaluation. Its
-[qualification suite](architecture/rime-testing.md) includes reference-model
-fuzzing and a [standalone concurrent live workload](tests-live/rime/README.md).
-Its [SQLite comparisons](architecture/rime-benchmarks.md) cover one and four
-writers against shared in-memory databases with matching secondary indexes.
-The [performance plan](architecture/rime-performance-plan.md) records proposed
-work based on write profiles; concurrent commit publication is not yet implemented.
-See [RIME's usage reference](rime/USAGE.md) for its current Go syntax and
-[architecture](rime/ARCHITECTURE.md) for storage, snapshots, indexes and
-reader/writer coordination.
+| Option | Default |
+| --- | --- |
+| Encryption algorithm | AES-256-GCM (fixed; no algorithm option exposed) |
+| `key` argument to `Database::open(path, key, options)` | Required application-provided 32-byte key; no default |
+| `capture_interval` | 5 seconds |
+| `capture_bytes` | 8 MiB |
+| `queue_bytes` | 64 MiB |
+| `transaction_bytes` | 64 MiB |
+| `compression_level` | Zstd level 3 |
+| `segment_bytes` | 256 MiB |
+| `spool_block_bytes` | 64 KiB |
+| `spool_cache_bytes` | 32 MiB (zero disables) |
+| `snapshot_deltas` | 128 checkpoints |
+| `snapshot_bytes` | 256 MiB of checkpoint records |
+| `storage_workers` | 2 Spool workers |
 
-The [migration plan](architecture/migration-plan.md) records the remaining release
-qualification for the managed RIME API. Applications register exemplars through
-`Config.Models`, or supply definitions compiled with `Model[T]` and `ModelOptions`
-to override collection names and durable schema IDs.
-`WriteTxContext` and explicit `BeginTx` transactions persist
-changes to encrypted Spool before publishing them to RIME. A generic Storm-style item API
-(`InsertItem`/`GetItem`/`SaveItem`/`UpdateFields`/`DeleteItem` plus
-`Find`/`FindOne`/`Count`/`Exists` and `DB.Query` with comparison, membership,
-string, and range matchers; `Update` accepts explicit `Set` assignments) serves
-every registered struct through one function per operation. It supports
-managed CRUD, LWW fields, MIN/MAX, PN_COUNTER, OR_SET,
-filters, order/page/count, compiled parameters, aggregates, joins, subscriptions,
-node-local durable tables, and ephemeral tables. Remote winners rebuild into
-RIME without echo. For ambiguous durable failures,
-`CommitOutcomeUncertainError` exposes the transaction ID and
-`HasTransactionReceipt` resolves it after reopen. The remaining migration gates
-are listed in [the migration plan](architecture/migration-plan.md).
-`DB.GC(ctx)` runs a context-bounded replication log and receipt collection pass
-using persisted peer acknowledgements and retention limits.
-Remote materialization streams affected rows from one authoritative snapshot
-into one RIME transaction, up to a bounded 100,000 rows per apply.
-Compatible additive schemas preserve unknown nested struct, array, slice and
-map-value fields when older typed writers update known values.
-Additive typed schema changes can be published at runtime with
-`DB.MigrateRecords(ctx, completeDefinitions)`; compatible older typed peers
-retain unknown fields while adopting the new manifest. The `typed-records`
-live test checks an older peer's write and restart after migration, and verifies
-offline PN_COUNTER and OR_SET updates converge after reconnect. It also checks
-two concurrent additive schema branches merge after reconnect with both field
-values retained. Operational feature ports are implemented. The live `rekey`
-scenario rotates a typed database and verifies records after restart; the live
-`backup-restore` scenario verifies typed recovery under a fresh writer identity.
-Bridge schema validation uses the persisted manifest, typed row-existence
-checks use RIME, and native imports commit imported data with provenance and
-source receipts through Spool before RIME publication. The live
-`typed-bridge` scenario verifies Low-to-High import and restart reconstruction.
-Bridge row imports now require managed typed tables; the legacy SQL import
-transaction has been removed.
-See the
-[migration status](architecture/migration-plan.md).
+The encryption key is the second argument to `Database::open`, outside `Options`.
+Supply the same key when reopening the directory. AES-256-GCM encrypts Spool
+blocks; the application key protects Spool’s stored data keys. Passphrases and
+selectable encryption algorithms are not exposed by this crate.
 
-## Quick start
+The capture threshold is checked between transactions. The transaction limit
+bounds the active session's reported memory/changeset size before commit; it is
+not a hard cap on temporary allocations during a SQL statement. Queue accounting
+covers captured payloads, not every allocator or disk framing byte. Serialized
+log and snapshot records are limited to 512 MiB. Queue settings allow at most
+128 MiB. Snapshot compaction also uses temporary buffers proportional to the
+stored changesets it compacts.
 
-Register models once and use the same operations for every collection:
+A full queue returns `Error::Busy`. Storage failure stops further writes while
+leaving reads available, retains pending batches, and appears in `status()`.
+After resolving the storage problem, call `retry_storage()`. `close()` flushes
+and reports errors; explicit close is recommended over relying on drop.
 
-```go
-type Device struct {
-    ID       murmur.RowID `rime:"ID"`
-    Name     string       `rime:"primary"`
-    Hostname string       `rime:"index"`
-    Site     string       `rime:"index"`
-    Status   int          `rime:"ordered"`
-    Online   bool
+## Observability, Spool metrics, and write backpressure
+
+Murmur provides real-time diagnostic metrics and structured progress interfaces so applications can monitor database internals, track reload progress, and proactively pace write workloads before hitting queue capacity limits (`Error::Busy`).
+
+### Structured reload progress
+
+When opening a database or recovering after restart, applications can observe reload phases (`Opening`, `Rebuilding`, `Indexing`, `Finalizing`, `Ready`, `Failed`) using `options.on_open_progress`:
+
+```rust
+use sqlite_session::{Database, OpenPhase, Options};
+use std::sync::Arc;
+
+let mut opts = Options::default();
+opts.on_open_progress = Some(Arc::new(|p| {
+    println!(
+        "[{:?}] {:.1}% complete - table: {:?}, rows: {}/{}",
+        p.phase, p.percent, p.current_table, p.rows_processed, p.rows_total
+    );
+}));
+
+let db = Database::open("./data", [7u8; 32], opts)?;
+assert_eq!(db.open_progress().unwrap().phase, OpenPhase::Ready);
+```
+
+### Metrics inspection
+
+Applications can query in-memory SQLite and on-disk Spool persistence metrics without acquiring write locks or blocking SQLite queries:
+
+```rust
+// SQLite in-memory engine metrics (memory usage, page count, rows, tables, capture memory)
+let sqlite = db.sqlite_metrics()?;
+println!("SQLite RAM: {} bytes across {} tables ({} rows)", sqlite.memory_used_bytes, sqlite.table_count, sqlite.total_rows);
+
+// Spool persistence engine metrics (disk usage, compression, buffer depths, block commits)
+let spool = db.spool_metrics();
+println!("Spool disk footprint: {} bytes across {} segments (ratio: {:.2}x)", spool.disk_bytes, spool.segments, spool.compression_ratio);
+
+// Consolidated snapshot
+let status = db.status();
+println!("Committed: {}, Durable: {}, Pending Queue: {} bytes", status.committed, status.durable, status.pending_bytes);
+```
+
+### Understanding `capture_interval` and write buffer growth
+
+The frequency at which background checkpoints run is governed by `options.capture_interval` (default: **5 seconds**):
+
+- **Expected buffer accumulation**: When transactions commit, SQLite changesets accumulate in memory during the collection window. If `capture_interval` is set to 5s, the pending session buffer (`status.pending_bytes`) is **expected to continuously grow** across those 5 seconds as writes arrive.
+- **Collection boundary**: Only when the timer elapses (or an explicit `db.flush()` is called) does Murmur capture the accumulated changeset, advance the collection clock, and hand the payload off to the background Spool storage worker to compress, encrypt, and fsync to disk.
+- **Tuning trade-off**:
+  - Setting a lower interval (e.g. `Duration::from_millis(500)`) flushes to disk more frequently, reducing the in-flight buffer size and narrowing the crash-loss window at the cost of higher Spool block/sync overhead.
+  - Setting a higher interval batches writes more efficiently into larger Zstd blocks, but requires `options.queue_bytes` to accommodate the entire burst of writes generated across that interval.
+
+### Monitoring Spool to pace writes and back off
+
+Murmur commits transactions to SQLite in memory immediately and buffers changesets in a bounded background persistence queue (`options.queue_bytes`, default 64 MiB). If write volume during a collection interval exceeds `queue_bytes`, or if background Spool writes and disk flushes fall behind, incoming writes fail with `Error::Busy`.
+
+Applications can monitor `db.status().pending_bytes` alongside `db.spool_metrics()` to apply adaptive backpressure or back off before rejections occur:
+
+```rust
+use sqlite_session::{Database, Error, Result};
+use std::{thread, time::Duration};
+
+fn execute_with_backpressure<T>(
+    db: &Database,
+    queue_budget: usize,
+    mut txn: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    loop {
+        let status = db.status();
+
+        // 1. Proactive backpressure: check Murmur's checkpoint queue fill level
+        if status.pending_bytes > (queue_budget * 3 / 4) {
+            // Queue is over 75% full: slow down writes to allow Spool worker to catch up
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+
+        // 2. Proactive backpressure: check Spool's internal write stage queue
+        if let Some(spool) = status.spool {
+            if spool.pending_bytes > (queue_budget as u64 / 2) {
+                // Spool block sealing/crypto queue is backed up
+                thread::sleep(Duration::from_millis(15));
+                continue;
+            }
+        }
+
+        // 3. Execute transaction with retry on busy
+        match txn() {
+            Err(Error::Busy) => {
+                // Queue full or storage write collision: back off and retry
+                thread::sleep(Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
 }
-
-db, err := murmur.Open(ctx, murmur.Config{
-    Path:          "./node-data",
-    NodeID:        nodeID,
-    Models:        []any{Device{}},
-    Schema:        murmur.SchemaConfig{Version: 1},
-    Spool:         murmur.DefaultSpoolConfig(),
-    Encryption:    murmur.EncryptionConfig{Key: key32, KeyID: "app-key-1"},
-    OriginSigning: signing,
-})
-if err != nil { return err }
-defer db.Close()
-
-device := Device{Name: "router-01", Hostname: "router-01", Site: "OTT"}
-err = db.InsertItem(ctx, &device) // generates UUIDv5 from the business key
-err = db.Update(ctx, &device, murmur.Set("Status", 2))
-var devices []Device
-err = db.Find(ctx, &devices, q.Eq("Site", "OTT"), q.Gte("Status", 2))
 ```
 
-Import `q` from `github.com/marcgauthier/murmur/q`. The application supplies a
-persistent node identity, a 32-byte encryption key, and an Ed25519 origin signing
-configuration; see [origin signatures](architecture/origin-signatures.md).
-Tag the row identity `ID` with `rime:"ID"`. Tag an application value, such as
-`Name`, with `rime:"primary"` to generate unset IDs as UUIDv5 from the model name
-and that value. Without an application primary key, unset IDs become UUIDv4.
-Supplied IDs are retained. `Model[T]` adds explicit overrides for names and
-durable identities.
+## Schema, recovery, and offline merging
 
-See [USAGE.md](USAGE.md) for CRUD, transactions, atomic batches, indexed queries,
-and explicit `MigrateModels` examples. Replication options still configure the
-existing QUIC/TLS mesh; opening a local database does not require peers.
+Tables need non-null declared primary keys. Composite keys and `WITHOUT ROWID`
+are supported. Nonunique indexes are supported; foreign keys, CHECK constraints,
+non-primary unique constraints, virtual tables, views, and application triggers
+are currently rejected. Use `migrate()` for schema changes. Explicit
+`TableMapping` entries preserve identities when renaming tables or columns.
+Primary-key identity cannot change.
 
-For local applications that accept a short loss window after a crash, set
-`Durability: murmur.DurabilityConfig{Mode: murmur.DurabilityAsync,
-SyncInterval: time.Second}` in `Config`. Individual commits return without a
-disk sync; the database syncs Spool about once per second and also syncs on
-graceful close. The default remains a disk sync before each write acknowledgement.
-Spool appends group frames to segments on each commit, so this setting controls sync
-frequency rather than the exact number of physical disk writes.
-Set `MaxUnsyncedBytes` (for example `10 << 20`) to also sync once roughly
-that many bytes have been written without one; with both triggers set,
-whichever is reached first fires.
+Schema migrations are separate ordered records because sessions do not capture
+DDL. Migrations inspect rows before and after their SQL to preserve versions of
+unchanged cells and stamp transformed cells. This scan is confined to explicit
+migrations, rather than ordinary writes, and can pause a large database.
 
-Write concurrency comes from the application: run one goroutine per writer
-Concurrent `WriteTxContext` calls use synchronous group commit by default:
-eligible replicated typed writes share a Spool commit and fsync, and each
-caller returns only after durable commit and ordered RIME publication. See
-[synchronous group commit](architecture/transactions.md#synchronous-group-commit)
-and the [benchmark methodology](architecture/benchmarks.md#62-running-the-matrix).
+Recovery replays a compacted changeset archive and later committed log entries
+into the one application database. Metadata remains in Spool. Snapshot publication
+is durable before covered log records are removed. Compaction combines changesets
+within a schema epoch; schema transitions and their earlier replay dependencies
+are retained. It does not require a duplicate live database or a live row mirror.
 
-Run the native typed-record example without CGO or SQLite build tags:
+`export_state()` and `merge_state()` support offline state exchange between replicas
+with identical database IDs and schema history. Export explicitly reads current
+SQL rows and combines them with Spool metadata. The worker computes the LWW join;
+accepted row changes are then applied in one application-database transaction.
+These explicit operations can pause the connection and allocate complete state
+buffers. Each replica must have its own node ID. Network transport is deferred.
 
-```sh
-go run ./examples/basic
+Sessions report net changes. Repeated updates collapse into a final update, an
+insert followed by delete can disappear, and delete/reinsert within one capture
+can become an update. Such a reinsert cannot acquire a distinct generation from
+session data alone. Collect the deletion first if that distinction is needed.
+Operation-based counters or sets need additional operation capture.
+
+## Backup and restore
+
+`db.backup("./backup")` takes an online, encrypted, point-in-time copy via
+Spool's consistent checkpoint. It flushes durable state first; writes after the
+checkpoint are not included. The destination must be a new directory. Same
+filesystem destinations stay as hardlink checkpoints; cross-filesystem
+destinations copy through a temporary sibling checkpoint.
+
+`Database::verify_backup("./backup", key)` checks a backup opens and rebuilds
+without mutating it. `Database::restore("./backup", "./restored", key)` copies
+to a new live directory and verifies the copy before returning. Restore never
+overwrites an existing directory. Backups keep the live encryption key; a wrong
+key returns `Error::WrongKey`.
+
+`Database::restore_with_options(..., RestoreOptions { new_database_id,
+new_node_id })` clones with fresh identity. Keep the database id and set a
+distinct node id to reseed a new replica of the same database. Set a new
+database id for an independent copy. Retention is caller-managed: each backup is
+an independent directory, delete old ones to prune.
+
+## Minimal helpers and benchmarks
+
+`open_in_memory()` and `start_session()` remain available for session-only use.
+The independent benchmark crate is in [benchmark](benchmark/README.md). Its
+`persistence` binary compares plain SQLite, session capture, and the managed
+crate with collection deferred or background persistence enabled. Earlier
+measurements made with synchronous CRDT stamping do not describe this design.
+
+### Spool point reads
+
+Atomic commits may span many independently compressed and authenticated blocks.
+Small records are grouped into approximately 64 KiB plaintext blocks, rather than
+one large encrypted checkpoint. Changeset and snapshot payloads use 64 KiB
+chunks. A record larger than the block target gets a dedicated larger block;
+reading a large individual value still requires decoding that value's block.
+Existing larger blocks remain readable; these settings affect newly written blocks.
+
+Spool admits a block into its cache after a second read. Least recently accessed
+blocks are evicted within the byte budget, and oversized blocks bypass the cache.
+The cache retains the compressed encrypted frame and the decoded body with record
+offsets, so a hot point read avoids disk I/O, decryption, decompression and parsing.
+Decoded buffers are wiped when released. This cache lives in Spool, outside SQLite.
+
+## File operations
+
+Enable the `replication` Cargo feature and set
+`options.replication.as_mut().unwrap().files = Some(FileConfig::new(directory,
+file_key, fetch_bind))` before opening the database. `FileConfig` and
+`FileMetadata` are exported directly by `sqlite_session`.
+
+File operations are available directly on `Database`:
+
+```rust,ignore
+let uploaded = db.upload_file("reports/report.pdf", std::fs::File::open("report.pdf")?)?;
+let matches = db.search_files("report")?;
+let metadata = db.file_metadata("reports/report.pdf")?;
+db.get_file("reports/report.pdf", std::fs::File::create("download.pdf")?)?;
 ```
 
-The basic and transaction examples use automatic models and the item API. See
-[examples/README.md](examples/README.md) for the complete index.
-For querying — get by ID, `Where` filters, ordering, aggregates, compiled
-queries, and joins — see [USAGE.md](USAGE.md).
+`list_files()` lists nondeleted files; `search_files(query)` filters names by a
+case-sensitive substring, with an empty query listing all files. These return
+metadata even when a remote payload is not yet available locally. Use
+`file_available(name)` to check local availability. `file_availability(name)`
+reports `Local`, recently observed remote peers, or `Unavailable`.
+`get_file(name, writer)`
+streams decrypted contents and reports an error when the payload is unavailable.
+`delete_file(name)` publishes a deletion tombstone. All methods return an error
+when file storage is not configured or the database is closed. File operations
+use the object store and Spool without executing SQL on the SQLite writer.
+`file_key_rotation_status()` reports old-generation objects, missing old-generation
+payloads, staged fetches, and whether the previous key is unused in this local
+store. Coordinate key retirement across every replication peer.
 
-### Display startup progress
+When High/Low bridge and file storage are both configured, the Low exporter
+automatically sends available file contents in bounded, recipient-sealed bridge
+bundles. The High receiver verifies the complete content and encrypts it with
+its own configured file key before publishing local metadata. Transfer offsets
+are durable in Spool and resume after restart. A receiver needs enough
+`bridge.staging_bytes` capacity for the file being transferred. Old object
+generations are re-encrypted in the background when the file configuration is
+reopened with the new key, incremented generation, and previous key; unreferenced
+objects are collected after a seven-day grace period.
 
-Set `Config.OnOpenProgress` before calling `Open`:
+## Table replication settings
 
-```go
-cfg.OnOpenProgress = func(p murmur.OpenProgress) {
-    fmt.Printf("%s: %d cells processed, %d rows loaded, elapsed %s\n",
-        p.Phase, p.ProcessedItems, p.RowsInserted,
-        p.Elapsed.Round(time.Second))
-}
-db, err := murmur.Open(ctx, cfg)
+```rust,ignore
+db.SetReplication("private_notes", false)?; // Durable locally; row changes stay local.
+db.SetReplication("shared_items", true)?;
+// Idiomatic Rust spelling is also available:
+db.set_replication("shared_items", true)?;
+let enabled = db.replication_enabled("shared_items")?;
 ```
 
-Callbacks run serially on a dedicated goroutine; forward snapshots to your
-application's UI thread and return promptly. Progress comes from the existing
-rebuild scan, without a preliminary counting pass. Totals, percentage, and
-remaining time stay unknown. Nil disables reporting. Only `OpenReady` means
-startup succeeded; indexing and finalization follow cell loading. The terminal
-snapshot is also available through `db.Status().OpenProgress`. Phases run
-opening, replaying, rebuilding, finalizing, ready; during replaying the
-`Replay*` counters track segment files/bytes over the member size sum plus
-validated record visits, so a slow open shows movement while a wedged one
-goes still.
-See [startup progress details](architecture/runtime-and-diagnostics.md#startup-progress-reporting).
+Tables default to enabled. The setting is local to this node and is saved as
+`00/schema/replication` in encrypted Spool storage, atomically with the schema
+manifest. It survives reopening, backups and schema renames using stable table
+IDs. Tables created after a drop default to enabled. No configuration SQL, CRDT
+tables or triggers are added to SQLite.
 
-## Schema rules (v1)
+Changing the setting flushes pending local changes under the previous setting
+and waits until the new setting is durable. Disabled tables still use session
+capture and local persistence, but their new rows, deletes and CRDT records are
+excluded from outgoing replication snapshots and batches. Incoming changes to
+disabled tables are ignored when applying replicated state. Table definitions
+remain shared for schema compatibility; this is a row-data setting.
 
-Every replicated table stores a 16-byte row identity in its `ID` field
-(supplied explicitly or generated by model insertion as UUIDv4/UUIDv5). This
-storage identity is separate from the application value tagged `rime:"primary"`.
-Tables/columns get stable numeric IDs for replication;
-derived deterministically unless set explicitly. Additive evolution only:
-`DB.MigrateModels` and `DB.MigrateRecords` add record tables/fields (never drops or changes
-stable IDs incompatibly); the schema manifest is stored in Spool, replicated
-to peers with ancestry/merge exchange before mutation sync, and applied under
-the `AcceptRemoteSchema` policy (auto-upgrade or strict refusal). SQL-only
-`Schema.Tables` configurations are rejected by `Open`; define tables through
-`Config.Models` or `Model[T]` definitions in `Config.Tables`. Secondary `UNIQUE` constraints, virtual tables,
-and non-additive schema changes are out of scope for v1. Foreign keys are
-application-level (not enforced during remote apply/rebuild).
+Enabling a table publishes its current locally persisted rows, tombstones and
+causal policy state when networking is enabled. It does not automatically replay
+remote changes ignored while disabled. Previously published signed history and
+peer copies are retained; disabling does not retract data already replicated.
+The methods also work without networking, so settings can be prepared before
+replication is configured. Unknown tables return an error.
 
-LWW remains the default. Set `ColumnSchema.MergePolicy` to `schema.PN_COUNTER`
-(TEXT), `schema.OR_SET` (TEXT), or `schema.MAX`/`schema.MIN` (INTEGER or REAL)
-for columns that need different concurrent merge semantics.
+## Schema replication authority (master)
 
-Records use `int64` PN counters and top-level `[]string` OR-sets. Update
-them inside `WriteTxContext` with `tx.CounterAdd`, `tx.SetAdd`, and
-`tx.SetRemove`; re-read their projections with `GetItem`.
-`tx.Min` and `tx.Max` update extrema fields. Direct assignment to an
-existing CRDT-owned field is rejected. Policies are immutable; add a new field
-to introduce different semantics.
+One node may act as the schema master. Set `master = true` and
+`schema_master = Some(own node id)` on that node, and
+`schema_master = Some(master id)` on every other node (the id must have a key
+in `trusted_origins`). The master signs its canonical schema (tables plus
+indexes, local-only tables excluded) with its Ed25519 origin key and pushes it
+to divergent peers; receivers verify the signature and the monotonic sequence
+number, then adjust their schema. Replays and manifests from anyone else are
+recorded for payload filtering but never adopted, and the master never adopts
+remote schemas.
 
-```go
-// In SchemaConfig.Tables[].Columns:
-{Name: "count", Type: schema.ColText, MergePolicy: schema.PN_COUNTER},
-{Name: "tags", Type: schema.ColText, MergePolicy: schema.OR_SET},
+Adoption is additive only: new tables, new nullable non-primary-key columns,
+and new indexes. Drops, renames, type changes, and primary-key changes are
+rejected loudly; make those by migrating the master and letting peers adopt
+each additive step, or migrate every node manually. Replicated DDL must
+originate on the master: a non-master that creates a replicated table will see
+its own writes stop applying upstream until the master carries the same
+definition. Receiver-local tables (replication disabled) are never created,
+altered, or dropped by adoption, and each sender's latest signed manifest lets
+receivers keep applying old transactions that reference tables the sender has
+since retired.
+
+Without `schema_master` the previous symmetric behavior applies: any trusted
+origin's signed schema can be adopted. Subset filtering needs at least one
+direct session per sender; purely gossiped history from never-contacted senders
+keeps strict checking.
+
+## Replication history retention
+
+Configure these fields on the replication `Config` supplied at open:
+
+| Setting | Default |
+| --- | --- |
+| `retention` | 1 hour minimum history age |
+| `minimum_retained` | 1,000 transaction records per origin |
+| `maximum_offline` | 7 days |
+| `retention_interval` | 60 seconds |
+
+Both minimum limits must be exceeded before a log entry is eligible. Within the
+offline window, every admitted, unretired peer must acknowledge that entry. After
+the window expires, that peer's acknowledgement stops blocking cleanup; it may
+need a full snapshot to catch up. Configure `trusted_snapshot_sources` explicitly
+on the receiving node to permit that recovery. Disconnecting or suspecting a peer
+does not retire it. Peer acknowledgements and retirement survive restart in Spool.
+
+A pass first publishes a durable recovery snapshot covering the applied history.
+Log deletions, receipt deletions, retained-history bounds and permanent duplicate
+sequence floors then commit atomically. Current rows, conflict versions and CRDT
+delete tombstones are preserved. High/Low export progress pins entries that have
+not yet been copied to the durable encrypted outbox. Pending outbox artifacts are
+retained separately. This policy does not delete backups or current application
+rows and is not a hard disk quota.
+
+Each pass deletes at most 256 logs per origin and 2,048 logs overall. Age is
+measured from local durable persistence, not a remote HLC. Existing entries with
+no recorded persistence time receive a conservative new retention start time.
+Physical disk space becomes available through Spool reclamation on each collection cycle;
+retained backups can still reference old segment files. All cleanup runs outside
+SQLite. New appends are rechecked on the storage worker before updating log bounds.
+
+Direct administrative methods are available on `Database`:
+
+```rust,ignore
+let status = db.retention_status()?;
+let deleted = db.collect_retention()?; // Run a bounded pass using configured limits.
+db.retire_peer(peer_node_id)?;         // Durable, permanent exclusion.
 ```
 
-See [merge policies](architecture/merge-policies.md) for transaction examples,
-High/Low ownership, retained history, and limits.
-
-> [!WARNING]
-> JSON arrays in ordinary LWW TEXT columns still lose concurrent updates.
-> JSON arrays stored in ordinary LWW fields are atomic values. Use OR_SET with
-> explicit set operations when concurrent additions/removals must survive.
-
-### Node-local records and indexes
-
-Use a typed table with `TableScopeNodeLocal` for persistent data that belongs
-only to one node. RIME indexes are declared on the Go record and stay in that
-node's in-memory materializer:
-
-```go
-type cacheEntry struct {
-    ID    ids.RowID `rime:"ID"`
-    Key   string    `rime:"primary"`
-    Value []byte
-}
-
-definition, err := murmur.Model[cacheEntry](murmur.ModelOptions{
-    Name: "local_cache", TableID: 500,
-    RecordOptions: murmur.RecordOptions{
-        FieldIDs:     map[string]uint32{"ID": 1, "Key": 2, "Value": 3},
-        Scope:        murmur.TableScopeNodeLocal,
-    },
-})
-```
-
-Add the definition to `Config.Tables`; node-local rows persist on that node and
-are excluded from replication. Reusable views are Go query functions. The
-migration does not provide FTS5; use indexed RIME filters such as prefix search
-where they fit, without assuming tokenization or ranking parity. Schema and local-object metadata are declared through managed Go table definitions.
-
-## Repository layout
-
-```text
-MURMUR/                   managed Go API (db.go, records.go, config.go, ...)
-  architecture/          architecture, subsystem design, testing, and implementation roadmap
-  crdt/                  HLC clock, version comparison, LWW merge
-  codec/                 binary value / mutation-batch / snapshot encodings
-  schema/                stable table/column registry + validation
-  state/                 Spool-backed authoritative store with in-memory B-tree (commit, log, GC, snapshot)
-  replication/           framed QUIC protocol + peer manager (batches, acks, snapshot)
-  plumtree/              bounded eager/lazy dissemination state machine
-  overload/              bounded global/per-peer accounting and token-bucket primitives
-  transport/             QUIC listener/dialer, mTLS, NodeID-bound certificates
-  crypto/                at-rest encryption: AEAD ciphers, key provider interfaces
-  spool/                 embedded write-optimized persistence engine for database state
-  objectstore/           encrypted storage for uploaded file contents (optional file APIs)
-  rime/                  in-memory MVCC relational engine (native Go API, no SQL; Tidwall B-tree ordered indexes)
-  ids/                   128-bit identity types
-  metrics/               JSON metrics HTTP handler over DB.Status
-  bridge/                one-way Low-to-High logical replication roles and transfer types
-  backup/                backup/restore with local/HTTPS/FTP destinations, file objects
-  filefetch/             bounded mesh fetch of file object bytes (client/server protocol)
-  examples/              graduated examples: single node → 3-node mesh
-  tool/                  operational CLI utility, durable-state diagnostics, and backup manager
-  tests-live/             live multi-process integration test scenarios
-```
-
-## Operational CLI (`murmur`)
-
-The repository includes a standalone CLI tool under `tool/` for database initialization, offline storage inspection and verification, repair, cryptographic key inspection, backup/restore lifecycle management, and online cluster diagnostics over mTLS. SQL shell, query, import, export, and dump commands have been removed; applications use the managed Go API for typed records.
-
-### Building the CLI
-
-The operational CLI builds without CGO:
-
-```sh
-CGO_ENABLED=0 go build -o bin/murmur ./tool
-```
-
-### Quick Commands
-
-```sh
-# Initialize a durable database directory
-./bin/murmur init /var/lib/murmur/data
-
-# Run health check scorecard
-./bin/murmur doctor /var/lib/murmur/data
-
-# Verify durable storage and the schema manifest (materializer is not checked)
-./bin/murmur verify /var/lib/murmur/data --quick
-
-# Check durable state
-./bin/murmur repair /var/lib/murmur/data
-
-# Create and verify an encrypted backup snapshot
-./bin/murmur backup create /var/lib/murmur/data /backups/backup.tar.gz
-./bin/murmur backup verify /backups/backup.tar.gz
-
-# Inspect remote cluster lag and SWIM membership over mTLS
-./bin/murmur cluster https://node1:8443 --cert=client.crt --key=client.key --ca=ca.crt
-./bin/murmur lag https://node1:8443 --cert=client.crt --key=client.key --ca=ca.crt
-```
-
-See [tool/USAGE.md](tool/USAGE.md) and [architecture/18-operational-tooling.md](architecture/18-operational-tooling.md) for full documentation.
-
-> **Planned:** A standalone `murmurd` daemon (MySQL + PostgreSQL wire frontends,
-> `config.toml`) is deferred and not yet part of this repository.
-> The embedded Go package is the current focus.
-
-`objectstore/` stores the contents of files uploaded through `UploadFile` in
-immutable, authenticated encrypted chunks, separately from Spool. Spool persists
-their metadata (name, content digest, and size). `Files.Enabled` adds replicated file metadata
-with streaming upload/read, search/list, delete tombstones, availability
-status, grace-based collection, and bounded mesh fetch of object bytes from
-statically configured peers (separate QUIC endpoint sharing cluster mTLS
-credentials). File metadata uses Spool directly and works with native
-`Config.Tables` databases without a SQLite materializer; object-key rotation advances per-file key generations, and
-backups optionally include objects (`IncludeFiles`) or stay metadata-only
-with mesh repair after restore;
-see [encrypted file replication](architecture/file-replication.md).
-
-The `tests-live/encryption` scenario checks wrong-key rejection, plaintext
-absence from durable files, and correct-key restart recovery. Run it with
-`go test -count=1 ./tests-live/encryption`.
-
-The native `tests-live/three-node-sync` scenario checks typed record
-convergence across three encrypted QUIC nodes; run it with
-`CGO_ENABLED=0 bash tests-live/run.sh three-node-sync`. The
-`tests-live/crash-recovery` scenario checks encrypted-store recovery after an
-abrupt process kill during typed writes; run it with
-`CGO_ENABLED=0 bash tests-live/run.sh crash-recovery`.
-
-The `tests-live/partition` scenario checks isolation and healing across a
-four-node, two-pair network partition using typed records. Run it without
-SQLite or CGO with `CGO_ENABLED=0 bash tests-live/run.sh partition`.
-
-The `tests-live/chaos-load` scenario keeps writers active while a third node
-is partitioned and while the mesh heals. Run it with
-`go test -count=1 ./tests-live/chaos-load`.
-
-The `tests-live/files-soak` scenario repeatedly uploads encrypted file objects
-over a two-node QUIC mesh, checks metadata/search and peer-fetched content
-digests, and records latency SLOs. Run a short pass with
-`CGO_ENABLED=0 bash tests-live/run.sh files-soak`; it uses managed typed
-records without SQLite or CGO. Configure the ten-minute soak with
-`MURMUR_FILES_SOAK_DURATION_SECONDS=600` and
-`MURMUR_FILES_SOAK_INTERVAL_SECONDS=60`, passing `-timeout=12m` to `go test`.
-
-The `tests-live/files-bridge` scenario checks encrypted file transfer from a
-two-node Low mesh through a recipient-sealed bridge into a two-node High mesh,
-with four isolated nodes driven over TLS (upload, peer fetch,
-sealed staging with a no-plaintext check, High re-encryption, search, and a
-delete cascade). It uses managed typed records and runs without SQLite or CGO;
-run it with `CGO_ENABLED=0 bash tests-live/run.sh files-bridge`.
-The `files-crash` and `files-corrupt-source` crash-integrity rehearsals also
-use typed databases and run without CGO:
-`CGO_ENABLED=0 bash tests-live/run.sh files-crash` and
-`CGO_ENABLED=0 bash tests-live/run.sh files-corrupt-source`.
-The `tests-live/soak-slo` scenario measures continuous writes and convergence
-on three encrypted replicas. Both have short smoke commands in their local
-READMEs and environment-configurable longer acceptance runs.
-
-The `tests-live/endurance-chaos` scenario overlaps every fault at once
-(writes, restarts, packet loss, latency, disk pressure, clock skew, key
-rotation, snapshots, GC) over one chaos window — 10 minutes by default,
-24–72 hours via `MURMUR_ENDURANCE_DURATION_SECONDS` — and verdicts on
-exact cross-node convergence. Run it with
-`bash tests-live/run.sh endurance-chaos`; see
-[the suite README](tests-live/endurance-chaos/README.md) for the 24h/72h
-profiles and degraded-mode notes.
-
-## Build, vet, test
-
-The production module has no SQLite dependency and builds with CGO disabled:
-
-```sh
-CGO_ENABLED=0 go build ./...
-CGO_ENABLED=0 go vet ./...
-CGO_ENABLED=0 go test -p 1 ./...
-go test -race -p 1 ./... # requires CGO for the Go race detector, not for Murmur
-
-# Managed-record live replication and storage checks
-CGO_ENABLED=0 bash tests-live/run.sh typed-records
-CGO_ENABLED=0 bash tests-live/run.sh typed-bridge
-CGO_ENABLED=0 bash tests-live/run.sh three-node-sync
-CGO_ENABLED=0 bash tests-live/run.sh migration-concurrency
-CGO_ENABLED=0 bash tests-live/run.sh partition
-CGO_ENABLED=0 bash tests-live/run.sh crash-recovery
-
-# All live scenarios (long)
-CGO_ENABLED=0 bash tests-live/run.sh all
-```
-
-CI separately tests the isolated historical comparison modules under
-`tests-benchmark/`; those optional SQLite benchmarks are not production
-packages. See [benchmark methodology](architecture/benchmarks.md) and
-[release status](architecture/release-status.md) for evidence and outstanding
-acceptance requirements.
-
-## Status
-
-Murmur is implemented as an embedded Go database with typed queries, encrypted
-storage, and multi-writer replication over QUIC with mutual TLS. It supports
-offline writes and convergence after reconnect, backup and restore, key rotation,
-additive schema migration, replicated files, and one-way Low-to-High transfers.
-
-Release qualification is still in progress. Live tests cover replication,
-recovery, and fault scenarios; extended soaks and broader performance and
-impaired-network measurements remain outstanding.
-
-See the [release status](architecture/release-status.md) for verification evidence
-and the [migration plan](architecture/migration-plan.md) for remaining release gates.
-
-## License
-
-Murmur is MIT licensed. See [LICENSE.md](LICENSE.md), which also lists every
-dependency module and its license.
+These methods require replication and must be called outside SQL callbacks.
+Retiring a peer releases its retention obligation and rejects subsequent
+connections from that identity. `retention_status()` exposes durable peer
+acknowledgements, retired flags, the last collection time and total deleted logs.

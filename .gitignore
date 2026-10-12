@@ -29,3 +29,7 @@ tests-benchmark/bin/
 tests-benchmark/runtime/
 tests-benchmark/failures/
 tests-benchmark/benchmark/perf-report-*.json
+
+# Rust build artifacts
+target/
+**/target/
