@@ -163,13 +163,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     raw_inserts(secs)?;
     let temp = tempfile::tempdir()?;
     let db = db_inserts(&temp.path().join("single"), secs, 1)?;
-    db.close()?;
+    // NOTE: close()/drop flushes the whole unflushed session first, which is
+    // pathological after a deferred-capture run (100+ MiB changeset). This
+    // benchmark explicitly excludes persistence, so leak instead of closing;
+    // the OS reclaims everything at exit.
+    std::mem::forget(db);
     let db = db_inserts(&temp.path().join("batch"), secs, 20)?;
     let rows: i64 = db.read(|s| {
         Ok(s.query_row("SELECT COUNT(*) FROM items", [], |r| r.get::<_, i64>(0))?)
     })?;
     point_selects(&db, rows, secs)?;
     scans(&db, secs)?;
-    db.close()?;
+    std::mem::forget(db);
     Ok(())
 }
