@@ -204,7 +204,7 @@ fn concurrent_deletes_resurrections_and_updates_converge() {
             cluster
                 .node(i)
                 .migrate(Migration::new(
-                    "CREATE TABLE contention(id TEXT PRIMARY KEY, name TEXT NOT NULL)",
+                    "CREATE TABLE contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL)",
                 ))
                 .expect("migrate contention table");
             cluster.node(i).flush().expect("flush schema");

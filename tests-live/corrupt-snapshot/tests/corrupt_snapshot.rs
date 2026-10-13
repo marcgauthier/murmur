@@ -510,10 +510,14 @@ fn stale_node_discards_corrupt_snapshot_then_converges() {
                 .unwrap_or_else(|e| panic!("RemovePeer({from},{target}): {e}"));
         }
         cluster.stop_node(STALE);
+        // Flush every write: the product mints one replication log entry per
+        // flush batch, not per SQL transaction, so a single trailing flush
+        // would leave fewer entries than `minimum_retained` and nothing
+        // would ever become eligible for pruning.
         for i in 0..60 {
             insert(&cluster, 0, 100 + i, &format!("fresh-{i}"));
+            cluster.node(0).flush().expect("flush survivor write");
         }
-        cluster.node(0).flush().expect("flush survivor writes");
         wait_row_count(&cluster, 0, 65, ROW_TIMEOUT);
         wait_row_count(&cluster, 1, 65, ROW_TIMEOUT);
         // Member-deadline expiry, then explicit collection passes: the stale

@@ -21,7 +21,7 @@ use murmur_live_harness::{Cluster, ClusterOptions};
 const SECRET_MARKER: &[u8] = b"TYPED-CONFIDENTIAL-PLAINTEXT-SECRET-246813579";
 /// Typed table (Go: `Config.Tables`; here plain SQL with the marker as
 /// the row key, like the Go `TypedInsert`/`TypedCount` name argument).
-const DDL: &str = "CREATE TABLE records(name TEXT PRIMARY KEY)";
+const DDL: &str = "CREATE TABLE records(name TEXT NOT NULL PRIMARY KEY)";
 
 /// Typed insert on one node (Go: `Cluster.TypedInsert`).
 fn typed_insert(db: &Database, name: &str) {

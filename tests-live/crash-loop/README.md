@@ -29,7 +29,7 @@ restart (no wedge); and a post-loop write on it must replicate everywhere.
   `close()` + reopen of the same directory with the same key (**clean close,
   not SIGKILL**: killing one in-process node would kill the test driver).
 - Plain SQL replaces the typed-records HTTP API: table
-  `live_typed_records(name TEXT PRIMARY KEY)`; writers tick every 25 ms.
+  `live_typed_records(name TEXT NOT NULL PRIMARY KEY)`; writers tick every 25 ms.
 - Peer counts come from the replication status (`peers`), not `/v1/status`.
 - Ordered-vec equality replaces the joined-name digest.
 - Ready time covers `start_node` (open under the unlock watchdog) plus the

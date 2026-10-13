@@ -31,7 +31,7 @@ Standard harness knobs only: `MURMUR_LIVE_RUNTIME`,
 
 ## Deviations from the Go original
 
-- Plain SQL (`CREATE TABLE live_typed_records(name TEXT PRIMARY KEY)`,
+- Plain SQL (`CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY)`,
   `Database::transaction` / `Database::read`) replaces the Go managed
   typed-records HTTP API; the Rust product has no HTTP server.
 - In-process `stop_node` + `start_node` + `mesh` replaces the mid-life

@@ -29,7 +29,7 @@ dual-contention writer service, and convergence.
 
 ## Deviations from the Go original
 
-- Plain SQL (`records(id TEXT PRIMARY KEY, name TEXT)` via
+- Plain SQL (`records(id TEXT NOT NULL PRIMARY KEY, name TEXT)` via
   `Database::transaction`/`read` + `flush`) replaces the typed-contention
   HTTP API; one transaction per insert, as in Go. Same key shapes
   (16-byte node/worker/seq row IDs, `v-n<node>-w<worker>-<seq>` names).

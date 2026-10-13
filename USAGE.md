@@ -15,7 +15,6 @@ applications must supply their own keys and identities.
 ## Contents
 
 - [Go client](#go-client)
-- [GORM client (go-client-gorm)](#gorm-client-go-client-gorm)
 - [Installation and features](#installation-and-features)
 - [Create, write, read, and reopen](#create-write-read-and-reopen)
 - [SQL and schema restrictions](#sql-and-schema-restrictions)
@@ -39,22 +38,29 @@ applications must supply their own keys and identities.
 
 ## Go client
 
-`./go-client` provides an embedded cgo client for the Rust API, including
+`./clients/go` provides an embedded cgo client for the Rust API, including
 replication, vector/FTS search, subscriptions, files, backups/key rotation,
 standalone backends, High/Low bridges, transport/protocol/snapshot utilities,
 scheduling, and unmanaged SQLite sessions. It enables the Rust `replication`
 and `vector` features and uses the same background workers and storage formats.
 
+The [19 runnable Go examples](clients/go/examples/README.md) cover the full feature
+catalog, including local replication and High/Low bridges, files, retention,
+subscriptions, protocol/snapshot utilities, recovery, scheduling and sessions.
+They generate temporary data and credentials and verify results automatically.
+
 ```sh
-./go-client/build.sh test -count=1 -timeout 180s ./...
-./go-client/build.sh run ./examples/basic /tmp/murmur-go-example
+./clients/go/build.sh test -count=1 -timeout 180s ./...
+./clients/go/build.sh run ./examples/basic
+./clients/go/build.sh run ./examples/replication
+./clients/go/build.sh run ./examples/bridge-transports
 ```
 
-Use `go-client/build.ps1` on Windows. Native builds require Go 1.24+, Rust,
+Use `clients/go/build.ps1` on Windows. Native builds require Go 1.24+, Rust,
 a C toolchain and libclang. Targets are Linux/macOS amd64 and arm64, and Windows
 amd64 with MinGW. Binaries are built locally; pure Go (`CGO_ENABLED=0`) and
-server/RPC access are not provided. See [Go build and feature examples](go-client/README.md),
-[API coverage](go-client/API-COVERAGE.md), and [native ownership rules](go-client/ABI.md).
+server/RPC access are not provided. See [Go build and feature examples](clients/go/README.md),
+[API coverage](clients/go/API-COVERAGE.md), and [native ownership rules](clients/go/ABI.md).
 
 Go `Read` and `Transaction` callbacks receive a scoped `Sql`. Statements and
 rows must remain on that callback's OS thread and cannot escape its lifetime.
@@ -62,7 +68,12 @@ Return callback errors to roll back; ordinary panics become `ErrCallbackPanicked
 Do not call `runtime.Goexit` or `testing.T.Fatal` inside native callbacks.
 Close native handles explicitly; Go garbage collection does not close them.
 `DefaultOptions()` obtains current Rust defaults. `Flush()` is the durability
-barrier, with the same asynchronous write restrictions as Rust. Network helpers
+barrier, with the same asynchronous write restrictions as Rust. Examples accept `--dir`, `--keep`, and `--timeout`; working directories must be
+new and are removed after closing handles unless retained. Retained demo data
+uses ephemeral keys that are not printed or saved. Bridge transport examples
+run HTTP/FTP/FTPS locally; generated-CA HTTPS rejection demonstrates the current
+absence of a private-CA option in `PublishHTTP`. An optional trusted external
+HTTPS URL demonstrates a successful upload. Network helpers
 are blocking wrappers over the native runtime; subscription receive supports
 context cancellation. Control/codec JSON requires finite real numbers; SQL and
 SQL subscriptions use binary values and preserve infinities.
@@ -70,31 +81,6 @@ SQL subscriptions use binary values and preserve infinities.
 Windows skips directory fsync for Spool, file objects, and bridge/backup
 directories; file contents are synchronized, while directory-entry crash
 durability follows the underlying platform.
-
-## GORM client (go-client-gorm)
-
-`./go-client-gorm` (package `murmurgorm`) serves GORM over an open `go-client`
-database. Murmur's SQLite is private to the Rust core, so stock GORM+SQLite
-drivers cannot reach it; this module bridges to `database/sql/driver` and
-vends the SQLite dialect (the upstream dialect package cannot link: its
-bundled SQLite collides with Murmur's staticlib). It needs the same native
-library as `go-client` and a `replace` to `../go-client`.
-
-```go
-db, _ := murmur.Open("/data/murmur", key32, opts) // caller owns this handle
-gdb, _ := gorm.Open(murmurgorm.Open(db), &gorm.Config{TranslateError: true})
-gdb.AutoMigrate(&User{}) // DDL routes to Migrate; FK constraints forced off
-gdb.Create(&User{Name: "ada"})
-native, _ := murmurgorm.Native(gdb) // admin (Flush, Backup, ...) stays native
-native.Flush()
-```
-
-Limitations, all enforced by Murmur: no nested transactions (savepoints
-denied); DDL runs through `Migrate` and never inside a transaction; no
-non-PK `UNIQUE`, `CHECK`, FK constraints, views, triggers, or
-`AUTOINCREMENT`; every table needs a non-null primary key; queries buffer
-their rows; timestamps parse by format. See `go-client-gorm/README.md` for
-the full list.
 
 ## Installation and features
 

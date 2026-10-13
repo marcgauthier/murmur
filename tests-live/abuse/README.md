@@ -44,7 +44,7 @@ Transient write errors during abuse are counted, never fatal.
 
 ## Deviations from the Go original
 
-- Plain SQL (`contention(id TEXT PRIMARY KEY, name TEXT NOT NULL,
+- Plain SQL (`contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL,
   phone TEXT NOT NULL, score INTEGER NOT NULL)`) replaces the
   typed-contention HTTP API; baseline/writer row shapes keep the Go
   32-hex-char ids and `writer-<n>` names.

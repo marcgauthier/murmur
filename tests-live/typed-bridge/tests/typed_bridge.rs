@@ -34,7 +34,7 @@ const STREAM: &str = "typed-stream";
 /// Typed table (Go: `live_typed_records`). `title` is the LWW rename target.
 const TABLE: &str = "live_typed_records";
 const DDL: &str =
-    "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY, title TEXT NOT NULL)";
+    "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY, title TEXT NOT NULL)";
 /// Row identity, fixed for the whole scenario (Go renames one row by ID).
 const ROW: &str = "bridge-native-record";
 /// Convergence deadline (Go: 30 s waits).

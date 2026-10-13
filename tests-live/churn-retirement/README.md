@@ -23,7 +23,7 @@ Go pass criterion:
 
 | Go | Rust |
 |---|---|
-| `Cluster.TypedInsert` / `TypedNames` (HTTP API) | Plain SQL `records(name TEXT PRIMARY KEY)` via `Database::transaction` / `Database::read` + `flush()` |
+| `Cluster.TypedInsert` / `TypedNames` (HTTP API) | Plain SQL `records(name TEXT NOT NULL PRIMARY KEY)` via `Database::transaction` / `Database::read` + `flush()` |
 | `RemovePeer` (exclusion legs) | `Cluster::remove_peer` (durable `07/replication/excluded/*` record, reversible via `add_peer`) |
 | Retention-pin release inside `RemovePeer` | `Database::retire_peer` (durable `retired=true` retention record) |
 | `spedsql_peer_connected{peer=...}` | `Handle::status().peers_diagnostics` (`node_id` + `connected`) |

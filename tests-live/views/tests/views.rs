@@ -14,7 +14,7 @@ use murmur_live_harness::{wait_until, Cluster, ClusterOptions};
 
 /// Base table DDL (Go: typed `contacts` records; `score` plays the role of
 /// the enabling PN counter).
-const TABLE_DDL: &str = "CREATE TABLE contacts(name TEXT PRIMARY KEY, score INTEGER NOT NULL)";
+const TABLE_DDL: &str = "CREATE TABLE contacts(name TEXT NOT NULL PRIMARY KEY, score INTEGER NOT NULL)";
 /// Managed-view DDL (Go: `TypedEnabledNames` over managed typed queries).
 const VIEW_DDL: &str =
     "CREATE VIEW enabled_names AS SELECT name FROM contacts WHERE score > 0 ORDER BY name";

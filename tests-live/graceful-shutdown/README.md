@@ -37,7 +37,7 @@ via the receiver's counters, not merely by convergence.
   "SIGTERM" is `close()` + reopen of the same directory with the same key,
   followed by an explicit re-mesh (fresh ephemeral port).
 - Plain SQL replaces the typed-contention HTTP API: table
-  `contention(id TEXT PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL
+  `contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL
   DEFAULT '')`; ordered-name vecs replace the joined-name digest.
 - Clean shutdown is proven by completed handle release (`db.is_none()`
   after stop; `stop_node` logs close errors) instead of daemon log

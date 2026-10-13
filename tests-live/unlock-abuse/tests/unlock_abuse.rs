@@ -19,7 +19,7 @@ use murmur_live_harness::sqlite_session::{
 use murmur_live_harness::{wait_until, Cluster, ClusterOptions};
 
 /// Table DDL (Go: typed contention rows).
-const TABLE_DDL: &str = "CREATE TABLE contention(id TEXT PRIMARY KEY, name TEXT NOT NULL)";
+const TABLE_DDL: &str = "CREATE TABLE contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL)";
 /// Convergence deadline (Go: 10 s `waitAllCount`).
 const CONVERGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Convergence poll interval (Go: 50 ms).

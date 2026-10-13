@@ -50,7 +50,7 @@ const HIGH_NAME: &str = "bridge-two-streams-high";
 /// Bridge streams (Go: `stream-a`, `stream-b`).
 const STREAM_A: &str = "stream-a";
 const STREAM_B: &str = "stream-b";
-const DDL: &str = "CREATE TABLE live_typed_contention(id TEXT PRIMARY KEY, name TEXT NOT NULL)";
+const DDL: &str = "CREATE TABLE live_typed_contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL)";
 /// Convergence deadline (Go: 60 s waits).
 const WAIT: Duration = Duration::from_secs(60);
 /// Convergence poll interval (Go: 200 ms polls).

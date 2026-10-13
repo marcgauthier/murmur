@@ -1,0 +1,62 @@
+{
+  "Lifecycle, recovery, durability": [
+    "basic",
+    "recovery"
+  ],
+  "Migrations and offline exchange": [
+    "migrations",
+    "offline"
+  ],
+  "FTS5 and vector indexes": [
+    "search",
+    "replication"
+  ],
+  "Table replication": [
+    "migrations",
+    "replication"
+  ],
+  "Subscriptions": [
+    "subscriptions"
+  ],
+  "Counters, sets, min/max": [
+    "policies",
+    "retention"
+  ],
+  "Network replication": [
+    "replication"
+  ],
+  "Replication retention": [
+    "retention",
+    "snapshots"
+  ],
+  "Files": [
+    "files",
+    "bridge"
+  ],
+  "Backup and key management": [
+    "backup",
+    "keys"
+  ],
+  "Scheduling and metrics": [
+    "scheduler"
+  ],
+  "Standalone backend": [
+    "backend",
+    "files"
+  ],
+  "High/Low bridge": [
+    "bridge",
+    "bridge-transports"
+  ],
+  "Snapshot protocol": [
+    "snapshots",
+    "retention"
+  ],
+  "Transport, crypto and wire format": [
+    "protocol",
+    "bridge-transports"
+  ],
+  "Unmanaged SQLite sessions": [
+    "sessions"
+  ]
+}

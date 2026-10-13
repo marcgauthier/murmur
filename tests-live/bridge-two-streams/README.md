@@ -34,7 +34,7 @@ Convergence waits are 60 s with 200 ms polls, matching the Go timeouts.
 
 - Plain SQL via `Database::transaction`/`Database::read` replaces the typed
   HTTP API; there is no HTTP server in the Rust product. Row IDs keep the
-  Go `%032x` shape as the `TEXT PRIMARY KEY`.
+  Go `%032x` shape as the `TEXT NOT NULL PRIMARY KEY`.
 - `BridgeExport`/`BridgeImport` map to direct `Bridge::capture()` (Low) and
   `Bridge::process()` (High) pumps, with a pump inside every wait poll.
   Per-call bundle counts are not asserted: the replication engine also

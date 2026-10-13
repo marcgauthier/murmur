@@ -223,8 +223,8 @@ impl Backend for Adapter {
     }
     fn apply(&self,payloads:Vec<Vec<u8>>,records:Vec<Record>)->net::Result<bool>{
         let database=self.database()?;
-        let ticket = database.inner.scheduler.admit(crate::scheduler::WriterClass::Remote).map_err(error)?;
-        let cursor=database.call(|c|{let s=c.status.lock().unwrap();if s.committed!=c.captured_cursor || s.durable!=c.captured_cursor || s.storage_error.is_some(){return Ok(None);}Ok(Some(s.committed))}).map_err(error)?;
+        eprintln!("DBG apply[{:02x}]: admit?", self.identity.1[0]);let ticket = database.inner.scheduler.admit(crate::scheduler::WriterClass::Remote).map_err(error)?;eprintln!("DBG apply[{:02x}]: admitted", self.identity.1[0]);
+        eprintln!("DBG apply[{:02x}]: cursor?", self.identity.1[0]);let cursor=database.call(|c|{let s=c.status.lock().unwrap();if s.committed!=c.captured_cursor || s.durable!=c.captured_cursor || s.storage_error.is_some(){return Ok(None);}Ok(Some(s.committed))}).map_err(error)?;eprintln!("DBG apply[{:02x}]: cursor ok", self.identity.1[0]);
         let Some(cursor)=cursor else{return Ok(false);};
         let (patch, auxiliary)=self.spool(move|o|{if o.cursor!=cursor{return Err(Error::Busy);}let baseline=metadata::state(&o.store,o.schema.clone(),o.identity.database,o.clock)?;let mut joined=baseline.clone();let mut auxiliary=Vec::new();for payload in payloads {
                 let content:net::Content=decode_content(&payload)?;
@@ -241,15 +241,15 @@ impl Backend for Adapter {
             auxiliary=crate::policy::join(o,auxiliary,&mut joined)?;
             auxiliary=join_auxiliary(o,auxiliary)?;
             crate::table_replication::preserve_local(&mut joined, &baseline);
-            Ok((merge::prepare_joined(&baseline,joined,cursor)?,auxiliary))})?;
+            Ok((merge::prepare_joined(&baseline,joined,cursor)?,auxiliary))})?;eprintln!("DBG apply[{:02x}]: joined", self.identity.1[0]);
         let mut records=records;records.extend(auxiliary);
-        let published=database.call(move|c|c.publish_network(patch,records,false)).map_err(error)?;
+        eprintln!("DBG apply[{:02x}]: publish?", self.identity.1[0]);let published=database.call(move|c|c.publish_network(patch,records,false)).map_err(error)?;eprintln!("DBG apply[{:02x}]: published={published}", self.identity.1[0], published=published);
         if !published{return Ok(false);}
         // Wait on Spool off the writer thread. The durable staging remains until
         // the state, receipt, watermark and cleanup commit together.
         let (tx, rx) = mpsc::channel();
         self.worker.send(Work::Barrier(tx)).map_err(|_| net::Error::Unavailable("storage worker stopped".into()))?;
-        rx.recv().map_err(|_|net::Error::Unavailable("durability reply lost".into()))?.map_err(error)?;
+        eprintln!("DBG apply[{:02x}]: barrier?", self.identity.1[0]);rx.recv().map_err(|_|net::Error::Unavailable("durability reply lost".into()))?.map_err(error)?;eprintln!("DBG apply[{:02x}]: barrier ok", self.identity.1[0]);
         drop(ticket);
         Ok(true)
     }

@@ -23,7 +23,7 @@ use murmur_live_harness::sqlite_session::{Database, Migration};
 use murmur_live_harness::{wait_until, Cluster, ClusterOptions};
 
 /// Table DDL (Go: typed records; only names matter here).
-const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY)";
+const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY)";
 /// Frozen node (Go: node2).
 const FROZEN: usize = 1;
 /// Freeze-window knob (Go: `MURMUR_PAUSE_RESUME_STOP_SECONDS`, default 20,

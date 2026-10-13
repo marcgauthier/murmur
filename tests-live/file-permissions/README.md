@@ -39,7 +39,7 @@ None scenario-specific. Harness knobs apply: `MURMUR_LIVE_RUNTIME`,
 
 - In-process multi-`Database` cluster (QUIC mesh, ephemeral `127.0.0.1:0`)
   instead of `testnode` daemon processes over HTTPS+mTLS (per design).
-- Plain SQL (`live_typed_records(name TEXT PRIMARY KEY)`) instead of the
+- Plain SQL (`live_typed_records(name TEXT NOT NULL PRIMARY KEY)`) instead of the
   managed typed-records HTTP API; canonical order comes from
   `ORDER BY name` rather than the API response.
 - `stop_node`/`start_node` + `mesh()` instead of `StopNode`/`StartNode` +

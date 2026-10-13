@@ -29,7 +29,7 @@ use rand::RngCore;
 /// Seed rows (Go: 30 typed rows).
 const NUM_ROWS: usize = 30;
 /// Mesh-leg DDL: plain replicated rows (Go: `TypedInsert` names).
-const NAMES_DDL: &str = "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY)";
+const NAMES_DDL: &str = "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY)";
 
 /// Typed insert on one node (Go: `Cluster.TypedInsert`).
 fn typed_insert(db: &Database, name: String) {

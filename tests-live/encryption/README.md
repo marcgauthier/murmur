@@ -33,7 +33,7 @@ unlocks the row again.
 
 ## Deviations from the Go original
 
-- Plain SQL (`records(name TEXT PRIMARY KEY)`, `INSERT` /
+- Plain SQL (`records(name TEXT NOT NULL PRIMARY KEY)`, `INSERT` /
   `SELECT count(*)`, `migrate` + `flush`) instead of the managed
   typed-records HTTP API (`Config.Tables`, `TypedInsert`,
   `TypedCount`); the marker is the row key in both.

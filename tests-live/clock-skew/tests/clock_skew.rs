@@ -16,7 +16,7 @@ use murmur_live_harness::sqlite_session::{
 use murmur_live_harness::{Cluster, ClusterOptions};
 
 /// Table DDL (Go: typed contention rows).
-const TABLE_DDL: &str = "CREATE TABLE skew(id TEXT PRIMARY KEY, val TEXT NOT NULL)";
+const TABLE_DDL: &str = "CREATE TABLE skew(id TEXT NOT NULL PRIMARY KEY, val TEXT NOT NULL)";
 /// Contended rows (Go: concurrent shared-row writes; same shape, fixed N).
 const ROWS: usize = 20;
 /// Synthetic clock skew applied to exported versions (±5 min, both signs).

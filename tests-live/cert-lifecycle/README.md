@@ -44,7 +44,7 @@ to a fresh cert and show full reconvergence plus a bidirectional write.
 
 - In-process multi-`Database` cluster (QUIC mesh, ephemeral `127.0.0.1:0`)
   instead of `testnode` daemon processes over HTTPS+mTLS (per design).
-- Plain SQL (`records(name TEXT PRIMARY KEY)`) instead of the managed
+- Plain SQL (`records(name TEXT NOT NULL PRIMARY KEY)`) instead of the managed
   typed-records HTTP API (`/v1/typed/insert`, `/v1/typed/names`).
 - Session state comes from `Handle::status()` (`peers`,
   `peers_diagnostics`) instead of `debug/peers` (`Connected`) and

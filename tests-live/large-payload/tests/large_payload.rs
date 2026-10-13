@@ -62,7 +62,7 @@ fn large_payload() {
             cluster
                 .node(i)
                 .migrate(Migration::new(
-                    "CREATE TABLE records(id TEXT PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL)",
+                    "CREATE TABLE records(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL)",
                 ))
                 .expect("migrate records table");
             cluster.node(i).flush().expect("flush schema");

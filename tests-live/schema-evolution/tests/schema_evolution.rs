@@ -16,7 +16,7 @@ use murmur_live_harness::{wait_until, Cluster, ClusterOptions};
 /// Base table DDL (Go: typed records with a Name and a PN counter).
 const TABLE: &str = "live_typed_records";
 const TABLE_DDL: &str =
-    "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY, counter INTEGER NOT NULL)";
+    "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY, counter INTEGER NOT NULL)";
 /// Additive migration DDL, applied on node 0 only (Go: `MigrateTypedRecords`
 /// registers the Note field; the manifest replicates to the peers).
 const NOTE_DDL: &str = "ALTER TABLE live_typed_records ADD COLUMN note TEXT";

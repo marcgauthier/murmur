@@ -22,7 +22,7 @@ use murmur_live_harness::{wait_until, Cluster, ClusterOptions, ReplicationOption
 /// Contention table DDL (Go: typed contention rows; `phone` carries the
 /// fat snapshot-widening payload, otherwise empty).
 const TABLE_DDL: &str =
-    "CREATE TABLE contention(id TEXT PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL DEFAULT '')";
+    "CREATE TABLE contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL DEFAULT '')";
 /// Member-deadline knob (Go: `MURMUR_GRACEFUL_MEMBER_DEADLINE_SECONDS`, 25).
 const DEADLINE_ENV: &str = "MURMUR_GRACEFUL_MEMBER_DEADLINE_SECONDS";
 const DEFAULT_DEADLINE_SECS: u64 = 25;

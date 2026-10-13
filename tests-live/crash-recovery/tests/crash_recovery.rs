@@ -18,7 +18,7 @@ use murmur_live_harness::sqlite_session::Database;
 use murmur_live_harness::{wait_until, Cluster, ClusterOptions};
 
 /// Table DDL (Go: typed records; only names matter here).
-const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY)";
+const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY)";
 /// Write-window knob (Go: `MURMUR_CRASH_WRITE_SECONDS`, default 12).
 const WRITE_ENV: &str = "MURMUR_CRASH_WRITE_SECONDS";
 const DEFAULT_WRITE_SECS: u64 = 12;

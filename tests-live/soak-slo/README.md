@@ -43,7 +43,7 @@ MURMUR_SLO_SETTLE_SECONDS=300 \
 
 ## Deviations from the Go original
 
-- Plain SQL (`contention(id TEXT PRIMARY KEY, name TEXT NOT NULL,
+- Plain SQL (`contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL,
   phone TEXT NOT NULL)`) replaces the typed-contention HTTP API; row ids
   keep the Go `%032x`-of-`(node*1e12+slot+1)` shape, names keep
   `node-<n>`, and values keep `node-<n>-write-<seq>`.

@@ -41,7 +41,7 @@ final backup matches the survivors exactly.
 
 - **SQL instead of the typed-records mesh API**: the Rust product has no
   HTTP server, so writes/reads use `Database::transaction`/`read` on a
-  plain `live_typed_records(name TEXT PRIMARY KEY)` table. Every Go write
+  plain `live_typed_records(name TEXT NOT NULL PRIMARY KEY)` table. Every Go write
   inserts a fresh unique row, so the typed merge policies never trigger —
   behaviorally identical for this scenario.
 - **In-process members instead of the backupagent subprocess**: agent A is

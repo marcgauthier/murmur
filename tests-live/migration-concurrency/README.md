@@ -36,7 +36,7 @@ materialized new-column reads on every node.
   isolation/heal via `remove_peer`/`add_peer` (no explicit re-mesh needed:
   no restarts, no port rebinds).
 - Plain SQL replaces the typed-records HTTP API: table
-  `live_typed_records(name TEXT PRIMARY KEY, counter INTEGER NOT NULL)` plus
+  `live_typed_records(name TEXT NOT NULL PRIMARY KEY, counter INTEGER NOT NULL)` plus
   `ALTER TABLE ... ADD COLUMN note TEXT`.
 - Epoch assertions are `PRAGMA table_info` column-presence checks (the
   established `typed-records` port pattern); the Note exposed/hidden probe

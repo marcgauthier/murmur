@@ -20,7 +20,7 @@ use murmur_live_harness::sqlite_session::{Database, Migration};
 use murmur_live_harness::{wait_until, Cluster, ClusterOptions, ReplicationOptions};
 
 /// Contention table DDL (Go: typed contention rows).
-const TABLE_DDL: &str = "CREATE TABLE contention(id TEXT PRIMARY KEY, name TEXT NOT NULL)";
+const TABLE_DDL: &str = "CREATE TABLE contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL)";
 /// Force knob (Go: `MURMUR_IMPAIRED_NETWORK_FORCE=1`).
 const FORCE_ENV: &str = "MURMUR_IMPAIRED_NETWORK_FORCE";
 /// Row-count knob (Go: `MURMUR_IMPAIRED_NETWORK_ROWS`, default 8).

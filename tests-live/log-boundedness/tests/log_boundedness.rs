@@ -204,7 +204,7 @@ fn log_boundedness_under_sustained_load() {
             cluster
                 .node(i)
                 .migrate(Migration::new(
-                    "CREATE TABLE contention(id TEXT PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL, score INTEGER NOT NULL)",
+                    "CREATE TABLE contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL, score INTEGER NOT NULL)",
                 ))
                 .expect("migrate contention table");
             cluster.node(i).flush().expect("flush schema");

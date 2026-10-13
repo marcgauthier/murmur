@@ -43,7 +43,7 @@ MURMUR_FIVE_NODE_SETTLE_SECONDS=300 \
 
 ## Deviations from the Go original
 
-- Plain SQL (`records(id TEXT PRIMARY KEY, name TEXT NOT NULL)`) replaces the
+- Plain SQL (`records(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL)`) replaces the
   typed-records HTTP API; row names keep the
   `node-<n>-capacity-<seq>` shape with dense per-node sequences.
 - In-process `close()` + reopen replaces the daemon restart; the Go

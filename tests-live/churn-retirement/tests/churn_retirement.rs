@@ -29,7 +29,7 @@ const GATING_TIMEOUT: Duration = Duration::from_secs(30);
 const ISOLATION_HOLD: Duration = Duration::from_secs(5);
 
 /// Plain-SQL stand-in for the Go typed-records fixture table.
-const DDL: &str = "CREATE TABLE records(name TEXT PRIMARY KEY)";
+const DDL: &str = "CREATE TABLE records(name TEXT NOT NULL PRIMARY KEY)";
 
 /// Baseline rows (Go: `a-0` .. `a-4` inserted on node 0).
 fn baseline_names() -> Vec<String> {

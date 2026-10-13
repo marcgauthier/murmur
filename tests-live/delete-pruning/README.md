@@ -50,7 +50,7 @@ and are out of scope.
 
 - In-process multi-`Database` cluster (QUIC mesh, ephemeral `127.0.0.1:0`)
   instead of `testnode` daemon processes over HTTPS+mTLS (per design).
-- Plain SQL (`contention(id TEXT PRIMARY KEY, name TEXT)`) via
+- Plain SQL (`contention(id TEXT NOT NULL PRIMARY KEY, name TEXT)`) via
   `Database::transaction`/`Database::read` instead of the managed
   typed-contention HTTP API (`TypedContentionInsert/Update/Delete/Read/Rows`);
   row ids keep the Go `deleteRowID` UUID-shaped format; "not found" is a

@@ -37,7 +37,7 @@ use rand::RngCore;
 /// Mesh-leg DDL: plain replicated rows (Go: `TypedInsert` names). Each Go
 /// write inserts a fresh unique row, so the typed merge policies never
 /// trigger; a plain table is behaviorally identical here.
-const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY)";
+const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY)";
 /// Per-writer cadence (Go: 25 ms ticker on each of the 2 mesh nodes).
 const WRITE_TICK: Duration = Duration::from_millis(25);
 const POLL: Duration = Duration::from_millis(200);

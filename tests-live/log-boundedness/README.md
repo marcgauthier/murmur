@@ -45,7 +45,7 @@ still converge on exactly the acked rows with identical contents.
 
 - In-process multi-`Database` cluster (QUIC mesh, ephemeral `127.0.0.1:0`)
   instead of `testnode` daemon processes over HTTPS+mTLS (per design).
-- Plain SQL (`contention(id TEXT PRIMARY KEY, name TEXT, phone TEXT,
+- Plain SQL (`contention(id TEXT NOT NULL PRIMARY KEY, name TEXT, phone TEXT,
   score INTEGER)`) via `Database::transaction`/`Database::read` instead of
   the managed typed-contention HTTP API (`TypedContentionInsert/Rows`);
   keys keep the Go zero-based `%032x` format and values keep the Go

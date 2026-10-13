@@ -1,9 +1,9 @@
 name: Go client
 on:
   push:
-    paths: ['go-client/**', 'src/**', 'replication/**', 'spool/**', 'Cargo.*', '.github/workflows/go-client.yml']
+    paths: ['clients/go/**', 'src/**', 'replication/**', 'spool/**', 'Cargo.*', '.github/workflows/go-client.yml']
   pull_request:
-    paths: ['go-client/**', 'src/**', 'replication/**', 'spool/**', 'Cargo.*', '.github/workflows/go-client.yml']
+    paths: ['clients/go/**', 'src/**', 'replication/**', 'spool/**', 'Cargo.*', '.github/workflows/go-client.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -44,28 +44,28 @@ jobs:
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build and test Go (Unix)
         if: runner.os != 'Windows'
-        run: bash go-client/build.sh test -count=1 -timeout 180s ./...
+        run: bash clients/go/build.sh test -p 2 -count=1 -timeout 180s ./...
       - name: Build and test Go (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./go-client/build.ps1 test -count=1 -timeout 180s ./...
+        run: ./clients/go/build.ps1 test -p 2 -count=1 -timeout 180s ./...
       - name: Native ABI tests
-        run: cargo test --locked --manifest-path go-client/native/Cargo.toml --target ${{ matrix.target }}
+        run: cargo test --locked --manifest-path clients/go/native/Cargo.toml --target ${{ matrix.target }}
       - name: Go static analysis
-        working-directory: go-client
+        working-directory: clients/go
         run: go vet ./...
       - name: Race detector
         if: runner.os != 'Windows'
-        working-directory: go-client
-        run: go test -race -count=1 -timeout 180s ./...
+        working-directory: clients/go
+        run: go test -p 2 -race -count=1 -timeout 180s ./...
       - name: cgo pointer checks
-        working-directory: go-client
+        working-directory: clients/go
         env:
           GOEXPERIMENT: cgocheck2
-        run: go test -count=1 -timeout 180s ./...
+        run: go test -p 2 -count=1 -timeout 180s ./...
       - name: Public API coverage audit
         shell: bash
-        working-directory: go-client
+        working-directory: clients/go
         run: |
           mkdir -p build
           cargo run --locked --quiet --manifest-path native/Cargo.toml --example api_inventory > build/current-api.json

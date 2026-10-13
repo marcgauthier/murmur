@@ -18,7 +18,7 @@ use murmur_live_harness::sqlite_session::{Database, Migration};
 use murmur_live_harness::{wait_until, Cluster, ClusterOptions};
 
 /// Table DDL (Go: typed records; only names matter here).
-const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY)";
+const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY)";
 /// Outage-row knob (Go: `MURMUR_REJOIN_STORM_OUTAGE_ROWS`, default 40).
 const OUTAGE_ENV: &str = "MURMUR_REJOIN_STORM_OUTAGE_ROWS";
 const DEFAULT_OUTAGE_ROWS: usize = 40;

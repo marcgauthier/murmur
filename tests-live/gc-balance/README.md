@@ -50,7 +50,7 @@ Scope (same as Go): version churn only; deletes are out of scope
 
 - In-process multi-`Database` cluster (QUIC mesh, ephemeral `127.0.0.1:0`)
   instead of `testnode` daemon processes over HTTPS+mTLS (per design).
-- Plain SQL (`contention(id TEXT PRIMARY KEY, name TEXT, phone TEXT,
+- Plain SQL (`contention(id TEXT NOT NULL PRIMARY KEY, name TEXT, phone TEXT,
   score INTEGER)`) via `Database::transaction`/`Database::read` instead
   of the managed typed-contention HTTP API
   (`TypedContentionInsert/Update/Read/Rows`); keys keep the Go 1-based

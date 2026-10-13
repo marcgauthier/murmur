@@ -27,7 +27,7 @@ use murmur_live_harness::{
 };
 
 /// Contention table DDL (Go: shared `live_typed_contention` fixture).
-const TABLE_DDL: &str = "CREATE TABLE contention(id TEXT PRIMARY KEY, name TEXT NOT NULL)";
+const TABLE_DDL: &str = "CREATE TABLE contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL)";
 /// Count poll interval (Go: 500 ms `waitCounts`).
 const COUNT_POLL: Duration = Duration::from_millis(500);
 /// Digest poll interval (Go: 1 s `waitDigests`).

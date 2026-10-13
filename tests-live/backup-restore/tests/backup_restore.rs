@@ -41,11 +41,11 @@ use rand::RngCore;
 /// Typed table (Go: `live_typed_records` managed typed table).
 const TABLE: &str = "live_typed_records";
 /// Mesh-leg DDL: plain replicated rows (Go: `TypedInsert` names).
-const NAMES_DDL: &str = "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY)";
+const NAMES_DDL: &str = "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY)";
 /// Typed-leg DDL: plain field plus counter/set/extrema policy columns (the
 /// `typed-records` port's table shape). Set projections start as `x'00'`
 /// (postcard empty vec), the `tests/` convention for fresh set cells.
-const TYPED_DDL: &str = "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY, title TEXT NOT NULL, counter INTEGER NOT NULL, tags BLOB NOT NULL, peak INTEGER NOT NULL, floor REAL NOT NULL)";
+const TYPED_DDL: &str = "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY, title TEXT NOT NULL, counter INTEGER NOT NULL, tags BLOB NOT NULL, peak INTEGER NOT NULL, floor REAL NOT NULL)";
 /// Seed rows and convergence deadlines (Go: 20 rows; 30 s, then 90 s).
 const NUM_ROWS: usize = 20;
 const CONVERGE_TIMEOUT: Duration = Duration::from_secs(30);

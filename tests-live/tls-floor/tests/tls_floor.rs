@@ -24,7 +24,7 @@ use rustls::client::danger::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
 /// Table DDL (Go: typed records marker).
-const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY)";
+const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY)";
 /// Mesh convergence deadline (Go: 60 s).
 const MESH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Per-dial timeout (Go: 10 s client timeout).

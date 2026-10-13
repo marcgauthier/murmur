@@ -1,6 +1,6 @@
 # VENDORS
 
-This inventory separates crates declared directly in Murmur’s Cargo manifests from crates they bring in transitively. It covers the root workspace `Cargo.lock` and the standalone `tests-benchmark/Cargo.lock` and `go-client/native/Cargo.lock`; locked versions are shown. Dev/test, build, optional, and platform-specific dependencies are included. Rust standard-library components and Murmur’s own path dependencies are not external crates.
+This inventory separates crates declared directly in Murmur’s Cargo manifests from crates they bring in transitively. It covers the root workspace `Cargo.lock` and the standalone `tests-benchmark/Cargo.lock` and `clients/go/native/Cargo.lock`; locked versions are shown. Dev/test, build, optional, and platform-specific dependencies are included. Rust standard-library components and Murmur’s own path dependencies are not external crates.
 
 “Direct” means declared in a Murmur package manifest, including dev/test or build dependencies; it does not assert that source code directly imports the crate. A crate declared directly by one Murmur package can also be transitive for another. Crates not declared in any Murmur manifest are listed as transitive.
 
@@ -287,7 +287,7 @@ These are internal packages, not third-party crates:
 ## Embedded Go binding dependencies
 
 The Go module uses only the Go standard library (including cgo); it has no external
-Go modules. `go-client/native/Cargo.toml` declares `rusqlite`, `serde`,
+Go modules. `clients/go/native/Cargo.toml` declares `rusqlite`, `serde`,
 `serde_json`, `postcard`, `zeroize`, `tokio`, and `quinn` at runtime, and `syn`
 for the development API inventory scanner. These crates and all locked transitive
 packages are included above; authors/organizations and countries use the same
@@ -298,23 +298,3 @@ The native binding also depends on the internal `sqlite-session` and
 `murmur-spool` path packages. Go and Rust toolchains, a C compiler (GNU/MinGW or
 Apple's toolchain), LLVM/libclang, and platform system libraries are build/system
 prerequisites, not downloaded Go modules or additional Cargo runtime crates.
-
-## go-client-gorm Go module dependencies
-
-The sibling `go-client-gorm` module (GORM over `go-client`) is the only Murmur
-Go code with external Go modules. It additionally vendors SQLite-dialect source
-(not a module dependency) from `gorm.io/driver/sqlite` v1.6.0 because that
-package's bundled SQLite cannot link against Murmur's staticlib; the vendored
-files carry MIT attribution and the full license text in
-`go-client-gorm/LICENSE.UPSTREAM`.
-
-| Module | Locked version | Author(s) / organization stated by project | Country of origin |
-|---|---|---|---|
-| `gorm.io/gorm` | `v1.31.2` | Jinzhu <wosmvp@gmail.com> | Not stated |
-| `github.com/jinzhu/inflection` | `v1.0.0` | Jinzhu <wosmvp@gmail.com> | Not stated |
-| `github.com/jinzhu/now` | `v1.1.5` | Jinzhu <wosmvp@gmail.com> | Not stated |
-| `golang.org/x/text` | `v0.20.0` | The Go Authors (Google) | Not stated |
-| vendored `gorm.io/driver/sqlite` source | `v1.6.0` | Jinzhu <wosmvp@gmail.com> | Not stated |
-
-`go-client` itself stays dependency-free (standard library plus cgo); the
-`replace` to `../go-client` is internal, not third-party.

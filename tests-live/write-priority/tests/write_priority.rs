@@ -108,7 +108,7 @@ fn local_write_priority() {
             cluster
                 .node(i)
                 .migrate(Migration::new(
-                    "CREATE TABLE records(id TEXT PRIMARY KEY, name TEXT)",
+                    "CREATE TABLE records(id TEXT NOT NULL PRIMARY KEY, name TEXT)",
                 ))
                 .expect("migrate records table");
             cluster.node(i).flush().expect("flush schema");

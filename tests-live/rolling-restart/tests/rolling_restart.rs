@@ -21,7 +21,7 @@ use murmur_live_harness::sqlite_session::{Database, Migration};
 use murmur_live_harness::{wait_until, Cluster, ClusterOptions};
 
 /// Contention table DDL (Go: typed contention rows; only id+name matter here).
-const TABLE_DDL: &str = "CREATE TABLE contention(id TEXT PRIMARY KEY, name TEXT NOT NULL)";
+const TABLE_DDL: &str = "CREATE TABLE contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL)";
 /// Baseline rows (Go: 5).
 const BASELINE_ROWS: usize = 5;
 /// Baseline wait (Go: 60 s `waitCounts`).

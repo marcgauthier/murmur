@@ -37,7 +37,7 @@ None scenario-specific. Harness knobs apply: `MURMUR_LIVE_RUNTIME`,
 
 - In-process multi-`Database` cluster (QUIC mesh, ephemeral `127.0.0.1:0`)
   instead of `testnode` daemon processes over HTTPS+mTLS (per design).
-- Plain SQL (`contention(id TEXT PRIMARY KEY, name TEXT, phone TEXT, score
+- Plain SQL (`contention(id TEXT NOT NULL PRIMARY KEY, name TEXT, phone TEXT, score
   INTEGER)`) instead of the managed typed-records HTTP API
   (`TypedContentionInsert/Update/Read`); contention resolution is whatever
   the replicated-SQL layer converges to rather than the Go RIME per-column

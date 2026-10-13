@@ -30,10 +30,10 @@ const TABLE: &str = "live_typed_records";
 /// [`merge_policies`]); `title` is a plain LWW field for the rename leg.
 /// Set projections start as `x'00'` (postcard empty vec), the `tests/`
 /// convention for fresh set cells.
-const BASE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY, title TEXT NOT NULL, counter INTEGER NOT NULL, tags BLOB NOT NULL, peak INTEGER NOT NULL, floor REAL NOT NULL)";
+const BASE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY, title TEXT NOT NULL, counter INTEGER NOT NULL, tags BLOB NOT NULL, peak INTEGER NOT NULL, floor REAL NOT NULL)";
 /// Node-local table (Go: `TableScopeNodeLocal`; replication disabled).
 const PRIVATE_DDL: &str =
-    "CREATE TABLE typed_local_private(name TEXT PRIMARY KEY, v INTEGER NOT NULL)";
+    "CREATE TABLE typed_local_private(name TEXT NOT NULL PRIMARY KEY, v INTEGER NOT NULL)";
 /// Convergence deadline (Go: 30 s waits).
 const WAIT: Duration = Duration::from_secs(30);
 /// Convergence poll interval (Go: 25-100 ms polls).

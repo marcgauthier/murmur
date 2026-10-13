@@ -29,7 +29,7 @@ None scenario-specific. Harness knobs apply: `MURMUR_LIVE_RUNTIME`,
 
 - In-process multi-`Database` cluster (QUIC mesh, ephemeral `127.0.0.1:0`)
   instead of `testnode` daemon processes over HTTPS+mTLS (per design).
-- Plain SQL (`records(id TEXT PRIMARY KEY, name TEXT, phone TEXT)`)
+- Plain SQL (`records(id TEXT NOT NULL PRIMARY KEY, name TEXT, phone TEXT)`)
   instead of the managed typed-records HTTP API (`TypedContentionInsert` /
   `TypedContentionRows` / `TypedContentionRead`); the bulk-row score travels
   in the `phone` column as text.

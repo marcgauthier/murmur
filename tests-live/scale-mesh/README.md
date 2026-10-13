@@ -36,7 +36,7 @@ None scenario-specific. Harness knobs apply: `MURMUR_LIVE_RUNTIME`,
 
 - In-process multi-`Database` cluster (QUIC mesh, ephemeral `127.0.0.1:0`)
   instead of `testnode` daemon processes over HTTPS+mTLS (per design).
-- Plain SQL (`records(id TEXT PRIMARY KEY, name TEXT)`) instead of the
+- Plain SQL (`records(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL)`) instead of the
   managed typed-contention RIME API (`TypedContentionInsert`,
   `TypedContentionRows`); the `phone`/`score` contention columns have no
   equivalent because the Rust product has no typed-records layer.

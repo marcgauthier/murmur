@@ -1115,6 +1115,7 @@ dependencies = [
  "ipnet",
  "libc",
  "murmur-replication",
+ "murmur-spool",
  "rand 0.8.8",
  "rcgen",
  "sqlite-session",

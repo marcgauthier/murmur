@@ -29,7 +29,7 @@ restarts and names plus counters are verified again.
   `close()` + reopen of the same directory with the same key, followed by an
   explicit re-mesh (fresh ephemeral port).
 - Plain SQL replaces the typed-records HTTP API: table
-  `live_typed_records(name TEXT PRIMARY KEY, counter INTEGER NOT NULL)` plus
+  `live_typed_records(name TEXT NOT NULL PRIMARY KEY, counter INTEGER NOT NULL)` plus
   `ALTER TABLE ... ADD COLUMN note TEXT`; counter adds are
   `UPDATE ... SET counter = counter + ?`.
 - Epoch waits are expressed as `PRAGMA table_info` column-presence waits (the

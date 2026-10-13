@@ -77,6 +77,9 @@ honest snapshot path with bit-identical digests.
   the first quiet slice); strictly more waiting, same assertions.
 - Commit cursor (`Database::status().committed`) stands in for the Go state
   generation metric.
+- Survivor writes flush per row: the product mints one replication log entry
+  per flush batch rather than per SQL transaction, so the 60 writes need 60
+  flushes to produce enough history for the prune-past-retention leg.
 
 ## Compile check (only gate; never run here)
 

@@ -20,7 +20,7 @@ use murmur_live_harness::sqlite_session::{Database, Migration};
 use murmur_live_harness::{wait_until, Cluster, ClusterOptions};
 
 /// Table DDL (Go: typed records with a value field).
-const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY, value TEXT NOT NULL)";
+const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)";
 /// Baseline rows (Go: 20).
 const BASELINE_ROWS: usize = 20;
 /// Convergence deadline (Go: 30 s).

@@ -29,7 +29,7 @@ post-rejoin writes on both revived nodes replicate everywhere.
   node would kill the test driver); restart reopens the same directory with
   the same key.
 - Plain SQL replaces the typed-records HTTP API: table
-  `live_typed_records(name TEXT PRIMARY KEY)`.
+  `live_typed_records(name TEXT NOT NULL PRIMARY KEY)`.
 - Peer counts come from the replication status (`peers`), not `/v1/status`;
   ordered-vec equality replaces the joined-name digest.
 - The outage-real probe checks that no open handle remains

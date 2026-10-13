@@ -25,7 +25,7 @@ use rustls::client::danger::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
 /// Contention table DDL (Go: typed contention rows).
-const TABLE_DDL: &str = "CREATE TABLE contention(id TEXT PRIMARY KEY, name TEXT NOT NULL)";
+const TABLE_DDL: &str = "CREATE TABLE contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL)";
 /// Attack-duration knob (Go: `MURMUR_DOS_CLIENT_ATTACK_SECONDS`, default 60).
 const ATTACK_ENV: &str = "MURMUR_DOS_CLIENT_ATTACK_SECONDS";
 const DEFAULT_ATTACK_SECS: u64 = 60;

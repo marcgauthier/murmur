@@ -533,6 +533,6 @@ Retention rechecks these pins on the serialized Spool worker before pruning.
 Expired transfers require a fresh snapshot; they cannot extend their lease by
 reconnecting. No transfer metadata or maintenance SQL is added to SQLite.
 
-The [embedded Go client](go-client/README.md) wraps the full public Rust surface
+The [embedded Go client](clients/go/README.md) wraps the full public Rust surface
 through cgo, with local builds and Linux/macOS/Windows CI. See its
-[API coverage](go-client/API-COVERAGE.md) and [runnable example](go-client/examples/basic/main.go).
+[API coverage](clients/go/API-COVERAGE.md) and [runnable example](clients/go/examples/basic/main.go).

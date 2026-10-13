@@ -19,7 +19,7 @@ use murmur_live_harness::sqlite_session::{Database, Migration};
 use murmur_live_harness::{wait_until, Cluster, ClusterOptions};
 
 /// Table DDL (Go: typed records).
-const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY)";
+const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY)";
 /// Convergence deadline (Go: 20 s `waitTypedCount`).
 const CONVERGE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Convergence poll interval.

@@ -31,7 +31,7 @@ const REJECT_TIMEOUT: Duration = Duration::from_secs(45);
 const SKEW: Duration = Duration::from_secs(120);
 
 /// Plain-SQL stand-in for the Go typed-records fixture table.
-const DDL: &str = "CREATE TABLE records(name TEXT PRIMARY KEY)";
+const DDL: &str = "CREATE TABLE records(name TEXT NOT NULL PRIMARY KEY)";
 
 /// Sorted expectation list (Go: `waitConverged` compares joined names).
 fn sorted(names: &[&str]) -> Vec<String> {

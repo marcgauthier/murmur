@@ -31,7 +31,7 @@ Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/rolling-restart/`
   is `close()` + reopen of the same directory with the same key, followed
   by an explicit re-mesh (fresh ephemeral port).
 - Plain SQL replaces the typed-contention HTTP API: table
-  `contention(id TEXT PRIMARY KEY, name TEXT NOT NULL)`; ordered
+  `contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL)`; ordered
   `(id, name)` vecs replace the SHA-256 digest.
 - Writers resolve the current-generation handle per write from a shared
   slot the driver refreshes after every restart.

@@ -33,7 +33,7 @@ post-recovery write that replicates everywhere.
   Abrupt mid-write death is therefore not exercised; durability of
   acknowledged writes across restart is.
 - Plain SQL replaces the typed-records HTTP API: table
-  `live_typed_records(name TEXT PRIMARY KEY)`.
+  `live_typed_records(name TEXT NOT NULL PRIMARY KEY)`.
 - Peer counts come from the replication status (`peers`), not `/v1/status`.
 - Ordered-vec equality replaces the SHA-256 name digest (identical strength
   for an equality check; no new dependency).

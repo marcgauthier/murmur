@@ -72,8 +72,8 @@ const STREAM: &str = "field-records";
 /// Contacts table (Go: `liveContactsSchema`).
 const TABLE: &str = "contacts";
 const BASE_DDL: &str =
-    "CREATE TABLE contacts(id TEXT PRIMARY KEY, name TEXT, score INTEGER)";
-const EMAIL_DDL: &str = "CREATE TABLE contacts(id TEXT PRIMARY KEY, name TEXT, score INTEGER, email TEXT)";
+    "CREATE TABLE contacts(id TEXT NOT NULL PRIMARY KEY, name TEXT, score INTEGER)";
+const EMAIL_DDL: &str = "CREATE TABLE contacts(id TEXT NOT NULL PRIMARY KEY, name TEXT, score INTEGER, email TEXT)";
 const ADD_EMAIL: &str = "ALTER TABLE contacts ADD COLUMN email TEXT";
 /// Convergence deadline (Go: 30 s waits).
 const WAIT: Duration = Duration::from_secs(30);

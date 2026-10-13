@@ -24,7 +24,7 @@ use murmur_live_harness::{wait_until, Cluster, ClusterOptions};
 /// Base table DDL (Go: typed records with a Name field).
 const TABLE: &str = "live_typed_records";
 const TABLE_DDL: &str =
-    "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY, counter INTEGER NOT NULL)";
+    "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY, counter INTEGER NOT NULL)";
 /// Additive migration DDL (Go: `MigrateTypedRecords` registers Note).
 const NOTE_DDL: &str = "ALTER TABLE live_typed_records ADD COLUMN note TEXT";
 /// Seed-row knob (Go: `MURMUR_MIGRATION_CONCURRENCY_SEED`, default 60).

@@ -23,7 +23,7 @@ use murmur_live_harness::{wait_until, Cluster, ClusterOptions};
 use rand::RngCore;
 
 /// Typed table (Go: `live_typed_records` managed typed table).
-const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY)";
+const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY)";
 /// Marker rows (Go: 8) plus sustained filler (Go: 200).
 const NUM_MARKERS: usize = 8;
 const NUM_FILLER: usize = 200;

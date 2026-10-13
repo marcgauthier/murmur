@@ -22,7 +22,7 @@ out. Node 3 then restarts and its rebuilt view must contain the same two rows.
   `close()` + reopen of the same directory with the same key, followed by an
   explicit re-mesh (fresh ephemeral port).
 - Plain SQL replaces the typed-RIME managed query: base table
-  `contacts(name TEXT PRIMARY KEY, score INTEGER NOT NULL)` plus
+  `contacts(name TEXT NOT NULL PRIMARY KEY, score INTEGER NOT NULL)` plus
   `VIEW enabled_names AS SELECT name FROM contacts WHERE score > 0 ORDER BY
   name`. `score` plays the role of the enabling PN counter.
 - Same schema is migrated locally on every node (no shared schema manifest).

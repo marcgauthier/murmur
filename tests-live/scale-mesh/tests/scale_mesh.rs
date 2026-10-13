@@ -139,7 +139,7 @@ fn scale_mesh() {
             cluster
                 .node(i)
                 .migrate(Migration::new(
-                    "CREATE TABLE records(id TEXT PRIMARY KEY, name TEXT NOT NULL)",
+                    "CREATE TABLE records(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL)",
                 ))
                 .expect("migrate records table");
             cluster.node(i).flush().expect("flush schema");

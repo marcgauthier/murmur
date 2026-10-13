@@ -72,7 +72,7 @@ fn writer_shares_under_load() {
             cluster
                 .node(i)
                 .migrate(Migration::new(
-                    "CREATE TABLE records(name TEXT PRIMARY KEY)",
+                    "CREATE TABLE records(name TEXT NOT NULL PRIMARY KEY)",
                 ))
                 .expect("migrate records table");
             cluster.node(i).flush().expect("flush schema");

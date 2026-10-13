@@ -13,15 +13,18 @@ when modifying overlapping documentation.
 
 # Go client maintenance
 
-Keep the embedded binding in `./go-client` in sync with all public Rust exports,
+Keep the embedded binding in `./clients/go` in sync with all public Rust exports,
 including public replication modules and scheduler/session utilities. After a
 public API change, regenerate the Rust inventory into a temporary file, review and
-implement the Go mapping, then update `go-client/api-inventory.json` and
-`go-client/api-coverage.json`. Run the API audit documented in `go-client/README.md`;
+implement the Go mapping, then update `clients/go/api-inventory.json` and
+`clients/go/api-coverage.json`. Run the API audit documented in `clients/go/README.md`;
 do not refresh inventories merely to suppress failures. Update the Go README,
 ABI documentation, examples, and root USAGE.md for user-visible binding changes.
 Build the native library again before running Go tests, using the build script so
 its generated fingerprint invalidates Go's cache. Keep native binaries untracked.
+Keep the Go example catalog and `clients/go/examples/coverage.json` aligned with
+the client feature table. New capabilities need a runnable example, result checks,
+a smoke test of the same scenario, and documented setup/restrictions.
 Run relevant integration tests, `go vet`, and cgo pointer checks; run the race
 detector for callback/concurrency changes. Preserve Linux, macOS, and Windows CI.
 Keep `VENDORS.md` synchronized with the standalone native Cargo manifest/lockfile

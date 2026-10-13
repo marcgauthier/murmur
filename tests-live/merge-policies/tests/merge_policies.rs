@@ -26,7 +26,7 @@ const TABLE: &str = "live_merge_policies";
 /// Base DDL. `counter`/`tags`/`peak`/`floor` are policy columns (see
 /// [`merge_policies`]). Set projections start as `x'00'` (postcard empty
 /// vec), the `tests/` convention for fresh set cells.
-const BASE_DDL: &str = "CREATE TABLE live_merge_policies(name TEXT PRIMARY KEY, counter INTEGER NOT NULL, tags BLOB NOT NULL, peak INTEGER NOT NULL, floor REAL NOT NULL)";
+const BASE_DDL: &str = "CREATE TABLE live_merge_policies(name TEXT NOT NULL PRIMARY KEY, counter INTEGER NOT NULL, tags BLOB NOT NULL, peak INTEGER NOT NULL, floor REAL NOT NULL)";
 /// Shared row (Go: `merge-policy-row`, one row id seeded on every node).
 const ROW: &str = "merge-policy-row";
 /// Convergence deadline (Go: 30 s waits).

@@ -29,7 +29,7 @@ const OLD_KEY: [u8; 32] = [9; 32];
 const NEW_KEY: [u8; 32] = [0x5a; 32];
 /// Typed table (Go: `Config.Tables`; here plain SQL with the record name
 /// as the row key, like the Go `TypedInsert`/`TypedCount` name argument).
-const DDL: &str = "CREATE TABLE records(name TEXT PRIMARY KEY)";
+const DDL: &str = "CREATE TABLE records(name TEXT NOT NULL PRIMARY KEY)";
 
 /// Typed insert on one node (Go: `Cluster.TypedInsert`).
 fn typed_insert(db: &Database, name: &str) {

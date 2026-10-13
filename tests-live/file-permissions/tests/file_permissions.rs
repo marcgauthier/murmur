@@ -24,7 +24,7 @@ use murmur_live_harness::{wait_until, Cluster, ClusterOptions};
 use rand::RngCore;
 
 /// Typed table (Go: `live_typed_records` managed typed table).
-const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT PRIMARY KEY)";
+const TABLE_DDL: &str = "CREATE TABLE live_typed_records(name TEXT NOT NULL PRIMARY KEY)";
 /// Seed rows (Go: 25) and convergence deadlines (Go: 30 s, then 60 s).
 const NUM_ROWS: usize = 25;
 const CONVERGE_TIMEOUT: Duration = Duration::from_secs(30);
