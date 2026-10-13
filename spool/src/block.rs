@@ -25,7 +25,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::error::{err, ErrorKind, Result};
+use crate::error::{ErrorKind, Result, err};
 use crate::record::PendingRecord;
 
 pub(crate) const BLOCK_MAGIC: &[u8; 4] = b"SPOL";
@@ -46,6 +46,75 @@ pub(crate) const ABS_MAX_GROUP_RECORDS: u32 = 1 << 24;
 
 pub(crate) fn crc32c(data: &[u8]) -> u32 {
     crc32c::crc32c(data)
+}
+
+#[cfg(test)]
+mod malformed_tests {
+    use super::*;
+    #[test]
+    fn every_truncated_header_and_body_is_rejected_without_panic() {
+        let header = encode_block_header(1, 0, false, 1, 1, 1, 40, 56, &[0; 12]).unwrap();
+        for len in 0..header.len() {
+            assert!(parse_block_header(&header[..len]).is_err());
+        }
+        let body = encode_body(
+            1,
+            0,
+            1,
+            &[PendingRecord {
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+                seq: 1,
+                ..Default::default()
+            }],
+        );
+        decode_body(&body, 1).unwrap();
+        for len in 0..body.len() {
+            assert!(decode_body(&body[..len], 1).is_err(), "body length {len}");
+        }
+    }
+    #[test]
+    fn forged_record_lengths_counts_and_group_bounds_are_rejected() {
+        let body = encode_body(
+            1,
+            0,
+            1,
+            &[PendingRecord {
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+                seq: 1,
+                ..Default::default()
+            }],
+        );
+        for (offset, value) in [
+            (8, 1u32),
+            (12, 0),
+            (12, u32::MAX),
+            (16, u32::MAX),
+            (29, u32::MAX),
+            (33, u32::MAX),
+        ] {
+            let mut bad = body.clone();
+            bad[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(decode_body(&bad, 1).is_err(), "offset {offset}");
+        }
+        assert!(decode_body(&body, u32::MAX).is_err());
+        let mut trailing = body.clone();
+        trailing.push(0);
+        assert!(decode_body(&trailing, 1).is_err());
+    }
+    #[test]
+    fn seeded_arbitrary_parser_inputs_do_not_panic() {
+        use rand::{RngCore, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(123);
+        for len in 0..512 {
+            let mut bytes = vec![0; len];
+            rng.fill_bytes(&mut bytes);
+            let _ = parse_block_header(&bytes);
+            let _ = decode_body(&bytes, 1);
+            let _ = decode_completion(&bytes);
+        }
+    }
 }
 
 fn u16le(b: &[u8]) -> u16 {

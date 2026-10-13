@@ -418,6 +418,30 @@ fn data_key_rotation_and_table_rebuild() -> Result<()> {
     db.close()
 }
 #[test]
+fn master_key_rotation_rewraps_keyring() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join("db");
+    let db = create(&path)?;
+    db.transaction(|c| {
+        c.execute("INSERT INTO items VALUES('one','keep',1)", [])?;
+        Ok(())
+    })?;
+    db.rotate_master_key([9; 32])?;
+    assert_eq!(count(&db)?, 1);
+    db.transaction(|c| {
+        c.execute("INSERT INTO items VALUES('two','after',2)", [])?;
+        Ok(())
+    })?;
+    db.close()?;
+    assert!(matches!(
+        Database::open(&path, [7; 32], Options::default()),
+        Err(Error::WrongKey)
+    ));
+    let db = Database::open(&path, [9; 32], Options::default())?;
+    assert_eq!(count(&db)?, 2);
+    db.close()
+}
+#[test]
 fn delete_reinsert_in_one_transaction_and_composite_keys() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let db = Database::open(tmp.path().join("db"), [7; 32], options())?;

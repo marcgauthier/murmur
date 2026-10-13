@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use crate::error::{err, ErrorKind, Result};
+use crate::error::{ErrorKind, Result, err};
 
 /// Passthrough codec id.
 pub const ID_NONE: u8 = 0;
@@ -64,6 +64,28 @@ impl Codec for NoneCodec {
 }
 
 struct DeflateCodec;
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+    #[test]
+    fn highly_compressed_payload_cannot_exceed_decoded_limit() {
+        let codec = DeflateCodec;
+        let bytes = vec![0; 1 << 20];
+        let encoded = codec.compress(&bytes).unwrap();
+        assert!(encoded.len() < bytes.len() / 16);
+        for limit in [0, 1, 4096, bytes.len() - 1] {
+            assert!(codec.decompress(&encoded, limit).is_err());
+        }
+        assert_eq!(codec.decompress(&encoded, bytes.len()).unwrap(), bytes);
+    }
+    #[test]
+    fn invalid_deflate_and_passthrough_bounds_fail_closed() {
+        assert!(DeflateCodec.decompress(&[0xff; 8], 100).is_err());
+        assert!(NoneCodec.decompress(&[1; 10], 9).is_err());
+        assert_eq!(NoneCodec.decompress(&[1; 10], 10).unwrap(), vec![1; 10]);
+    }
+}
 
 impl Codec for DeflateCodec {
     fn id(&self) -> u8 {

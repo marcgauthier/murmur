@@ -160,3 +160,78 @@ fn altered_payload_with_same_version_is_rejected() -> Result<()> {
     assert_eq!(db.export_state()?, baseline);
     db.close()
 }
+
+#[test]
+fn seeded_partitioned_edits_and_stale_replays_match_independent_model_after_restart() -> Result<()>
+{
+    use rand::{Rng, SeedableRng};
+    use std::collections::BTreeMap;
+    for seed in [1, 42, 999] {
+        let tmp = tempfile::tempdir()?;
+        let mut replicas = (0..3)
+            .map(|n| create(&tmp.path().join(format!("n{n}")), n + 1))
+            .collect::<Result<Vec<_>>>()?;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut expected = BTreeMap::new();
+        let mut deliveries = Vec::new();
+        // Nodes own disjoint key ranges, giving an independent SQL oracle while
+        // exercising deletion generations, reinsertion, and stale delivery.
+        for (node, db) in replicas.iter().enumerate() {
+            for step in 0..60 {
+                let key = format!("{node}-{}", rng.gen_range(0..12));
+                if rng.gen_bool(0.3) {
+                    let key_for_sql = key.clone();
+                    db.transaction(move |sql| {
+                        sql.execute("DELETE FROM devices WHERE id=?", [key_for_sql])?;
+                        Ok(())
+                    })?;
+                    expected.remove(&key);
+                } else {
+                    let host = format!("host-{seed}-{node}-{step}");
+                    let status = format!("status-{}", rng.gen_range(0..4));
+                    let args = (key.clone(), host.clone(), status.clone());
+                    db.transaction(move|sql|{sql.execute("INSERT INTO devices VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET hostname=excluded.hostname,status=excluded.status",rusqlite::params![args.0,args.1,args.2])?;Ok(())})?;
+                    expected.insert(key, (host, status));
+                }
+                if step % 15 == 14 {
+                    deliveries.push(db.export_state()?);
+                }
+            }
+        }
+        for db in &replicas {
+            for _ in 0..30 {
+                db.merge_state(deliveries[rng.gen_range(0..deliveries.len())].clone())?;
+            }
+            for state in deliveries.iter().rev() {
+                db.merge_state(state.clone())?;
+            }
+        }
+        let state = replicas[0].export_state()?;
+        for db in &replicas {
+            let sql = db.read(|sql| {
+                let mut st = sql.prepare("SELECT id,hostname,status FROM devices ORDER BY id")?;
+                let rows = st.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        (r.get::<_, String>(1)?, r.get::<_, String>(2)?),
+                    ))
+                })?;
+                Ok(rows.collect::<rusqlite::Result<BTreeMap<_, _>>>()?)
+            })?;
+            assert_eq!(sql, expected, "seed {seed}");
+            assert_eq!(db.export_state()?, state);
+            db.close()?;
+        }
+        replicas.clear();
+        for n in 0..3 {
+            let db = Database::open(
+                tmp.path().join(format!("n{n}")),
+                [7; 32],
+                Options::default(),
+            )?;
+            assert_eq!(db.export_state()?, state, "recovered seed {seed}");
+            db.close()?;
+        }
+    }
+    Ok(())
+}

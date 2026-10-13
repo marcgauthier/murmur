@@ -1122,6 +1122,7 @@ dependencies = [
  "rand 0.8.8",
  "reqwest",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "sha2",
  "thiserror",
@@ -1628,6 +1629,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "rustls-pki-types"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1818,10 +1828,21 @@ dependencies = [
  "rcgen",
  "rusqlite",
  "serde",
+ "serde_json",
+ "sqlite-vec",
  "tempfile",
  "thiserror",
  "zeroize",
  "zstd",
+]
+
+[[package]]
+name = "sqlite-vec"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ec77b84fb8dd5f0f8def127226db83b5d1152c5bf367f09af03998b76ba554a"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

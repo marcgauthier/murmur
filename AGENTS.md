@@ -1,3 +1,33 @@
+# Usage documentation maintenance
+
+Keep `./USAGE.md` accurate after code changes. Any change to public APIs, SQL
+behavior, Cargo features, configuration options or defaults, CLI commands,
+replication, persistence, search, or operational restrictions must update the
+corresponding examples and restrictions in `USAGE.md` in the same change.
+Document new user-visible features with an example and state their limitations.
+Check examples against the current implementation and compile Rust examples
+with the features they require when changing those examples. For internal-only
+changes, review whether documented behavior changes; do not invent documentation
+changes when behavior is unchanged. Keep README guidance consistent with USAGE.md
+when modifying overlapping documentation.
+
+# Go client maintenance
+
+Keep the embedded binding in `./go-client` in sync with all public Rust exports,
+including public replication modules and scheduler/session utilities. After a
+public API change, regenerate the Rust inventory into a temporary file, review and
+implement the Go mapping, then update `go-client/api-inventory.json` and
+`go-client/api-coverage.json`. Run the API audit documented in `go-client/README.md`;
+do not refresh inventories merely to suppress failures. Update the Go README,
+ABI documentation, examples, and root USAGE.md for user-visible binding changes.
+Build the native library again before running Go tests, using the build script so
+its generated fingerprint invalidates Go's cache. Keep native binaries untracked.
+Run relevant integration tests, `go vet`, and cgo pointer checks; run the race
+detector for callback/concurrency changes. Preserve Linux, macOS, and Windows CI.
+Keep `VENDORS.md` synchronized with the standalone native Cargo manifest/lockfile
+as well as the root Rust dependencies. Avoid duplicating Rust conflict, crypto,
+wire-format, or persistence implementations in Go.
+
 # Architecture guidance
 
 The design is an SQLITE in memory database that has background functions that provide data persistance with compression and encryption and data replication via masterless peer-to-peer. Keep this in mind when developping, it's SQLITE in memory (with some limitation) first and the replication and persistance is done in the background.

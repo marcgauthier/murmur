@@ -11,6 +11,7 @@ mod merge;
 mod metadata;
 mod model;
 mod schema;
+mod search;
 mod progress;
 mod table_replication;
 #[cfg(feature = "replication")]
@@ -27,11 +28,22 @@ mod high_low;
 #[cfg(feature = "replication")]
 pub use murmur_replication as replication;
 
+mod subscription;
+pub mod scheduler;
+pub use scheduler::{
+    SchedulerClassStats, SchedulerConfig, SchedulerSnapshot, Ticket, WriterClass, WriterScheduler,
+};
+
 pub use database::{Database, Sql};
+pub use search::{DistanceMetric, Fts5Index, SearchIndex, SearchIndexStatus, VectorIndex};
 pub use model::{
     Cell, Column, MergePolicy, Migration, OpenMode, OpenPhase, OpenProgress, Options, ReplicaState,
     RestoreOptions, RowState, Schema, SqliteMetrics, SpoolMetrics, Status, Table, TableMapping,
     Tombstone, Value, Version,
+};
+pub use spool::{DataKeyInfo, KeyInventory, KeyStatus};
+pub use subscription::{
+    ChangeType, RowChange, Subscription, SubscriptionCursor, SubscriptionEvent, SubscriptionOptions,
 };
 
 #[derive(Debug, thiserror::Error)]

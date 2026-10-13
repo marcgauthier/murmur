@@ -45,6 +45,24 @@ fn tomb(table: &str, key: Vec<u8>, generation: Version, version: Version) -> Res
     };
     Ok(Mutation::put(tomb_key(&t)?, encode(&t)?))
 }
+pub(crate) fn tables_in_changeset(bytes: &[u8]) -> Vec<String> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let mut cursor = std::io::Cursor::new(bytes);
+    let reader: &mut dyn std::io::Read = &mut cursor;
+    let mut iter = match ChangesetIter::start_strm(&reader) {
+        Ok(it) => it,
+        Err(_) => return Vec::new(),
+    };
+    let mut set = std::collections::HashSet::new();
+    while let Ok(Some(item)) = iter.next() {
+        if let Ok(op) = item.op() {
+            set.insert(op.table_name().to_string());
+        }
+    }
+    set.into_iter().collect()
+}
 pub(crate) fn delta(
     store: &Store,
     schema: &Schema,

@@ -1,0 +1,8 @@
+[package]
+name = "murmur-live-backup-restore"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+murmur-live-harness = { path = "../harness" }
+rand = "0.8"

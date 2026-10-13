@@ -1,0 +1,46 @@
+# clock-skew (Rust port, test-side equivalent)
+
+Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/clock-skew/`
+(`clock_skew_test.go`).
+
+## What it proves
+
+Go runs nodes under libfaketime with skewed clocks and requires
+concurrent shared-row writes to resolve to identical LWW winners
+everywhere. Per-node clocks are impossible in-process (one clock per
+process) and the harness fixture has no replication mode, so this port
+proves the same property deterministically: real exported replica states
+with synthetically skewed version stamps (±5 min) merge to identical
+winners regardless of merge order.
+
+## Pass criteria (adapted from Go)
+
+- 20 same-key rows written concurrently on two unlinked nodes export
+  exactly 20 row states each.
+- Fast clock wins: A's state at +5 min merged into B beats B's local
+  writes on every row.
+- Slow clock loses: B's state at -5 min merged into A loses to A's
+  local writes on every row.
+- Merge order is irrelevant: present-then-fast and fast-then-present
+  merges into two fresh nodes hold identical (skewed-fast) winners on
+  every row.
+- Fully synchronous and deterministic: no timeouts, no libfaketime.
+
+## Deviations from the Go original
+
+- No live skewed clocks: skew is synthesized by shifting real exported
+  `Version` stamps (`millis ± 300_000`, node/logical kept) and driving
+  the real `Database::merge_state` path on unlinked nodes
+  (`manual_peers`, so background replication cannot confound the merge).
+- Fixed N=20 rows and ±5 min skew (Go parameterizes its libfaketime
+  offsets); the merge accepts future versions per LWW rather than
+  rejecting them (Go resolves skewed writes the same way).
+- A full live libfaketime run stays blocked on a replication-capable
+  fixture subprocess; port that when the fixture gains a mesh mode.
+
+## Compile check (only gate; never run here)
+
+```sh
+CARGO_TARGET_DIR=/home/marc/MURMUR/tests-live/target \
+  cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/clock-skew/Cargo.toml
+```

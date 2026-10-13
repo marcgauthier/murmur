@@ -2,7 +2,7 @@
 use crate::*;
 use ed25519_dalek::{Signer, Signature, SigningKey, VerifyingKey};
 use sha2::{Sha256,Digest};
-pub const VERSION:u16=8;
+pub const VERSION:u16=9;
 pub const ALPN:&[u8]=b"murmur-sqlite/1";
 pub const FRAME_BYTES:usize=8<<20;
 pub const CHUNK_BYTES:usize=64<<10;
@@ -64,6 +64,14 @@ impl SignedSchema {
 }
 #[derive(Clone,Debug,Serialize,Deserialize)]
 pub struct Chunk {pub proof:Transaction,pub origin:NodeId,pub sequence:u64,pub id:NodeId,pub index:u32,pub count:u32,pub total:u64,pub digest:[u8;32],pub data:Vec<u8>}
+/// Durable per-transfer chunk manifest. Stored on the first chunk after the
+/// proof signature verifies; later chunks bind to it by digest instead of
+/// re-verifying. Survives restarts, so repair can resume without the sender.
+#[derive(Clone,Debug,Serialize,Deserialize)]
+pub struct ChunkManifest {pub id:NodeId,pub count:u32,pub total:u64,pub digest:[u8;32]}
+pub fn chunk_prefix(origin:NodeId,seq:u64)->String {format!("07/replication/chunks/{}/{seq:020}/",hex(&origin))}
+pub fn chunk_key(origin:NodeId,seq:u64,index:u32)->Vec<u8> {format!("{}{index:08}",chunk_prefix(origin,seq)).into_bytes()}
+pub fn chunk_manifest_key(origin:NodeId,seq:u64)->Vec<u8> {format!("{}manifest",chunk_prefix(origin,seq)).into_bytes()}
 #[derive(Clone,Debug,Serialize,Deserialize)]
 pub struct Progress {pub origin:NodeId,pub applied:u64,pub observed:u64,pub retained_from:u64,pub retained_through:u64}
 #[derive(Clone,Debug,Serialize,Deserialize)]
@@ -71,14 +79,18 @@ pub enum Message {
     Hello {capabilities:u64,required:u64,version:u16,database:NodeId,node:NodeId,fetch:Option<SocketAddr>,schema:Vec<u8>,mode:Dissemination,max_transaction:u64},
     Welcome {capabilities:u64,required:u64,database:NodeId,node:NodeId,fetch:Option<SocketAddr>,schema:Vec<u8>,mode:Dissemination},
     Batches(Vec<Transaction>),Ack(Vec<Progress>),Need{origin:NodeId,from:u64,through:u64},
-    SnapshotRequest,SnapshotManifest{transfer:NodeId,bytes:u64,digest:[u8;32],progress:Vec<Progress>},SnapshotChunk{transfer:NodeId,index:u32,data:Vec<u8>},SnapshotDone{transfer:NodeId},
+    SnapshotRequest,
+    SnapshotManifest(crate::snapshot::Manifest),
+    SnapshotChunk{transfer:NodeId,index:u32,data:Vec<u8>},SnapshotDone{transfer:NodeId},
+    SnapshotResume{transfer:NodeId},SnapshotNeed{transfer:NodeId,indexes:Vec<u32>},
+    SnapshotApplied{transfer:NodeId,digest:[u8;32]},SnapshotUnavailable{transfer:NodeId},SnapshotCancel{transfer:NodeId},
     Ping(u64),Pong(u64),Error{code:u16,message:String},SchemaRequest,SchemaManifest(SignedSchema),SchemaAck{digest:[u8;32],sequence:u64},
     PlumtreeData(Transaction),IHave{origin:NodeId,sequence:u64},Prune,Graft{origin:NodeId,sequence:u64},
     ProgressRequest{offset:u32},ProgressPage{offset:u32,more:bool,entries:Vec<Progress>},TransactionChunk(Chunk),
     MembersRequest{offset:u32},MembersPage{offset:u32,more:bool,entries:Vec<crate::membership::Member>},
     ChunkNeed{origin:NodeId,sequence:u64,indexes:Vec<u32>},ChunkAvailabilityRequest{offset:u32},ChunkAvailabilityPage{entries:Vec<(NodeId,u64,Vec<u32>)>,more:bool},
 }
-impl Message {fn kind(&self)->u16 {match self {Self::Hello{..}=>1,Self::Welcome{..}=>2,Self::Batches(_)=>3,Self::Ack(_)=>4,Self::Need{..}=>5,Self::SnapshotRequest=>6,Self::SnapshotManifest{..}=>7,Self::SnapshotChunk{..}=>8,Self::SnapshotDone{..}=>9,Self::Ping(_)=>10,Self::Pong(_)=>11,Self::Error{..}=>12,Self::SchemaRequest=>13,Self::SchemaManifest(_)=>14,Self::SchemaAck{..}=>15,Self::PlumtreeData(_)=>16,Self::IHave{..}=>17,Self::Prune=>18,Self::Graft{..}=>19,Self::ProgressRequest{..}=>20,Self::ProgressPage{..}=>21,Self::TransactionChunk(_)=>22,Self::ChunkNeed{..}=>23,Self::ChunkAvailabilityRequest{..}=>24,Self::ChunkAvailabilityPage{..}=>25,Self::MembersRequest{..}=>26,Self::MembersPage{..}=>27}} }
+impl Message {fn kind(&self)->u16 {match self {Self::Hello{..}=>1,Self::Welcome{..}=>2,Self::Batches(_)=>3,Self::Ack(_)=>4,Self::Need{..}=>5,Self::SnapshotRequest=>6,Self::SnapshotManifest(..)=>7,Self::SnapshotChunk{..}=>8,Self::SnapshotDone{..}=>9,Self::Ping(_)=>10,Self::Pong(_)=>11,Self::Error{..}=>12,Self::SchemaRequest=>13,Self::SchemaManifest(_)=>14,Self::SchemaAck{..}=>15,Self::PlumtreeData(_)=>16,Self::IHave{..}=>17,Self::Prune=>18,Self::Graft{..}=>19,Self::ProgressRequest{..}=>20,Self::ProgressPage{..}=>21,Self::TransactionChunk(_)=>22,Self::ChunkNeed{..}=>23,Self::ChunkAvailabilityRequest{..}=>24,Self::ChunkAvailabilityPage{..}=>25,Self::SnapshotResume{..}=>28,Self::SnapshotNeed{..}=>29,Self::SnapshotApplied{..}=>30,Self::SnapshotUnavailable{..}=>31,Self::SnapshotCancel{..}=>32,Self::MembersRequest{..}=>26,Self::MembersPage{..}=>27}} }
 pub async fn write(stream:&mut quinn::SendStream,message:&Message)->Result<()> {
     let data=encode(message)?; if data.len()>FRAME_BYTES {return Err(Error::Overloaded);}
     let (data,flags)=if data.len()>1024 {let compressed=zstd::stream::encode_all(data.as_slice(),3)?;if compressed.len()+4<data.len(){let mut bytes=(data.len() as u32).to_be_bytes().to_vec();bytes.extend(compressed);(bytes,0x8002u16)}else{(data,0u16)}}else{(data,0u16)};

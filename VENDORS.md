@@ -1,6 +1,6 @@
 # VENDORS
 
-This inventory separates crates declared directly in Murmur’s Cargo manifests from crates they bring in transitively. It covers the root workspace `Cargo.lock` and the standalone `benchmark/Cargo.lock`; locked versions are shown. Dev/test, build, optional, and platform-specific dependencies are included. Rust standard-library components and Murmur’s own path dependencies are not external crates.
+This inventory separates crates declared directly in Murmur’s Cargo manifests from crates they bring in transitively. It covers the root workspace `Cargo.lock` and the standalone `tests-benchmark/Cargo.lock` and `go-client/native/Cargo.lock`; locked versions are shown. Dev/test, build, optional, and platform-specific dependencies are included. Rust standard-library components and Murmur’s own path dependencies are not external crates.
 
 “Direct” means declared in a Murmur package manifest, including dev/test or build dependencies; it does not assert that source code directly imports the crate. A crate declared directly by one Murmur package can also be transitive for another. Crates not declared in any Murmur manifest are listed as transitive.
 
@@ -23,15 +23,17 @@ Crate authors below come from crate manifests when available. Cargo metadata doe
 | `libc` | `0.2.190` | murmur-spool (runtime) | Not stated in crate metadata | Not stated |
 | `postcard` | `1.1.3` | murmur-replication (runtime), sqlite-session (runtime) | James Munns <james@onevariable.com> | Not stated |
 | `quinn` | `0.11.12` | murmur-replication (runtime) | Not stated in crate metadata | Not stated |
-| `rand` | `0.8.8` | murmur-replication (runtime), murmur-spool (runtime), sqlite-session (runtime) | The Rand Project Developers, The Rust Project Developers | Not stated |
-| `rand` | `0.10.3` | The Rand Project Developers, The Rust Project Developers | Not stated |
-| `rcgen` | `0.13.2` | sqlite-session (dev/test), sqlite-session-benchmark (runtime) | Not stated in crate metadata | Not stated |
+| `rand` | `0.10.3`, `0.8.8` | murmur-replication (runtime), murmur-spool (runtime), sqlite-session (runtime) | The Rand Project Developers, The Rust Project Developers | Not stated |
+| `rand` | `0.10.3`, `0.8.8` | The Rand Project Developers, The Rust Project Developers | Not stated |
+| `rcgen` | `0.13.2` | sqlite-session (dev/test), sqlite-session-benchmark (runtime), murmur-replication (dev/test) | Not stated in crate metadata | Not stated |
 | `reqwest` | `0.12.28` | murmur-replication (runtime) | Sean McArthur <sean@seanmonstar.com> | Not stated |
 | `rusqlite` | `0.40.2` | sqlite-session (runtime), sqlite-session-benchmark (runtime) | The rusqlite developers | Not stated |
+| `sqlite-vec` | `0.1.6` | sqlite-session (optional runtime, `vector` feature) | Alex Garcia <alexsebastian.garcia@gmail.com>; no company stated in crate metadata | Not stated |
 | `rustls` | `0.23.45` | murmur-replication (runtime) | Not stated in crate metadata | Not stated |
+| `rustls-pemfile` | `2.2.0` | murmur-replication (runtime) | Not stated in crate metadata | Not stated |
 | `serde` | `1.0.229` | murmur-replication (runtime), sqlite-session (runtime) | Erick Tryzelaar <erick.tryzelaar@gmail.com>, David Tolnay <dtolnay@gmail.com> | Not stated |
 | `sha2` | `0.10.9` | murmur-replication (runtime), murmur-spool (runtime) | RustCrypto Developers | Not stated |
-| `tempfile` | `3.27.0` | murmur-spool (dev/test), sqlite-session (dev/test), sqlite-session-benchmark (runtime) | Steven Allen <steven@stebalien.com>, The Rust Project Developers, Ashley Mannix <ashleymannix@live.com.au>, Jason White <me@jasonwhite.io> | Not stated |
+| `tempfile` | `3.27.0` | murmur-spool (dev/test), sqlite-session (dev/test), sqlite-session-benchmark (runtime), murmur-replication (dev/test) | Steven Allen <steven@stebalien.com>, The Rust Project Developers, Ashley Mannix <ashleymannix@live.com.au>, Jason White <me@jasonwhite.io> | Not stated |
 | `thiserror` | `2.0.21` | murmur-replication (runtime), sqlite-session (runtime) | David Tolnay <dtolnay@gmail.com> | Not stated |
 | `tokio` | `1.53.2` | murmur-replication (runtime) | Tokio Contributors <team@tokio.rs> | Not stated |
 | `x25519-dalek` | `2.0.1` | murmur-replication (runtime) | Isis Lovecruft <isis@patternsinthevoid.net>, DebugSteven <debugsteven@gmail.com>, Henry de Valence <hdevalence@hdevalence.ca> | Not stated |
@@ -56,8 +58,7 @@ These crates are in the lockfile but are not declared directly by any Murmur pac
 | `atomic-polyfill` | `1.0.3` | Not stated in crate metadata | Not stated |
 | `atomic-waker` | `1.1.2` | Stjepan Glavina <stjepang@gmail.com>, Contributors to futures-rs | Not stated |
 | `autocfg` | `1.5.1` | Josh Stone <cuviper@gmail.com> | Not stated |
-| `base64` | `0.22.1` | Marshall Pierce <marshall@mpierce.org> | Not stated |
-| `base64` | `0.23.1` | Marshall Pierce <marshall@mpierce.org> | Not stated |
+| `base64` | `0.22.1`, `0.23.1` | Marshall Pierce <marshall@mpierce.org> | Not stated |
 | `base64ct` | `1.8.3` | RustCrypto Developers | Not stated |
 | `bindgen` | `0.72.1` | Jyun-Yan You <jyyou.tw@gmail.com>, Emilio Cobos Álvarez <emilio@crisal.io>, Nick Fitzgerald <fitzgen@gmail.com>, The Servo project developers | Not stated |
 | `bitflags` | `2.13.2` | The Rust Project Developers | Not stated |
@@ -70,15 +71,13 @@ These crates are in the lockfile but are not declared directly by any Murmur pac
 | `cexpr` | `0.6.0` | Jethro Beekman <jethro@jbeekman.nl> | Not stated |
 | `cfg-if` | `1.0.5` | Alex Crichton <alex@alexcrichton.com> | Not stated |
 | `cfg_aliases` | `0.2.2` | Zicklag <zicklag@katharostech.com> | Not stated |
-| `chacha20` | `0.10.2` | RustCrypto Developers | Not stated |
-| `chacha20` | `0.9.1` | RustCrypto Developers | Not stated |
+| `chacha20` | `0.10.2`, `0.9.1` | RustCrypto Developers | Not stated |
 | `cipher` | `0.4.4` | RustCrypto Developers | Not stated |
 | `clang-sys` | `1.9.1` | Kyle Mayes <kyle@mayeses.com> | Not stated |
 | `cobs` | `0.3.0` | Allen Welkie <>, James Munns <james@onevariable.com> | Not stated |
 | `const-oid` | `0.9.6` | RustCrypto Developers | Not stated |
 | `constant_time_eq` | `0.4.2` | Cesar Eduardo Barros <cesarb@cesarb.eti.br> | Not stated |
-| `cpufeatures` | `0.2.17` | RustCrypto Developers | Not stated |
-| `cpufeatures` | `0.3.1` | RustCrypto Developers | Not stated |
+| `cpufeatures` | `0.2.17`, `0.3.1` | RustCrypto Developers | Not stated |
 | `crc32fast` | `1.5.2` | Sam Rijs <srijs@airpost.net>, Alex Crichton <alex@alexcrichton.com> | Not stated |
 | `critical-section` | `1.2.0` | Not stated in crate metadata | Not stated |
 | `crypto-common` | `0.1.7` | RustCrypto Developers | Not stated |
@@ -88,13 +87,12 @@ These crates are in the lockfile but are not declared directly by any Murmur pac
 | `data-encoding` | `2.11.1` | Not stated in crate metadata | Not stated |
 | `der` | `0.7.10` | RustCrypto Developers | Not stated |
 | `der-parser` | `10.0.0` | Pierre Chifflier <chifflier@wzdftpd.net> | Not stated |
-| `deranged` | `0.5.8` | Jacob Pratt <jacob@jhpratt.dev> | Not stated |
+| `deranged` | `0.5.8`, `0.5.9` | Jacob Pratt <jacob@jhpratt.dev> | Not stated |
 | `digest` | `0.10.7` | RustCrypto Developers | Not stated |
 | `displaydoc` | `0.2.7` | Jane Lusby <jlusby@yaah.dev> | Not stated |
 | `ed25519` | `2.2.3` | RustCrypto Developers | Not stated |
 | `either` | `1.19.0` | Not stated in crate metadata | Not stated |
-| `embedded-io` | `0.4.0` | Not stated in crate metadata | Not stated |
-| `embedded-io` | `0.6.1` | Not stated in crate metadata | Not stated |
+| `embedded-io` | `0.4.0`, `0.6.1` | Not stated in crate metadata | Not stated |
 | `errno` | `0.3.14` | Chris Wong <lambda.fairy@gmail.com>, Dan Gohman <dev@sunfishcode.online> | Not stated |
 | `fallible-iterator` | `0.3.0` | Steven Fackler <sfackler@gmail.com> | Not stated |
 | `fallible-streaming-iterator` | `0.1.9` | Steven Fackler <sfackler@gmail.com> | Not stated |
@@ -108,13 +106,12 @@ These crates are in the lockfile but are not declared directly by any Murmur pac
 | `futures-task` | `0.3.34` | Not stated in crate metadata | Not stated |
 | `futures-util` | `0.3.34` | Not stated in crate metadata | Not stated |
 | `generic-array` | `0.14.7` | Bartłomiej Kamiński <fizyk20@gmail.com>, Aaron Trent <novacrazy@gmail.com> | Not stated |
-| `getrandom` | `0.2.17` | The Rand Project Developers | Not stated |
-| `getrandom` | `0.4.3` | The Rand Project Developers | Not stated |
+| `getrandom` | `0.2.17`, `0.4.3` | The Rand Project Developers | Not stated |
 | `ghash` | `0.5.1` | RustCrypto Developers | Not stated |
 | `glob` | `0.3.4` | The Rust Project Developers | Not stated |
 | `hash32` | `0.2.1` | Jorge Aparicio <jorge@japaric.io> | Not stated |
-| `hashbrown` | `0.16.1` | Amanieu d'Antras <amanieu@gmail.com> | Not stated |
-| `hashbrown` | `0.17.1` | Not stated in crate metadata | Not stated |
+| `hashbrown` | `0.16.1`, `0.17.1` | Amanieu d'Antras <amanieu@gmail.com> | Not stated |
+| `hashbrown` | `0.16.1`, `0.17.1` | Not stated in crate metadata | Not stated |
 | `hashlink` | `0.12.2` | Not stated in crate metadata | Not stated |
 | `heapless` | `0.7.17` | Jorge Aparicio <jorge@japaric.io>, Per Lindgren <per.lindgren@ltu.se>, Emil Fresk <emil.fresk@gmail.com> | Not stated |
 | `hmac` | `0.12.1` | RustCrypto Developers | Not stated |
@@ -176,8 +173,8 @@ These crates are in the lockfile but are not declared directly by any Murmur pac
 | `quote` | `1.0.47` | David Tolnay <dtolnay@gmail.com> | Not stated |
 | `r-efi` | `6.0.0` | Not stated in crate metadata | Not stated |
 | `rand_chacha` | `0.3.1` | The Rand Project Developers, The Rust Project Developers, The CryptoCorrosion Contributors | Not stated |
-| `rand_core` | `0.10.1` | The Rand Project Developers | Not stated |
-| `rand_core` | `0.6.4` | The Rand Project Developers, The Rust Project Developers | Not stated |
+| `rand_core` | `0.10.1`, `0.6.4` | The Rand Project Developers | Not stated |
+| `rand_core` | `0.10.1`, `0.6.4` | The Rand Project Developers, The Rust Project Developers | Not stated |
 | `rand_pcg` | `0.10.2` | The Rand Project Developers | Not stated |
 | `regex` | `1.13.1` | The Rust Project Developers, Andrew Gallant <jamslam@gmail.com> | Not stated |
 | `regex-automata` | `0.4.18` | The Rust Project Developers, Andrew Gallant <jamslam@gmail.com> | Not stated |
@@ -190,7 +187,7 @@ These crates are in the lockfile but are not declared directly by any Murmur pac
 | `rustix` | `1.1.5` | Dan Gohman <dev@sunfishcode.online>, Jakub Konka <kubkon@jakubkonka.com> | Not stated |
 | `rustls-pki-types` | `1.15.1` | Not stated in crate metadata | Not stated |
 | `rustls-webpki` | `0.103.15` | Not stated in crate metadata | Not stated |
-| `rustversion` | `1.0.23` | David Tolnay <dtolnay@gmail.com> | Not stated |
+| `rustversion` | `1.0.22`, `1.0.23` | David Tolnay <dtolnay@gmail.com> | Not stated |
 | `ryu` | `1.0.23` | David Tolnay <dtolnay@gmail.com> | Not stated |
 | `scopeguard` | `1.2.0` | bluss | Not stated |
 | `semver` | `1.0.28` | David Tolnay <dtolnay@gmail.com> | Not stated |
@@ -198,8 +195,7 @@ These crates are in the lockfile but are not declared directly by any Murmur pac
 | `serde_derive` | `1.0.229` | Erick Tryzelaar <erick.tryzelaar@gmail.com>, David Tolnay <dtolnay@gmail.com> | Not stated |
 | `serde_json` | `1.0.154` | Not stated in crate metadata | Not stated |
 | `serde_urlencoded` | `0.7.1` | Anthony Ramine <n.oxyde@gmail.com> | Not stated |
-| `shlex` | `1.3.0` | comex <comexk@gmail.com>, Fenhl <fenhl@fenhl.net>, Adrian Taylor <adetaylor@chromium.org>, Alex Touchet <alextouchet@outlook.com>, Daniel Parks <dp+git@oxidized.org>, Garrett Berg <googberg@gmail.com> | Not stated |
-| `shlex` | `2.0.1` | comex <comexk@gmail.com>, Fenhl <fenhl@fenhl.net>, Adrian Taylor <adetaylor@chromium.org>, Alex Touchet <alextouchet@outlook.com>, Daniel Parks <dp+git@oxidized.org>, Garrett Berg <googberg@gmail.com> | Not stated |
+| `shlex` | `1.3.0`, `2.0.1` | comex <comexk@gmail.com>, Fenhl <fenhl@fenhl.net>, Adrian Taylor <adetaylor@chromium.org>, Alex Touchet <alextouchet@outlook.com>, Daniel Parks <dp+git@oxidized.org>, Garrett Berg <googberg@gmail.com> | Not stated |
 | `signature` | `2.2.0` | RustCrypto Developers | Not stated |
 | `simd-adler32` | `0.3.10` | Marvin Countryman <me@maar.vin> | Not stated |
 | `slab` | `0.4.12` | Carl Lerche <me@carllerche.com> | Not stated |
@@ -210,11 +206,9 @@ These crates are in the lockfile but are not declared directly by any Murmur pac
 | `sqlite-wasm-rs` | `0.5.5` | Not stated in crate metadata | Not stated |
 | `stable_deref_trait` | `1.2.1` | Robert Grosse <n210241048576@gmail.com> | Not stated |
 | `subtle` | `2.6.1` | Isis Lovecruft <isis@patternsinthevoid.net>, Henry de Valence <hdevalence@hdevalence.ca> | Not stated |
-| `syn` | `2.0.119` | David Tolnay <dtolnay@gmail.com> | Not stated |
-| `syn` | `3.0.9` | David Tolnay <dtolnay@gmail.com> | Not stated |
+| `syn` | `2.0.119`, `3.0.9` | David Tolnay <dtolnay@gmail.com> | Not stated |
 | `sync_wrapper` | `1.0.2` | Actyx AG <developer@actyx.io> | Not stated |
-| `synstructure` | `0.13.2` | Nika Layzell <nika@thelayzells.com> | Not stated |
-| `synstructure` | `0.14.0` | Nika Layzell <nika@thelayzells.com> | Not stated |
+| `synstructure` | `0.13.2`, `0.14.0` | Nika Layzell <nika@thelayzells.com> | Not stated |
 | `thiserror-impl` | `2.0.21` | David Tolnay <dtolnay@gmail.com> | Not stated |
 | `time` | `0.3.55` | Jacob Pratt <open-source@jhpratt.dev>, Time contributors | Not stated |
 | `time-core` | `0.1.9` | Jacob Pratt <open-source@jhpratt.dev>, Time contributors | Not stated |
@@ -252,8 +246,8 @@ These crates are in the lockfile but are not declared directly by any Murmur pac
 | `winapi-i686-pc-windows-gnu` | `0.4.0` | Not stated in crate metadata | Not stated |
 | `winapi-x86_64-pc-windows-gnu` | `0.4.0` | Peter Atashian <retep998@gmail.com> | Not stated |
 | `windows-link` | `0.2.1` | Not stated in crate metadata | Not stated |
-| `windows-sys` | `0.52.0` | Microsoft | Not stated |
-| `windows-sys` | `0.61.2` | Not stated in crate metadata | Not stated |
+| `windows-sys` | `0.52.0`, `0.61.2` | Microsoft | Not stated |
+| `windows-sys` | `0.52.0`, `0.61.2` | Not stated in crate metadata | Not stated |
 | `windows-targets` | `0.52.6` | Microsoft | Not stated |
 | `windows_aarch64_gnullvm` | `0.52.6` | Not stated in crate metadata | Not stated |
 | `windows_aarch64_msvc` | `0.52.6` | Not stated in crate metadata | Not stated |
@@ -289,3 +283,38 @@ These are internal packages, not third-party crates:
 | `murmur-spool` | `sqlite-session` |
 | `murmur-replication` | `sqlite-session` (optional) |
 | `sqlite-session` | `sqlite-session-benchmark` |
+
+## Embedded Go binding dependencies
+
+The Go module uses only the Go standard library (including cgo); it has no external
+Go modules. `go-client/native/Cargo.toml` declares `rusqlite`, `serde`,
+`serde_json`, `postcard`, `zeroize`, `tokio`, and `quinn` at runtime, and `syn`
+for the development API inventory scanner. These crates and all locked transitive
+packages are included above; authors/organizations and countries use the same
+metadata-based attribution. `syn` and `serde_json` are direct dependencies of this
+native binding in addition to their transitive roles elsewhere.
+
+The native binding also depends on the internal `sqlite-session` and
+`murmur-spool` path packages. Go and Rust toolchains, a C compiler (GNU/MinGW or
+Apple's toolchain), LLVM/libclang, and platform system libraries are build/system
+prerequisites, not downloaded Go modules or additional Cargo runtime crates.
+
+## go-client-gorm Go module dependencies
+
+The sibling `go-client-gorm` module (GORM over `go-client`) is the only Murmur
+Go code with external Go modules. It additionally vendors SQLite-dialect source
+(not a module dependency) from `gorm.io/driver/sqlite` v1.6.0 because that
+package's bundled SQLite cannot link against Murmur's staticlib; the vendored
+files carry MIT attribution and the full license text in
+`go-client-gorm/LICENSE.UPSTREAM`.
+
+| Module | Locked version | Author(s) / organization stated by project | Country of origin |
+|---|---|---|---|
+| `gorm.io/gorm` | `v1.31.2` | Jinzhu <wosmvp@gmail.com> | Not stated |
+| `github.com/jinzhu/inflection` | `v1.0.0` | Jinzhu <wosmvp@gmail.com> | Not stated |
+| `github.com/jinzhu/now` | `v1.1.5` | Jinzhu <wosmvp@gmail.com> | Not stated |
+| `golang.org/x/text` | `v0.20.0` | The Go Authors (Google) | Not stated |
+| vendored `gorm.io/driver/sqlite` source | `v1.6.0` | Jinzhu <wosmvp@gmail.com> | Not stated |
+
+`go-client` itself stays dependency-free (standard library plus cgo); the
+`replace` to `../go-client` is internal, not third-party.

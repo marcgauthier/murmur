@@ -1,6 +1,6 @@
 <img src="murmur-sql.png" alt="murmur-sql logo" width="400">
 
-# sqlite-session
+# Murmur-SQL
 
 One in-memory SQLite database with SQLite session capture, encrypted background
 persistence in Murmur Spool, and per-column last-writer-wins conflict metadata.
@@ -190,10 +190,92 @@ fn execute_with_backpressure<T>(
 
 Tables need non-null declared primary keys. Composite keys and `WITHOUT ROWID`
 are supported. Nonunique indexes are supported; foreign keys, CHECK constraints,
-non-primary unique constraints, virtual tables, views, and application triggers
+non-primary unique constraints, unmanaged virtual tables, views, and application triggers
 are currently rejected. Use `migrate()` for schema changes. Explicit
 `TableMapping` entries preserve identities when renaming tables or columns.
 Primary-key identity cannot change.
+
+## FTS5 and vector search with replication
+
+Murmur manages local, rebuildable search indexes over ordinary source tables.
+Write text and embeddings to the source table; query the virtual index with
+normal FTS5 or `vec0` SQL. Source rows use the existing SQLite session capture,
+encrypted Spool persistence, conflict resolution, and peer replication. Search
+indexes reflect the resolved local rows, including deletions and local-only
+tables. Their contents and internal shadow tables are never replicated.
+
+```rust,no_run
+use sqlite_session::{Database, Fts5Index, Migration, OpenMode, Options};
+
+let db = Database::open("./search-db", [7; 32], Options {
+    mode: OpenMode::CreateNew,
+    search_indexes: vec![Fts5Index::new(
+        "documents_fts", "documents", vec!["title".into(), "body".into()],
+    ).into()],
+    ..Options::default()
+})?;
+db.migrate(Migration::new(
+    "CREATE TABLE documents(id INTEGER PRIMARY KEY, title TEXT, body TEXT)",
+))?;
+db.transaction(|sql| {
+    sql.execute("INSERT INTO documents VALUES(1001, 'Murmur', 'Replicated search')", [])?;
+    Ok(())
+})?;
+db.refresh_indexes()?;
+let id: i64 = db.read(|sql| Ok(sql.query_row(
+    "SELECT rowid FROM documents_fts WHERE documents_fts MATCH 'replicated'",
+    [], |row| row.get(0),
+)?))?;
+assert_eq!(id, 1001);
+# Ok::<(), sqlite_session::Error>(())
+```
+
+Enable the optional `vector` Cargo feature for sqlite-vec. Configure a
+`VectorIndex::new("documents_vec", "documents", "embedding", 768)` alongside
+FTS5. Its source column must be declared `BLOB`, containing exactly 768 finite
+little-endian float32 values; `NULL` excludes a row from vector search. Vector
+column names must be ASCII identifiers starting with a letter. The default
+distance is L2; `DistanceMetric::Cosine` and `DistanceMetric::L1` are also supported.
+For example, query `SELECT rowid, distance FROM documents_vec WHERE embedding
+MATCH ? AND k=10 ORDER BY distance`, binding a vector BLOB or JSON vector string.
+Murmur stores the supplied embeddings and does not generate them.
+
+Indexed source tables require one declared `INTEGER PRIMARY KEY`. Assign IDs
+uniquely across writers; independent SQLite-generated row IDs can collide between
+peers. FTS5 source columns must be declared `TEXT`. FTS5 uses its normal content
+storage, trading additional memory for simple deferred updates without retaining
+old document text. Built-in tokenizer options are `unicode61` (default), `ascii`,
+`porter`, and `trigram`.
+
+Indexes live in the same connection's temporary schema, with `temp_store=MEMORY`
+so index pages stay in RAM. Definitions are
+node-local: provide them in `Options.search_indexes` on every open. Opening an
+existing database rebuilds them before queries start. New databases may configure
+indexes before their source tables are created or adopted from a peer. Backups
+contain authoritative source data; restore and reopen with the desired index
+definitions. `db.set_search_indexes(definitions)` replaces definitions atomically
+and rebuilds them, and an empty list removes managed indexes. Remove/reconfigure
+indexes before migrating away their source tables or indexed columns.
+
+Ordinary searches may lag by the capture interval plus maintenance time.
+`db.refresh_indexes()` collects pending writes and waits for local indexing; it
+does not wait for peer delivery or disk durability. `db.flush()` controls source
+durability and does not imply index freshness. Maintenance runs between requests
+on the SQLite owner thread, never inside ordinary application transactions.
+Defaults are an 8 MiB work budget, 256 rows per turn, and a 100 ms maintenance
+interval (`search_queue_bytes`, `search_batch_rows`, `search_interval`). Queue
+overflow discards work and rebuilds affected indexes. Initial rebuilds and index
+clearing can pause access; background population is batched.
+
+`db.status().search_indexes` reports readiness, rebuilds, pending keys, shared
+queued changeset bytes, and errors. Managed indexes and their shadow tables reject
+application writes. Searches against rebuilding or failed indexes return an
+authorization error; source writes remain available. Failed maintenance retains
+work for retry. Repair invalid source data and call `refresh_indexes()` again.
+If an index rebuild fails during open, reopen without that definition, repair the
+source data, then use `set_search_indexes()` to restore the index.
+Index publication notifies subscriptions; watch the virtual table name to receive
+search updates after indexing.
 
 Schema migrations are separate ordered records because sessions do not capture
 DDL. Migrations inspect rows before and after their SQL to preserve versions of
@@ -242,7 +324,7 @@ an independent directory, delete old ones to prune.
 ## Minimal helpers and benchmarks
 
 `open_in_memory()` and `start_session()` remain available for session-only use.
-The independent benchmark crate is in [benchmark](benchmark/README.md). Its
+The independent benchmark crate is in [tests-benchmark](tests-benchmark/README.md). Its
 `persistence` binary compares plain SQLite, session capture, and the managed
 crate with collection deferred or background persistence enabled. Earlier
 measurements made with synchronous CRDT stamping do not describe this design.
@@ -405,3 +487,52 @@ These methods require replication and must be called outside SQL callbacks.
 Retiring a peer releases its retention obligation and rejects subsequent
 connections from that identity. `retention_status()` exposes durable peer
 acknowledgements, retired flags, the last collection time and total deleted logs.
+
+### Resumable peer snapshots
+
+When a peer cannot recover from retained transaction history, it requests a full
+replicated-state snapshot from an explicitly configured `trusted_snapshot_sources`
+node. Protocol version **9** requires a coordinated upgrade of every peer; version
+8 peers are rejected. Existing databases remain readable. Incomplete version 8
+snapshot staging is discarded because those transfers have no durable donor ID.
+
+The donor atomically stores an immutable signed manifest, 64 KiB chunks and a
+history-retention pin in encrypted Spool. The manifest binds the database, donor,
+recipient, schema, payload and chunk hashes, and applied-progress boundary.
+Either peer can reopen and resume the same transfer. Missing chunks are requested
+in pages of at most 128; duplicate chunks are harmless and conflicting data is
+rejected. Resume uses the original donor. If its transfer has expired or is
+unavailable, the receiver requests a fresh snapshot. A schema mismatch explicitly
+cancels an unapplied transfer before negotiating schema and starting again.
+
+| Replication configuration | Default |
+|---|---|
+| `snapshot_bytes` | 512 MiB maximum individual snapshot payload |
+| `snapshot_staging_bytes` | 512 MiB aggregate payload budget for each of incoming and outgoing staging |
+| `snapshot_transfer_lifetime` | 7 days, without automatic renewal |
+| `staging_transfers` | 4,096 maximum outgoing pins and retained incoming completion receipts |
+
+One incoming transfer runs at a time. Chunk reclamation runs in bounded batches;
+leftover chunks count toward the staging budget until reclaimed. Manifest metadata
+is additional to the payload budget. Peer queues must allow at least 1 MiB so a
+maximum-size manifest fits. Reducing limits can prevent existing transfers from
+resuming; restore compatible limits or allow the transfer to expire.
+
+The receiver merges through existing conflict resolution, preserving local-only
+tables and concurrent local edits. Applied progress and a completion receipt
+commit durably with the merged state before acknowledgement. Receipts survive
+reopening and remain available for one transfer lifetime after completion.
+Snapshots include file metadata; encrypted file contents use normal peer fetching.
+
+The donor retains post-snapshot history while transferring. After a durable
+completion acknowledgement, it freezes a catch-up target at its current applied
+progress. Payload chunks can then be reclaimed, but the retention pin remains
+until the recipient's durable progress ACKs cover that target or the original
+transfer lifetime expires. Peer retirement does not bypass a live transfer pin.
+Retention rechecks these pins on the serialized Spool worker before pruning.
+Expired transfers require a fresh snapshot; they cannot extend their lease by
+reconnecting. No transfer metadata or maintenance SQL is added to SQLite.
+
+The [embedded Go client](go-client/README.md) wraps the full public Rust surface
+through cgo, with local builds and Linux/macOS/Windows CI. See its
+[API coverage](go-client/API-COVERAGE.md) and [runnable example](go-client/examples/basic/main.go).

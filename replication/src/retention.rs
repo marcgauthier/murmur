@@ -162,6 +162,7 @@ fn collect_at(backend: &dyn Backend, config: &Config, now: u64) -> Result<u64> {
         } else {
             u64::MAX
         };
+        let snapshot_floor = crate::snapshot::prune_limit(backend, head.origin, now)?;
         let mut through = None;
         let mut prefix_blocked = false;
         for key in keys.into_iter().take(eligible) {
@@ -194,6 +195,7 @@ fn collect_at(backend: &dyn Backend, config: &Config, now: u64) -> Result<u64> {
                 || sequence > head.applied
                 || sequence > peer_floor
                 || sequence > bridge_floor
+                || sequence > snapshot_floor
             {
                 break;
             }
@@ -287,7 +289,10 @@ fn parse_node(name: &str) -> Result<NodeId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     #[derive(Default)]
     struct TestBackend {
@@ -296,89 +301,247 @@ mod tests {
         checkpoint_fails: AtomicBool,
     }
     impl Backend for TestBackend {
-        fn identity(&self) -> (NodeId, NodeId) { ([1;16],[2;16]) }
-        fn get(&self,key:&[u8])->Result<Option<Vec<u8>>>{Ok(self.records.lock().unwrap().get(key).cloned())}
-        fn keys(&self,prefix:&[u8])->Result<Vec<Vec<u8>>>{Ok(self.records.lock().unwrap().keys().filter(|k|k.starts_with(prefix)).cloned().collect())}
-        fn commit(&self,records:Vec<Record>)->Result<()> {let mut state=self.records.lock().unwrap(); for r in records {match r.value {Some(v)=>{state.insert(r.key,v);},None=>{state.remove(&r.key);}}} Ok(())}
-        fn retention_checkpoint(&self)->Result<()> {self.events.lock().unwrap().push("snapshot".into()); if self.checkpoint_fails.load(Ordering::SeqCst){Err(Error::Storage("snapshot failed".into()))}else{Ok(())}}
-        fn prune_history(&self,origin:NodeId,through:u64)->Result<u64>{self.events.lock().unwrap().push(format!("prune:{}:{through}",origin[0]));Ok(through)}
-        fn reclaim_retention(&self)->Result<()>{self.events.lock().unwrap().push("reclaim".into());Ok(())}
-        fn publish(&self,_:Vec<Record>)->Result<()>{unreachable!()}
-        fn import_bridge(&self,_:bridge::Header,_:Vec<u8>)->Result<bool>{unreachable!()}
-        fn release_ownership(&self,_:String,_:Vec<u8>,_:Option<String>)->Result<bool>{unreachable!()}
-        fn snapshot(&self)->Result<Vec<u8>>{unreachable!()}
-        fn snapshot_with_progress(&self)->Result<(Vec<u8>,Vec<Progress>)>{unreachable!()}
-        fn schema(&self)->Result<Vec<u8>>{unreachable!()}
-        fn apply(&self,_:Vec<Vec<u8>>,_:Vec<Record>)->Result<bool>{unreachable!()}
-        fn observe(&self,_:u64,_:u32)->Result<()>{unreachable!()}
-        fn accept_schema(&self,_:Vec<u8>)->Result<bool>{unreachable!()}
+        fn identity(&self) -> (NodeId, NodeId) {
+            ([1; 16], [2; 16])
+        }
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+            Ok(self.records.lock().unwrap().get(key).cloned())
+        }
+        fn keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+            Ok(self
+                .records
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+        fn commit(&self, records: Vec<Record>) -> Result<()> {
+            let mut state = self.records.lock().unwrap();
+            for r in records {
+                match r.value {
+                    Some(v) => {
+                        state.insert(r.key, v);
+                    }
+                    None => {
+                        state.remove(&r.key);
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn retention_checkpoint(&self) -> Result<()> {
+            self.events.lock().unwrap().push("snapshot".into());
+            if self.checkpoint_fails.load(Ordering::SeqCst) {
+                Err(Error::Storage("snapshot failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+        fn prune_history(&self, origin: NodeId, through: u64) -> Result<u64> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("prune:{}:{through}", origin[0]));
+            Ok(through)
+        }
+        fn reclaim_retention(&self) -> Result<()> {
+            self.events.lock().unwrap().push("reclaim".into());
+            Ok(())
+        }
+        fn publish(&self, _: Vec<Record>) -> Result<()> {
+            unreachable!()
+        }
+        fn import_bridge(&self, _: bridge::Header, _: Vec<u8>) -> Result<bool> {
+            unreachable!()
+        }
+        fn release_ownership(&self, _: String, _: Vec<u8>, _: Option<String>) -> Result<bool> {
+            unreachable!()
+        }
+        fn snapshot(&self) -> Result<Vec<u8>> {
+            unreachable!()
+        }
+        fn snapshot_with_progress(&self) -> Result<(Vec<u8>, Vec<Progress>)> {
+            unreachable!()
+        }
+        fn schema(&self) -> Result<Vec<u8>> {
+            unreachable!()
+        }
+        fn apply(&self, _: Vec<Vec<u8>>, _: Vec<Record>) -> Result<bool> {
+            unreachable!()
+        }
+        fn observe(&self, _: u64, _: u32) -> Result<()> {
+            unreachable!()
+        }
+        fn accept_schema(&self, _: Vec<u8>) -> Result<bool> {
+            unreachable!()
+        }
     }
-    const NOW:u64=100_000;
-    fn config()->Config {
-        let mut c=Config::new("127.0.0.1:0".parse().unwrap(),Credentials{chain:vec![],private_key:vec![].into(),roots:vec![]},[1;32]);
-        c.minimum_retained=2; c.retention=Duration::from_millis(1000); c.maximum_offline=Duration::from_millis(5000); c
+    const NOW: u64 = 100_000;
+    fn config() -> Config {
+        let mut c = Config::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Credentials {
+                chain: vec![],
+                private_key: vec![].into(),
+                roots: vec![],
+            },
+            [1; 32],
+        );
+        c.minimum_retained = 2;
+        c.retention = Duration::from_millis(1000);
+        c.maximum_offline = Duration::from_millis(5000);
+        c
     }
-    fn logs(b:&TestBackend,count:u64,age:u64) {
-        let origin=[3;16];
-        b.commit(vec![Record::put(retained_key(origin),encode(&Progress{origin,observed:count,applied:count,retained_from:1,retained_through:count}).unwrap())]).unwrap();
-        for seq in 1..=count {b.commit(vec![Record::put(log_key(origin,seq),vec![0xff]),Record::put(time_key(origin,seq),encode(&(NOW-age)).unwrap())]).unwrap();}
+    fn logs(b: &TestBackend, count: u64, age: u64) {
+        let origin = [3; 16];
+        b.commit(vec![Record::put(
+            retained_key(origin),
+            encode(&Progress {
+                origin,
+                observed: count,
+                applied: count,
+                retained_from: 1,
+                retained_through: count,
+            })
+            .unwrap(),
+        )])
+        .unwrap();
+        for seq in 1..=count {
+            b.commit(vec![
+                Record::put(log_key(origin, seq), vec![0xff]),
+                Record::put(time_key(origin, seq), encode(&(NOW - age)).unwrap()),
+            ])
+            .unwrap();
+        }
     }
-    fn put_peer(b:&TestBackend,last_seen:u64,ack:u64,retired:bool) {
-        let peer=PeerRetention{node:[4;16],last_seen_millis:last_seen,retired,acknowledged:BTreeMap::from([([3;16],ack)])};
-        b.commit(vec![Record::put(peer_key(peer.node),encode(&peer).unwrap())]).unwrap();
+    fn put_peer(b: &TestBackend, last_seen: u64, ack: u64, retired: bool) {
+        let peer = PeerRetention {
+            node: [4; 16],
+            last_seen_millis: last_seen,
+            retired,
+            acknowledged: BTreeMap::from([([3; 16], ack)]),
+        };
+        b.commit(vec![Record::put(
+            peer_key(peer.node),
+            encode(&peer).unwrap(),
+        )])
+        .unwrap();
     }
     #[test]
     fn age_and_count_are_independent_retention_requirements() {
-        for (count,age,expected) in [(2,2000,0),(6,999,0),(6,1000,4)] {
-            let b=TestBackend::default(); logs(&b,count,age); assert_eq!(collect_at(&b,&config(),NOW).unwrap(),expected);
-            let events=b.events.lock().unwrap(); if expected>0 {assert_eq!(&events[..2],["snapshot","prune:3:4"]);}else{assert_eq!(&*events,&["reclaim"]);}
+        for (count, age, expected) in [(2, 2000, 0), (6, 999, 0), (6, 1000, 4)] {
+            let b = TestBackend::default();
+            logs(&b, count, age);
+            assert_eq!(collect_at(&b, &config(), NOW).unwrap(), expected);
+            let events = b.events.lock().unwrap();
+            if expected > 0 {
+                assert_eq!(&events[..2], ["snapshot", "prune:3:4"]);
+            } else {
+                assert_eq!(&*events, &["reclaim"]);
+            }
         }
     }
     #[test]
     fn offline_window_acknowledgements_and_retirement_bound_pruning() {
-        for (last_seen,ack,retired,expected) in [(NOW-5000,0,false,0),(NOW-5000,2,false,2),(NOW-5001,0,false,4),(NOW,0,true,4)] {
-            let b=TestBackend::default(); logs(&b,6,2000); put_peer(&b,last_seen,ack,retired); assert_eq!(collect_at(&b,&config(),NOW).unwrap(),expected);
+        for (last_seen, ack, retired, expected) in [
+            (NOW - 5000, 0, false, 0),
+            (NOW - 5000, 2, false, 2),
+            (NOW - 5001, 0, false, 4),
+            (NOW, 0, true, 4),
+        ] {
+            let b = TestBackend::default();
+            logs(&b, 6, 2000);
+            put_peer(&b, last_seen, ack, retired);
+            assert_eq!(collect_at(&b, &config(), NOW).unwrap(), expected);
         }
     }
     #[test]
     fn pending_bridge_exports_protect_transaction_history() {
-        for (exported,expected) in [(None,0),(Some(2u64),2),(Some(6),4)] {
-            let b=TestBackend::default(); logs(&b,6,2000); let mut c=config();
-            c.bridge=Some(bridge::Config::exporter([1;16],std::path::PathBuf::new(),"low".into(),[5;32],[6;32]));
-            if let Some(seq)=exported {b.commit(vec![Record::put(format!("09/bridge/exported/low/{}",hex(&[3;16])).into_bytes(),encode(&seq).unwrap())]).unwrap();}
-            assert_eq!(collect_at(&b,&c,NOW).unwrap(),expected);
+        for (exported, expected) in [(None, 0), (Some(2u64), 2), (Some(6), 4)] {
+            let b = TestBackend::default();
+            logs(&b, 6, 2000);
+            let mut c = config();
+            c.bridge = Some(bridge::Config::exporter(
+                [1; 16],
+                std::path::PathBuf::new(),
+                "low".into(),
+                [5; 32],
+                [6; 32],
+            ));
+            if let Some(seq) = exported {
+                b.commit(vec![Record::put(
+                    format!("09/bridge/exported/low/{}", hex(&[3; 16])).into_bytes(),
+                    encode(&seq).unwrap(),
+                )])
+                .unwrap();
+            }
+            assert_eq!(collect_at(&b, &c, NOW).unwrap(), expected);
         }
     }
     #[test]
     fn failed_snapshot_never_prunes_and_retry_snapshots_first() {
-        let b=TestBackend::default(); logs(&b,6,2000); b.checkpoint_fails.store(true,Ordering::SeqCst);
-        assert!(collect_at(&b,&config(),NOW).is_err()); assert_eq!(&*b.events.lock().unwrap(),&["snapshot"]);
-        assert_eq!(b.keys(b"07/replication/log/").unwrap().len(),6);
-        b.checkpoint_fails.store(false,Ordering::SeqCst); assert_eq!(collect_at(&b,&config(),NOW).unwrap(),4);
-        assert_eq!(&*b.events.lock().unwrap(),&["snapshot","snapshot","prune:3:4","reclaim"]);
+        let b = TestBackend::default();
+        logs(&b, 6, 2000);
+        b.checkpoint_fails.store(true, Ordering::SeqCst);
+        assert!(collect_at(&b, &config(), NOW).is_err());
+        assert_eq!(&*b.events.lock().unwrap(), &["snapshot"]);
+        assert_eq!(b.keys(b"07/replication/log/").unwrap().len(), 6);
+        b.checkpoint_fails.store(false, Ordering::SeqCst);
+        assert_eq!(collect_at(&b, &config(), NOW).unwrap(), 4);
+        assert_eq!(
+            &*b.events.lock().unwrap(),
+            &["snapshot", "snapshot", "prune:3:4", "reclaim"]
+        );
     }
     #[test]
     fn legacy_missing_time_blocks_prefix_until_full_minimum_age() {
-        let b=TestBackend::default(); logs(&b,6,2000); b.commit(vec![Record::delete(time_key([3;16],1))]).unwrap();
-        assert_eq!(collect_at(&b,&config(),NOW).unwrap(),0); assert_eq!(decode::<u64>(&b.get(&time_key([3;16],1)).unwrap().unwrap()).unwrap(),NOW);
-        assert_eq!(collect_at(&b,&config(),NOW+999).unwrap(),0); assert_eq!(collect_at(&b,&config(),NOW+1000).unwrap(),4);
+        let b = TestBackend::default();
+        logs(&b, 6, 2000);
+        b.commit(vec![Record::delete(time_key([3; 16], 1))])
+            .unwrap();
+        assert_eq!(collect_at(&b, &config(), NOW).unwrap(), 0);
+        assert_eq!(
+            decode::<u64>(&b.get(&time_key([3; 16], 1)).unwrap().unwrap()).unwrap(),
+            NOW
+        );
+        assert_eq!(collect_at(&b, &config(), NOW + 999).unwrap(), 0);
+        assert_eq!(collect_at(&b, &config(), NOW + 1000).unwrap(), 4);
     }
     #[test]
     fn retirement_is_atomic_and_cannot_be_undone_by_peer_touch() {
-        let b=TestBackend::default(); put_peer(&b,NOW,2,false); retire(&b,[4;16]).unwrap();
-        assert!(peer(&b,[4;16]).unwrap().unwrap().retired); assert!(b.get(format!("07/replication/excluded/{}",hex(&[4;16])).as_bytes()).unwrap().is_some());
-        assert!(matches!(touch(&b,[4;16],&[]),Err(Error::Auth(_))));
+        let b = TestBackend::default();
+        put_peer(&b, NOW, 2, false);
+        retire(&b, [4; 16]).unwrap();
+        assert!(peer(&b, [4; 16]).unwrap().unwrap().retired);
+        assert!(
+            b.get(format!("07/replication/excluded/{}", hex(&[4; 16])).as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        assert!(matches!(touch(&b, [4; 16], &[]), Err(Error::Auth(_))));
     }
     #[test]
     fn legacy_peer_migration_preserves_max_ack_and_retirement() {
-        let b=TestBackend::default(); put_peer(&b,NOW,7,true);
-        let key=format!("07/replication/peer/{}/{}",hex(&[4;16]),hex(&[3;16])).into_bytes();
-        b.commit(vec![Record::put(key,encode(&(2u64,NOW-1)).unwrap())]).unwrap(); migrate_peers(&b).unwrap(); migrate_peers(&b).unwrap();
-        let p=peer(&b,[4;16]).unwrap().unwrap(); assert!(p.retired); assert_eq!(p.acknowledged[&[3;16]],7); assert_eq!(p.last_seen_millis,NOW); assert!(b.keys(b"07/replication/peer/").unwrap().is_empty());
+        let b = TestBackend::default();
+        put_peer(&b, NOW, 7, true);
+        let key = format!("07/replication/peer/{}/{}", hex(&[4; 16]), hex(&[3; 16])).into_bytes();
+        b.commit(vec![Record::put(key, encode(&(2u64, NOW - 1)).unwrap())])
+            .unwrap();
+        migrate_peers(&b).unwrap();
+        migrate_peers(&b).unwrap();
+        let p = peer(&b, [4; 16]).unwrap().unwrap();
+        assert!(p.retired);
+        assert_eq!(p.acknowledged[&[3; 16]], 7);
+        assert_eq!(p.last_seen_millis, NOW);
+        assert!(b.keys(b"07/replication/peer/").unwrap().is_empty());
     }
     #[test]
     fn pruning_is_bounded_even_when_history_is_large() {
-        let b=TestBackend::default(); logs(&b,600,2000); assert_eq!(collect_at(&b,&config(),NOW).unwrap(),256);
+        let b = TestBackend::default();
+        logs(&b, 600, 2000);
+        assert_eq!(collect_at(&b, &config(), NOW).unwrap(), 256);
         assert!(b.events.lock().unwrap().contains(&"prune:3:256".into()));
     }
 }

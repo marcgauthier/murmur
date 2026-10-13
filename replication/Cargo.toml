@@ -22,3 +22,8 @@ aes-gcm = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rustls-pemfile = "2"
+
+[dev-dependencies]
+rcgen = "=0.13.2"
+tempfile = "3"

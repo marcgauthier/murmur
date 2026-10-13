@@ -24,8 +24,9 @@ fn sync_dir(dir: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
     }
-    let f = fs::File::open(dir)?;
-    f.sync_all()?;
+    // Match Spool: Windows does not support opening a directory for fsync.
+    #[cfg(not(windows))]
+    fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 

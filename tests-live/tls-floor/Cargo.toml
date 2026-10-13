@@ -1,0 +1,10 @@
+[package]
+name = "murmur-live-tls-floor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+murmur-live-harness = { path = "../harness" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["rt", "time"] }

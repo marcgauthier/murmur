@@ -2,6 +2,12 @@
 use crate::{*,database::{Inner,Core},model::*,storage::{Opened,Work,Event},metadata,merge,schema};
 use murmur_replication::{self as net, Backend,Record};
 use std::sync::{Arc,Weak,mpsc};
+#[cfg(test)]
+#[path = "retention_tests.rs"]
+mod retention_tests;
+#[cfg(test)]
+#[path = "snapshot_tests.rs"]
+mod snapshot_tests;
 fn error(e:Error)->net::Error {net::Error::Storage(e.to_string())}
 pub(crate) struct Adapter {inner:Weak<Inner>,worker:mpsc::Sender<Work>,identity:([u8;16],[u8;16])}
 impl Adapter {
@@ -30,6 +36,116 @@ impl Backend for Adapter {
     fn snapshot_with_progress(&self)->net::Result<(Vec<u8>,Vec<net::protocol::Progress>)> {
         self.spool(|o| Ok((snapshot_content(o)?, durable_progress(o)?)))
     }
+    fn create_snapshot(
+        &self,
+        recipient: net::NodeId,
+        config: &net::Config,
+    ) -> net::Result<net::snapshot::Manifest> {
+        let config = config.clone();
+        self.spool(move |o| {
+            use net::snapshot::*;
+            let now = net::retention::now_millis();
+            let schema = sha_schema(&o.schema)?;
+            for key in o
+                .store
+                .keys_with_prefix(OUT)
+                .into_iter()
+                .filter(|k| k.ends_with(b"/header"))
+            {
+                if let Some(bytes) = o.store.get(&key)? {
+                    let m: Manifest =
+                        net::decode(&bytes).map_err(|e| Error::Corrupt(e.to_string()))?;
+                    let pin = o
+                        .store
+                        .get(&pin_key(m.transfer))?
+                        .map(|b| net::decode::<Pin>(&b))
+                        .transpose()
+                        .map_err(|e| Error::Corrupt(e.to_string()))?;
+                    if m.recipient == recipient
+                        && m.expires > now
+                        && m.schema == schema
+                        && pin.is_some_and(|p| p.target.is_none())
+                    {
+                        return Ok(m);
+                    }
+                }
+            }
+            if o.store.keys_with_prefix(PINS).len() >= config.staging_transfers {
+                return Err(Error::Limit("snapshot transfer count".into()));
+            }
+            let data = snapshot_content(o)?;
+            let mut used = data.len();
+            for key in o
+                .store
+                .keys_with_prefix(OUT)
+                .into_iter()
+                .filter(|k| !k.ends_with(b"/header"))
+            {
+                used = used
+                    .checked_add(o.store.get(&key)?.map_or(0, |b| b.len()))
+                    .ok_or(Error::Limit("snapshot staging bytes".into()))?;
+                if used > config.snapshot_staging_bytes {
+                    return Err(Error::Limit("snapshot staging bytes".into()));
+                }
+            }
+            let (manifest, records) = build(
+                (o.identity.database, o.identity.node),
+                recipient,
+                data,
+                durable_progress(o)?,
+                schema,
+                &config,
+                now,
+            )
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+            let changes: Vec<_> = records
+                .into_iter()
+                .map(|r| match r.value {
+                    Some(v) => spool::Mutation::put(r.key, v),
+                    None => spool::Mutation::delete(r.key),
+                })
+                .collect();
+            o.store.commit(&changes, spool::Durability::Sync)?;
+            Ok(manifest)
+        })
+    }
+    fn acknowledge_snapshot(
+        &self,
+        recipient: net::NodeId,
+        transfer: net::NodeId,
+        digest: [u8; 32],
+    ) -> net::Result<()> {
+        self.spool(move |o| {
+            use net::snapshot::*;
+            let key = pin_key(transfer);
+            let Some(bytes) = o.store.get(&key)? else {
+                return Ok(());
+            };
+            let mut pin: Pin = net::decode(&bytes).map_err(|e| Error::Corrupt(e.to_string()))?;
+            if pin.recipient != recipient || pin.digest != digest {
+                return Err(Error::Invalid("snapshot acknowledgement identity".into()));
+            }
+            if pin.expires <= net::retention::now_millis() {
+                return Err(Error::Invalid("snapshot acknowledgement expired".into()));
+            }
+            if pin.target.is_none() {
+                pin.target = Some(
+                    durable_progress(o)?
+                        .into_iter()
+                        .map(|p| (p.origin, p.applied))
+                        .collect(),
+                );
+                o.store.commit(
+                    &[spool::Mutation::put(
+                        key,
+                        net::encode(&pin).map_err(|e| Error::Invalid(e.to_string()))?,
+                    )],
+                    spool::Durability::Sync,
+                )?;
+            }
+            Ok(())
+        })
+    }
     fn retention_checkpoint(&self)->net::Result<()> {
         self.spool(|o| {
             crate::storage::snapshot(o)?;
@@ -39,10 +155,23 @@ impl Backend for Adapter {
         })
     }
     fn prune_history(&self,origin:[u8;16],through:u64)->net::Result<u64> {
-        self.spool(move|o| {
+        let database = self.database()?;
+        let ticket = database.inner.scheduler.admit(crate::scheduler::WriterClass::Maintenance).map_err(error)?;
+        let res = self.spool(move|o| {
             use net::{protocol::*,retention::*};
             let old=o.store.get(&floor_key(origin))?.map(|b|decode::<u64>(&b)).transpose()?.unwrap_or(0);
             if through<=old {return Ok(0);}
+            // Recheck transfer obligations on this same serialized worker that
+            // publishes captures, so a newly created pin cannot be missed.
+            for key in o.store.keys_with_prefix(net::snapshot::PINS) {
+                if let Some(bytes)=o.store.get(&key)? {
+                    let pin:net::snapshot::Pin=net::decode(&bytes).map_err(|e|Error::Corrupt(e.to_string()))?;
+                    if pin.expires>net::retention::now_millis() && through>pin.boundary.get(&origin).copied().unwrap_or(0) {
+                        return Err(Error::Busy);
+                    }
+                }
+            }
+
             let bytes=o.store.get(COVERAGE_KEY)?.ok_or_else(||Error::Invalid("retention snapshot missing".into()))?;
             let (sequence,coverage):(u64,std::collections::BTreeMap<[u8;16],u64>)=decode(&bytes)?;
             if sequence>o.sequence || coverage.get(&origin).copied().unwrap_or(0)<through {
@@ -71,14 +200,30 @@ impl Backend for Adapter {
             changes.push(spool::Mutation::put(b"07/replication/retention/collected".to_vec(),encode(&total.saturating_add(count))?));
             o.store.commit(&changes,spool::Durability::Sync)?;
             Ok(count)
-        })
+        });
+        drop(ticket);
+        res
     }
-    fn reclaim_retention(&self)->net::Result<()> { self.spool(|o|o.store.reclaim().map_err(Error::from)) }
+    fn reclaim_retention(&self)->net::Result<()> {
+        let database = self.database()?;
+        let ticket = database.inner.scheduler.admit(crate::scheduler::WriterClass::Maintenance).map_err(error)?;
+        let res = self.spool(|o|o.store.reclaim().map_err(Error::from));
+        drop(ticket);
+        res
+    }
     fn schema(&self)->net::Result<Vec<u8>>{self.spool(|o|encode(&canonical_schema(&crate::table_replication::filter_schema(&o.schema))?))}
     fn observe(&self,millis:u64,logical:u32)->net::Result<()>{self.database()?.call(move|c|{c.collection_clock=c.collection_clock.max(Version{millis,logical,node:[0xff;16]});Ok(())}).map_err(error)}
-    fn accept_schema(&self,bytes:Vec<u8>)->net::Result<bool>{let incoming:Schema=decode(&bytes).map_err(error)?;self.database()?.call(move|c|c.adopt_schema(incoming)).map_err(error)}
+    fn accept_schema(&self,bytes:Vec<u8>)->net::Result<bool>{
+        let incoming:Schema=decode(&bytes).map_err(error)?;
+        let database = self.database()?;
+        let ticket = database.inner.scheduler.admit(crate::scheduler::WriterClass::Remote).map_err(error)?;
+        let res = database.call(move|c|c.adopt_schema(incoming)).map_err(error);
+        drop(ticket);
+        res
+    }
     fn apply(&self,payloads:Vec<Vec<u8>>,records:Vec<Record>)->net::Result<bool>{
         let database=self.database()?;
+        let ticket = database.inner.scheduler.admit(crate::scheduler::WriterClass::Remote).map_err(error)?;
         let cursor=database.call(|c|{let s=c.status.lock().unwrap();if s.committed!=c.captured_cursor || s.durable!=c.captured_cursor || s.storage_error.is_some(){return Ok(None);}Ok(Some(s.committed))}).map_err(error)?;
         let Some(cursor)=cursor else{return Ok(false);};
         let (patch, auxiliary)=self.spool(move|o|{if o.cursor!=cursor{return Err(Error::Busy);}let baseline=metadata::state(&o.store,o.schema.clone(),o.identity.database,o.clock)?;let mut joined=baseline.clone();let mut auxiliary=Vec::new();for payload in payloads {
@@ -104,7 +249,9 @@ impl Backend for Adapter {
         // the state, receipt, watermark and cleanup commit together.
         let (tx, rx) = mpsc::channel();
         self.worker.send(Work::Barrier(tx)).map_err(|_| net::Error::Unavailable("storage worker stopped".into()))?;
-        rx.recv().map_err(|_|net::Error::Unavailable("durability reply lost".into()))?.map_err(error)?;Ok(true)
+        rx.recv().map_err(|_|net::Error::Unavailable("durability reply lost".into()))?.map_err(error)?;
+        drop(ticket);
+        Ok(true)
     }
 }
 pub(crate) fn attach(database:&Database,config:net::Config)->Result<net::Handle>{let adapter=Arc::new(Adapter{inner:Arc::downgrade(&database.inner),worker:database.inner.worker.clone(),identity:(database.database_id(),database.node_id())});net::start(config,adapter).map_err(|e|Error::Invalid(e.to_string()))}
@@ -116,6 +263,8 @@ impl Core {
         self.capture.take();self.connection.execute_batch("BEGIN IMMEDIATE")?;
         let result=(||->Result<()>{for row in &patch.deleted{let table=self.schema.tables.iter().find(|t|t.id==row.table).ok_or(Error::SchemaMismatch)?;let predicate=schema::pk_columns(table).iter().map(|c|format!("{} IS ?",quote(&c.name))).collect::<Vec<_>>().join(" AND ");self.connection.execute(&format!("DELETE FROM {} WHERE {predicate}",quote(&table.name)),rusqlite::params_from_iter(&row.key))?;}for row in &patch.rows{let table=self.schema.tables.iter().find(|t|t.id==row.table).ok_or(Error::SchemaMismatch)?;schema::put_user_row(&self.connection,table,row)?;}self.connection.execute_batch("COMMIT")?;Ok(())})();
         if result.is_err(){let _=self.connection.execute_batch("ROLLBACK");}self.capture=Some(schema::capture(&self.connection,&self.schema)?);result?;
+        self.search.rows(&self.schema, &patch.rows);self.search.rows(&self.schema, &patch.deleted);
+        self.status.lock().unwrap().search_indexes = self.search.status();
         let cursor=self.bump()?;self.collection_clock=self.collection_clock.max(patch.state.clock);
         self.send(Event::ReplicaPatch{rows:patch.rows,deleted:patch.deleted,tombstones:patch.tombstones,clock:patch.state.clock,records:records.into_iter().map(|r|(r.key,r.value)).collect(),remint},cursor,bytes)?;self.captured_cursor=cursor;Ok(true)
     }
@@ -151,6 +300,33 @@ fn snapshot_content(o:&mut Opened)->Result<Vec<u8>> {
 fn key_sequence(key:&[u8])->Result<u64> {
     std::str::from_utf8(key).ok().and_then(|key|key.rsplit('/').next()).and_then(|s|s.parse().ok())
         .ok_or_else(||Error::Corrupt("replication sequence key".into()))
+}
+// Application of a snapshot may race with a file publication that advances
+// progress without changing the SQLite cursor. Resolve watermarks at commit time.
+pub(crate) fn monotonic_progress(
+    o: &Opened,
+    records: &mut [(Vec<u8>, Option<Vec<u8>>)],
+) -> Result<()> {
+    let mut seen = std::collections::BTreeMap::<Vec<u8>, u64>::new();
+    for (key, value) in records {
+        if key.starts_with(b"07/replication/applied/") {
+            if let Some(bytes) = value {
+                let old = match seen.get(key) {
+                    Some(v) => *v,
+                    None => o
+                        .store
+                        .get(key)?
+                        .map(|b| decode::<u64>(&b))
+                        .transpose()?
+                        .unwrap_or(0),
+                };
+                let next = decode::<u64>(bytes)?.max(old);
+                *bytes = encode(&next)?;
+                seen.insert(key.clone(), next);
+            }
+        }
+    }
+    Ok(())
 }
 fn durable_progress(o:&Opened)->Result<Vec<net::protocol::Progress>> {
     let mut entries=Vec::new();for key in o.store.keys_with_prefix(b"07/replication/applied/") {
@@ -282,12 +458,12 @@ impl Core {
             }
         }
         if ddl.is_empty(){return Ok(true);}
-        let before=schema::read_rows(&self.connection,&self.schema)?;self.capture.take();self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let before=schema::read_rows(&self.connection,&self.schema)?;let previous_search=self.search.clone();self.capture.take();self.connection.execute_batch("BEGIN IMMEDIATE")?;
         let result=(||->Result<(Schema,Vec<RowState>)>{self.connection.execute_batch(&ddl)?;let migration=Migration::new(ddl.clone());let mut actual=schema::inspect(&self.connection,&self.schema,&migration)?;
             for table in &mut actual.tables {let intended=target.tables.iter().find(|t|t.name==table.name).ok_or(Error::SchemaMismatch)?;table.id=intended.id.clone();for column in &mut table.columns {let definition=intended.columns.iter().find(|c|c.name==column.name).ok_or(Error::SchemaMismatch)?;column.id=definition.id.clone();column.policy=definition.policy;}}
-            actual.history=canonical_schema(&actual)?.history;let after=schema::read_rows(&self.connection,&actual)?;self.connection.execute_batch("COMMIT")?;Ok((actual,after))})();
-        let (actual,after)=match result {Ok(v)=>v,Err(e)=>{let _=self.connection.execute_batch("ROLLBACK");self.capture=Some(schema::capture(&self.connection,&self.schema)?);return Err(e);}};
-        self.schema=actual.clone();crate::database::configure_authorizer(&self.connection,&self.schema,self.access.clone())?;let bytes=encode(&before)?.len()+encode(&after)?.len()+ddl.len();let cursor=self.bump()?;self.capture=Some(schema::capture(&self.connection,&actual)?);
+            actual.history=canonical_schema(&actual)?.history;self.search.sync_schema(&self.connection,&actual,true)?;self.search.refresh(&self.connection,&actual)?;let after=schema::read_rows(&self.connection,&actual)?;self.connection.execute_batch("COMMIT")?;Ok((actual,after))})();
+        let (actual,after)=match result {Ok(v)=>v,Err(e)=>{let _=self.connection.execute_batch("ROLLBACK");self.search=previous_search;self.search.publish_guard();self.capture=Some(schema::capture(&self.connection,&self.schema)?);return Err(e);}};
+        self.schema=actual.clone();crate::database::configure_authorizer(&self.connection,&self.schema,self.access.clone(),self.search.guard.clone())?;self.status.lock().unwrap().search_indexes=self.search.status();let bytes=encode(&before)?.len()+encode(&after)?.len()+ddl.len();let cursor=self.bump()?;self.capture=Some(schema::capture(&self.connection,&actual)?);
         self.send(Event::SchemaCaptured{migration:ddl,schema:actual.clone(),before,after,version:Version::default()},cursor,bytes)?;self.captured_cursor=cursor;
         Ok(true)
     }

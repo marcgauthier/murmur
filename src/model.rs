@@ -168,6 +168,13 @@ pub enum OpenMode {
 }
 #[derive(Clone)]
 pub struct Options {
+    /// Node-local, rebuildable search indexes over ordinary source tables.
+    pub search_indexes: Vec<crate::SearchIndex>,
+    /// Byte budget for disposable indexing work; overflow triggers a rebuild.
+    pub search_queue_bytes: usize,
+    /// Maximum rows processed per maintenance turn.
+    pub search_batch_rows: usize,
+    pub search_interval: Duration,
     #[cfg(feature = "replication")]
     pub replication: Option<murmur_replication::Config>,
     pub mode: OpenMode,
@@ -189,10 +196,16 @@ pub struct Options {
     pub node_id: Option<[u8; 16]>,
     pub fault_hooks: Option<std::sync::Arc<spool::FaultHooks>>,
     pub on_open_progress: Option<std::sync::Arc<dyn Fn(OpenProgress) + Send + Sync>>,
+    pub scheduler: crate::scheduler::SchedulerConfig,
 }
 impl std::fmt::Debug for Options {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("Options");
+        d.field("search_indexes", &self.search_indexes)
+            .field("search_queue_bytes", &self.search_queue_bytes)
+            .field("search_batch_rows", &self.search_batch_rows)
+            .field("search_interval", &self.search_interval)
+            .field("scheduler", &self.scheduler);
         #[cfg(feature = "replication")]
         d.field("replication", &self.replication);
         d.field("mode", &self.mode)
@@ -218,6 +231,10 @@ impl std::fmt::Debug for Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            search_indexes: Vec::new(),
+            search_queue_bytes: 8 << 20,
+            search_batch_rows: 256,
+            search_interval: Duration::from_millis(100),
             #[cfg(feature = "replication")]
             replication: None,
             mode: OpenMode::Existing,
@@ -237,11 +254,14 @@ impl Default for Options {
             node_id: None,
             fault_hooks: None,
             on_open_progress: None,
+            scheduler: crate::scheduler::SchedulerConfig::default(),
         }
     }
 }
 impl Options {
     pub(crate) fn validate(&self) -> Result<()> {
+        self.scheduler.validate()?;
+        crate::search::validate_options(self)?;
         #[cfg(feature = "replication")]
         if let Some(config) = &self.replication { config.validate().map_err(|e| Error::Invalid(e.to_string()))?; }
         if self.capture_interval.is_zero()
@@ -377,6 +397,7 @@ impl From<spool::Stats> for SpoolMetrics {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Status {
+    pub search_indexes: Vec<crate::SearchIndexStatus>,
     pub committed: u64,
     pub durable: u64,
     pub pending_bytes: usize,
@@ -386,6 +407,7 @@ pub struct Status {
     pub open_progress: Option<OpenProgress>,
     pub sqlite: Option<SqliteMetrics>,
     pub spool: Option<SpoolMetrics>,
+    pub scheduler: Option<crate::scheduler::SchedulerSnapshot>,
     #[cfg(feature = "replication")]
     pub replication: Option<murmur_replication::Status>,
 }

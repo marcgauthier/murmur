@@ -1,0 +1,8 @@
+[package]
+name = "murmur-live-cert-lifecycle"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+murmur-live-harness = { path = "../harness" }
+x509-parser = "0.18"

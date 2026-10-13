@@ -101,6 +101,7 @@ pub(crate) enum Work {
     Network(Box<dyn FnOnce(&mut Opened) + Send>),
     Export {
         rows: Vec<RowState>,
+        replicated_only: bool,
         reply: mpsc::Sender<Result<ReplicaState>>,
     },
     Merge {
@@ -116,6 +117,10 @@ pub(crate) enum Work {
     Barrier(mpsc::Sender<Result<()>>),
     Retry(mpsc::Sender<Result<()>>),
     Rotate(mpsc::Sender<Result<()>>),
+    RotateMasterKey {
+        key: Vec<u8>,
+        reply: mpsc::Sender<Result<()>>,
+    },
     Stop(mpsc::Sender<Result<()>>),
 }
 pub(crate) struct Opened {
@@ -651,6 +656,22 @@ pub(crate) fn start(
                             opened.store.rotate_key().map_err(Error::from)
                         });
                     }
+                    Work::RotateMasterKey { mut key, reply } => {
+                        let result = if let Some(e) = &failed {
+                            Err(Error::Storage(e.clone()))
+                        } else {
+                            match opened.store.rotate_master_key(&key, "") {
+                                Ok(()) => {
+                                    zeroize::Zeroize::zeroize(&mut opened.opts.master_key);
+                                    opened.opts.master_key = std::mem::take(&mut key);
+                                    Ok(())
+                                }
+                                Err(e) => Err(Error::from(e)),
+                            }
+                        };
+                        zeroize::Zeroize::zeroize(&mut key);
+                        let _ = reply.send(result);
+                    }
                     Work::Backup { destination, reply } => {
                         let result = if let Some(e) = &failed {
                             Err(Error::Storage(e.clone()))
@@ -666,7 +687,7 @@ pub(crate) fn start(
                             opened.store.flush().map_err(Error::from)
                         });
                     }
-                    Work::Export { rows, reply } => {
+                    Work::Export { rows, replicated_only, reply } => {
                         let result = if let Some(e) = &failed {
                             Err(Error::Storage(e.clone()))
                         } else {
@@ -677,7 +698,7 @@ pub(crate) fn start(
                                 rows,
                                 opened.clock,
                             ).map(|mut state| {
-                                crate::table_replication::filter(&mut state, &opened.schema);
+                                if replicated_only { crate::table_replication::filter(&mut state, &opened.schema); }
                                 state
                             })
                         };
@@ -862,6 +883,8 @@ fn materialize(o: &Opened, event: Event) -> Result<(Event, Vec<Mutation>, Versio
             )
         }
         Event::ReplicaPatch {rows,deleted,tombstones,clock,records,remint} => {
+            #[cfg(feature="replication")]
+            let records={let mut records=records;crate::network::monotonic_progress(o,&mut records)?;records};
             let mut changes=metadata::patch(&o.store,&rows,&deleted,&tombstones)?;
             changes.extend(records.iter().cloned().map(|(key,value)|match value{Some(v)=>Mutation::put(key,v),None=>Mutation::delete(key)}));
             (Event::ReplicaPatch{rows,deleted,tombstones,clock,records,remint},changes,clock)

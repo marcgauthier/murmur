@@ -94,34 +94,83 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn block(size:usize)->Arc<Block> {
-        Arc::new(Block{frame:vec![1;32],plain:vec![7;size],body:DecodedBody{group_id:1,block_index:0,block_count:1,records:vec![]}})
+    fn block(size: usize) -> Arc<Block> {
+        Arc::new(Block {
+            frame: vec![1; 32],
+            plain: vec![7; size],
+            body: DecodedBody {
+                group_id: 1,
+                block_index: 0,
+                block_count: 1,
+                records: vec![],
+            },
+        })
     }
-    fn admit(cache:&mut Cache,key:Key,b:&Arc<Block>) {cache.insert(key,b.clone());cache.insert(key,b.clone());}
+    fn admit(cache: &mut Cache, key: Key, b: &Arc<Block>) {
+        cache.insert(key, b.clone());
+        cache.insert(key, b.clone());
+    }
     #[test]
     fn disabled_and_oversized_blocks_are_never_cached() {
-        let b=block(100); for capacity in [0,b.bytes()-1] {let mut cache=Cache::new(capacity);admit(&mut cache,(1,0),&b);assert!(cache.get((1,0)).is_none());assert_eq!(cache.bytes,0);}
+        let b = block(100);
+        for capacity in [0, b.bytes() - 1] {
+            let mut cache = Cache::new(capacity);
+            admit(&mut cache, (1, 0), &b);
+            assert!(cache.get((1, 0)).is_none());
+            assert_eq!(cache.bytes, 0);
+        }
     }
     #[test]
     fn eviction_is_byte_bounded_and_uses_recent_access() {
-        let b=block(100);let mut cache=Cache::new(b.bytes()*2);admit(&mut cache,(1,0),&b);admit(&mut cache,(2,0),&b);
-        assert!(cache.get((1,0)).is_some());admit(&mut cache,(3,0),&b);
-        assert!(cache.get((2,0)).is_none());assert!(cache.get((1,0)).is_some());assert!(cache.get((3,0)).is_some());assert_eq!(cache.bytes,b.bytes()*2);
+        let b = block(100);
+        let mut cache = Cache::new(b.bytes() * 2);
+        admit(&mut cache, (1, 0), &b);
+        admit(&mut cache, (2, 0), &b);
+        assert!(cache.get((1, 0)).is_some());
+        admit(&mut cache, (3, 0), &b);
+        assert!(cache.get((2, 0)).is_none());
+        assert!(cache.get((1, 0)).is_some());
+        assert!(cache.get((3, 0)).is_some());
+        assert_eq!(cache.bytes, b.bytes() * 2);
     }
     #[test]
     fn sequential_scan_cannot_displace_hot_blocks_or_grow_probation_unbounded() {
-        let b=block(100);let mut cache=Cache::new(b.bytes());admit(&mut cache,(1,0),&b);
-        for seq in 2..10000 {cache.insert((seq,0),b.clone());assert!(cache.bytes<=cache.limit);}
-        assert!(cache.get((1,0)).is_some());assert_eq!(cache.probation.len(),4096);assert_eq!(cache.seen.len(),4096);
+        let b = block(100);
+        let mut cache = Cache::new(b.bytes());
+        admit(&mut cache, (1, 0), &b);
+        for seq in 2..10000 {
+            cache.insert((seq, 0), b.clone());
+            assert!(cache.bytes <= cache.limit);
+        }
+        assert!(cache.get((1, 0)).is_some());
+        assert_eq!(cache.probation.len(), 4096);
+        assert_eq!(cache.seen.len(), 4096);
     }
     #[test]
     fn clear_releases_buffers_without_invalidating_active_readers() {
-        let b=block(100);let weak=Arc::downgrade(&b);let mut cache=Cache::new(b.bytes());admit(&mut cache,(1,0),&b);drop(b);
-        let reader=cache.get((1,0)).unwrap();cache.clear();assert_eq!(reader.plain,vec![7;100]);assert_eq!(cache.bytes,0);assert!(cache.entries.is_empty());assert!(cache.seen.is_empty());
-        drop(reader);assert!(weak.upgrade().is_none());
+        let b = block(100);
+        let weak = Arc::downgrade(&b);
+        let mut cache = Cache::new(b.bytes());
+        admit(&mut cache, (1, 0), &b);
+        drop(b);
+        let reader = cache.get((1, 0)).unwrap();
+        cache.clear();
+        assert_eq!(reader.plain, vec![7; 100]);
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.entries.is_empty());
+        assert!(cache.seen.is_empty());
+        drop(reader);
+        assert!(weak.upgrade().is_none());
     }
     #[test]
     fn duplicate_insert_preserves_accounting() {
-        let b=block(100);let mut cache=Cache::new(b.bytes());admit(&mut cache,(1,0),&b);for _ in 0..100 {cache.insert((1,0),b.clone());}assert_eq!(cache.bytes,b.bytes());assert_eq!(cache.entries.len(),1);
+        let b = block(100);
+        let mut cache = Cache::new(b.bytes());
+        admit(&mut cache, (1, 0), &b);
+        for _ in 0..100 {
+            cache.insert((1, 0), b.clone());
+        }
+        assert_eq!(cache.bytes, b.bytes());
+        assert_eq!(cache.entries.len(), 1);
     }
 }

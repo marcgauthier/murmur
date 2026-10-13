@@ -64,9 +64,12 @@ pub(crate) struct Inner {
     pub(crate) thread: Mutex<Option<thread::JoinHandle<()>>>,
     status: Arc<Mutex<Status>>,
     identity: Identity,
+    pub(crate) sub_mgr: Arc<crate::subscription::SubscriptionManager>,
+    pub(crate) scheduler: Arc<crate::scheduler::WriterScheduler>,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
+        self.scheduler.close();
         #[cfg(feature = "replication")]
         if let Some(handle) = self.replication.get_mut().unwrap().take() { let _ = handle.close(); }
         let (tx, rx) = mpsc::channel();
@@ -85,6 +88,7 @@ impl Database {
     pub fn open(
         path: impl AsRef<std::path::Path>,
         key: impl AsRef<[u8]>,
+        #[allow(unused_mut)]
         mut options: Options,
     ) -> Result<Self> {
         #[cfg(feature = "replication")]
@@ -95,6 +99,7 @@ impl Database {
         #[cfg(feature = "replication")]
         let network_config = options.replication.clone();
         options.validate()?;
+        let scheduler_config = options.scheduler.clone();
         let path = path.as_ref().to_path_buf();
         let mut key = zeroize::Zeroizing::new(key.as_ref().to_vec());
         let (tx, rx) = mpsc::channel();
@@ -115,10 +120,16 @@ impl Database {
                     let schema = opened.schema.clone();
                     let cursor = opened.cursor;
                     let collection_clock = opened.clock;
+                    let mut search = crate::search::Manager::new(&options);
+                    crate::search::Manager::register(&connection, &options.search_indexes)?;
+                    search.sync_schema(&connection, &schema, options.mode == OpenMode::CreateNew)?;
+                    search.refresh(&connection, &schema)?;
+                    search.take_publications();
+                    state.lock().unwrap().search_indexes = search.status();
                     p.phase(OpenPhase::Finalizing);
                     let capture = Some(schema::capture(&connection, &schema)?);
                     let access = Arc::new(AtomicU8::new(0));
-                    configure_authorizer(&connection, &schema, access.clone())?;
+                    configure_authorizer(&connection, &schema, access.clone(), search.guard.clone())?;
                     let (store, worker, worker_thread) =
                         storage::start(opened, options.clone(), state.clone())?;
                     let final_progress = p.finish(&Ok(()));
@@ -128,6 +139,7 @@ impl Database {
                         s.durable = cursor;
                         s.open_progress = final_progress;
                     }
+                    let sub_mgr = Arc::new(crate::subscription::SubscriptionManager::new(identity.database, 1024));
                     let core = Core {
                         capture,
                         connection,
@@ -143,6 +155,9 @@ impl Database {
                         captured_cursor: cursor,
                         last_capture: Instant::now(),
                         pending_intents: Vec::new(),
+                        search,
+                        last_search: Instant::now(),
+                        sub_mgr: sub_mgr.clone(),
                     };
                     {
                         let mut s = state.lock().unwrap();
@@ -152,7 +167,7 @@ impl Database {
                 })();
                 let mut core = match setup {
                     Ok(c) => {
-                        let _ = start_tx.send(Ok((c.identity.clone(), c.worker.clone(), c.store.clone())));
+                        let _ = start_tx.send(Ok((c.identity.clone(), c.worker.clone(), c.store.clone(), c.sub_mgr.clone())));
                         c
                     }
                     Err(e) => {
@@ -162,10 +177,13 @@ impl Database {
                     }
                 };
                 loop {
-                    let delay = core
+                    let mut delay = core
                         .options
                         .capture_interval
                         .saturating_sub(core.last_capture.elapsed());
+                    if core.search.pending() {
+                        delay = delay.min(core.options.search_interval.saturating_sub(core.last_search.elapsed()));
+                    }
                     match rx.recv_timeout(delay) {
                         Ok(Message::Job(job)) => job(&mut core),
                         Ok(Message::Stop(reply)) => {
@@ -186,25 +204,32 @@ impl Database {
                         let _ = core.checkpoint();
                         core.last_capture = Instant::now();
                     }
+                    if core.search.pending() && core.last_search.elapsed() >= core.options.search_interval {
+                        let _ = core.maintain_search(false);
+                        core.last_search = Instant::now();
+                    }
                 }
             })?;
-        let (identity, worker, store) = match start_rx.recv().map_err(|_| Error::Closed)? {
+        let (identity, worker, store, sub_mgr) = match start_rx.recv().map_err(|_| Error::Closed)? {
             Ok(i) => i,
             Err(e) => {
                 let _ = handle.join();
                 return Err(e);
             }
         };
+        let scheduler = Arc::new(crate::scheduler::WriterScheduler::new(scheduler_config));
         let database = Self {
             inner: Arc::new(Inner {
                 tx,
                 worker,
                 store,
+                scheduler,
                 #[cfg(feature = "replication")]
                 replication: Mutex::new(None),
                 thread: Mutex::new(Some(handle)),
                 status,
                 identity,
+                sub_mgr,
             }),
         };
         #[cfg(feature = "replication")]
@@ -249,7 +274,10 @@ impl Database {
         T: Send + 'static,
         F: FnOnce(&Sql<'_>) -> Result<T> + Send + 'static,
     {
-        self.call(move |c| c.transaction(f))
+        let ticket = self.inner.scheduler.admit(crate::scheduler::WriterClass::Local)?;
+        let res = self.call(move |c| c.transaction(f));
+        drop(ticket);
+        res
     }
     pub fn read<T, F>(&self, f: F) -> Result<T>
     where
@@ -272,7 +300,46 @@ impl Database {
         })
     }
     pub fn migrate(&self, migration: Migration) -> Result<()> {
-        self.call(move |c| c.migrate(migration))
+        let ticket = self.inner.scheduler.admit(crate::scheduler::WriterClass::Maintenance)?;
+        let res = self.call(move |c| c.migrate(migration));
+        drop(ticket);
+        res
+    }
+    /// Collect pending writes and wait for local search indexes to catch up.
+    /// Does not wait for remote peers or require persistence to finish.
+    pub fn refresh_indexes(&self) -> Result<()> {
+        self.call(|c| { c.checkpoint()?; c.maintain_search(true) })
+    }
+    /// Replace node-local index definitions atomically and rebuild them.
+    /// Supply these definitions again in Options when reopening the database.
+    pub fn set_search_indexes(&self, definitions: Vec<crate::SearchIndex>) -> Result<()> {
+        self.call(move |c| {
+            c.writable()?;
+            c.checkpoint()?;
+            let mut options = c.options.clone();
+            options.search_indexes = definitions;
+            options.validate()?;
+            let mut search = crate::search::Manager::new(&options);
+            crate::search::Manager::register(&c.connection, &options.search_indexes)?;
+            c.connection.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> Result<()> {
+                c.search.drop_indexes(&c.connection)?;
+                search.sync_schema(&c.connection, &c.schema, false)?;
+                search.refresh(&c.connection, &c.schema)?;
+                c.connection.execute_batch("COMMIT")?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let _ = c.connection.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+            c.options = options;
+            c.search = search;
+            configure_authorizer(&c.connection, &c.schema, c.access.clone(), c.search.guard.clone())?;
+            c.status.lock().unwrap().search_indexes = c.search.status();
+            c.sub_mgr.notify_reset("search indexes reconfigured");
+            Ok(())
+        })
     }
     /// Persist a table's local replication setting with its schema in Spool.
     /// Tables default to enabled. Local writes remain durable when disabled.
@@ -354,6 +421,25 @@ impl Database {
             rx.recv().map_err(|_| Error::Closed)?
         })
     }
+    /// Replace the 32-byte application (master) key. Data keys are
+    /// rewrapped under the new key; bulk data is not re-encrypted.
+    /// The old key stops working immediately: reopen with `new_key`.
+    pub fn rotate_master_key(&self, new_key: [u8; 32]) -> Result<()> {
+        let ticket = self.inner.scheduler.admit(crate::scheduler::WriterClass::Maintenance)?;
+        let res = self.call(move |c| {
+            c.flush()?;
+            let (tx, rx) = mpsc::channel();
+            c.worker
+                .send(Work::RotateMasterKey {
+                    key: new_key.to_vec(),
+                    reply: tx,
+                })
+                .map_err(|_| Error::Closed)?;
+            rx.recv().map_err(|_| Error::Closed)?
+        });
+        drop(ticket);
+        res
+    }
     /// Retry retained checkpoints after the storage problem is resolved.
     pub fn retry_storage(&self) -> Result<()> {
         self.call(|c| {
@@ -364,14 +450,15 @@ impl Database {
         })
     }
     pub fn export_state(&self) -> Result<ReplicaState> {
-        self.call(|c| c.export())
+        self.call(|c| c.export(true))
     }
     pub fn merge_state(&self, state: ReplicaState) -> Result<()> {
         // Prepare joins off the database thread. If concurrent writes changed
         // the baseline, retry from a new durable boundary.
         for _ in 0..8 {
             let (worker, baseline, cursor) = self.call(|c| {
-                let baseline = c.export()?;
+                // Local-only rows must remain in the join and persisted metadata.
+                let baseline = c.export(false)?;
                 Ok((
                     c.worker.clone(),
                     baseline,
@@ -410,17 +497,41 @@ impl Database {
     pub fn status(&self) -> Status {
         let mut s = self.inner.status.lock().unwrap().clone();
         s.spool = Some(SpoolMetrics::from(self.inner.store.stats()));
+        s.scheduler = Some(self.inner.scheduler.snapshot());
         #[cfg(feature = "replication")]
         {
             s.replication = self.inner.replication.lock().unwrap().as_ref().map(|h| h.status());
         }
         s
     }
+    pub fn scheduler(&self) -> Arc<crate::scheduler::WriterScheduler> {
+        self.inner.scheduler.clone()
+    }
     pub fn database_id(&self) -> [u8; 16] {
         self.inner.identity.database
     }
     pub fn node_id(&self) -> [u8; 16] {
         self.inner.identity.node
+    }
+    pub fn key_inventory(&self) -> spool::KeyInventory {
+        self.inner.store.key_inventory()
+    }
+    pub fn schema(&self) -> Result<Schema> {
+        self.call(|c| Ok(c.schema.clone()))
+    }
+    /// Create a reactive query subscription observing local and replicated changes.
+    pub fn subscribe<T, Q, K>(
+        &self,
+        query: Q,
+        key_fn: K,
+        options: crate::subscription::SubscriptionOptions,
+    ) -> Result<crate::subscription::Subscription<T>>
+    where
+        T: Clone + PartialEq + Send + 'static,
+        Q: Fn(&Sql<'_>) -> rusqlite::Result<Vec<T>> + Send + Sync + 'static,
+        K: Fn(&T) -> Vec<u8> + Send + Sync + 'static,
+    {
+        crate::subscription::start_subscription(self, query, key_fn, options)
     }
     #[cfg(feature = "replication")]
     pub fn replication(&self) -> Option<murmur_replication::Handle> { self.inner.replication.lock().unwrap().clone() }
@@ -440,6 +551,7 @@ impl Database {
         if self.status().closed {
             return Ok(());
         }
+        self.inner.sub_mgr.close();
         #[cfg(feature = "replication")]
         if let Some(handle) = self.inner.replication.lock().unwrap().take() { handle.close().map_err(|e|Error::Storage(e.to_string()))?; }
         let (tx, rx) = mpsc::channel();
@@ -470,8 +582,22 @@ pub(crate) struct Core {
     pub(crate) captured_cursor: u64,
     last_capture: Instant,
     pending_intents: Vec<PolicyIntent>,
+    pub(crate) search: crate::search::Manager,
+    last_search: Instant,
+    pub(crate) sub_mgr: Arc<crate::subscription::SubscriptionManager>,
 }
 impl Core {
+    pub(crate) fn maintain_search(&mut self, all: bool) -> Result<()> {
+        let result = if all { self.search.refresh(&self.connection, &self.schema) }
+            else { self.search.tick(&self.connection, &self.schema) };
+        self.status.lock().unwrap().search_indexes = self.search.status();
+        let published = self.search.take_publications();
+        if !published.is_empty() {
+            let cursor = self.status.lock().unwrap().committed;
+            self.sub_mgr.notify_commit(cursor, &published);
+        }
+        result.map(|_| ())
+    }
     fn sqlite_metrics(&self) -> SqliteMetrics {
         let memory_used_bytes = unsafe { rusqlite::ffi::sqlite3_memory_used() as i64 };
         let memory_highwater_bytes = unsafe { rusqlite::ffi::sqlite3_memory_highwater(0) as i64 };
@@ -575,9 +701,13 @@ impl Core {
         self.capture = Some(new);
         let cursor = self.status.lock().unwrap().committed;
         let intents=std::mem::take(&mut self.pending_intents);
+        let affected = crate::metadata::tables_in_changeset(&bytes);
+        self.search.enqueue(&bytes, &affected);
+        self.status.lock().unwrap().search_indexes = self.search.status();
         self.send(Event::Delta { bytes, version, intents }, cursor, length)?;
         self.collection_clock = version;
         self.captured_cursor = cursor;
+        self.sub_mgr.notify_commit(cursor, &affected);
         {
             let mut status = self.status.lock().unwrap();
             status.checkpoint_pause = start.elapsed();
@@ -605,12 +735,12 @@ impl Core {
             .map_err(|_| Error::Closed)?;
         rx.recv().map_err(|_| Error::Closed)?
     }
-    fn export(&mut self) -> Result<ReplicaState> {
+    fn export(&mut self, replicated_only: bool) -> Result<ReplicaState> {
         self.flush()?;
         let rows = schema::read_rows(&self.connection, &self.schema)?;
         let (tx, rx) = mpsc::channel();
         self.worker
-            .send(Work::Export { rows, reply: tx })
+            .send(Work::Export { rows, replicated_only, reply: tx })
             .map_err(|_| Error::Closed)?;
         rx.recv().map_err(|_| Error::Closed)?
     }
@@ -694,6 +824,7 @@ impl Core {
         self.writable()?;
         self.checkpoint()?;
         let before = schema::read_rows(&self.connection, &self.schema)?;
+        let previous_search = self.search.clone();
         self.capture.take();
         self.connection.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<(Schema, Vec<RowState>, usize, Version)> {
@@ -702,9 +833,12 @@ impl Core {
             let sql_result = self.connection.execute_batch(&m.sql);
             self.access.store(0, Ordering::Relaxed);
             sql_result?;
+            #[allow(unused_mut)]
             let mut new = schema::inspect(&self.connection, &self.schema, &m)?;
             #[cfg(feature="replication")]
             crate::policy::configure(&mut new, self.options.replication.as_ref())?;
+            self.search.sync_schema(&self.connection, &new, true)?;
+            self.search.refresh(&self.connection, &new)?;
             let after = schema::read_rows(&self.connection, &new)?;
             let bytes =
                 encode(&before)?.len() + encode(&after)?.len() + m.sql.len() + encode(&new)?.len();
@@ -720,7 +854,8 @@ impl Core {
             Ok((new, after, bytes, version)) => {
                 self.collection_clock = version;
                 self.schema = new.clone();
-                configure_authorizer(&self.connection, &self.schema, self.access.clone())?;
+                configure_authorizer(&self.connection, &self.schema, self.access.clone(), self.search.guard.clone())?;
+                self.status.lock().unwrap().search_indexes = self.search.status();
                 self.capture = Some(schema::capture(&self.connection, &self.schema)?);
                 let cursor = self.bump()?;
                 self.send(
@@ -735,11 +870,15 @@ impl Core {
                     bytes,
                 )?;
                 self.captured_cursor = cursor;
+                self.sub_mgr.notify_reset("schema migration applied");
                 Ok(())
             }
             Err(e) => {
                 self.access.store(0, Ordering::Relaxed);
                 let _ = self.connection.execute_batch("ROLLBACK");
+                self.search = previous_search;
+                self.search.publish_guard();
+                self.status.lock().unwrap().search_indexes = self.search.status();
                 self.capture = Some(schema::capture(&self.connection, &self.schema)?);
                 Err(e)
             }
@@ -793,11 +932,16 @@ impl Core {
             }
             self.finish_commit()?;
             self.connection.execute_batch("COMMIT")?;
+            self.search.rows(&self.schema, &p.rows);
+            self.search.rows(&self.schema, &p.deleted);
+            self.status.lock().unwrap().search_indexes = self.search.status();
             self.capture = Some(schema::capture(&self.connection, &self.schema)?);
             let cursor = self.bump()?;
             self.collection_clock = self.collection_clock.max(p.state.clock);
             self.send(Event::Replica(p.state), cursor, bytes)?;
             self.captured_cursor = cursor;
+            let affected: Vec<String> = self.schema.tables.iter().map(|t| t.name.clone()).collect();
+            self.sub_mgr.notify_commit(cursor, &affected);
             Ok(())
         })();
         if result.is_err() {
@@ -826,7 +970,7 @@ enum Access {
     Write = 2,
     Migration = 3,
 }
-pub(crate) fn configure_authorizer(c: &Connection, s: &Schema, mode: Arc<AtomicU8>) -> Result<()> {
+pub(crate) fn configure_authorizer(c: &Connection, s: &Schema, mode: Arc<AtomicU8>, search: crate::search::Guard) -> Result<()> {
     let pk = s
         .tables
         .iter()
@@ -838,6 +982,7 @@ pub(crate) fn configure_authorizer(c: &Connection, s: &Schema, mode: Arc<AtomicU
         })
         .collect::<Vec<_>>();
     let policies:Vec<_>=s.tables.iter().flat_map(|t|t.columns.iter().filter(|c|c.policy!=MergePolicy::Lww).map(|c|(t.name.clone(),c.name.clone()))).collect();
+    let has_search = !search.read().unwrap().is_empty();
     c.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
         let access = match mode.load(Ordering::Relaxed) {
             1 => Access::Read,
@@ -846,6 +991,25 @@ pub(crate) fn configure_authorizer(c: &Connection, s: &Schema, mode: Arc<AtomicU
             _ => return Authorization::Allow,
         };
         let internal = |name: &str| name.to_ascii_lowercase().starts_with("_crdt_");
+        // Managed TEMP indexes are read-only to application SQL. Module maintenance
+        // runs with Access=0 on this connection, outside application callbacks.
+        // Ordinary MAIN-table operations cannot address managed TEMP objects.
+        // Schema validation separately rejects name collisions at migration time.
+        if has_search && context.database_name != Some("main") {
+            let guard = search.read().unwrap();
+            match context.action {
+                AuthAction::Read { table_name, .. } if guard.get(&table_name.to_ascii_lowercase()) == Some(&false) => return Authorization::Deny,
+                AuthAction::Insert { table_name } | AuthAction::Delete { table_name }
+                | AuthAction::Update { table_name, .. } | AuthAction::DropTable { table_name }
+                | AuthAction::AlterTable { table_name, .. }
+                | AuthAction::CreateTable { table_name } if guard.contains_key(&table_name.to_ascii_lowercase()) => return Authorization::Deny,
+                AuthAction::CreateIndex { table_name, .. } | AuthAction::DropIndex { table_name, .. }
+                    if guard.contains_key(&table_name.to_ascii_lowercase()) => return Authorization::Deny,
+                AuthAction::Reindex { index_name }
+                    if guard.contains_key(&index_name.to_ascii_lowercase()) => return Authorization::Deny,
+                _ => {}
+            }
+        }
         let allowed = match context.action {
             AuthAction::Select | AuthAction::Recursive => true,
             AuthAction::Read { table_name, .. } => !internal(table_name),
@@ -865,8 +1029,9 @@ pub(crate) fn configure_authorizer(c: &Connection, s: &Schema, mode: Arc<AtomicU
                 pragma_name,
                 pragma_value,
             } => {
-                ["table_xinfo", "table_info", "index_list", "index_info"].contains(&pragma_name)
-                    && pragma_value.is_some_and(|name| !internal(name))
+                (["table_xinfo", "table_info", "index_list", "index_info"].contains(&pragma_name)
+                    && pragma_value.is_some_and(|name| !internal(name)))
+                    || (pragma_name == "data_version" && pragma_value.is_none() && context.database_name == Some("temp"))
             }
             AuthAction::Reindex { index_name } => {
                 access == Access::Migration && !internal(index_name)

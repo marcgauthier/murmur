@@ -1,11 +1,17 @@
 //! Background replication. This crate owns no SQLite connections and no storage engine.
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod transfer_tests;
 pub mod bridge;
 pub mod files;
 pub mod policies;
 pub mod protocol;
 pub mod retention;
+pub mod snapshot;
 pub mod transport;
 mod engine;
+pub mod ftp;
 mod membership;
 mod queue;
 mod filefetch;
@@ -44,6 +50,15 @@ pub trait Backend: Send + Sync + 'static {
     fn snapshot(&self) -> Result<Vec<u8>>;
     /// Return logical state and applied progress from the same storage boundary.
     fn snapshot_with_progress(&self) -> Result<(Vec<u8>, Vec<protocol::Progress>)>;
+    /// Capture and publish an immutable transfer and its retention pin on the
+    /// serialized storage worker. Implementations must enforce the aggregate budget.
+    fn create_snapshot(&self, _recipient: NodeId, _config: &Config) -> Result<snapshot::Manifest> {
+        Err(Error::Unavailable("durable snapshots unsupported by backend".into()))
+    }
+    /// Atomically freeze the catch-up target after a durable recipient receipt.
+    fn acknowledge_snapshot(&self, _recipient: NodeId, _transfer: NodeId, _digest: [u8;32]) -> Result<()> {
+        Err(Error::Unavailable("durable snapshots unsupported by backend".into()))
+    }
     /// Make current logical state and its schema a durable recovery snapshot.
     fn retention_checkpoint(&self) -> Result<()>;
     /// Atomically recheck snapshot coverage, delete a bounded history prefix,
@@ -94,6 +109,10 @@ pub struct Config {
     pub staging_transfers: usize,
     pub max_transaction_bytes: usize,
     pub snapshot_bytes: usize,
+    /// Aggregate payload budget for each direction of durable snapshot staging.
+    pub snapshot_staging_bytes: usize,
+    /// Fixed lease for transfers and their history pins; reconnects do not renew it.
+    pub snapshot_transfer_lifetime: Duration,
     pub incoming_interval: Duration,
     pub anti_entropy_interval: Duration,
     pub retention: Duration,
@@ -106,10 +125,10 @@ pub struct Config {
 }
 impl Config {
     pub fn new(bind:SocketAddr, credentials:Credentials, signing_key:[u8;32]) -> Self {
-        Self {bind,advertise:None,credentials,signing_key:zeroize::Zeroizing::new(signing_key),trusted_origins:BTreeMap::new(),allowed_peers:BTreeSet::new(),allowed_networks:Vec::new(),trusted_snapshot_sources:BTreeSet::new(),bootstrap:Vec::new(),membership:true,dissemination:Dissemination::Gossip,accept_remote_schema:true,master:false,schema_master:None,fanout:4,repairs:2,sessions:32,connections:64,queue_bytes:64<<20,peer_queue_bytes:4<<20,staging_bytes:256<<20,staging_transfers:4096,max_transaction_bytes:64<<20,snapshot_bytes:512<<20,incoming_interval:Duration::from_secs(1),anti_entropy_interval:Duration::from_secs(10),retention:Duration::from_secs(3600),retention_interval:Duration::from_secs(60),minimum_retained:1000,maximum_offline:Duration::from_secs(7*86400),merge_policies:BTreeMap::new(),files:None,bridge:None}
+        Self {bind,advertise:None,credentials,signing_key:zeroize::Zeroizing::new(signing_key),trusted_origins:BTreeMap::new(),allowed_peers:BTreeSet::new(),allowed_networks:Vec::new(),trusted_snapshot_sources:BTreeSet::new(),bootstrap:Vec::new(),membership:true,dissemination:Dissemination::Gossip,accept_remote_schema:true,master:false,schema_master:None,fanout:4,repairs:2,sessions:32,connections:64,queue_bytes:64<<20,peer_queue_bytes:4<<20,staging_bytes:256<<20,staging_transfers:4096,max_transaction_bytes:64<<20,snapshot_bytes:512<<20,snapshot_staging_bytes:512<<20,snapshot_transfer_lifetime:Duration::from_secs(7*86400),incoming_interval:Duration::from_secs(1),anti_entropy_interval:Duration::from_secs(10),retention:Duration::from_secs(3600),retention_interval:Duration::from_secs(60),minimum_retained:1000,maximum_offline:Duration::from_secs(7*86400),merge_policies:BTreeMap::new(),files:None,bridge:None}
     }
     pub fn validate(&self) -> Result<()> {
-        if self.queue_bytes>128<<20 || self.connections>4096 || self.sessions>4096 || self.fanout==0 || self.repairs==0 || self.fanout+self.repairs>self.sessions || self.connections<self.sessions+8 || self.queue_bytes<self.peer_queue_bytes || self.peer_queue_bytes<protocol::CHUNK_BYTES+1024 || self.staging_bytes<self.max_transaction_bytes || self.staging_transfers==0 || self.max_transaction_bytes==0 || self.max_transaction_bytes>64<<20 || self.incoming_interval.is_zero() || self.anti_entropy_interval.is_zero() || self.retention_interval.is_zero() || self.maximum_offline.is_zero() || self.minimum_retained==0 || self.snapshot_bytes==0 || self.snapshot_bytes>512<<20 || self.credentials.chain.is_empty() || self.credentials.roots.is_empty() { return Err(Error::Invalid("inconsistent transport or capacity limits".into())); }
+        if self.queue_bytes>128<<20 || self.connections>4096 || self.sessions>4096 || self.fanout==0 || self.repairs==0 || self.fanout+self.repairs>self.sessions || self.connections<self.sessions+8 || self.queue_bytes<self.peer_queue_bytes || self.peer_queue_bytes<1<<20 || self.staging_bytes<self.max_transaction_bytes || self.staging_transfers==0 || self.max_transaction_bytes==0 || self.max_transaction_bytes>64<<20 || self.incoming_interval.is_zero() || self.anti_entropy_interval.is_zero() || self.retention_interval.is_zero() || self.maximum_offline.is_zero() || self.minimum_retained==0 || self.snapshot_transfer_lifetime.is_zero() || self.snapshot_staging_bytes==0 || self.snapshot_staging_bytes>512<<20 || self.snapshot_bytes==0 || self.snapshot_bytes>512<<20 || self.credentials.chain.is_empty() || self.credentials.roots.is_empty() { return Err(Error::Invalid("inconsistent transport or capacity limits".into())); }
         if self.master && self.schema_master.is_none() { return Err(Error::Invalid("schema master requires schema_master".into())); }
         if let Some(c)=&self.files { c.validate()?; }
         if let Some(c)=&self.bridge { c.validate()?; }
