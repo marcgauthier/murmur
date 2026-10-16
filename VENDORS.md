@@ -12,7 +12,7 @@ Crate authors below come from crate manifests when available. Cargo metadata doe
 |---|---:|---|---|---|
 | `aes-gcm` | `0.10.3` | murmur-replication (runtime), murmur-spool (runtime) | RustCrypto Developers | Not stated |
 | `argon2` | `0.5.3` | murmur-spool (runtime) | RustCrypto Developers | Not stated |
-| `blake3` | `1.8.7` | sqlite-session (runtime) | Jack O'Connor <oconnor663@gmail.com>, Samuel Neves | Not stated |
+| `blake3` | `1.8.7` | sqlite-session (runtime), sqlite-session-benchmark (runtime) | Jack O'Connor <oconnor663@gmail.com>, Samuel Neves | Not stated |
 | `chacha20poly1305` | `0.10.1` | murmur-replication (runtime) | RustCrypto Developers | Not stated |
 | `crc32c` | `0.6.8` | murmur-spool (runtime) | Zack Owens | Not stated |
 | `ed25519-dalek` | `2.2.0` | murmur-replication (runtime) | isis lovecruft <isis@patternsinthevoid.net>, Tony Arcieri <bascule@gmail.com>, Michael Rosenberg <michael@mrosenberg.pub> | Not stated |
@@ -32,6 +32,7 @@ Crate authors below come from crate manifests when available. Cargo metadata doe
 | `rustls` | `0.23.45` | murmur-replication (runtime) | Not stated in crate metadata | Not stated |
 | `rustls-pemfile` | `2.2.0` | murmur-replication (runtime) | Not stated in crate metadata | Not stated |
 | `serde` | `1.0.229` | murmur-replication (runtime), sqlite-session (runtime) | Erick Tryzelaar <erick.tryzelaar@gmail.com>, David Tolnay <dtolnay@gmail.com> | Not stated |
+| `serde_json` | `1.0.154` | sqlite-session (runtime), sqlite-session-benchmark (runtime), murmur-go (runtime) | Not stated in crate metadata | Not stated |
 | `sha2` | `0.10.9` | murmur-replication (runtime), murmur-spool (runtime) | RustCrypto Developers | Not stated |
 | `tempfile` | `3.27.0` | murmur-spool (dev/test), sqlite-session (dev/test), sqlite-session-benchmark (runtime), murmur-replication (dev/test) | Steven Allen <steven@stebalien.com>, The Rust Project Developers, Ashley Mannix <ashleymannix@live.com.au>, Jason White <me@jasonwhite.io> | Not stated |
 | `thiserror` | `2.0.21` | murmur-replication (runtime), sqlite-session (runtime) | David Tolnay <dtolnay@gmail.com> | Not stated |
@@ -193,7 +194,6 @@ These crates are in the lockfile but are not declared directly by any Murmur pac
 | `semver` | `1.0.28` | David Tolnay <dtolnay@gmail.com> | Not stated |
 | `serde_core` | `1.0.229` | Erick Tryzelaar <erick.tryzelaar@gmail.com>, David Tolnay <dtolnay@gmail.com> | Not stated |
 | `serde_derive` | `1.0.229` | Erick Tryzelaar <erick.tryzelaar@gmail.com>, David Tolnay <dtolnay@gmail.com> | Not stated |
-| `serde_json` | `1.0.154` | Not stated in crate metadata | Not stated |
 | `serde_urlencoded` | `0.7.1` | Anthony Ramine <n.oxyde@gmail.com> | Not stated |
 | `shlex` | `1.3.0`, `2.0.1` | comex <comexk@gmail.com>, Fenhl <fenhl@fenhl.net>, Adrian Taylor <adetaylor@chromium.org>, Alex Touchet <alextouchet@outlook.com>, Daniel Parks <dp+git@oxidized.org>, Garrett Berg <googberg@gmail.com> | Not stated |
 | `signature` | `2.2.0` | RustCrypto Developers | Not stated |
@@ -298,3 +298,17 @@ The native binding also depends on the internal `sqlite-session` and
 `murmur-spool` path packages. Go and Rust toolchains, a C compiler (GNU/MinGW or
 Apple's toolchain), LLVM/libclang, and platform system libraries are build/system
 prerequisites, not downloaded Go modules or additional Cargo runtime crates.
+
+## Optional benchmark profiling prerequisites
+
+The Linux `tests-benchmark/tools/profile_mesh.py` helper uses Python 3's standard
+library only; it adds no Python package or Cargo dependency. It optionally invokes
+`iostat` and `pidstat` from an installed sysstat distribution. Versions are system
+prerequisites rather than lockfile dependencies (this run used Python 3.12.3 and
+sysstat 12.6.1).
+
+| Tool | Organization / author | Country | Primary attribution |
+|---|---|---|---|
+| Python 3 and standard library | Python Software Foundation | United States (PSF organization) | [PSF legal information](https://www.python.org/about/legal/) |
+| sysstat (`iostat`, `pidstat`) | Sébastien Godard, creator and maintainer | Not stated as country of origin in upstream biography | [Author biography](https://sysstat.github.io/about) |
+| gperftools (`libprofiler`, `google-pprof`; optional component sampling) | gperftools contributors; originally developed at Google | Not stated by upstream profiling documentation | [Upstream CPU profiler documentation](https://gperftools.github.io/gperftools/cpuprofile.html) |

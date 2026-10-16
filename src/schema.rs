@@ -202,81 +202,235 @@ pub(crate) fn pk_columns(t: &Table) -> Vec<&Column> {
     pk.sort_by_key(|c| c.primary_key);
     pk
 }
+pub(crate) fn read_table_rows(c: &Connection, t: &Table) -> Result<Vec<RowState>> {
+    let mut rows = Vec::new();
+    let mut q = c.prepare(&format!(
+        "SELECT {} FROM {} ORDER BY {}",
+        t.columns
+            .iter()
+            .map(|c| quote(&c.name))
+            .collect::<Vec<_>>()
+            .join(","),
+        quote(&t.name),
+        pk_columns(t)
+            .iter()
+            .map(|c| quote(&c.name))
+            .collect::<Vec<_>>()
+            .join(",")
+    ))?;
+    let mut cursor = q.query([])?;
+    while let Some(row) = cursor.next()? {
+        let values = (0..t.columns.len())
+            .map(|i| Value::read(row.get_ref(i)?))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let key = pk_columns(t)
+            .iter()
+            .map(|col| values[t.columns.iter().position(|c| c.id == col.id).unwrap()].clone())
+            .collect::<Vec<_>>();
+        if key.iter().any(|v| matches!(v, Value::Null)) {
+            return Err(Error::Invalid("null primary key".into()));
+        }
+        rows.push(RowState {
+            table: t.id.clone(),
+            key,
+            generation: Version::default(),
+            cells: t
+                .columns
+                .iter()
+                .zip(values)
+                .map(|(c, value)| Cell {
+                    column: c.id.clone(),
+                    value,
+                    version: Version::default(),
+                })
+                .collect(),
+        });
+    }
+    Ok(rows)
+}
 // Used only for explicit export and schema migration, never normal commits.
 pub(crate) fn read_rows(c: &Connection, s: &Schema) -> Result<Vec<RowState>> {
     let mut rows = Vec::new();
     for t in &s.tables {
-        let mut q = c.prepare(&format!(
-            "SELECT {} FROM {} ORDER BY {}",
-            t.columns
-                .iter()
-                .map(|c| quote(&c.name))
-                .collect::<Vec<_>>()
-                .join(","),
-            quote(&t.name),
-            pk_columns(t)
-                .iter()
-                .map(|c| quote(&c.name))
-                .collect::<Vec<_>>()
-                .join(",")
-        ))?;
-        let mut cursor = q.query([])?;
-        while let Some(row) = cursor.next()? {
-            let values = (0..t.columns.len())
-                .map(|i| Value::read(row.get_ref(i)?))
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let key = pk_columns(t)
-                .iter()
-                .map(|col| values[t.columns.iter().position(|c| c.id == col.id).unwrap()].clone())
-                .collect::<Vec<_>>();
-            if key.iter().any(|v| matches!(v, Value::Null)) {
-                return Err(Error::Invalid("null primary key".into()));
-            }
-            rows.push(RowState {
-                table: t.id.clone(),
-                key,
-                generation: Version::default(),
-                cells: t
-                    .columns
-                    .iter()
-                    .zip(values)
-                    .map(|(c, value)| Cell {
-                        column: c.id.clone(),
-                        value,
-                        version: Version::default(),
-                    })
-                    .collect(),
-            });
-        }
+        rows.extend(read_table_rows(c, t)?);
     }
     Ok(rows)
 }
-pub(crate) fn put_user_row(c: &Connection, t: &Table, row: &RowState) -> Result<()> {
-    let values = t
-        .columns
-        .iter()
-        .map(|col| {
-            row.cells
-                .iter()
-                .find(|v| v.column == col.id)
-                .map(|c| c.value.clone())
-                .ok_or_else(|| Error::Corrupt("missing cell".into()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    c.execute(
-        &format!(
-            "INSERT OR REPLACE INTO {}({}) VALUES({})",
-            quote(&t.name),
-            t.columns
-                .iter()
-                .map(|c| quote(&c.name))
-                .collect::<Vec<_>>()
-                .join(","),
-            vec!["?"; values.len()].join(",")
-        ),
-        rusqlite::params_from_iter(&values),
-    )?;
-    Ok(())
+
+fn row_approx_size(r: &RowState) -> usize {
+    64 + r.key.len() * 16
+        + r.cells
+            .iter()
+            .map(|c| {
+                c.column.len()
+                    + match &c.value {
+                        Value::Text(s) => s.len(),
+                        Value::Blob(b) => b.len(),
+                        _ => 16,
+                    }
+            })
+            .sum::<usize>()
+}
+
+pub(crate) fn chunk_migration_rows(
+    before: Vec<RowState>,
+    after: Vec<RowState>,
+    chunk_rows: usize,
+    max_chunk_bytes: usize,
+) -> Vec<(Vec<RowState>, Vec<RowState>)> {
+    if before.is_empty() && after.is_empty() {
+        return Vec::new();
+    }
+    let chunk_rows = chunk_rows.max(1);
+    let max_chunk_bytes = max_chunk_bytes.max(1024);
+
+    let mut table_order = Vec::new();
+    for r in &before {
+        if !table_order.contains(&r.table) {
+            table_order.push(r.table.clone());
+        }
+    }
+    for r in &after {
+        if !table_order.contains(&r.table) {
+            table_order.push(r.table.clone());
+        }
+    }
+
+    let mut before_by_table: std::collections::BTreeMap<String, Vec<RowState>> =
+        std::collections::BTreeMap::new();
+    for r in before {
+        before_by_table.entry(r.table.clone()).or_default().push(r);
+    }
+    let mut after_by_table: std::collections::BTreeMap<String, Vec<RowState>> =
+        std::collections::BTreeMap::new();
+    for r in after {
+        after_by_table.entry(r.table.clone()).or_default().push(r);
+    }
+
+    let mut chunks = Vec::new();
+
+    for table_id in table_order {
+        let b_rows = before_by_table.remove(&table_id).unwrap_or_default();
+        let a_rows = after_by_table.remove(&table_id).unwrap_or_default();
+
+        if b_rows.is_empty() && a_rows.is_empty() {
+            continue;
+        }
+
+        let mut b_iter = b_rows.into_iter().peekable();
+        let mut a_iter = a_rows.into_iter().peekable();
+
+        while b_iter.peek().is_some() || a_iter.peek().is_some() {
+            let mut chunk_b = Vec::new();
+            let mut chunk_a = Vec::new();
+            let mut count = 0;
+            let mut chunk_bytes = 0;
+
+            while (count < chunk_rows && chunk_bytes < max_chunk_bytes)
+                && (b_iter.peek().is_some() || a_iter.peek().is_some())
+            {
+                match (b_iter.peek(), a_iter.peek()) {
+                    (Some(b), Some(a)) => match cmp_values(&b.key, &a.key) {
+                        std::cmp::Ordering::Less => {
+                            let item = b_iter.next().unwrap();
+                            chunk_bytes += row_approx_size(&item);
+                            chunk_b.push(item);
+                        }
+                        std::cmp::Ordering::Greater => {
+                            let item = a_iter.next().unwrap();
+                            chunk_bytes += row_approx_size(&item);
+                            chunk_a.push(item);
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let item_b = b_iter.next().unwrap();
+                            let item_a = a_iter.next().unwrap();
+                            chunk_bytes += row_approx_size(&item_b) + row_approx_size(&item_a);
+                            chunk_b.push(item_b);
+                            chunk_a.push(item_a);
+                        }
+                    },
+                    (Some(_), None) => {
+                        let item = b_iter.next().unwrap();
+                        chunk_bytes += row_approx_size(&item);
+                        chunk_b.push(item);
+                    }
+                    (None, Some(_)) => {
+                        let item = a_iter.next().unwrap();
+                        chunk_bytes += row_approx_size(&item);
+                        chunk_a.push(item);
+                    }
+                    (None, None) => break,
+                }
+                count += 1;
+            }
+
+            if !chunk_b.is_empty() || !chunk_a.is_empty() {
+                chunks.push((chunk_b, chunk_a));
+            }
+        }
+    }
+
+    chunks
+}
+
+fn cmp_values(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    for (va, vb) in a.iter().zip(b.iter()) {
+        let ord = cmp_value(va, vb);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+fn cmp_value(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+        (Value::Real(x), Value::Real(y)) => x.total_cmp(y),
+        (Value::Integer(x), Value::Real(y)) => (*x as f64).total_cmp(y),
+        (Value::Real(x), Value::Integer(y)) => x.total_cmp(&(*y as f64)),
+        (Value::Integer(_) | Value::Real(_), _) => Ordering::Less,
+        (_, Value::Integer(_) | Value::Real(_)) => Ordering::Greater,
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        (Value::Text(_), _) => Ordering::Less,
+        (_, Value::Text(_)) => Ordering::Greater,
+        (Value::Blob(x), Value::Blob(y)) => x.cmp(y),
+    }
+}
+fn row_values<'a>(table:&Table,row:&'a RowState)->Result<Vec<&'a Value>> {
+    cell_values(table, &row.cells)
+}
+pub(crate) fn cell_values<'a>(table:&Table,cells:&'a [Cell])->Result<Vec<&'a Value>> {
+    table.columns.iter().map(|column|cells.iter().find(|cell|cell.column==column.id).map(|cell|&cell.value).ok_or_else(||Error::Corrupt("missing cell".into()))).collect()
+}
+pub(crate) fn row_insert_sql(table:&Table)->String {
+    format!("INSERT OR REPLACE INTO {}({}) VALUES({})",quote(&table.name),table.columns.iter().map(|column|quote(&column.name)).collect::<Vec<_>>().join(","),vec!["?";table.columns.len()].join(","))
+}
+pub(crate) fn put_user_row(c:&Connection,table:&Table,row:&RowState)->Result<()> {
+    let values=row_values(table,row)?;
+    c.prepare_cached(&row_insert_sql(table))?.execute(rusqlite::params_from_iter(&values))?;Ok(())
+}
+/// Preserve row order while reusing a statement for adjacent rows in a table.
+#[cfg(feature="replication")]
+pub(crate) fn put_user_rows(c:&Connection,schema:&Schema,rows:&[RowState])->Result<()> {
+    for group in rows.chunk_by(|a,b|a.table==b.table) {
+        let table=schema.tables.iter().find(|table|table.id==group[0].table).ok_or(Error::SchemaMismatch)?;
+        let mut statement=c.prepare_cached(&row_insert_sql(table))?;
+        for row in group {let values=row_values(table,row)?;statement.execute(rusqlite::params_from_iter(&values))?;}
+    }Ok(())
+}
+#[cfg(feature="replication")]
+pub(crate) fn delete_user_rows(c:&Connection,schema:&Schema,rows:&[RowState])->Result<()> {
+    for group in rows.chunk_by(|a,b|a.table==b.table) {
+        let table=schema.tables.iter().find(|table|table.id==group[0].table).ok_or(Error::SchemaMismatch)?;
+        let predicate=pk_columns(table).iter().map(|column|format!("{} IS ?",quote(&column.name))).collect::<Vec<_>>().join(" AND ");
+        let mut statement=c.prepare_cached(&format!("DELETE FROM {} WHERE {predicate}",quote(&table.name)))?;
+        for row in group {statement.execute(rusqlite::params_from_iter(&row.key))?;}
+    }Ok(())
 }
 
 /// Table named by a plain `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON

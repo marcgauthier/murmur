@@ -128,3 +128,65 @@ fn single_large_transaction_converges() {
     a.close().unwrap();
     b.close().unwrap();
 }
+
+#[test]
+fn transaction_above_spool_value_limit_replicates_and_reopens() {
+    let temp=tempfile::tempdir().unwrap();let mut cfg=configs();
+    let opts=|config,mode|Options{mode,database_id:Some([7;16]),replication:Some(config),capture_interval:Duration::from_secs(3600),..Options::default()};
+    let first=cfg.remove(0);let second=cfg.remove(0);
+    let a=Database::open(temp.path().join("a"),[9;32],opts(first.clone(),OpenMode::CreateNew)).unwrap();
+    let b=Database::open(temp.path().join("b"),[9;32],opts(second.clone(),OpenMode::CreateNew)).unwrap();
+    for db in [&a,&b] {db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,value BLOB NOT NULL)")).unwrap();db.flush().unwrap();}
+    a.transaction(|s|{for id in 0..10 {s.execute("INSERT INTO items VALUES(?,zeroblob(2100000))",[id])?;}Ok(())}).unwrap();a.flush().unwrap();
+    b.replication().unwrap().add_peer(a.replication().unwrap().status().address.unwrap()).unwrap();
+    let deadline=Instant::now()+Duration::from_secs(60);while count(&b)!=10 {assert!(Instant::now()<deadline,"large transfer stalled: {:?}",b.replication().unwrap().status());std::thread::sleep(Duration::from_millis(20));}
+    b.flush().unwrap();a.close().unwrap();b.close().unwrap();drop(a);drop(b);
+    let b=Database::open(temp.path().join("b"),[9;32],opts(second,OpenMode::Existing)).unwrap();assert_eq!(count(&b),10);
+    assert_eq!(b.read(|s|Ok(s.query_row("SELECT sum(length(value)) FROM items",[],|r|r.get::<_,i64>(0))?)).unwrap(),21_000_000);b.close().unwrap();
+}
+
+/// Wire payloads include CRDT/schema overhead, so 63 MiB of row data tests
+/// near the 64 MiB limit without assuming application bytes equal wire bytes.
+#[test]
+#[ignore = "release large-transfer boundary matrix; run in isolation"]
+fn large_transfer_boundaries_and_oversized_row_recover() {
+    for (rows, bytes) in [(32i64, 1usize << 20), (63, 1 << 20), (1, 32 << 20)] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = configs();
+        let opts = |config, mode| Options {
+            mode,
+            database_id: Some([7; 16]),
+            replication: Some(config),
+            capture_interval: Duration::from_secs(3600),
+            queue_bytes: 128 << 20,
+            ..Options::default()
+        };
+        let first = cfg.remove(0);
+        let second = cfg.remove(0);
+        let a = Database::open(temp.path().join("a"), [9; 32], opts(first, OpenMode::CreateNew)).unwrap();
+        let b = Database::open(temp.path().join("b"), [9; 32], opts(second.clone(), OpenMode::CreateNew)).unwrap();
+        for db in [&a, &b] {
+            db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,value BLOB NOT NULL)")).unwrap();
+            db.flush().unwrap();
+        }
+        a.transaction(move |sql| {
+            for id in 0..rows {sql.execute("INSERT INTO items VALUES(?,zeroblob(?))", (id, bytes as i64))?;}
+            Ok(())
+        }).unwrap();
+        a.flush().unwrap();
+        b.replication().unwrap().add_peer(a.replication().unwrap().status().address.unwrap()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while count(&b) != rows {
+            assert!(Instant::now() < deadline, "{rows} x {bytes} boundary stalled: {:?}", b.replication().unwrap().status());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        b.flush().unwrap();
+        a.close().unwrap(); b.close().unwrap(); drop(a); drop(b);
+        let recovered = Database::open(temp.path().join("b"), [9; 32], opts(second, OpenMode::Existing)).unwrap();
+        assert_eq!(count(&recovered), rows);
+        assert_eq!(recovered.read(|sql| Ok(sql.query_row("SELECT sum(length(value)) FROM items", [], |row| row.get::<_,i64>(0))?)).unwrap(), rows * bytes as i64);
+        // Check content as well as length: every transferred byte must be zero.
+        assert_eq!(recovered.read(|sql| Ok(sql.query_row("SELECT count(*) FROM items WHERE value != zeroblob(length(value))", [], |row| row.get::<_,i64>(0))?)).unwrap(), 0);
+        recovered.close().unwrap();
+    }
+}

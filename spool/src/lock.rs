@@ -20,11 +20,14 @@ pub(crate) struct StoreLock {
 
 /// Take the store lock. Double opens fail with [`ErrorKind::Locked`].
 pub(crate) fn lock_store(dir: &Path) -> Result<StoreLock> {
-    let f = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts
         .open(dir.join(LOCK_FILE_NAME))
         .map_err(|e| err(ErrorKind::Io, format!("lock file: {e}")))?;
     f.try_lock_exclusive()

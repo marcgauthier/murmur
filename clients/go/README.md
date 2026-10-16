@@ -33,6 +33,12 @@ CI builds and tests each target. Native binaries are built locally into ignored
 library fingerprint so Go's build cache notices native changes. Rebuild after
 changing Rust code. `CGO_ENABLED=0` is unsupported. There are no external Go modules.
 
+Use `./clients/go/build.sh --release` (PowerShell: `./clients/go/build.ps1 -Release`)
+before linking an application for realistic startup and throughput measurements.
+The default build is debug. Running `go build` in a consuming application only
+links the installed native archive; it does not rebuild Rust sources, even with
+a local Go module replacement.
+
 For another application, use a local module replacement until distributing a
 native build with your application:
 
@@ -54,6 +60,12 @@ Start with `DefaultOptions()`, set `Mode = CreateNew` for a new directory, and
 call `Open(path, secret32ByteKey, options)`. A zero `Options{}` is not a defaults
 constructor. `Existing` reopens persisted state; `Flush` is the explicit durability
 barrier. A successful application transaction alone does not guarantee persistence.
+
+Spool's index includes fixed namespace hints for prefix searches: 32 KiB with
+the default 256 shards. These contain no record values, are rebuilt on open,
+and can cause extra searches when hashes collide or namespaces have been deleted.
+Setting `SpoolCacheBytes` to zero disables the decoded-block cache; these fixed
+index hints remain. See the [root usage guide](../../USAGE.md) for memory options.
 
 ## SQL and transactions
 
@@ -106,11 +118,15 @@ Rust, including primary keys, transaction control, and reserved objects. See the
 | Subscriptions | `SubscribeRows`, generic `Subscribe[T]`, `RowCodec[T]`, `RecvContext`, `RecvTimeout`, `TryRecv`, `Close` | [subscriptions](examples/subscriptions/main.go) |
 | Counters, sets, min/max | `sql.CounterAdd`, `SetAdd`, `SetRemove`, `Min`, `Max`; causal policies require replication configuration | [policies](examples/policies/main.go), [retention](examples/retention/main.go) |
 | Network replication | `NewReplicationConfig`, `Credentials`, trust/allow lists, `Options.Replication`, `DB.Replication`; returned `Replication` exposes peer management, status, sync and retention | [replication](examples/replication/main.go) |
+| Continuous replication and bounded batches | `BatchTransactions`, `BatchBytes`, opt-in `AdaptiveSync`; byte/count limits bound each batch, not transactions per second | [replication](examples/replication/main.go) |
+| Streamed snapshot installation | `BuildSnapshotStream`, `FinishSnapshot`; verified pages become visible incrementally, final progress waits for completion | [snapshots](examples/snapshots/main.go) |
 | Replication retention | `RetentionStatus`, `CollectRetention`, `RetirePeer`, minimum age/count and offline protection | [retention](examples/retention/main.go), [snapshots](examples/snapshots/main.go) |
 | Files | `NewFileConfig`, `UploadFile`, `GetFile`, `ListFiles`, `SearchFiles`, metadata/availability/deletion/key rotation; `Objects` exposes standalone lifecycle and chunk operations | [files](examples/files/main.go), [bridge](examples/bridge/main.go) |
 | Backup and key management | `Backup`, `VerifyBackup`, `Restore` with `RestoreOptions`, `RotateDataKey`, `RotateMasterKey`, `KeyInventory` | [backup](examples/backup/main.go), [keys](examples/keys/main.go) |
 | Scheduling and metrics | `Scheduler`, `NewWriterScheduler`, `Admit`, `AdmitTimeout`, `Ticket.Release`, scheduler snapshots, `Status`, `SQLiteMetrics`, `SpoolMetrics` | [scheduler](examples/scheduler/main.go) |
-| Standalone backend | Implement `Backend`, `RegisterBackend`, `BindSigner`, `StartReplication`; record-only teaching implementation | [backend](examples/backend/main.go), [files](examples/files/main.go) |
+| Batched backend reads | Optional `BatchBackend`, `BackendHandle.GetMany`, `GetManyBounded`; ordered bounded prefixes | [backend](examples/backend/main.go) |
+| Blocking scheduler utility | `RunBlocking` invokes Rust; ordinary Go calls run inline | [backend](examples/backend/main.go) |
+| Standalone backend | Implement `Backend`, `RegisterBackend`, `BindSigner`, `BackendHandle.Progress`, `GetMany`, `GetManyBounded`, optional `BatchBackend`, `RunBlocking`, `StartReplication`; record-only teaching implementation | [backend](examples/backend/main.go), [files](examples/files/main.go) |
 | High/Low bridge | `ExporterConfig`, `ReceiverConfig`, `OpenBridge`, `Capture`, `Export`, `Stage`, `Process`, `ReleaseOwnership`, `PublishHTTP`, `PublishFTP` | [bridge](examples/bridge/main.go), [bridge-transports](examples/bridge-transports/main.go) |
 | Snapshot protocol | `BuildSnapshot`, manifest `Verify`, `AcceptSnapshot`, `ReceiveSnapshot`, `MissingSnapshot`, `FinishSnapshot`, outgoing/cancel/maintenance/prune helpers | [snapshots](examples/snapshots/main.go), [retention](examples/retention/main.go) |
 | Transport, crypto and wire format | `NewEndpoint`, `Connect`/`Accept`, bidirectional streams, `ReadMessage`/`WriteMessage`, `Encode`/`Decode`, signing/verification, `StorageKey`, `Constants` | [protocol](examples/protocol/main.go), [bridge-transports](examples/bridge-transports/main.go) |
@@ -174,3 +190,27 @@ test exchanges persisted source rows and checks a Go FTS index. Running tests wi
 a fixture skips that test with an explicit reason. Set `MURMUR_RUST_FIXTURE` to the
 fixture binary to choose its path. Native ABI tests cover malformed requests,
 invalid scopes, unwind containment, defaults, and integer codec fidelity.
+
+Database capture now defaults to one second. Incoming application drains continuously;
+`IncomingInterval` is a recovery retry interval capped at one second, not a throughput ceiling.
+`BatchTransactions` defaults to 64, `BatchBytes` to 4 MiB, and `AdaptiveSync` to false.
+A larger transaction is admitted alone. `ApplyBatches`, `ApplyBytes`, and `ApplyNanos`
+report completed incoming work. Optional `PagedBackend.KeysPage` avoids materializing
+large prefixes; existing custom backends receive a sorted fallback over `Keys`.
+`BuildSnapshotStream` persists encoded `Content` pages through Rust; its Go input slice
+is materialized. Managed database exports instead stream from an immutable Spool checkpoint.
+Protocol version 10 and database format 5 require new databases and upgraded peers;
+older formats are rejected, and no migration is provided.
+
+Custom backends may implement optional `CancellableBackend.CancelPending` to interrupt
+pending owner/admission waits during `Replication.Close`; active durable commits must
+finish. Backends that leave synchronous calls blocked cannot guarantee bounded shutdown.
+
+Batched backend reads preserve input order and missing values (`nil` in `[]*Bytes`);
+a pointer to empty bytes represents an existing empty value. `BatchBackend.GetMany`
+receives a nullable byte budget: nil requests every key, otherwise return a bounded
+prefix with one oversized first value allowed. Custom backends without this optional
+interface fall back to `Get` inside one native callback. These are not atomic read
+snapshots. The backend example implements batching under one storage lock and
+checks missing/empty results. `RunBlocking` delegates to Rust's scheduler utility;
+ordinary Go callers execute inline rather than launching a goroutine.

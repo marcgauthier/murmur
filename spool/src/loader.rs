@@ -109,7 +109,7 @@ pub fn load_with_options(o: LoadOptions, f: LoadFunc<'_>) -> Result<()> {
         ));
     }
     let mut l = open_loader(&o)?;
-    l.scan_all(&l.man.members.clone(), Some(f), None, None, false)?;
+    l.scan_all(&l.man.members.clone(), Some(f), None, None, false, &mut crate::read_cache::Cache::new(32 << 20))?;
     Ok(())
 }
 
@@ -699,6 +699,7 @@ impl Loader {
         idx: Option<&Index>,
         fs: Option<&FileStatsRegistry>,
         ordered: bool,
+        cache: &mut crate::read_cache::Cache,
     ) -> Result<(u64, u64, std::collections::HashMap<u64, u64>, u64)> {
         use std::collections::HashMap;
         let mut ends: HashMap<u64, u64> = HashMap::with_capacity(members.len());
@@ -749,23 +750,33 @@ impl Loader {
         if ordered {
             let mut sorted: Vec<_> = winners.iter().collect();
             sorted.sort_by(|a, b| a.0.cmp(b.0));
-            // First pass has authenticated every committed group. Re-read only
-            // winners, keeping payload memory bounded to one decoded block.
-            let mut cache: Option<(u64, i64, Vec<u8>)> = None;
+            // First pass authenticated every committed group. Sorted keys can
+            // interleave blocks: retain decoded bodies in the byte-bounded hot
+            // cache, plus the current block even when cache admission is disabled.
+            let mut current: Option<((u64, i64), Arc<crate::read_cache::Block>)> = None;
             for (key, winner) in sorted {
                 let loc = winner.loc;
-                if cache.as_ref().map(|c| (c.0, c.1)) != Some((loc.file_id, loc.block_offset)) {
-                    let path = self.dir.join(SEGMENTS_DIR_NAME).join(segment_file_name(loc.file_id));
-                    let mut file = File::open(path).map_err(|e| err(ErrorKind::Io, e.to_string()))?;
-                    let (header, sealed, _) = read_block_frame(&mut file, loc.block_offset as u64, u32::MAX)?
-                        .ok_or_else(|| err(ErrorKind::Corrupt, "missing winner block"))?;
-                    let plain = self.open_payload(&header, &sealed[BLOCK_HEADER_LEN..])?;
-                    cache = Some((loc.file_id, loc.block_offset, plain));
+                let cache_key = (loc.file_id, loc.block_offset);
+                if current.as_ref().map(|c| c.0) != Some(cache_key) {
+                    let block = match cache.get(cache_key) {
+                        Some(block) => block,
+                        None => {
+                            let path = self.dir.join(SEGMENTS_DIR_NAME).join(segment_file_name(loc.file_id));
+                            let mut file = File::open(path).map_err(|e| err(ErrorKind::Io, e.to_string()))?;
+                            let (header, frame, _) = read_block_frame(&mut file, loc.block_offset as u64, ABS_MAX_BLOCK_BYTES as u32)?
+                                .ok_or_else(|| err(ErrorKind::Corrupt, "missing winner block"))?;
+                            let plain = self.open_payload(&header, &frame[BLOCK_HEADER_LEN..])?;
+                            let body = decode_body(&plain, header.record_count)?;
+                            let block = Arc::new(crate::read_cache::Block { frame, plain, body });
+                            cache.insert(cache_key, block.clone());
+                            block
+                        }
+                    };
+                    current = Some((cache_key, block));
                 }
-                let plain = &cache.as_ref().unwrap().2;
-                let count = u32::from_le_bytes(plain[16..20].try_into().unwrap());
-                let decoded = decode_body(plain, count)?;
-                let record = decoded.records.get(loc.record_index as usize)
+                let block = &current.as_ref().unwrap().1;
+                let plain = &block.plain;
+                let record = block.body.records.get(loc.record_index as usize)
                     .ok_or_else(|| err(ErrorKind::Corrupt, "bad winner index"))?;
                 if &plain[record.key_range.0..record.key_range.1] != key.as_slice() {
                     return Err(err(ErrorKind::Corrupt, "winner key mismatch"));

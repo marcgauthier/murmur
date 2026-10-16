@@ -13,11 +13,18 @@ The crate name on disk is `murmur-spool`; the library imports as
 
 ## Design
 
-There is deliberately no `get`: the application keeps current values
-in RAM, spool durably journals every mutation and rebuilds state at
-startup through load callbacks. Writes are sharded in memory, sealed
+Spool durably journals every mutation, rebuilds state at startup through load
+callbacks, and supports point reads from its key/location index. Writes are sharded in memory, sealed
 into blocks, compressed and encrypted in parallel, and appended
 sequentially to segment files.
+
+Prefix searches use fixed 1,024-bit namespace hints per index shard (32 KiB for
+256 shards) to skip shards that cannot contain a matching path namespace. The
+first three `/` separators identify a namespace; shorter or binary non-path
+prefixes use the full ordered-index traversal. Binary keys remain supported.
+Hints are rebuilt during loading and never cleared on deletion, so collisions
+or deleted namespaces can cause extra searches. Every returned key comes from
+the ordered index. This index overhead is independent of `read_cache_bytes`.
 
 - Concurrent `put` / `delete` / batches plus atomic multi-key
   `commit` groups with per-call durability (`Async`, `Flush`, `Sync`).
@@ -122,3 +129,15 @@ on a second read and evicted by least recent access. The byte budget includes
 compressed encrypted frames, decoded buffers and record descriptors. Hot reads
 skip disk reads, decryption, decompression and body parsing. Decoded buffers are
 wiped when released. Existing larger blocks remain compatible.
+
+Ordered startup delivery uses this same bounded cache and parses each decoded
+body once per cache miss. Cache entries survive into the opened store. One
+current block remains available during delivery even with caching disabled;
+all committed groups are still authenticated before winner delivery begins.
+
+`Store::keys_page(prefix, after, limit)` returns a bounded, sorted page from the
+existing location index, exclusively after the supplied key. It reads no values.
+Use an immutable checkpoint for a stable boundary across pages; live pages can
+reflect concurrent commits. Prefix lookups use ordered index ranges. The managed
+SQLite layer handles oversized logical values with multiple physical records;
+Spool's default 16 MiB value limit and 64 KiB block target remain unchanged.

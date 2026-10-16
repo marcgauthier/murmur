@@ -22,7 +22,9 @@ use murmur_live_harness::murmur_replication::{
     retention, snapshot, transport, Config as ReplConfig, Dissemination,
 };
 use murmur_live_harness::sqlite_session::{Database, Migration};
-use murmur_live_harness::{env_seconds, Cluster, ClusterOptions, ReplicationOptions};
+use murmur_live_harness::{
+    env_seconds, wait_until, Cluster, ClusterOptions, ReplicationOptions,
+};
 use sha2::{Digest, Sha256};
 
 /// Role index: node3 goes stale, then rejoins (Go: `stale = 2`).
@@ -587,18 +589,24 @@ fn stale_node_discards_corrupt_snapshot_then_converges() {
             ATTACKER_SEED,
         );
         attacker_config.snapshot_transfer_lifetime = FORGED_LIFETIME;
-        let attacker = Attacker::new(attacker_config);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("attacker runtime");
         rt.block_on(async {
+            // The QUIC endpoint requires a live tokio runtime context.
+            let attacker = Attacker::new(attacker_config);
             let mut evil = attacker.dial(victim_addr, dbid, victim_id).await;
             // Prove the "only available source" premise: exactly one peer.
-            assert_eq!(
-                connected_peers(&cluster, STALE),
-                1,
-                "stale node has != 1 connected peer during the attack"
+            // The victim registers the inbound session asynchronously, so
+            // poll for the count instead of asserting immediately.
+            let one_peer = wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+                connected_peers(&cluster, STALE) == 1
+            });
+            assert!(
+                one_peer,
+                "stale node has {} connected peers during the attack, want 1",
+                connected_peers(&cluster, STALE)
             );
             // Induce the pull: an unsolicited history-unavailable error makes
             // the node request a snapshot from this peer over the live session.

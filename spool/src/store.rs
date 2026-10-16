@@ -255,6 +255,11 @@ fn open_store(
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
             .map_err(|e| err(ErrorKind::Io, format!("secure store dir: {e}")))?;
+        fs::set_permissions(
+            dir.join(SEGMENTS_DIR_NAME),
+            fs::Permissions::from_mode(0o700),
+        )
+        .map_err(|e| err(ErrorKind::Io, format!("secure segments dir: {e}")))?;
     }
     let mut lock_slot: Option<StoreLock> = Some(lock_store(&dir)?);
 
@@ -340,7 +345,9 @@ fn open_store(
     m.clean_files = 0;
     m.clean_gen = 0;
     m.clean_group = 0;
-    // Bump the epoch first and persist before any data handling.
+    // Bump the epoch first (the manifest persist itself is deferred until
+    // the load phase below succeeds, so a refused or failed open leaves the
+    // store content-untouched; it still lands before any data handling).
     let use_epoch = m.next_epoch;
     m.next_epoch = m.next_epoch.wrapping_add(1);
     if m.next_epoch == 0 {
@@ -348,9 +355,6 @@ fn open_store(
             ErrorKind::Invalid,
             "epoch space exhausted after 65535 opens"
         ));
-    }
-    if let Err(e) = write_manifest_file(&dir, &m, o.faults.as_deref()) {
-        fail!(e);
     }
 
     // Keys.
@@ -445,6 +449,7 @@ fn open_store(
 
     // Rebuild index and statistics from disk before serving writes.
     // (Runs without the segment writer; uses a temporary loader.)
+    let mut read_cache = crate::read_cache::Cache::new(o.read_cache_bytes);
     let (max_block, max_group, ends, discarded) = {
         let mut loader = Loader {
             dir: dir.clone(),
@@ -464,7 +469,7 @@ fn open_store(
             torn_tail_id: max_id,
             store_id: m.store_id,
         };
-        match loader.scan_all(&ids, f, Some(&idx), Some(&fstats), ordered) {
+        match loader.scan_all(&ids, f, Some(&idx), Some(&fstats), ordered, &mut read_cache) {
             Ok(v) => v,
             Err(e) => fail!(e),
         }
@@ -481,6 +486,13 @@ fn open_store(
         if let Err(e) = check_clean_marker(&seg_dir, &ids, m.generation, want, max_group) {
             fail!(e);
         }
+    }
+    // The load callback and clean verification above accepted the store, so
+    // publish the bumped epoch now, still before any data handling (tail
+    // truncation and writer open below). A refused open returns before this
+    // point and leaves every existing file byte-identical.
+    if let Err(e) = write_manifest_file(&dir, &m, o.faults.as_deref()) {
+        fail!(e);
     }
 
     let active = if max_id == 0 { 1 } else { max_id };
@@ -550,7 +562,7 @@ fn open_store(
         ctx: RwLock::new(ctx),
         wrap_id: RwLock::new(wrap_id),
         idx,
-        read_cache: Mutex::new(crate::read_cache::Cache::new(o.read_cache_bytes)),
+        read_cache: Mutex::new(read_cache),
         fstats,
         workers,
         next_block_id: AtomicU64::new(next_block),
@@ -985,6 +997,13 @@ impl Store {
     /// values are read from disk with `get`.
     pub fn keys_with_prefix(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
         self.inner.idx.keys_with_prefix(prefix)
+    }
+
+    /// Return at most `limit` sorted committed keys with `prefix`, exclusively
+    /// after `after`. Values remain in authenticated blocks; no value scan occurs.
+    /// Use a checkpoint when a stable multi-page boundary is required.
+    pub fn keys_page(&self,prefix:&[u8],after:Option<&[u8]>,limit:usize)->Vec<Vec<u8>> {
+        self.inner.idx.keys_page(prefix,after,limit)
     }
 
     pub fn storage_error(&self) -> Option<Error> {
@@ -1478,12 +1497,21 @@ impl Store {
         }
         self.check_terminal()?;
         let start = now_system();
+        let t0 = std::time::Instant::now();
         let id = self.flush_internal(Durability::Sync, false)?;
+        let t1 = std::time::Instant::now();
         self.wait_for_group(id, false)?;
+        let t2 = std::time::Instant::now();
         if let Err(e) = self.inner.seg.sync() {
             let e = err(e.kind(), format!("{e}"));
             self.set_terminal(e.clone());
             return Err(e);
+        }
+        if std::env::var("MURMUR_SPOOL_TIMING").is_ok() {
+            let total = t0.elapsed();
+            if total.as_millis() >= 20 {
+                eprintln!("[spool-barrier] total={}ms seal={}ms groupwait={}ms segsync={}ms", total.as_millis(), t1.duration_since(t0).as_millis(), t2.duration_since(t1).as_millis(), t0.elapsed().saturating_sub(t2.duration_since(t0)).as_millis());
+            }
         }
         self.inner.syncs.fetch_add(1, Ordering::Relaxed);
         self.inner.sync_nanos.fetch_add(

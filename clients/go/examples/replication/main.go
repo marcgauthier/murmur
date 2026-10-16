@@ -22,6 +22,9 @@ func replicate(ctx context.Context, e *demo.Env, mode murmur.Dissemination) erro
 	}
 	for i := range cluster.Configs {
 		cluster.Configs[i].Dissemination = mode
+		cluster.Configs[i].BatchTransactions = 32
+		cluster.Configs[i].BatchBytes = 2 << 20
+		cluster.Configs[i].AdaptiveSync = true
 		cluster.Configs[i].AllowedNetworks = []string{"127.0.0.0/8"}
 		cluster.Configs[i].SchemaMaster = &cluster.Nodes[0]
 		cluster.Configs[i].Master = i == 0

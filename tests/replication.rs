@@ -1,5 +1,5 @@
 #![cfg(feature="replication")]
-use sqlite_session::{Database,Options,OpenMode,Migration,Value,Result,replication::{self,Config,Credentials,policies::Policy}};
+use sqlite_session::{Database,Options,OpenMode,Migration,Value,Result,SubscriptionEvent,SubscriptionOptions,replication::{self,Config,Credentials,policies::Policy}};
 use rcgen::{CertificateParams,KeyPair,IsCa,BasicConstraints,SanType,ExtendedKeyUsagePurpose};
 use std::{collections::BTreeMap,time::{Duration,Instant}};
 fn configs()->Vec<Config>{
@@ -104,6 +104,113 @@ fn counter_operations_converge_after_offline_writes()->Result<()> {
     assert!(a.transaction(|s|{s.execute("UPDATE items SET n=100",[])?;Ok(())}).is_err());a.close()?;b.close()?;Ok(())
 }
 #[test]
+fn removed_peer_reconnects_after_restart_with_fresh_address()->Result<()> {
+    let temp=tempfile::tempdir()?;let mut config=configs();let bcfg=config.remove(1);let acfg=config.remove(0);
+    let bpath=temp.path().join("b");let a=open(&temp.path().join("a"),acfg)?;let b=open(&bpath,bcfg.clone())?;
+    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    a.replication().unwrap().add_peer(b.replication().unwrap().status().address.unwrap()).unwrap();wait(||a.replication().unwrap().status().peers==1);
+    a.replication().unwrap().remove_peer(b.node_id()).unwrap();b.replication().unwrap().remove_peer(a.node_id()).unwrap();wait(||a.replication().unwrap().status().peers==0);
+    // Restart: the exclusion persists in Spool while the node rebinds a fresh
+    // ephemeral port, so re-adding must clear the exclusion for the id found
+    // at the new address (member-table lookup alone cannot resolve it).
+    let bnode=b.node_id();b.close()?;
+    let b2=Database::open(&bpath,[9;32],Options{mode:OpenMode::Existing,database_id:Some([7;16]),node_id:Some(bnode),replication:Some(bcfg),..Options::default()})?;
+    a.replication().unwrap().add_peer(b2.replication().unwrap().status().address.unwrap()).unwrap();b2.replication().unwrap().add_peer(a.replication().unwrap().status().address.unwrap()).unwrap();
+    wait(||a.replication().unwrap().status().peers==1&&b2.replication().unwrap().status().peers==1);
+    a.close()?;b2.close()?;Ok(())
+}
+#[test]
+fn concurrent_inserts_union_counter_and_set_ops()->Result<()> {
+    let temp=tempfile::tempdir()?;let mut config=configs();for c in &mut config{c.merge_policies.insert(("items".into(),"n".into()),Policy::Counter);c.merge_policies.insert(("items".into(),"tags".into()),Policy::Set);}
+    let a=open(&temp.path().join("a"),config.remove(0))?;let b=open(&temp.path().join("b"),config.remove(0))?;
+    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL,tags BLOB NOT NULL)"))?;db.flush()?;}
+    for db in [&a,&b]{db.transaction(|s|{s.execute("INSERT INTO items VALUES(1,0,x'00')",[])?;Ok(())})?;db.flush()?;}
+    a.transaction(|s|s.counter_add("items",vec![Value::Integer(1)],"n",7))?;a.flush()?;
+    b.transaction(|s|s.counter_add("items",vec![Value::Integer(1)],"n",11))?;b.flush()?;
+    a.transaction(|s|s.set_add("items",vec![Value::Integer(1)],"tags",Value::Text("a".into())))?;a.flush()?;
+    b.transaction(|s|s.set_add("items",vec![Value::Integer(1)],"tags",Value::Text("b".into())))?;b.flush()?;
+    a.replication().unwrap().add_peer(b.replication().unwrap().status().address.unwrap()).unwrap();
+    let tags=|db:&Database|->Vec<String>{db.read(|s|Ok(s.query_row("SELECT tags FROM items WHERE id=1",[],|r|r.get::<_,Vec<u8>>(0))?)).ok().and_then(|bytes|postcard::from_bytes::<Vec<Value>>(&bytes).ok()).map(|v|v.into_iter().filter_map(|x|match x{Value::Text(s)=>Some(s),_=>None}).collect()).unwrap_or_default()};
+    wait(||value(&a)==18&&value(&b)==18&&tags(&a)==vec!["a".to_string(),"b".to_string()]&&tags(&b)==vec!["a".to_string(),"b".to_string()]);
+    a.close()?;b.close()?;Ok(())
+}
+#[test]
+fn forwarded_counter_ops_union_across_three_incarnations()->Result<()> {
+    let temp=tempfile::tempdir()?;let mut config=configs();for c in &mut config{c.merge_policies.insert(("items".into(),"n".into()),Policy::Counter);}
+    let a=open(&temp.path().join("a"),config.remove(0))?;let b=open(&temp.path().join("b"),config.remove(0))?;let c=open(&temp.path().join("c"),config.remove(0))?;
+    for db in [&a,&b,&c]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    for db in [&a,&b,&c]{db.transaction(|s|{s.execute("INSERT INTO items VALUES(1,0)",[])?;Ok(())})?;db.flush()?;}
+    a.transaction(|s|s.counter_add("items",vec![Value::Integer(1)],"n",10))?;a.flush()?;
+    b.transaction(|s|s.counter_add("items",vec![Value::Integer(1)],"n",7))?;b.flush()?;
+    c.transaction(|s|s.counter_add("items",vec![Value::Integer(1)],"n",-2))?;c.flush()?;
+    a.replication().unwrap().add_peer(b.replication().unwrap().status().address.unwrap()).unwrap();
+    b.replication().unwrap().add_peer(a.replication().unwrap().status().address.unwrap()).unwrap();
+    wait(||value(&a)==17&&value(&b)==17);
+    // The first writer stops; the middle node forwards both incarnations to
+    // the third in one batch. Every orphan in the batch must chain onto the
+    // rebased winner (last push wins would keep exactly one of them).
+    a.close()?;
+    b.replication().unwrap().add_peer(c.replication().unwrap().status().address.unwrap()).unwrap();
+    c.replication().unwrap().add_peer(b.replication().unwrap().status().address.unwrap()).unwrap();
+    wait(||value(&b)==15&&value(&c)==15);
+    b.close()?;c.close()?;Ok(())
+}
+#[test]
+fn extrema_join_across_concurrent_incarnations_and_fence_deletes()->Result<()> {
+    let temp=tempfile::tempdir()?;let mut config=configs();for c in &mut config{c.merge_policies.insert(("items".into(),"peak".into()),Policy::Max);c.merge_policies.insert(("items".into(),"floor".into()),Policy::Min);}
+    let a=open(&temp.path().join("a"),config.remove(0))?;let b=open(&temp.path().join("b"),config.remove(0))?;
+    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,peak INTEGER NOT NULL,floor REAL NOT NULL)"))?;db.flush()?;}
+    for db in [&a,&b]{db.transaction(|s|{s.execute("INSERT INTO items VALUES(1,0,100.0)",[])?;Ok(())})?;db.flush()?;}
+    a.transaction(|s|{s.max("items",vec![Value::Integer(1)],"peak",Value::Integer(10))?;s.min("items",vec![Value::Integer(1)],"floor",Value::Real(30.0))})?;a.flush()?;
+    b.transaction(|s|{s.max("items",vec![Value::Integer(1)],"peak",Value::Integer(20))?;s.min("items",vec![Value::Integer(1)],"floor",Value::Real(15.0))})?;b.flush()?;
+    a.replication().unwrap().add_peer(b.replication().unwrap().status().address.unwrap()).unwrap();
+    let extrema=|db:&Database|->(i64,f64){db.read(|s|Ok(s.query_row("SELECT peak,floor FROM items WHERE id=1",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,f64>(1)?)))?)).unwrap_or((i64::MIN,f64::NAN))};
+    wait(||extrema(&a)==(20,15.0)&&extrema(&b)==(20,15.0));
+    a.replication().unwrap().remove_peer(b.node_id()).unwrap();wait(||a.replication().unwrap().status().peers==0);
+    a.transaction(|s|{s.execute("DELETE FROM items WHERE id=1",[])?;Ok(())})?;a.flush()?;
+    a.transaction(|s|{s.execute("INSERT INTO items VALUES(1,0,100.0)",[])?;Ok(())})?;a.flush()?;
+    a.transaction(|s|{s.max("items",vec![Value::Integer(1)],"peak",Value::Integer(3))?;s.min("items",vec![Value::Integer(1)],"floor",Value::Real(90.0))})?;a.flush()?;
+    b.transaction(|s|{s.max("items",vec![Value::Integer(1)],"peak",Value::Integer(25))?;s.min("items",vec![Value::Integer(1)],"floor",Value::Real(5.0))})?;b.flush()?;
+    a.replication().unwrap().add_peer(b.replication().unwrap().status().address.unwrap()).unwrap();
+    // The delete fences the old incarnation's extrema: no resurrection.
+    wait(||extrema(&a)==(3,90.0)&&extrema(&b)==(3,90.0));
+    a.close()?;b.close()?;Ok(())
+}
+#[test]
+fn reinserted_row_excludes_deleted_incarnation_counter_ops()->Result<()> {
+    let temp=tempfile::tempdir()?;let mut config=configs();for c in &mut config{c.merge_policies.insert(("items".into(),"n".into()),Policy::Counter);}
+    let a=open(&temp.path().join("a"),config.remove(0))?;let b=open(&temp.path().join("b"),config.remove(0))?;
+    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    a.transaction(|s|{s.execute("INSERT INTO items VALUES(1,0)",[])?;Ok(())})?;a.flush()?;
+    a.transaction(|s|s.counter_add("items",vec![Value::Integer(1)],"n",5))?;a.flush()?;
+    a.transaction(|s|{s.execute("DELETE FROM items WHERE id=1",[])?;Ok(())})?;a.flush()?;
+    a.transaction(|s|{s.execute("INSERT INTO items VALUES(1,0)",[])?;Ok(())})?;a.flush()?;
+    a.transaction(|s|s.counter_add("items",vec![Value::Integer(1)],"n",7))?;a.flush()?;
+    b.transaction(|s|{s.execute("INSERT INTO items VALUES(1,0)",[])?;Ok(())})?;b.flush()?;
+    b.transaction(|s|s.counter_add("items",vec![Value::Integer(1)],"n",11))?;b.flush()?;
+    a.replication().unwrap().add_peer(b.replication().unwrap().status().address.unwrap()).unwrap();
+    // The deleted incarnation's +5 stays fenced on both nodes; the live
+    // incarnations union to 0+7+11 regardless of which row wins the merge.
+    wait(||value(&a)==18&&value(&b)==18);
+    a.close()?;b.close()?;Ok(())
+}
+#[test]
+fn remote_applies_wake_subscriptions()->Result<()> {
+    let temp=tempfile::tempdir()?;let mut config=configs();
+    let a=open(&temp.path().join("a"),config.remove(0))?;let b=open(&temp.path().join("b"),config.remove(0))?;
+    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    a.replication().unwrap().add_peer(b.replication().unwrap().status().address.unwrap()).unwrap();
+    let sub=b.subscribe(|sql|{let mut st=sql.prepare("SELECT n FROM items WHERE id=1")?;let mut rows=st.query([])?;let mut out=Vec::new();while let Some(r)=rows.next()?{out.push(r.get::<_,i64>(0)?);}Ok(out)},|n:&i64|n.to_be_bytes().to_vec(),SubscriptionOptions{tables:vec!["items".into()],..Default::default()})?;
+    assert!(matches!(sub.recv_timeout(Duration::from_secs(10))?,SubscriptionEvent::Initial{rows,..} if rows.is_empty()));
+    a.transaction(|s|{s.execute("INSERT INTO items VALUES(1,42)",[])?;Ok(())})?;a.flush()?;
+    let deadline=Instant::now()+Duration::from_secs(25);
+    loop{
+        assert!(Instant::now()<deadline,"subscription never observed the replicated row");
+        match sub.recv_timeout(Duration::from_secs(5)){Err(sqlite_session::Error::Busy)=>continue,other=>match other?{SubscriptionEvent::Update{rows,..} if rows==vec![42]=>break,SubscriptionEvent::Reset{reason,..}=>panic!("subscription reset: {reason}"),_=>continue,}}
+    }
+    a.close()?;b.close()?;Ok(())
+}
+#[test]
 fn altered_origin_transaction_is_rejected(){let mut config=configs();let seed=*config[0].signing_key;let mut tx=replication::protocol::Transaction{database:[7;16],origin:[1;16],sequence:1,id:[5;16],millis:10,logical:0,schema:[0;32],payload_digest:[0;32],payload:vec![1,2,3],signature:Vec::new()};tx.sign(&seed).unwrap();tx.verify([7;16],&config.remove(0).trusted_origins,64<<20).unwrap();tx.payload.push(4);assert!(tx.verify([7;16],&BTreeMap::new(),64<<20).is_err());}
 #[test]
 fn encrypted_files_are_fetched_by_the_second_endpoint()->Result<()> {
@@ -148,6 +255,7 @@ fn master_schema_replicates_to_divergent_node()->Result<()> {
     wait(||has_table(&peer,"items"));
     wait(||value(&peer)==42);
     assert!(has_index(&peer,"items_n"));
+    assert!(peer.replication().unwrap().status().metrics.schema_adoptions>=1,"peer adopted the schema without recording it");
     master.close()?;peer.close()?;Ok(())
 }
 #[test]
@@ -556,4 +664,33 @@ fn snapshot_catches_up_pruned_history_with_concurrent_counters_sets_and_tombston
     assert_eq!(state(&b),Some((19,9,0)));
     assert_eq!(b.export_state()?,expected);
     a.close()?;b.close()?;Ok(())
+}
+
+#[test]
+fn replication_close_interrupts_pending_sql_owner_wait() -> Result<()> {
+    let temp=tempfile::tempdir()?;let mut cfg=configs();
+    let a=open(&temp.path().join("a"),cfg.remove(0))?;let b=open(&temp.path().join("b"),cfg.remove(0))?;
+    for db in [&a,&b] {db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    b.replication().unwrap().add_peer(a.replication().unwrap().status().address.unwrap()).unwrap();
+    wait(||a.replication().unwrap().status().peers>0);
+    let (entered_tx,entered_rx)=std::sync::mpsc::channel();let (release_tx,release_rx)=std::sync::mpsc::channel();
+    let held=b.clone();let owner=std::thread::spawn(move||held.read(move|_|{entered_tx.send(()).unwrap();release_rx.recv().unwrap();Ok(())}));entered_rx.recv().unwrap();
+    a.transaction(|s|{s.execute("INSERT INTO items VALUES(1,42)",[])?;Ok(())})?;a.flush()?;std::thread::sleep(Duration::from_millis(200));
+    let handle=b.replication().unwrap();let (finished_tx,finished_rx)=std::sync::mpsc::channel();
+    let closer=std::thread::spawn(move||{let result=handle.close();let _=finished_tx.send(result);});
+    let result=finished_rx.recv_timeout(Duration::from_secs(5));release_tx.send(()).unwrap();owner.join().unwrap()?;closer.join().unwrap();
+    result.expect("replication shutdown blocked on SQLite owner").unwrap();a.close()?;b.close()?;Ok(())
+}
+
+#[test]
+fn incoming_application_progresses_while_local_writes_continue() -> Result<()> {
+    let temp=tempfile::tempdir()?;let mut cfg=configs();let a=open(&temp.path().join("a"),cfg.remove(0))?;let b=open(&temp.path().join("b"),cfg.remove(0))?;
+    for db in [&a,&b] {db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    b.transaction(|s|{s.execute("INSERT INTO items VALUES(2,0)",[])?;Ok(())})?;b.flush()?;
+    b.replication().unwrap().add_peer(a.replication().unwrap().status().address.unwrap()).unwrap();wait(||b.replication().unwrap().status().peers>0);
+    let stop=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));let running=stop.clone();let local=b.clone();
+    let writer=std::thread::spawn(move||->Result<()> {let mut n=0;while !running.load(std::sync::atomic::Ordering::Acquire) {n+=1;local.transaction(move|s|{s.execute("UPDATE items SET n=? WHERE id=2",[n])?;Ok(())})?;std::thread::sleep(Duration::from_millis(2));}Ok(())});
+    a.transaction(|s|{s.execute("INSERT INTO items VALUES(1,42)",[])?;Ok(())})?;a.flush()?;
+    let deadline=Instant::now()+Duration::from_secs(10);let mut converged=false;while Instant::now()<deadline {if value(&b)==42 {converged=true;break;}std::thread::sleep(Duration::from_millis(10));}
+    stop.store(true,std::sync::atomic::Ordering::Release);writer.join().unwrap()?;assert!(converged,"remote publication starved during local writes");a.close()?;b.close()?;Ok(())
 }

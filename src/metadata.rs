@@ -5,7 +5,8 @@ use rusqlite::{
     fallible_streaming_iterator::FallibleStreamingIterator, hooks::Action, session::ChangesetIter,
 };
 use serde::{Deserialize, Serialize};
-use spool::{Mutation, Store};
+use spool::Mutation;
+use crate::logical_store::LogicalStore as Store;
 #[derive(Serialize, Deserialize)]
 pub(crate) struct RowMeta {
     pub key: Vec<u8>,
@@ -62,6 +63,24 @@ pub(crate) fn tables_in_changeset(bytes: &[u8]) -> Vec<String> {
         }
     }
     set.into_iter().collect()
+}
+/// Inspect only primary keys in a pending session capture. Used by background
+/// publication to prove that uncaptured local SQL cannot invalidate a point merge.
+#[cfg(feature="replication")]
+pub(crate) fn changeset_overlaps(schema:&Schema,bytes:&[u8],keys:&std::collections::BTreeSet<(String,Vec<u8>)>)->Result<bool> {
+    if bytes.is_empty(){return Ok(false);}
+    let mut cursor=std::io::Cursor::new(bytes);let reader:&mut dyn std::io::Read=&mut cursor;
+    let mut iter=ChangesetIter::start_strm(&reader)?;
+    while let Some(item)=iter.next()? {
+        let op=item.op()?;let table=schema.tables.iter().find(|table|table.name==op.table_name()).ok_or(Error::SchemaMismatch)?;
+        if op.number_of_columns() as usize!=table.columns.len(){return Err(Error::SchemaMismatch);}
+        let key=crate::schema::pk_columns(table).iter().map(|column|{
+            let index=table.columns.iter().position(|candidate|candidate.id==column.id).unwrap();
+            Value::read(if op.code()==Action::SQLITE_INSERT{item.new_value(index)?}else{item.old_value(index)?})
+        }).collect::<rusqlite::Result<Vec<_>>>()?;
+        if keys.contains(&(table.id.clone(),encode(&key)?)){return Ok(true);}
+    }
+    Ok(false)
 }
 pub(crate) fn delta(
     store: &Store,
@@ -164,25 +183,31 @@ pub(crate) fn migration(
     after: &[RowState],
     version: Version,
 ) -> Result<Vec<Mutation>> {
-    let mut changes = Vec::new();
-    for row in before {
-        if !after
-            .iter()
-            .any(|r| r.table == row.table && r.key == row.key)
-        {
-            let key = encode(&row.key)?;
-            let old = read(store, &row.table, &key)?
-                .ok_or_else(|| Error::Corrupt("migration row metadata missing".into()))?;
-            changes.push(tomb(&row.table, key.clone(), old.generation, version)?);
-            changes.push(Mutation::delete(row_key(&row.table, &key)));
-        }
+    if before.is_empty() && after.is_empty() {
+        return Ok(Vec::new());
     }
+    let mut changes = Vec::new();
+    let mut before_map = std::collections::HashMap::with_capacity(before.len());
+    for row in before {
+        let key = encode(&row.key)?;
+        before_map.insert((row.table.as_str(), key), row);
+    }
+    let mut after_map = std::collections::HashMap::with_capacity(after.len());
     for row in after {
         let key = encode(&row.key)?;
-        let old = read(store, &row.table, &key)?;
-        let prior = before
-            .iter()
-            .find(|r| r.table == row.table && r.key == row.key);
+        after_map.insert((row.table.as_str(), key), row);
+    }
+    for ((table, key), _row) in &before_map {
+        if !after_map.contains_key(&(table, key.clone())) {
+            let old = read(store, table, key)?
+                .ok_or_else(|| Error::Corrupt("migration row metadata missing".into()))?;
+            changes.push(tomb(table, key.clone(), old.generation, version)?);
+            changes.push(Mutation::delete(row_key(table, key)));
+        }
+    }
+    for ((table, key), row) in &after_map {
+        let old = read(store, table, key)?;
+        let prior = before_map.get(&(table, key.clone())).copied();
         let cells = row
             .cells
             .iter()
@@ -202,9 +227,9 @@ pub(crate) fn migration(
             })
             .collect();
         changes.push(put(
-            &row.table,
+            table,
             &RowMeta {
-                key,
+                key: key.clone(),
                 generation: old.map(|o| o.generation).unwrap_or(version),
                 cells,
             },
@@ -307,4 +332,40 @@ pub(crate) fn patch(store:&Store,rows:&[RowState],deleted:&[RowState],tombstones
     for row in rows {changes.push(put(&row.table,&RowMeta{key:encode(&row.key)?,generation:row.generation,cells:row.cells.clone()})?);}
     for t in tombstones {let key=tomb_key(t)?;let mut t=t.clone();if let Some(bytes)=store.get(&key)? {let old:Tombstone=decode(&bytes)?;t.version=t.version.max(old.version);}changes.push(Mutation::put(key,encode(&t)?));}
     Ok(changes)
+}
+
+/// Maximum deleted generation for one primary key. Historical tombstones remain intact.
+fn deleted_key(table: &str, key: &[u8]) -> Vec<u8> {
+    format!("05/meta/deleted/{table}/{}", blake3::hash(key).to_hex()).into_bytes()
+}
+pub(crate) fn summarize_tombs(store: &Store, records: &mut Vec<Mutation>) -> Result<()> {
+    let mut summaries = std::collections::BTreeMap::<Vec<u8>, Tombstone>::new();
+    for record in records.iter().filter(|r| !r.deleted && r.key.starts_with(b"05/meta/tomb/")) {
+        let tomb: Tombstone = decode(&record.value)?;
+        let key = deleted_key(&tomb.table, &tomb.key);
+        if !summaries.contains_key(&key) {
+            if let Some(bytes) = store.get(&key)? { summaries.insert(key.clone(), decode(&bytes)?); }
+        }
+        let current = summaries.entry(key).or_insert_with(|| tomb.clone());
+        if current.key != tomb.key || current.table != tomb.table { return Err(Error::Corrupt("deleted key collision".into())); }
+        if (tomb.generation,tomb.version) > (current.generation,current.version) { *current = tomb; }
+    }
+    for (key,tomb) in summaries { records.push(Mutation::put(key,encode(&tomb)?)); }
+    Ok(())
+}
+/// Read only rows and deletion floors that can be affected by this batch.
+pub(crate) fn affected_state(store:&Store, schema:Schema, database_id:[u8;16], clock:Version,
+    keys:&std::collections::BTreeSet<(String,Vec<u8>)>) -> Result<ReplicaState> {
+    let mut rows = Vec::new(); let mut tombstones = Vec::new();
+    for (table,key) in keys {
+        if let Some(meta) = read(store,table,key)? {
+            rows.push(RowState{table:table.clone(), key:decode(key)?, generation:meta.generation,cells:meta.cells});
+        }
+        if let Some(bytes) = store.get(&deleted_key(table,key))? {
+            let tomb:Tombstone=decode(&bytes)?;
+            if &tomb.table!=table || &tomb.key!=key {return Err(Error::Corrupt("deleted key collision".into()));}
+            tombstones.push(tomb);
+        }
+    }
+    Ok(ReplicaState{database_id,schema,clock,rows,tombstones})
 }

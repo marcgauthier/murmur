@@ -156,6 +156,24 @@ impl Store {
                 format!("create checkpoint segments dir: {e}"),
             ));
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = fs::set_permissions(destination, fs::Permissions::from_mode(0o700))
+            {
+                return fail(err(
+                    ErrorKind::Io,
+                    format!("secure checkpoint dir: {e}"),
+                ));
+            }
+            if let Err(e) = fs::set_permissions(&cp_seg_dir, fs::Permissions::from_mode(0o700))
+            {
+                return fail(err(
+                    ErrorKind::Io,
+                    format!("secure checkpoint segments dir: {e}"),
+                ));
+            }
+        }
         let seg_dir = self.inner.dir.join(SEGMENTS_DIR_NAME);
         for m_id in &members {
             if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {

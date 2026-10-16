@@ -555,16 +555,19 @@ fn typed_record_replicates_and_rebuilds_across_restart() {
         eprintln!("operator GC collected {collected} transaction records");
 
         // The peer subscription observes the remote insert (Go: watch.Next).
+        // A quiet 5 s window reports Busy; that only retries until the
+        // outer deadline (a single window must not fail the wait).
         let deadline = std::time::Instant::now() + WAIT;
         loop {
             assert!(
                 std::time::Instant::now() < deadline,
                 "peer subscription never observed the replicated row"
             );
-            match sub
-                .recv_timeout(Duration::from_secs(5))
-                .expect("subscription update")
-            {
+            let event = match sub.recv_timeout(Duration::from_secs(5)) {
+                Err(murmur_live_harness::sqlite_session::Error::Busy) => continue,
+                other => other.expect("subscription update"),
+            };
+            match event {
                 SubscriptionEvent::Update { rows, .. } if rows.len() == 1 => break,
                 SubscriptionEvent::Update { .. } => continue,
                 SubscriptionEvent::Reset { reason, .. } => {

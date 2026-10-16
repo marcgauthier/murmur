@@ -238,7 +238,7 @@ impl Default for Options {
             #[cfg(feature = "replication")]
             replication: None,
             mode: OpenMode::Existing,
-            capture_interval: Duration::from_secs(5),
+            capture_interval: Duration::from_secs(1),
             capture_bytes: 8 << 20,
             queue_bytes: 64 << 20,
             transaction_bytes: 64 << 20,

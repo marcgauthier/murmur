@@ -181,7 +181,10 @@ pub fn replication_unchecked(v: &Json) -> db::Result<net::Config> {
         max_transaction_bytes,
         snapshot_bytes,
         snapshot_staging_bytes,
-        minimum_retained
+        minimum_retained,
+        batch_transactions,
+        batch_bytes,
+        adaptive_sync
     );
     durations!(
         c,

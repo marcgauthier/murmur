@@ -17,7 +17,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::Instant,
+    time::{Duration,Instant},
 };
 /// Scoped SQL access. Does not expose connection hooks or transaction controls.
 pub struct Sql<'a> {
@@ -178,8 +178,7 @@ impl Database {
                 };
                 loop {
                     let mut delay = core
-                        .options
-                        .capture_interval
+                        .capture_interval()
                         .saturating_sub(core.last_capture.elapsed());
                     if core.search.pending() {
                         delay = delay.min(core.options.search_interval.saturating_sub(core.last_search.elapsed()));
@@ -200,7 +199,7 @@ impl Database {
                     if core.status.lock().unwrap().closed {
                         break;
                     }
-                    if core.last_capture.elapsed() >= core.options.capture_interval {
+                    if core.last_capture.elapsed() >= core.capture_interval() {
                         let _ = core.checkpoint();
                         core.last_capture = Instant::now();
                     }
@@ -241,6 +240,18 @@ impl Database {
         }
         Ok(database)
     }
+    /// Run a blocking Core/Spool channel wait cooperatively (see
+    /// `murmur_replication::run_blocking`); inline without replication.
+    pub(crate) fn blocking_wait<T>(wait: impl FnOnce() -> T) -> T {
+        #[cfg(feature = "replication")]
+        {
+            murmur_replication::run_blocking(wait)
+        }
+        #[cfg(not(feature = "replication"))]
+        {
+            wait()
+        }
+    }
     pub(crate) fn call<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut Core) -> Result<T> + Send + 'static,
@@ -257,7 +268,7 @@ impl Database {
                 "database callbacks cannot reenter the database".into(),
             ));
         }
-        if self.status().closed {
+        if self.inner.status.lock().unwrap().closed {
             return Err(Error::Closed);
         }
         let (tx, rx) = mpsc::channel();
@@ -267,7 +278,14 @@ impl Database {
                 let _ = tx.send(f(c));
             })))
             .map_err(|_| Error::Closed)?;
-        rx.recv().map_err(|_| Error::Closed)?
+        Self::blocking_wait(|| rx.recv()).map_err(|_| Error::Closed)?
+    }
+    #[cfg(feature="replication")]
+    pub(crate) fn call_cancel<T:Send+'static>(&self,f:impl FnOnce(&mut Core)->Result<T>+Send+'static,cancelled:Arc<std::sync::atomic::AtomicBool>)->Result<T> {
+        if cancelled.load(Ordering::Acquire){return Err(Error::Closed);}
+        let (tx,rx)=mpsc::channel();let check=cancelled.clone();
+        self.inner.tx.send(Message::Job(Box::new(move|core|{let result=if check.load(Ordering::Acquire){Err(Error::Closed)}else{f(core)};let _=tx.send(result);}))).map_err(|_|Error::Closed)?;
+        Self::blocking_wait(|| loop {match rx.recv_timeout(Duration::from_millis(20)){Ok(result)=>return result,Err(mpsc::RecvTimeoutError::Disconnected)=>return Err(Error::Closed),Err(mpsc::RecvTimeoutError::Timeout)=>if cancelled.load(Ordering::Acquire){return Err(Error::Closed);}}})
     }
     pub fn transaction<T, F>(&self, f: F) -> Result<T>
     where
@@ -548,10 +566,11 @@ impl Database {
                 "database callbacks cannot close the database".into(),
             ));
         }
-        if self.status().closed {
+        if self.inner.status.lock().unwrap().closed {
             return Ok(());
         }
         self.inner.sub_mgr.close();
+        self.inner.scheduler.close();
         #[cfg(feature = "replication")]
         if let Some(handle) = self.inner.replication.lock().unwrap().take() { handle.close().map_err(|e|Error::Storage(e.to_string()))?; }
         let (tx, rx) = mpsc::channel();
@@ -650,6 +669,8 @@ impl Core {
     }
     pub(crate) fn admit(&self, bytes: usize) -> Result<()> {
         let s = self.status.lock().unwrap();
+        #[cfg(feature="replication")]
+        if s.pending_bytes==0 && bytes>self.options.queue_bytes && self.options.replication.as_ref().is_some_and(|config|bytes<=config.max_transaction_bytes.saturating_mul(2).saturating_add(4<<20)) {return Ok(());}
         if s.pending_bytes
             .checked_add(bytes)
             .is_none_or(|n| n > self.options.queue_bytes)
@@ -683,7 +704,29 @@ impl Core {
         }
         Ok(())
     }
-    fn checkpoint(&mut self) -> Result<()> {
+    fn capture_interval(&self)->Duration {
+        #[cfg(feature="replication")]
+        if self.options.replication.as_ref().is_some_and(|c|c.adaptive_sync) {
+            let pending=self.status.lock().unwrap().pending_bytes;
+            return self.options.capture_interval.min(if pending>=self.options.queue_bytes/2 {Duration::from_millis(100)}else{Duration::from_secs(1)});
+        }
+        self.options.capture_interval
+    }
+    #[cfg(feature="replication")]
+    pub(crate) fn advance_disjoint_patch(&mut self,patch:&mut crate::merge::Patch,keys:&std::collections::BTreeSet<(String,Vec<u8>)>)->Result<bool> {
+        let committed={let status=self.status.lock().unwrap();if status.storage_error.is_some(){return Ok(false);}status.committed};
+        if committed==patch.cursor{return Ok(true);}
+        // An intervening capture/schema/publication has no retained key proof.
+        // Fall back to a fresh merge rather than maintaining a metadata journal.
+        if self.captured_cursor!=patch.cursor{return Ok(false);}
+        if !self.pending_intents.is_empty(){return Ok(false);}
+        let bytes=self.capture.as_mut().ok_or(Error::Closed)?.bytes()?;
+        if crate::metadata::changeset_overlaps(&self.schema,&bytes,keys)?{return Ok(false);}
+        // FIFO storage ordering publishes these unrelated local keys first.
+        // No authoritative metadata is cached or rewritten for them by the patch.
+        self.checkpoint()?;patch.cursor=committed;Ok(true)
+    }
+    pub(crate) fn checkpoint(&mut self) -> Result<()> {
         self.writable()?;
         let start = Instant::now();
         let cap = self.capture.as_mut().ok_or(Error::Closed)?;
@@ -823,11 +866,44 @@ impl Core {
     fn migrate(&mut self, m: Migration) -> Result<()> {
         self.writable()?;
         self.checkpoint()?;
-        let before = schema::read_rows(&self.connection, &self.schema)?;
         let previous_search = self.search.clone();
         self.capture.take();
+
+        let sql_keywords = crate::schema::keywords(&m.sql);
+        let index_only = !sql_keywords.is_empty()
+            && m.mappings.is_empty()
+            && sql_keywords.iter().all(|k| {
+                [
+                    "CREATE", "UNIQUE", "INDEX", "IF", "NOT", "EXISTS", "ON", "DROP", "ASC", "DESC", "WHERE", "COLLATE",
+                ]
+                .contains(&k.as_str())
+            });
+
+        let candidate_tables: Vec<Table> = if index_only {
+            Vec::new()
+        } else {
+            let sql_lower = m.sql.to_ascii_lowercase();
+            let mut candidates = Vec::new();
+            for t in &self.schema.tables {
+                let name_lower = t.name.to_ascii_lowercase();
+                let in_sql = sql_lower.contains(&name_lower);
+                let in_map = m.mappings.iter().any(|map| map.old_name.eq_ignore_ascii_case(&t.name) || map.new_name.eq_ignore_ascii_case(&t.name));
+                if in_sql || in_map {
+                    candidates.push(t.clone());
+                }
+            }
+            candidates
+        };
+
+        let mut before_candidate_rows = Vec::new();
+        for t in &candidate_tables {
+            before_candidate_rows.extend(schema::read_table_rows(&self.connection, t)?);
+        }
+
+        let total_changes_before = self.connection.total_changes();
+
         self.connection.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<(Schema, Vec<RowState>, usize, Version)> {
+        let result = (|| -> Result<(Schema, Vec<(Vec<RowState>, Vec<RowState>)>, Version)> {
             self.access
                 .store(Access::Migration as u8, Ordering::Relaxed);
             let sql_result = self.connection.execute_batch(&m.sql);
@@ -839,37 +915,111 @@ impl Core {
             crate::policy::configure(&mut new, self.options.replication.as_ref())?;
             self.search.sync_schema(&self.connection, &new, true)?;
             self.search.refresh(&self.connection, &new)?;
-            let after = schema::read_rows(&self.connection, &new)?;
-            let bytes =
-                encode(&before)?.len() + encode(&after)?.len() + m.sql.len() + encode(&new)?.len();
-            if bytes > self.options.transaction_bytes {
-                return Err(Error::Limit("migration capture budget exceeded".into()));
+
+            let total_changes_after = self.connection.total_changes();
+            let dml_occurred = total_changes_before != total_changes_after;
+
+            let mut affected_before = Vec::new();
+            let mut affected_after = Vec::new();
+
+            if !index_only || dml_occurred {
+                for old_t in &self.schema.tables {
+                    let new_t = new.tables.iter().find(|t| t.id == old_t.id);
+                    match new_t {
+                        None => {
+                            let b_rows = before_candidate_rows.iter().filter(|r| r.table == old_t.id).cloned().collect::<Vec<_>>();
+                            affected_before.extend(b_rows);
+                        }
+                        Some(new_t) => {
+                            let schema_changed = old_t.name != new_t.name || old_t.columns != new_t.columns;
+                            let in_candidates = candidate_tables.iter().any(|t| t.id == old_t.id);
+                            if schema_changed || (dml_occurred && in_candidates) {
+                                let b_rows = before_candidate_rows.iter().filter(|r| r.table == old_t.id).cloned().collect::<Vec<_>>();
+                                affected_before.extend(b_rows);
+                                affected_after.extend(schema::read_table_rows(&self.connection, new_t)?);
+                            }
+                        }
+                    }
+                }
+                for new_t in &new.tables {
+                    if !self.schema.tables.iter().any(|t| t.id == new_t.id) {
+                        affected_after.extend(schema::read_table_rows(&self.connection, new_t)?);
+                    }
+                }
             }
-            self.admit(bytes)?;
+
+            let max_chunk_bytes = (self.options.transaction_bytes / 2).min(2 * 1024 * 1024);
+            let chunks = schema::chunk_migration_rows(affected_before, affected_after, 2000, max_chunk_bytes);
             let version = self.collection_clock.next(self.identity.node)?;
             self.connection.execute_batch("COMMIT")?;
-            Ok((new, after, bytes, version))
+            Ok((new, chunks, version))
         })();
+
         match result {
-            Ok((new, after, bytes, version)) => {
+            Ok((new, chunks, version)) => {
                 self.collection_clock = version;
                 self.schema = new.clone();
                 configure_authorizer(&self.connection, &self.schema, self.access.clone(), self.search.guard.clone())?;
                 self.status.lock().unwrap().search_indexes = self.search.status();
                 self.capture = Some(schema::capture(&self.connection, &self.schema)?);
-                let cursor = self.bump()?;
-                self.send(
-                    Event::SchemaCaptured {
-                        migration: m.sql,
-                        schema: new,
-                        before,
-                        after,
-                        version,
-                    },
-                    cursor,
-                    bytes,
-                )?;
-                self.captured_cursor = cursor;
+
+                if chunks.is_empty() {
+                    let bytes = m.sql.len() + encode(&new)?.len();
+                    if bytes > self.options.transaction_bytes {
+                        return Err(Error::Limit("migration capture budget exceeded".into()));
+                    }
+                    let cursor = self.bump()?;
+                    self.send(
+                        Event::SchemaCaptured {
+                            migration: m.sql,
+                            schema: new,
+                            before: Vec::new(),
+                            after: Vec::new(),
+                            version,
+                        },
+                        cursor,
+                        bytes,
+                    )?;
+                    self.captured_cursor = cursor;
+                } else {
+                    for (i, (chunk_before, chunk_after)) in chunks.into_iter().enumerate() {
+                        let is_first = i == 0;
+                        let chunk_bytes = if is_first {
+                            encode(&chunk_before)?.len() + encode(&chunk_after)?.len() + m.sql.len() + encode(&new)?.len()
+                        } else {
+                            encode(&chunk_before)?.len() + encode(&chunk_after)?.len()
+                        };
+                        if chunk_bytes > self.options.transaction_bytes {
+                            return Err(Error::Limit("migration capture budget exceeded".into()));
+                        }
+                        let cursor = self.bump()?;
+                        if is_first {
+                            self.send(
+                                Event::SchemaCaptured {
+                                    migration: m.sql.clone(),
+                                    schema: new.clone(),
+                                    before: chunk_before,
+                                    after: chunk_after,
+                                    version,
+                                },
+                                cursor,
+                                chunk_bytes,
+                            )?;
+                        } else {
+                            self.send(
+                                Event::MigrationChunk {
+                                    before: chunk_before,
+                                    after: chunk_after,
+                                    version,
+                                },
+                                cursor,
+                                chunk_bytes,
+                            )?;
+                        }
+                        self.captured_cursor = cursor;
+                        self.barrier()?;
+                    }
+                }
                 self.sub_mgr.notify_reset("schema migration applied");
                 Ok(())
             }
@@ -892,12 +1042,13 @@ impl Core {
         if p.rows.is_empty()
             && p.deleted.is_empty()
             && p.tombstones.is_empty()
-            && p.state.clock <= self.collection_clock
+            && p.clock <= self.collection_clock
         {
             return Ok(());
         }
         self.checkpoint()?;
-        let bytes = encode(&p.state)?.len();
+        let state=p.state.ok_or_else(||Error::Corrupt("full import state missing".into()))?;
+        let bytes = encode(&state)?.len();
         self.admit(bytes)?;
         self.connection.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<()> {
@@ -937,8 +1088,8 @@ impl Core {
             self.status.lock().unwrap().search_indexes = self.search.status();
             self.capture = Some(schema::capture(&self.connection, &self.schema)?);
             let cursor = self.bump()?;
-            self.collection_clock = self.collection_clock.max(p.state.clock);
-            self.send(Event::Replica(p.state), cursor, bytes)?;
+            self.collection_clock = self.collection_clock.max(p.clock);
+            self.send(Event::Replica(state), cursor, bytes)?;
             self.captured_cursor = cursor;
             let affected: Vec<String> = self.schema.tables.iter().map(|t| t.name.clone()).collect();
             self.sub_mgr.notify_commit(cursor, &affected);

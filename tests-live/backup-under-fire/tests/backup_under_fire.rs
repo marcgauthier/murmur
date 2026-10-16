@@ -141,12 +141,19 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
 /// identity, freshly issued TLS leaf, cluster CA trust, both survivors as
 /// bootstrap + trusted snapshot sources (Go: `startAgent` + `addAgentPeer`).
 /// The agent never originates rows, so peers need not trust its origin key.
-fn open_agent(cluster: &Cluster, key: [u8; 32], data_dir: &Path, fresh: [u8; 16]) -> Database {
+fn open_agent(
+    cluster: &Cluster,
+    key: [u8; 32],
+    data_dir: &Path,
+    fresh: [u8; 16],
+    seed: [u8; 32],
+) -> Database {
     use murmur_live_harness::murmur_replication as repl;
     let issued = cluster.issue_cert(&fresh).expect("issue agent cert");
-    let seed: [u8; 32] = rand::random();
     let mut trusted: BTreeMap<[u8; 16], [u8; 32]> = BTreeMap::new();
-    for i in 0..2 {
+    // All cluster members: agent A (node 2) holds no rows but the agent
+    // must still verify anything forwarded under its origin.
+    for i in 0..3 {
         trusted.insert(cluster.node_id(i), cluster.node_origin_pubkey(i));
     }
     trusted.insert(fresh, repl::protocol::public_key(&seed));
@@ -221,6 +228,13 @@ fn backup_under_fire() {
     // Explicit ids so the late-joining agent slot can trust snapshots from
     // the two mesh nodes (Go: agent `snapshotSources = peers`).
     let node_ids: Vec<[u8; 16]> = (0..3).map(|_| rand::random()).collect();
+    // Agent B joins later under a fresh identity; the survivors must trust
+    // its origin key up front (trust is static config), or they close every
+    // session on first verify and the join trickles through reconnects.
+    let agent_id: [u8; 16] = rand::random();
+    let agent_seed: [u8; 32] = rand::random();
+    let agent_pubkey =
+        murmur_live_harness::murmur_replication::protocol::public_key(&agent_seed);
     let mut cluster = Cluster::new(ClusterOptions {
         name: "backup-under-fire".into(),
         num_nodes: 3,
@@ -231,11 +245,16 @@ fn backup_under_fire() {
             2,
             BTreeSet::from([node_ids[0], node_ids[1]]),
         )]),
+        extra_trusted_origins: HashMap::from([
+            (0, BTreeMap::from([(agent_id, agent_pubkey)])),
+            (1, BTreeMap::from([(agent_id, agent_pubkey)])),
+        ]),
         ..Default::default()
     })
     .expect("cluster setup");
     let write_dur = env_seconds("MURMUR_BACKUP_UNDER_FIRE_WRITE_SECONDS", 30);
     let backups = cluster.runtime_dir().join("backups");
+    std::fs::create_dir_all(&backups).expect("backups parent dir");
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Two-node mesh first; node 3 ("agent A") runs unmeshed until it
         // joins mid-load below.
@@ -359,10 +378,9 @@ fn backup_under_fire() {
 
         // Agent run B: rejoin fresh, converge on the quiesced total, take the
         // final online backup, and exit cleanly.
-        let agent_id: [u8; 16] = rand::random();
         let agent_root = cluster.runtime_dir().join("agent-b");
         std::fs::create_dir_all(&agent_root).expect("agent-b root");
-        let agent = open_agent(&cluster, key, &agent_root.join("data"), agent_id);
+        let agent = open_agent(&cluster, key, &agent_root.join("data"), agent_id, agent_seed);
         let agent_handle = agent.replication().expect("agent replication handle");
         let agent_addr = {
             let end = Instant::now() + Duration::from_secs(10);
@@ -388,6 +406,19 @@ fn backup_under_fire() {
                 .expect("agent dial seed");
         }
         let joined = wait_until(CONVERGE_TIMEOUT, POLL, || count_rows(&agent) >= total);
+        // Agent B is external to the cluster, so its state never appears in
+        // cluster forensics; one compact line keeps join failures debuggable.
+        let st = agent_handle.status();
+        eprintln!(
+            "agent B after join wait: rows={}/{} applied={} staged={} recv={} peers={} err={:?}",
+            count_rows(&agent),
+            total,
+            st.applied_transactions,
+            st.staged_transactions,
+            st.metrics.received_transactions,
+            st.peers,
+            st.last_error,
+        );
         assert!(
             joined,
             "agent B did not converge on {total} rows within {CONVERGE_TIMEOUT:?}"

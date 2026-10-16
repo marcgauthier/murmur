@@ -259,6 +259,9 @@ type ReplicationConfig struct {
 	SnapshotStagingBytes     uint64        `json:"snapshot_staging_bytes"`
 	SnapshotTransferLifetime time.Duration `json:"snapshot_transfer_lifetime"`
 	IncomingInterval         time.Duration `json:"incoming_interval"`
+	BatchTransactions        uint64        `json:"batch_transactions"`
+	BatchBytes               uint64        `json:"batch_bytes"`
+	AdaptiveSync             bool          `json:"adaptive_sync"`
 	AntiEntropyInterval      time.Duration `json:"anti_entropy_interval"`
 	Retention                time.Duration `json:"retention"`
 	RetentionInterval        time.Duration `json:"retention_interval"`

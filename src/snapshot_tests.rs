@@ -18,7 +18,11 @@ fn config(donor: [u8; 16]) -> net::Config {
     c
 }
 fn adapter(db: &Database, c: &net::Config) -> Adapter {
-    let a = Adapter {
+    let a = Adapter {last_reclaim_ms:std::sync::atomic::AtomicU64::new(0),
+        last_apply_barrier_ms:std::sync::atomic::AtomicU64::new(0),
+        progress_cache:std::sync::Mutex::new(None),
+        merge_deferrals:std::sync::atomic::AtomicUsize::new(0),
+        cancelled:Arc::new(std::sync::atomic::AtomicBool::new(false)),
         inner: Arc::downgrade(&db.inner),
         worker: db.inner.worker.clone(),
         identity: (db.database_id(), db.node_id()),
@@ -317,10 +321,11 @@ fn snapshot_waits_for_local_capture_preserves_local_only_tables_and_concurrent_w
         Ok(())
     })
     .unwrap();
-    // Explicit uncollected writer cursor makes the first attempt defer.
+    // The local capture is queued before the point read and remote patch.
+    // Completion waits for their durability without a separate flush/retry tick.
     let applied = snap::finish(&bb, &c, [1; 16], m.transfer, net::retention::now_millis()).unwrap();
-    assert!(!applied);
-    assert!(bb.get(&snap::receipt_key(m.transfer)).unwrap().is_none());
+    assert!(applied);
+    assert!(bb.get(&snap::receipt_key(m.transfer)).unwrap().is_some());
     b.flush().unwrap();
     assert!(snap::finish(&bb, &c, [1; 16], m.transfer, net::retention::now_millis()).unwrap());
     assert_eq!(
@@ -561,4 +566,44 @@ fn progress_resolves_racing_file_publication_at_serialized_commit_boundary() {
         9
     );
     db.close().unwrap();
+}
+
+#[test]
+fn incremental_merge_reads_only_affected_rows_and_matches_full_join() {
+    let temp=tempfile::tempdir().unwrap();let db=create(&temp.path().join("db"),1);let cfg=config(db.node_id());let a=adapter(&db,&cfg);
+    db.transaction(|s|{for id in 3..=10_000 {s.execute("INSERT INTO items VALUES(?,0,x'')",[id])?;}Ok(())}).unwrap();db.flush().unwrap();
+    a.spool(|o| {
+        let full=metadata::state(&o.store,o.schema.clone(),o.identity.database,o.clock)?;
+        let mut remote=full.clone();remote.rows.retain(|row|row.key==vec![Value::Integer(1)]);remote.tombstones.clear();
+        let version=Version{millis:full.clock.millis+1,logical:0,node:[2;16]};remote.clock=version;
+        let row=&mut remote.rows[0];let column=o.schema.tables[0].columns.iter().find(|c|c.name=="n").unwrap();
+        let cell=row.cells.iter_mut().find(|c|c.column==column.id).unwrap();cell.value=Value::Integer(99);cell.version=version;
+        let keys=std::collections::BTreeSet::from([(row.table.clone(),encode(&row.key)?)]);let before=o.store.reads();
+        let affected=metadata::affected_state(&o.store,o.schema.clone(),o.identity.database,o.clock,&keys)?;
+        assert_eq!(o.store.reads()-before,2,"merge loaded unrelated metadata");
+        let incremental=merge::prepare_delta(&affected,merge::join(&affected,&remote)?,o.cursor)?;
+        let oracle=merge::prepare(&full,&remote,o.cursor)?;
+        assert_eq!(incremental.rows,oracle.rows);assert_eq!(incremental.deleted,oracle.deleted);assert_eq!(incremental.tombstones,oracle.tombstones);assert!(incremental.state.is_none());Ok(())
+    }).unwrap();db.close().unwrap();
+}
+
+#[test]
+fn streamed_snapshot_resumes_incremental_installation_after_restart() {
+    let temp=tempfile::tempdir().unwrap();let donor=create(&temp.path().join("a"),1);let receiver=create(&temp.path().join("b"),2);let cfg=config(donor.node_id());
+    donor.transaction(|s|{for id in 3..=12 {s.execute("INSERT INTO items VALUES(?,100,zeroblob(700000))",[id])?;}Ok(())}).unwrap();donor.flush().unwrap();
+    let a=adapter(&donor,&cfg);let b=adapter(&receiver,&cfg);let m=a.create_snapshot(receiver.node_id(),&cfg).unwrap();stage(&a,&b,&cfg,&m,None);
+    assert!(!snap::finish(&b,&cfg,donor.node_id(),m.transfer,net::retention::now_millis()).unwrap());
+    assert!(snap::incoming(&b).unwrap().is_some());
+    let visible=receiver.read(|s|Ok(s.query_row("SELECT count(*) FROM items",[],|r|r.get::<_,i64>(0))?)).unwrap();assert!(visible>2 && visible<12);
+    receiver.close().unwrap();drop(b);drop(receiver);
+    let receiver=open(&temp.path().join("b"),2,OpenMode::Existing);let b=adapter(&receiver,&cfg);
+    let mut done=false;for _ in 0..32 {if snap::finish(&b,&cfg,donor.node_id(),m.transfer,net::retention::now_millis()).unwrap(){done=true;break;}}
+    assert!(done);assert_eq!(receiver.read(|s|Ok(s.query_row("SELECT count(*) FROM items",[],|r|r.get::<_,i64>(0))?)).unwrap(),12);
+    assert!(b.get(&snap::receipt_key(m.transfer)).unwrap().is_some());donor.close().unwrap();receiver.close().unwrap();
+}
+
+#[test]
+fn oversized_local_signed_content_is_rejected_before_durable_publication() {
+    let temp=tempfile::tempdir().unwrap();let db=create(&temp.path().join("db"),1);let mut cfg=config(db.node_id());cfg.max_transaction_bytes=16;let a=adapter(&db,&cfg);
+    a.spool(move|o|{let state=metadata::state(&o.store,o.schema.clone(),o.identity.database,o.clock)?;assert!(matches!(sign_local(o,&cfg,state,Vec::new()),Err(Error::Limit(_))));Ok(())}).unwrap();db.close().unwrap();
 }

@@ -336,9 +336,12 @@ fn restore_rejects_stale_identity() {
 /// Typed-leg insert (Go: `Cluster.TypedInsert` on the typed record table).
 fn typed_row_insert(db: &Database, name: &str) {
     let name = name.to_owned();
+    // Extrema baselines must sit outside the op range: max raises 0 -> 7
+    // and min lowers 9.5 -> 1.5. A 0.0 floor baseline would be a real
+    // minimum (min over {0.0, 1.5, 4.5} is 0.0), masking the min ops.
     db.transaction(move |sql| {
         sql.execute(
-            "INSERT INTO live_typed_records(name, title, counter, tags, peak, floor) VALUES(?, '', 0, x'00', 0, 0.0)",
+            "INSERT INTO live_typed_records(name, title, counter, tags, peak, floor) VALUES(?, '', 0, x'00', 0, 9.5)",
             [name],
         )?;
         Ok(())

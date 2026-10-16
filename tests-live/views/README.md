@@ -23,8 +23,9 @@ out. Node 3 then restarts and its rebuilt view must contain the same two rows.
   explicit re-mesh (fresh ephemeral port).
 - Plain SQL replaces the typed-RIME managed query: base table
   `contacts(name TEXT NOT NULL PRIMARY KEY, score INTEGER NOT NULL)` plus
-  `VIEW enabled_names AS SELECT name FROM contacts WHERE score > 0 ORDER BY
-  name`. `score` plays the role of the enabling PN counter.
+  the same `SELECT name FROM contacts WHERE score > 0 ORDER BY name` run
+  directly (the product rejects application `VIEW`s, so no view object is
+  created). `score` plays the role of the enabling PN counter.
 - Same schema is migrated locally on every node (no shared schema manifest).
 
 ## Compile check (only gate; never run here)

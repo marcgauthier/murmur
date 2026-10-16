@@ -2,7 +2,7 @@
 use crate::*;
 use ed25519_dalek::{Signer, Signature, SigningKey, VerifyingKey};
 use sha2::{Sha256,Digest};
-pub const VERSION:u16=9;
+pub const VERSION:u16=10;
 pub const ALPN:&[u8]=b"murmur-sqlite/1";
 pub const FRAME_BYTES:usize=8<<20;
 pub const CHUNK_BYTES:usize=64<<10;
@@ -91,12 +91,19 @@ pub enum Message {
     ChunkNeed{origin:NodeId,sequence:u64,indexes:Vec<u32>},ChunkAvailabilityRequest{offset:u32},ChunkAvailabilityPage{entries:Vec<(NodeId,u64,Vec<u32>)>,more:bool},
 }
 impl Message {fn kind(&self)->u16 {match self {Self::Hello{..}=>1,Self::Welcome{..}=>2,Self::Batches(_)=>3,Self::Ack(_)=>4,Self::Need{..}=>5,Self::SnapshotRequest=>6,Self::SnapshotManifest(..)=>7,Self::SnapshotChunk{..}=>8,Self::SnapshotDone{..}=>9,Self::Ping(_)=>10,Self::Pong(_)=>11,Self::Error{..}=>12,Self::SchemaRequest=>13,Self::SchemaManifest(_)=>14,Self::SchemaAck{..}=>15,Self::PlumtreeData(_)=>16,Self::IHave{..}=>17,Self::Prune=>18,Self::Graft{..}=>19,Self::ProgressRequest{..}=>20,Self::ProgressPage{..}=>21,Self::TransactionChunk(_)=>22,Self::ChunkNeed{..}=>23,Self::ChunkAvailabilityRequest{..}=>24,Self::ChunkAvailabilityPage{..}=>25,Self::SnapshotResume{..}=>28,Self::SnapshotNeed{..}=>29,Self::SnapshotApplied{..}=>30,Self::SnapshotUnavailable{..}=>31,Self::SnapshotCancel{..}=>32,Self::MembersRequest{..}=>26,Self::MembersPage{..}=>27}} }
-pub async fn write(stream:&mut quinn::SendStream,message:&Message)->Result<()> {
-    let data=encode(message)?; if data.len()>FRAME_BYTES {return Err(Error::Overloaded);}
-    let (data,flags)=if data.len()>1024 {let compressed=zstd::stream::encode_all(data.as_slice(),3)?;if compressed.len()+4<data.len(){let mut bytes=(data.len() as u32).to_be_bytes().to_vec();bytes.extend(compressed);(bytes,0x8002u16)}else{(data,0u16)}}else{(data,0u16)};
-    let mut h=[0u8;12];h[6..8].copy_from_slice(&flags.to_be_bytes()); h[..2].copy_from_slice(b"RD");h[2..4].copy_from_slice(&VERSION.to_be_bytes());h[4..6].copy_from_slice(&message.kind().to_be_bytes());h[8..12].copy_from_slice(&(data.len() as u32).to_be_bytes());
-    stream.write_all(&h).await.map_err(|e|Error::Protocol(e.to_string()))?;stream.write_all(&data).await.map_err(|e|Error::Protocol(e.to_string()))?;Ok(())
+// Reusable immutable wire frame. Queue accounting uses the uncompressed size.
+pub(crate) struct Prepared { pub(crate) bytes:Vec<u8>, pub(crate) charge:usize }
+impl Prepared {
+    pub(crate) fn new(message:&Message)->Result<Self> {
+        let data=encode(message)?;if data.len()>FRAME_BYTES{return Err(Error::Overloaded);}
+        let charge=data.len()+12;
+        let (data,flags)=if data.len()>1024 {let compressed=zstd::stream::encode_all(data.as_slice(),3)?;if compressed.len()+4<data.len(){let mut bytes=(data.len() as u32).to_be_bytes().to_vec();bytes.extend(compressed);(bytes,0x8002u16)}else{(data,0u16)}}else{(data,0u16)};
+        let mut bytes=vec![0u8;12];bytes[..2].copy_from_slice(b"RD");bytes[2..4].copy_from_slice(&VERSION.to_be_bytes());bytes[4..6].copy_from_slice(&message.kind().to_be_bytes());bytes[6..8].copy_from_slice(&flags.to_be_bytes());bytes[8..12].copy_from_slice(&(data.len() as u32).to_be_bytes());bytes.extend(data);
+        Ok(Self{bytes,charge})
+    }
+    pub(crate) async fn write(&self,stream:&mut quinn::SendStream)->Result<()> {stream.write_all(&self.bytes).await.map_err(|e|Error::Protocol(e.to_string()))}
 }
+pub async fn write(stream:&mut quinn::SendStream,message:&Message)->Result<()> {Prepared::new(message)?.write(stream).await}
 pub async fn read(stream:&mut quinn::RecvStream)->Result<Message> {
     let mut h=[0u8;12]; stream.read_exact(&mut h).await.map_err(|e|Error::Protocol(e.to_string()))?;
     let n=u32::from_be_bytes(h[8..12].try_into().unwrap()) as usize;

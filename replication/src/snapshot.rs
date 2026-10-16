@@ -182,6 +182,66 @@ pub fn build(
     records.push(Record::put(header(OUT, transfer), encode(&m)?));
     Ok((m, records))
 }
+const STREAM_MAGIC:&[u8]=b"MURMUR-SNAPSHOT\0\x02";
+/// Build a record-stream snapshot without materializing its complete payload.
+/// `pages` contains encoded Content batches. `emit` persists bounded groups;
+/// only the final group publishes the signed manifest and retention pin.
+/// Preliminary-record grace for an in-progress build: maintain() sweeps
+/// staged chunks whose transfer has no live header every second, so a
+/// build that streams chunks for longer than a tick would lose them
+/// before committing its header. The preliminary header/pin mark the
+/// transfer live for an hour; crashed builds are swept at grace expiry.
+pub const BUILD_GRACE_MILLIS: u64 = 3_600_000;
+/// A preliminary header older than this is a dead build's leftovers, not
+/// an active build: reuse ignores it and builds anew instead of reporting
+/// busy. Builds under normal conditions finish in well under a minute.
+pub const BUILD_STALE_MILLIS: u64 = 300_000;
+/// Freshness margin for preliminary reuse: a preliminary header whose
+/// remaining grace exceeds this is an actively streaming build.
+pub const BUILD_FRESH_MARGIN_MILLIS: u64 = BUILD_GRACE_MILLIS - BUILD_STALE_MILLIS;
+pub fn build_stream(
+    identity:(NodeId,NodeId),recipient:NodeId,pages:impl IntoIterator<Item=Result<Vec<u8>>>,
+    progress:Vec<Progress>,schema:[u8;32],config:&Config,now:u64,
+    mut emit:impl FnMut(Vec<Record>)->Result<()>,
+)->Result<Manifest> {
+    if progress.len()>4096{return Err(Error::Overloaded);}
+    let transfer=rand::random();
+    // Phase 1: preliminary pin+header. Chunkless by construction (a real
+    // snapshot always carries at least the stream-magic chunk), so
+    // receivers and reuse can tell it from a servable build.
+    let mut prelim=Manifest{database:identity.0,donor:identity.1,recipient,transfer,expires:now.saturating_add(BUILD_GRACE_MILLIS),bytes:0,digest:[0;32],schema,progress:progress.clone(),chunks:Vec::new(),signature:Vec::new()};
+    prelim.signature=SigningKey::from_bytes(&config.signing_key).sign(&prelim.signed_bytes()?).to_bytes().to_vec();
+    emit(vec![Record::put(pin_key(transfer),encode(&Pin{recipient,boundary:progress.iter().map(|p|(p.origin,p.applied)).collect(),target:None,expires:prelim.expires,digest:prelim.digest})?),Record::put(header(OUT,transfer),encode(&prelim)?)])?;
+    let mut hashes=Vec::new();let mut digest=Sha256::new();
+    let mut buffer=Vec::with_capacity(CHUNK_BYTES);let mut records=Vec::new();let mut total=0usize;
+    let mut push=|bytes:&[u8]|->Result<()> {
+        total=total.checked_add(bytes.len()).ok_or(Error::Overloaded)?;
+        if total>config.snapshot_bytes || total>config.snapshot_staging_bytes{return Err(Error::Overloaded);}
+        digest.update(bytes);
+        let mut rest=bytes;
+        while !rest.is_empty() {let n=(CHUNK_BYTES-buffer.len()).min(rest.len());buffer.extend_from_slice(&rest[..n]);rest=&rest[n..];
+            if buffer.len()==CHUNK_BYTES {hashes.push(Sha256::digest(&buffer).into());records.push(Record::put(chunk(OUT,transfer,(hashes.len()-1) as u32),std::mem::replace(&mut buffer,Vec::with_capacity(CHUNK_BYTES))));
+                if records.len()==16{emit(std::mem::take(&mut records))?;}
+            }
+        }Ok(())
+    };
+    push(STREAM_MAGIC)?;
+    for page in pages {let page=page?;if page.is_empty() || page.len()>config.max_transaction_bytes{return Err(Error::Overloaded);}push(&(page.len() as u32).to_be_bytes())?;push(&page)?;}
+    drop(push);
+    if !buffer.is_empty(){hashes.push(Sha256::digest(&buffer).into());records.push(Record::put(chunk(OUT,transfer,(hashes.len()-1) as u32),buffer));}
+    let mut manifest=Manifest{database:identity.0,donor:identity.1,recipient,transfer,expires:deadline(config,now),bytes:total as u64,digest:digest.finalize().into(),schema,progress,chunks:hashes,signature:Vec::new()};
+    manifest.signature=SigningKey::from_bytes(&config.signing_key).sign(&manifest.signed_bytes()?).to_bytes().to_vec();
+    let pin=Pin{recipient,boundary:manifest.progress.iter().map(|p|(p.origin,p.applied)).collect(),target:None,expires:manifest.expires,digest:manifest.digest};
+    records.push(Record::put(pin_key(transfer),encode(&pin)?));records.push(Record::put(header(OUT,transfer),encode(&manifest)?));emit(records)?;Ok(manifest)
+}
+fn install_key(transfer:NodeId)->Vec<u8>{format!("{}{}/install",String::from_utf8_lossy(IN),hex(&transfer)).into_bytes()}
+fn stream_read(backend:&dyn Backend,m:&Manifest,offset:u64,length:usize)->Result<Vec<u8>> {
+    if offset.checked_add(length as u64).is_none_or(|end|end>m.bytes){return Err(Error::Protocol("snapshot stream bounds".into()));}
+    let mut out=Vec::with_capacity(length);let mut at=offset as usize;
+    while out.len()<length {let index=at/CHUNK_BYTES;let bytes=backend.get(&chunk(IN,m.transfer,index as u32))?.ok_or_else(||Error::Unavailable("snapshot stream chunk missing".into()))?;
+        validate_chunk(m,m.donor,index as u32,&bytes)?;let n=(length-out.len()).min(bytes.len()-at%CHUNK_BYTES);out.extend_from_slice(&bytes[at%CHUNK_BYTES..at%CHUNK_BYTES+n]);at+=n;
+    }Ok(out)
+}
 pub fn outgoing(
     backend: &dyn Backend,
     recipient: NodeId,
@@ -242,6 +302,12 @@ pub fn accept(
     now: u64,
 ) -> Result<()> {
     m.verify(backend, config, source, now)?;
+    // A chunkless manifest is a donor's in-progress build marker, never a
+    // servable snapshot: refuse without prejudice so the requester retries
+    // once the build finalizes.
+    if m.chunks.is_empty() {
+        return Err(Error::Unavailable("snapshot build in progress".into()));
+    }
     if let Some(bytes) = backend.get(&receipt_key(m.transfer))? {
         let done: Incoming = decode(&bytes)?;
         if encode(&done.manifest)? != encode(&m)? {
@@ -368,24 +434,47 @@ pub fn finish(
     if r.manifest.schema != schema_digest(&backend.schema()?) {
         return Err(Error::Unavailable("snapshot schema mismatch".into()));
     }
-    let mut data = Vec::new();
-    for i in 0..r.manifest.chunks.len() {
-        let Some(bytes) = backend.get(&chunk(IN, transfer, i as u32))? else {
-            return Ok(false);
-        };
-        validate_chunk(&r.manifest, source, i as u32, &bytes)?;
-        data.extend(bytes);
+    if !missing(backend,&r)?.is_empty(){return Ok(false);}
+    let install=backend.get(&install_key(transfer))?.map(|bytes|decode::<u64>(&bytes)).transpose()?;
+    let streamed=if r.manifest.bytes>=STREAM_MAGIC.len() as u64 {stream_read(backend,&r.manifest,0,STREAM_MAGIC.len())?==STREAM_MAGIC}else{false};
+    let mut data=Vec::new();
+    if install.is_none() {
+        let mut digest=Sha256::new();let mut total=0u64;
+        for i in 0..r.manifest.chunks.len() {
+            let Some(bytes)=backend.get(&chunk(IN,transfer,i as u32))? else{return Ok(false)};
+            validate_chunk(&r.manifest,source,i as u32,&bytes)?;digest.update(&bytes);total+=bytes.len() as u64;
+            if !streamed {data.extend(bytes);}
+        }
+        if total!=r.manifest.bytes || <[u8;32]>::from(digest.finalize())!=r.manifest.digest{return Err(Error::Auth("snapshot payload digest".into()));}
     }
-    if data.len() as u64 != r.manifest.bytes
-        || <[u8; 32]>::from(Sha256::digest(&data)) != r.manifest.digest
-    {
-        return Err(Error::Auth("snapshot payload digest".into()));
+    if streamed {
+        let mut cursor=install.unwrap_or(STREAM_MAGIC.len() as u64);
+        if cursor<STREAM_MAGIC.len() as u64 || cursor>r.manifest.bytes{return Err(Error::Protocol("snapshot installation cursor".into()));}
+        if cursor<r.manifest.bytes {
+            // Batch install pages per apply call, like normal transaction
+            // batches: every apply is one cursor race against concurrent
+            // local writes, and installing page-by-page needs dozens of
+            // races (usually lost under write load) where a few suffice.
+            // A lost race commits nothing, so the next call re-reads from
+            // the same cursor.
+            let mut payloads=Vec::new();let mut bytes=0usize;
+            while cursor<r.manifest.bytes && payloads.len()<16 {
+                let length=u32::from_be_bytes(stream_read(backend,&r.manifest,cursor,4)?.try_into().unwrap()) as usize;
+                if length==0 || length>config.max_transaction_bytes {return Err(Error::Overloaded);}
+                if !payloads.is_empty() && bytes.saturating_add(length)>config.batch_bytes {break;}
+                bytes=bytes.saturating_add(length);
+                payloads.push(stream_read(backend,&r.manifest,cursor+4,length)?);cursor+=4+length as u64;
+            }
+            if !backend.apply(payloads,vec![Record::put(install_key(transfer),encode(&cursor)?)])? {return Ok(false);}
+            if cursor<r.manifest.bytes{return Ok(false);}
+        }
     }
     let mut receipt = r.clone();
     receipt.deadline = deadline(config, now);
     let mut records = vec![
         Record::put(receipt_key(transfer), encode(&receipt)?),
         Record::delete(header(IN, transfer)),
+        Record::delete(install_key(transfer)),
     ];
     for p in &r.manifest.progress {
         let old = backend
@@ -398,7 +487,7 @@ pub fn finish(
             encode(&old.max(p.applied))?,
         ));
     }
-    backend.apply(vec![data], records)
+    backend.apply(if streamed {Vec::new()}else{vec![data]}, records)
 }
 /// Minimum allowed pruning boundary. Origins absent at capture must retain all
 /// newly received history while a transfer pin is live.
@@ -864,11 +953,66 @@ mod tests {
         assert!(b.keys(IN).unwrap().is_empty());
     }
     #[test]
-    fn empty_transfer_completes_without_chunks() {
+    fn in_progress_build_chunks_survive_maintenance() {
+        // build_stream commits chunks incrementally while the header only
+        // finalizes at the end; the preliminary header must keep
+        // maintain()'s per-second orphan sweep from eating mid-stream
+        // chunks (donor builds take seconds under load).
+        let c = config();
+        let pages: Vec<Result<Vec<u8>>> =
+            (0..20).map(|_| Ok(vec![7u8; CHUNK_BYTES])).collect();
+        let mut emitted: Vec<Vec<Record>> = Vec::new();
+        let manifest = build_stream(
+            ([1; 16], [3; 16]),
+            [2; 16],
+            pages.into_iter(),
+            Vec::new(),
+            schema_digest(&[5]),
+            &c,
+            100,
+            |records| {
+                emitted.push(records);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(emitted.len() >= 2);
+        assert!(manifest.chunks.len() > 16);
+        // Simulate mid-build: preliminary header/pin plus the first chunk
+        // batch committed, the rest still streaming.
+        let b = Memory::new();
+        for batch in emitted.iter().take(2) {
+            b.commit(batch.clone()).unwrap();
+        }
+        let mid = b.keys(OUT).unwrap().len();
+        assert!(mid > 2, "expected staged chunks, got {mid} keys");
+        maintain(&b, 100 + 60_000).unwrap();
+        assert_eq!(
+            b.keys(OUT).unwrap().len(),
+            mid,
+            "maintain swept an in-progress build"
+        );
+        // Headerless chunks with no preliminary marker are still orphans.
+        let c2 = Memory::new();
+        c2.commit(vec![Record::put(chunk(OUT, [8; 16], 0), vec![1; 10])])
+            .unwrap();
+        maintain(&c2, 100 + 60_000).unwrap();
+        assert!(c2.keys(OUT).unwrap().is_empty());
+    }
+    #[test]
+    fn empty_manifest_is_an_in_progress_build_marker() {
+        // Chunkless manifests are reserved for in-progress builds (every
+        // servable build carries at least the stream-magic chunk), so the
+        // receiver refuses them without prejudice and retries once the
+        // donor finalizes.
         let b = Memory::new();
         let (c, m, _) = transfer(0);
-        accept(&b, &c, [3; 16], m.clone(), 100).unwrap();
-        assert!(finish(&b, &c, [3; 16], m.transfer, 100).unwrap());
+        assert!(m.chunks.is_empty());
+        assert!(matches!(
+            accept(&b, &c, [3; 16], m.clone(), 100),
+            Err(Error::Unavailable(_))
+        ));
+        assert!(incoming(&b).unwrap().is_none());
     }
     #[test]
     fn recipient_cancellation_reclaims_abandoned_payload_but_preserves_catchup_obligation() {

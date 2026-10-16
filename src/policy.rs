@@ -74,10 +74,31 @@ pub(crate) fn join(o:&Opened,records:Vec<net::Record>,state:&mut ReplicaState)->
     for record in records {if !record.key.starts_with(b"10/policy/state/"){ordinary.push(record);continue;}let bytes=record.value.ok_or_else(||Error::Corrupt("policy record deletion".into()))?;let incoming:State=decode(&bytes)?;if state_key(&incoming)?!=record.key {return Err(Error::Corrupt("policy record identity".into()));}
         let target=if let Some(prior)=joined.get(&record.key){Some(prior.clone())}else{o.store.get(&record.key)?.map(|b|decode::<State>(&b)).transpose()?};let mut resolved=target.unwrap_or_else(||incoming.clone());join_state(&mut resolved,&incoming)?;joined.insert(record.key,resolved);
     }
-    for (key,policy) in joined {if let Some(index)=state.rows.iter().position(|r|r.table==policy.table && r.key==policy.key && r.generation==policy.generation){
+    let order:Vec<Vec<u8>>=joined.keys().cloned().collect();
+    for key in order {let Some(policy)=joined.remove(&key) else{unreachable!("policy join key")};if let Some(index)=state.rows.iter().position(|r|r.table==policy.table && r.key==policy.key && r.generation==policy.generation){
             let row=&state.rows[index];let (domain,branch,scope,_)=crate::high_low::policy_scope(o,row,&policy.column,&ordinary)?;
             if (policy.domain,policy.branch,policy.scope)!=(domain,branch,scope) {ordinary.push(net::Record::put(key,encode(&policy)?));continue;}
-            let row=&mut state.rows[index];let column=state.schema.tables.iter().find(|t|t.id==row.table).and_then(|t|t.columns.iter().find(|c|c.id==policy.column)).ok_or(Error::SchemaMismatch)?;if !matches!((&policy.causal,column.policy),(Causal::Counter(_),MergePolicy::Counter)|(Causal::Set(_),MergePolicy::Set)){return Err(Error::SchemaMismatch);}let cell=row.cells.iter_mut().find(|c|c.column==policy.column).ok_or(Error::SchemaMismatch)?;cell.value=projection(&policy)?;}ordinary.push(net::Record::put(key,encode(&policy)?));}
+            let row=&mut state.rows[index];let column=state.schema.tables.iter().find(|t|t.id==row.table).and_then(|t|t.columns.iter().find(|c|c.id==policy.column)).ok_or(Error::SchemaMismatch)?;if !matches!((&policy.causal,column.policy),(Causal::Counter(_),MergePolicy::Counter)|(Causal::Set(_),MergePolicy::Set)){return Err(Error::SchemaMismatch);}let cell=row.cells.iter_mut().find(|c|c.column==policy.column).ok_or(Error::SchemaMismatch)?;cell.value=projection(&policy)?;}
+        else if let Some(rindex)=state.rows.iter().position(|r|r.table==policy.table && r.key==policy.key && r.generation>policy.generation){
+            // Concurrent creates share no generation: the row merge keeps one
+            // incarnation, but the loser's committed causal ops must join the
+            // winning row instead of orphaning. A delete at or past the loser
+            // generation fences it (delete-then-reinsert stays isolated).
+            let rowkey=encode(&policy.key)?;
+            let fenced=state.tombstones.iter().any(|t|t.table==policy.table && t.key==rowkey && t.generation>=policy.generation);
+            if !fenced{
+                let row=state.rows[rindex].clone();
+                let (domain,branch,scope,basis)=crate::high_low::policy_scope(o,&row,&policy.column,&ordinary)?;
+                let probe=State{version:Version::default(),domain,branch,scope,baseline:Value::Null,basis,table:row.table.clone(),column:policy.column.clone(),key:row.key.clone(),generation:row.generation,causal:Causal::Counter(Counter::default())};
+                let wkey=state_key(&probe)?;
+                if let Some(winner)=joined.get_mut(&wkey){if rebase_orphan(winner,&policy)?{ordinary.push(net::Record::put(wkey,encode(winner)?));}}
+                // Cache the rebased winner in the batch map (not just the
+                // output records) so a second orphan in the same batch joins
+                // the rebased state instead of the stale stored one; without
+                // this only one orphan per batch survives (last push wins).
+                else if let Some(bytes)=o.store.get(&wkey)?{let mut winner:State=decode(&bytes)?;if rebase_orphan(&mut winner,&policy)?{ordinary.push(net::Record::put(wkey.clone(),encode(&winner)?));joined.insert(wkey,winner);}}
+            }
+        }ordinary.push(net::Record::put(key,encode(&policy)?));}
     // A release can change the selected branch without receiving another
     // policy record. Project its already durable causal state as well.
     for index in 0..state.rows.len() {let row=state.rows[index].clone();let table=state.schema.tables.iter().find(|t|t.id==row.table).ok_or(Error::SchemaMismatch)?;
@@ -85,12 +106,44 @@ pub(crate) fn join(o:&Opened,records:Vec<net::Record>,state:&mut ReplicaState)->
             let(domain,branch,scope,basis)=crate::high_low::policy_scope(o,&row,&column.id,&ordinary)?;
             let probe=State{version:Version::default(),domain,branch,scope,baseline:Value::Null,basis,table:row.table.clone(),column:column.id.clone(),key:row.key.clone(),generation:row.generation,causal:Causal::Counter(Counter::default())};let key=state_key(&probe)?;
             let bytes=ordinary.iter().rev().find(|r|r.key==key).and_then(|r|r.value.clone()).or(o.store.get(&key)?);
-            if let Some(bytes)=bytes {let causal:State=decode(&bytes)?;let cell=state.rows[index].cells.iter_mut().find(|c|c.column==column.id).ok_or(Error::SchemaMismatch)?;cell.value=projection(&causal)?;cell.version=causal.version;}
+            if let Some(bytes)=bytes {let mut causal:State=decode(&bytes)?;
+                // Rebase already-durable losers (e.g. our own pre-merge
+                // incarnation) so their committed ops project too.
+                let rowkey=encode(&row.key)?;
+                let prefix=format!("10/policy/state/{}/{}/{}/",row.table,column.id,id(&rowkey));
+                let mut modified=false;
+                for okey in o.store.keys_with_prefix(prefix.as_bytes()){
+                    if okey==key{continue;}
+                    let Some(ob)=ordinary.iter().rev().find(|r|r.key==okey).and_then(|r|r.value.clone()).or(o.store.get(&okey)?) else{continue;};
+                    let orphan:State=decode(&ob)?;
+                    if orphan.generation>=causal.generation{continue;}
+                    let fenced=state.tombstones.iter().any(|t|t.table==row.table && t.key==rowkey && t.generation>=orphan.generation);
+                    if fenced{continue;}
+                    if rebase_orphan(&mut causal,&orphan)?{modified=true;}
+                }
+                let cell=state.rows[index].cells.iter_mut().find(|c|c.column==column.id).ok_or(Error::SchemaMismatch)?;cell.value=projection(&causal)?;cell.version=causal.version;
+                if modified{ordinary.push(net::Record::put(key,encode(&causal)?));}}
         }
     }Ok(ordinary)
 }
 pub(crate) fn compare(a:&Value,b:&Value)->Result<std::cmp::Ordering>{use std::cmp::Ordering;let rank=|v:&Value|match v{Value::Null=>0,Value::Integer(_)|Value::Real(_)=>1,Value::Text(_)=>2,Value::Blob(_)=>3};let ra=rank(a);let rb=rank(b);if ra!=rb{return Ok(ra.cmp(&rb));}Ok(match(a,b){(Value::Null,Value::Null)=>Ordering::Equal,(Value::Integer(a),Value::Integer(b))=>a.cmp(b),(Value::Real(a),Value::Real(b))=>a.partial_cmp(b).ok_or_else(||Error::Invalid("NaN policy value".into()))?,(Value::Integer(a),Value::Real(b))=>integer_real(*a,*b)?,(Value::Real(a),Value::Integer(b))=>integer_real(*b,*a)?.reverse(),(Value::Text(a),Value::Text(b))=>a.cmp(b),(Value::Blob(a),Value::Blob(b))=>a.cmp(b),_=>return Err(Error::Invalid("policy value types".into()))})}
 fn integer_real(a:i64,b:f64)->Result<std::cmp::Ordering>{use std::cmp::Ordering;if b.is_nan(){return Err(Error::Invalid("NaN policy value".into()));}if b>=9223372036854775808.0{return Ok(Ordering::Less);}if b< -9223372036854775808.0{return Ok(Ordering::Greater);}let integer=b as i64;let order=a.cmp(&integer);if order!=Ordering::Equal{return Ok(order);}Ok(if b.fract()>0.0{Ordering::Less}else if b.fract()<0.0{Ordering::Greater}else{Ordering::Equal})}
+
+/// Join a losing-incarnation state into the winning row's state. The winner
+/// keeps its baseline (its incarnation won the row merge); the orphan's seed
+/// tags never survive a baseline takeover. Scopes must match and the orphan
+/// basis must not exceed the winner's, otherwise the orphan stays carried
+/// but unprojected (false).
+fn rebase_orphan(winner:&mut State,orphan:&State)->Result<bool>{
+    if (orphan.domain,orphan.branch)!=(winner.domain,winner.branch)||orphan.basis>winner.basis{return Ok(false);}
+    let mut source=orphan.clone();
+    if source.baseline!=winner.baseline{
+        if let Causal::Set(set)=&mut source.causal{for tags in set.additions.values_mut(){tags.retain(|t|t.node!=[0;16]);}}
+        source.baseline=winner.baseline.clone();
+    }
+    join_state(winner,&source)?;
+    Ok(true)
+}
 
 fn join_state(target:&mut State,source:&State)->Result<()> {
     target.version=target.version.max(source.version);

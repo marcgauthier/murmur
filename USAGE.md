@@ -24,6 +24,7 @@ applications must supply their own keys and identities.
 - [Reactive query subscriptions](#reactive-query-subscriptions)
 - [Offline state exchange](#offline-state-exchange)
 - [Network replication](#network-replication)
+- [Scalability configuration](#scalability-configuration)
 - [Table replication settings](#table-replication-settings)
 - [Counters, sets, minimum, and maximum](#counters-sets-minimum-and-maximum)
 - [Replication retention and snapshot catch-up](#replication-retention-and-snapshot-catch-up)
@@ -350,7 +351,8 @@ Search restrictions and operational behavior:
 ## Reactive query subscriptions
 
 Subscriptions re-run a query after relevant captured commits and publish owned
-rows and keyed diffs. Use stable, unique row keys:
+rows and keyed diffs. Applied replication batches notify the same way as local
+commits. Use stable, unique row keys:
 
 ```rust,no_run
 use sqlite_session::{Database, Result, SubscriptionEvent, SubscriptionOptions};
@@ -485,7 +487,141 @@ Application commits do not wait for network I/O. Incoming application waits its
 turn on the single SQLite owner. Network queues can report `Overloaded` or
 transport/authentication errors; inspect replication diagnostics. Peers need
 compatible protocol versions and schema configuration. The current signed
-snapshot protocol is version 9; version 8 peers cannot exchange current traffic.
+snapshot protocol is version 10 and managed database format is 5. Older wire and
+database formats are rejected; no migration is provided.
+
+## Scalability configuration
+
+Incoming changes drain continuously, with one serialized apply worker. Batch defaults
+are 64 transactions and a 4 MiB encoded-byte target; these are batch limits, not a
+64-transactions-per-second ceiling. A larger transaction up to `max_transaction_bytes`
+(default 64 MiB signed content) runs alone. Envelope bytes are additional and bounded; `staging_bytes` must allow at least
+`max_transaction_bytes + 4096`. Local captures must fit the configured
+signed-content limit too; an oversized capture fails its durability barrier with a
+storage error rather than acknowledging a log that peers would reject. Choose capture
+thresholds and transaction sizes below that limit, including row/version encoding.
+The fallback `incoming_interval` is capped at one second; durable staging wakes the
+worker immediately. Busy/storage-error states retain staging and retry without spinning.
+
+```rust,no_run
+use std::time::Duration;
+use sqlite_session::{Options, replication::Config};
+
+fn configure_scalability(options: &mut Options, config: &mut Config) {
+    options.capture_interval = Duration::from_secs(1);
+    config.batch_transactions = 64;
+    config.batch_bytes = 4 << 20;
+    config.adaptive_sync = false; // Opt in after measuring local writer latency.
+}
+```
+
+`batch_transactions` accepts 1..=1024 and `batch_bytes` 1..=64 MiB. With
+`adaptive_sync = true`, capture uses at most one second and falls to 100 ms when
+persistence backlog reaches half the queue budget. Incoming batch counts shrink
+when batch service exceeds 10 ms and grow when below 2 ms, within the configured
+count limit. The controller never raises queue, connection, or transaction limits.
+`apply_batches`, `apply_bytes`, and `apply_nanos` expose completed incoming service.
+For Linux shared-host bottleneck diagnosis, the [benchmark profiler](tests-benchmark/README.md#shared-host-resource-profiling-linux)
+records process CPU, host/disk activity, and pressure without changing system settings.
+Shared-host latency under CPU saturation does not establish distributed-host capacity.
+`Backend::progress` collects durable origin progress; the managed backend performs
+one serialized Spool read rather than one worker round trip per scalar watermark.
+
+`Backend::get_many` returns one value per input key, in order, with `None` for
+missing keys. `get_many_bounded` returns an ordered prefix within its byte budget;
+one oversized first value is allowed so recovery can advance. Managed databases
+perform each call on the serialized Spool worker. Custom backends have per-key
+fallbacks and should override these hooks for efficient storage reads; neither hook
+promises a transactionally consistent read snapshot.
+
+```rust
+use sqlite_session::replication::{Backend, Result};
+fn read_versions(backend: &dyn Backend) -> Result<Vec<Option<Vec<u8>>>> {
+    let keys = vec![b"example/row-version".to_vec(), b"example/progress".to_vec()];
+    backend.get_many_bounded(&keys, 1 << 20)
+}
+```
+
+Outgoing push rounds reuse decoded transactions and serialized/compressed frames
+across peers. Disposable caches are capped at 4 MiB each and 1,024 entries, then
+cleared after the round; queue byte leases still apply per peer. Outgoing lookahead
+reads at most a 1 MiB value prefix, allowing one oversized first transaction.
+Large transfers retain their existing transfer permits and chunk/recovery protocol.
+
+Outgoing rounds rotate the starting origin independently for each peer after
+accepted outgoing work. This prevents an early origin's sustained backlog from
+consuming every bounded batch slot. The cursor resets on a new connection;
+durable progress and acknowledgments remain in Spool. Batch limits and the
+100 ms outgoing push interval are unchanged.
+
+Go custom backends may implement optional `BatchBackend.GetMany(keys, maxBytes)`;
+`maxBytes == nil` requires all keys, otherwise return an ordered bounded prefix.
+Results are `[]*Bytes`: nil means missing, a pointer to empty bytes means present.
+`BackendHandle.GetMany` and `GetManyBounded` expose the Rust hooks:
+
+```go
+values, err := handle.GetMany([][]byte{[]byte("example/row-version"), []byte("missing")})
+page, err := handle.GetManyBounded(keys, 1 << 20)
+```
+
+Check `err` after each call and advance a bounded cursor by the returned count.
+`RunBlocking(func() error)` maps Rust's synchronous scheduler utility; ordinary Go
+calls execute inline and it does not launch a goroutine. The runnable
+[backend example](clients/go/examples/backend/main.go) checks batched missing/empty
+values and the blocking callback.
+
+Small gossip envelopes stage their authenticated transactions in one atomic Spool
+commit, coalescing observed progress and clock updates. Count and byte budgets
+apply to the complete envelope; an over-budget envelope is retried through repair.
+Snapshot cleanup runs on the one-second maintenance tick rather than every apply batch.
+
+Incoming authentication uses a disposable FIFO cache of at most 1,024 digest/trust-key
+pairs. It retains no transaction payloads. Every lookup hashes the complete signed
+transaction and checks the current database, origin trust key, and size limit; changed
+bytes or trust settings require verification. Restart clears the cache and staged
+transactions are verified again. Staging, receipts, and progress remain authoritative
+in Spool.
+
+Ordinary incoming merges point-read affected row versions, deletion floors,
+ownership, shadows, and policy state from Spool. Historical tombstones remain durable.
+Within an incoming batch, one transient map joins affected rows and tombstones;
+unchanged batch rows are not rebuilt for each transaction. The map is discarded
+after preparation, and Spool remains the metadata authority. Sequential conflict,
+delete/reinsert, and clock behavior is preserved.
+Spool keeps a 64 KiB block target and a 16 MiB physical-value limit; larger logical
+values are split into 64 KiB pieces and published atomically. A single large remote
+publication can occupy up to twice the configured transaction limit plus 4 MiB in
+an otherwise empty persistence queue. Local admission pauses until it drains.
+The local SQLite session memory budget still applies separately; 64 MiB of wire
+content does not imply a 64 MiB application value fits the local session budget.
+
+Writer shares remain 90% local / 10% remote with maintenance reservations. Payload decoding and remote durability waits run outside SQLite writer admission.
+Incoming session collection and final SQLite publication both consume remote writer
+admission. Optimistic preparation releases admission between those operations.
+Merge preparation normally runs optimistically. Row-only merges can capture and preserve
+pending local SQL to unrelated primary keys before publication; overlapping keys,
+intervening captures, and auxiliary CRDT updates require a fresh merge. Local policy
+intents also require a retry. Spool processes the local capture before the remote
+patch, and durability still precedes ACKs. After repeated contention the worker reserves
+writer admission for the bounded point merge and publication to guarantee progress. Individual SQLite
+transactions remain atomic and non-preemptible; large ones can cause longer pauses.
+The network reserves 1 MiB of the global queue for control traffic and 64 KiB per
+peer; larger control messages use the bounded data lane. Peer selection randomizes
+outbound candidates and reserves session capacity for outbound connections.
+
+Managed snapshots stream from an immutable encrypted Spool checkpoint. Source
+payload buffers and receiver record batches are bounded; opening the checkpoint
+also requires its Spool location index. Verified batches become visible incrementally,
+with durable installation cursors. Final progress/ACK waits for complete installation.
+A restart resumes from the cursor, preserving newer local edits and local-only tables.
+Expired/unavailable transfers require a fresh trusted donor capture. Explicit
+`export_state`, backend `snapshot`, and `snapshot_with_progress` remain materialized
+APIs; streaming applies to managed network snapshot creation and installation.
+
+The 500-node, p95 <5 s / p99 <15 s convergence goals are benchmark acceptance targets,
+not measured guarantees. Run the process benchmark with sustained load and capture
+at one second or less. `Flush` is the local durable-data acknowledgement; ordinary
+transaction success and remote visibility alone do not guarantee durable replicas.
 
 ## Table replication settings
 
@@ -571,6 +707,10 @@ and removals rather than treating concurrent whole-set assignments as LWW.
 Min/max require comparable values. The row must exist, keys must match declared
 primary-key order, and at most 10,000 policy intents fit one transaction. Causal
 state lives in Spool; no policy metadata tables or triggers are added to SQLite.
+Concurrent inserts of the same key on different nodes union their counter
+deltas and set operations once the rows merge, and minimum/maximum columns
+take the extremum across all unfenced incarnations. A delete fences the
+deleted incarnation's operations, so a reinserted row never resurrects them.
 
 ## Replication retention and snapshot catch-up
 
@@ -592,11 +732,17 @@ Peer ACKs, retirements, ages, snapshot coverage, and duplicate floors are durabl
 Spool records. Unretired peers within `maximum_offline` (default seven days),
 pending bridge exports, and active snapshot transfers protect needed history.
 Cleanup publishes durable snapshot coverage before deleting logs/receipts and
-advancing duplicate floors. CRDT tombstones remain.
+advancing duplicate floors. CRDT tombstones remain. Physical segment
+reclamation after pruning is rate-limited maintenance (at most one pass per
+minute per trigger, skipped when a pass prunes nothing), so disk space
+follows logical pruning with a delay; frequent collection stays cheap.
 
 `db.retire_peer(node_id)` durably retires that identity and rejects its future
 connections; use it only for a permanently removed replica. `remove_peer` on the
 network handle disconnects a peer without making that retention decision.
+A removed peer stays blocked across restarts until `add_peer` dials it again;
+the re-admit works even when the peer restarted with a new address, and the
+latest of `add_peer`/`remove_peer` wins.
 Retention is not a hard storage quota or backup rotation policy.
 
 If retained logs cannot cover a peer's gap, an authorized snapshot donor provides
@@ -604,8 +750,9 @@ a signed, resumable snapshot. Transfers use 64 KiB chunks, durable staging, and
 bounded pages; the receiver merges concurrent local changes rather than replacing
 its entire database. Completion must be durable before ACK. Snapshot payload and
 per-direction aggregate staging budgets default to 512 MiB, with a seven-day
-fixed transfer lifetime. Larger states require a different seeding strategy such
-as backup/restore. File metadata can travel with catch-up; object payloads are
+fixed transfer lifetime. Larger states require explicitly larger snapshot and
+staging budgets; the signed manifest must also fit the configured peer queue and
+the 8 MiB frame limit. File metadata can travel with catch-up; object payloads are
 fetched separately. Snapshot catch-up needs an explicitly trusted donor.
 
 ## Encrypted file objects
@@ -811,6 +958,15 @@ Phases are `Opening`, `Rebuilding`, `Indexing`, `Finalizing`, `Ready`, `Failed`,
 and `Cancelled`. `open_progress()` returns a snapshot. Progress callbacks must
 return promptly and must not reenter the database.
 
+Startup authenticates Spool's committed groups and loads current records through
+its byte-bounded decoded block cache. SQLite rebuilding streams winning row
+metadata directly from Spool, reuses an insert statement per table, and then builds
+indexes and runs an integrity check. It uses one in-memory SQLite connection;
+`storage_workers` does not parallelize SQLite reconstruction. For Go applications,
+rebuild the native library with `./clients/go/build.sh --release` before rebuilding
+the application: `go build` alone does not rebuild changed Rust sources and can
+link an old debug archive. See [the Go build instructions](clients/go/README.md).
+
 `status()` reports committed/durable cursors, captured pending bytes, storage
 errors, checkpoint pause, closed state, progress, search status, scheduler state,
 and optional replication diagnostics. `pending_bytes` measures captured queued
@@ -852,7 +1008,7 @@ Supply operational options on each open. MiB/KiB below are binary units.
 | --- | --- | --- |
 | `mode` | `Existing` | Use `CreateNew` only for new storage |
 | `database_id`, `node_id` | `None` | Create identities or validate supplied identities; peers share database ID, differ in node ID |
-| `capture_interval` | 5 s | Nonzero collection interval between owner jobs |
+| `capture_interval` | 1 s | Nonzero collection interval between owner jobs |
 | `capture_bytes` | 8 MiB | Positive capture threshold, at most queue capacity |
 | `queue_bytes` | 64 MiB | Captured persistence queue; maximum 128 MiB |
 | `transaction_bytes` | 64 MiB | Positive transaction budget, at most queue capacity |
@@ -872,6 +1028,13 @@ Supply operational options on each open. MiB/KiB below are binary units.
 | `replication` | `None` | Optional network config, requires Cargo feature |
 | `on_open_progress` | `None` | Optional short synchronous progress callback |
 | `fault_hooks` | `None` | Failure injection for testing, not a production feature |
+
+Spool's index also keeps fixed namespace membership hints for prefix searches:
+128 bytes per index shard (32 KiB with the default 256 shards). They are rebuilt
+on open and contain no record values or conflict versions. Deleted namespaces or
+hash collisions can cause extra index searches; returned keys still come from
+the ordered index. This fixed index overhead remains when `spool_cache_bytes` is
+zero, which disables the decoded-block cache.
 
 `replication::Config::new` defaults and limits:
 

@@ -8,7 +8,7 @@ pub(crate) struct Owner {pub table:String,pub key:Vec<Value>,pub column:String,p
 #[derive(Clone,Debug,Serialize,Deserialize)]
 struct Shadow {pub database:[u8;16],pub row:Option<RowState>,pub tombstones:Vec<Tombstone>,pub table:String,pub key:Vec<Value>}
 pub(crate) fn owner_key(table:&str,key:&[Value],column:&str)->Result<Vec<u8>>{Ok(format!("09/bridge/owner/{}/{}/{}",table,id(&encode(&key)?),column).into_bytes())}
-fn shadow_key(shadow:&Shadow)->Result<Vec<u8>>{Ok(format!("09/bridge/shadow/{}/{}/{}",id(&shadow.database),shadow.table,id(&encode(&shadow.key)?)).into_bytes())}
+fn shadow_key(shadow:&Shadow)->Result<Vec<u8>>{Ok(format!("09/bridge/shadow/{}/{}/{}",shadow.table,id(&encode(&shadow.key)?),id(&shadow.database)).into_bytes())}
 pub(crate) fn current_owner(o:&Opened,table:&str,key:&[Value],column:&str)->Result<Option<Owner>>{o.store.get(&owner_key(table,key,column)?)?.map(|b|decode(&b)).transpose()}
 pub(crate) fn promote(o:&Opened,records:&mut Vec<spool::Mutation>,version:Version)->Result<()> {
     if !o.replication_config.as_ref().and_then(|c|c.bridge.as_ref()).is_some_and(|b|b.role==Role::HighReceiver){return Ok(());}
@@ -26,8 +26,22 @@ pub(crate) fn join(o:&Opened,records:Vec<Record>,state:&mut ReplicaState)->Resul
         else {let incoming:Shadow=decode(&value)?;if shadow_key(&incoming)?!=record.key{return Err(Error::Corrupt("shadow record identity".into()));}if let Some(bytes)=old{encode(&join_shadow(&decode(&bytes)?,&incoming,&state.schema)?)?}else{value}};
         changes.insert(record.key,resolved);
     }
-    let mut owners=BTreeMap::new();for key in o.store.keys_with_prefix(b"09/bridge/owner/"){if let Some(bytes)=o.store.get(&key)? {owners.insert(key,decode::<Owner>(&bytes)?);}}for(key,value)in &changes {if key.starts_with(b"09/bridge/owner/"){owners.insert(key.clone(),decode(value)?);}}
-    let mut shadows=BTreeMap::new();for key in o.store.keys_with_prefix(b"09/bridge/shadow/"){if let Some(bytes)=o.store.get(&key)?{shadows.insert(key,decode::<Shadow>(&bytes)?);}}for(key,value)in &changes{if key.starts_with(b"09/bridge/shadow/"){shadows.insert(key.clone(),decode(value)?);}}
+    let mut affected=std::collections::BTreeSet::new();
+    for row in &state.rows {affected.insert((row.table.clone(),encode(&row.key)?));}
+    affected.extend(affected_records(&records_from_changes(&changes))?);
+    let mut owners=BTreeMap::new(); let mut shadows=BTreeMap::new();
+    for (table,key) in &affected {
+        let values:Vec<Value>=decode(key)?;
+        let columns=state.schema.tables.iter().find(|t| &t.id==table).ok_or(Error::SchemaMismatch)?;
+        for column in std::iter::once("__row__").chain(columns.columns.iter().map(|c|c.id.as_str())) {
+            let key=owner_key(table,&values,column)?;
+            if let Some(bytes)=changes.get(&key).cloned().or(o.store.get(&key)?) { owners.insert(key,decode::<Owner>(&bytes)?); }
+        }
+        for key in o.store.keys_with_prefix(shadow_prefix(table,key).as_bytes()) {
+            if let Some(bytes)=o.store.get(&key)? {shadows.insert(key,decode::<Shadow>(&bytes)?);}
+        }
+    }
+    for(key,value)in &changes {if key.starts_with(b"09/bridge/shadow/"){shadows.insert(key.clone(),decode(value)?);}}
     // These maps exist only for this one bounded projection, not as a Rust replica.
     for shadow in shadows.values() {
         let row_owner=owners.get(&owner_key(&shadow.table,&shadow.key,"__row__")?);if row_owner.is_some_and(|o|o.owned){state.rows.retain(|r|r.table!=shadow.table || r.key!=shadow.key);continue;}
@@ -52,7 +66,7 @@ pub(crate) fn import(adapter:&Adapter,header:Header,payload:Vec<u8>)->net::Resul
         let config=o.replication_config.as_ref().and_then(|c|c.bridge.as_ref()).filter(|b|b.role==Role::HighReceiver && b.trusted_domains.contains(&header.source_database)).ok_or_else(||Error::Invalid("untrusted bridge domain".into()))?;let _=config;
         let receipt=format!("09/bridge/receipt/{}/{}",id(&header.source_database),header.origin.as_ref().map(|p|format!("{}-{:020}",id(&p.node),p.sequence)).unwrap_or_else(||id(&header.bundle))).into_bytes();
         if let Some(previous)=o.store.get(&receipt)? {if previous!=header.digest{return Err(Error::Corrupt("conflicting bridge receipt".into()));}return Ok(None);}
-        if o.cursor!=cursor{return Err(Error::Busy);}let baseline=metadata::state(&o.store,o.schema.clone(),o.identity.database,o.clock)?;let mut state=baseline.clone();let mut records=content.records;
+        if o.cursor!=cursor{return Err(Error::Busy);}let mut state=ReplicaState{database_id:o.identity.database,schema:o.schema.clone(),clock:o.clock,rows:Vec::new(),tombstones:Vec::new()};let mut records=content.records;
         if let Some(mut low)=low {if low.database_id!=header.source_database{return Err(Error::SchemaMismatch);}
         let allowed:std::collections::BTreeSet<_> = low.schema.tables.iter().filter(|source| {
             state.schema.tables.iter().find(|target|target.name==source.name)
@@ -70,6 +84,8 @@ pub(crate) fn import(adapter:&Adapter,header:Header,payload:Vec<u8>)->net::Resul
         for tomb in &low.tombstones {let low_table=low.schema.tables.iter().find(|t|t.id==tomb.table).ok_or(Error::SchemaMismatch)?;let high=state.schema.tables.iter().find(|t|t.name==low_table.name).ok_or(Error::SchemaMismatch)?;let mut tomb=tomb.clone();tomb.table=high.id.clone();let key:Vec<Value>=decode(&tomb.key)?;let shadow=Shadow{database:header.source_database,row:None,tombstones:vec![tomb],table:high.id.clone(),key};records.push(Record::put(shadow_key(&shadow)?,encode(&shadow)?));}
         state.clock=state.clock.max(low.clock);}
         records=crate::table_replication::filter_records(records,&o.schema)?;
+        let keys=affected_records(&records)?;let baseline=metadata::affected_state(&o.store,o.schema.clone(),o.identity.database,o.clock,&keys)?;
+        state.rows=baseline.rows.clone();state.tombstones=baseline.tombstones.clone();
         records=join(o,records,&mut state)?;
         // Low policy components keep their domain/scope but use the High visible
         // generation. Ownership selects the appropriate causal branch.
@@ -78,18 +94,32 @@ pub(crate) fn import(adapter:&Adapter,header:Header,payload:Vec<u8>)->net::Resul
         records.push(Record::put(receipt,header.digest.to_vec()));records.push(Record::put(format!("09/bridge/provenance/bundle/{}",id(&header.bundle)).into_bytes(),encode(&header)?));
         records.push(Record::put(format!("09/bridge/applied/{}/{}",net::hex(&header.source_database),header.stream).into_bytes(),encode(&header.sequence)?));
         crate::table_replication::preserve_local(&mut state, &baseline);
-        Ok(Some((merge::prepare_joined(&baseline,state,cursor)?,records)))
+        Ok(Some((merge::prepare_delta(&baseline,state,cursor)?,records)))
     })?;let Some((patch,records))=prepared else{return Ok(true);};publish(adapter,patch,records)
 }
-pub(crate) fn release(adapter:&Adapter,table:String,key:Vec<u8>,column:Option<String>)->net::Result<bool>{let values:Vec<Value>=decode(&key).map_err(net_error)?;let cursor=adapter.database()?.call(|c|{let s=c.status.lock().unwrap();Ok((s.committed==c.captured_cursor && s.durable==c.captured_cursor).then_some(s.committed))}).map_err(net_error)?;let Some(cursor)=cursor else{return Ok(false);};let(patch,records)=adapter.spool(move|o|{let baseline=metadata::state(&o.store,o.schema.clone(),o.identity.database,o.clock)?;let table=baseline.schema.tables.iter().find(|t|t.name==table).ok_or(Error::SchemaMismatch)?;let column=if let Some(name)=column {table.columns.iter().find(|c|c.name==name).ok_or(Error::SchemaMismatch)?.id.clone()}else{"__row__".into()};let version=o.clock.next(o.identity.node)?;let mut owner=current_owner(o,&table.id,&values,&column)?.ok_or_else(||Error::Invalid("field is not High-owned".into()))?;owner.owned=false;owner.epoch=version;owner.release_epoch=version;let record=Record::put(owner_key(&owner.table,&owner.key,&owner.column)?,encode(&owner)?);let mut state=baseline.clone();let records=join(o,vec![record],&mut state)?;let records=crate::policy::join(o,records,&mut state)?;state.clock=version;Ok((merge::prepare_joined(&baseline,state,cursor)?,records))})?;publish(adapter,patch,records)}
+pub(crate) fn release(adapter:&Adapter,table:String,key:Vec<u8>,column:Option<String>)->net::Result<bool>{let values:Vec<Value>=decode(&key).map_err(net_error)?;let cursor=adapter.database()?.call(|c|{let s=c.status.lock().unwrap();Ok((s.committed==c.captured_cursor && s.durable==c.captured_cursor).then_some(s.committed))}).map_err(net_error)?;let Some(cursor)=cursor else{return Ok(false);};let(patch,records)=adapter.spool(move|o|{let table=o.schema.tables.iter().find(|t|t.name==table).ok_or(Error::SchemaMismatch)?;let column=if let Some(name)=column {table.columns.iter().find(|c|c.name==name).ok_or(Error::SchemaMismatch)?.id.clone()}else{"__row__".into()};let version=o.clock.next(o.identity.node)?;let mut owner=current_owner(o,&table.id,&values,&column)?.ok_or_else(||Error::Invalid("field is not High-owned".into()))?;owner.owned=false;owner.epoch=version;owner.release_epoch=version;let record=Record::put(owner_key(&owner.table,&owner.key,&owner.column)?,encode(&owner)?);let keys=affected_records(std::slice::from_ref(&record))?;let baseline=metadata::affected_state(&o.store,o.schema.clone(),o.identity.database,o.clock,&keys)?;let mut state=baseline.clone();let records=join(o,vec![record],&mut state)?;let records=crate::policy::join(o,records,&mut state)?;state.clock=version;Ok((merge::prepare_delta(&baseline,state,cursor)?,records))})?;publish(adapter,patch,records)}
 
 pub(crate) fn policy_scope(o:&Opened,row:&RowState,column:&str,records:&[Record])->Result<([u8;16],Version,Version,Version)> {
     let key=owner_key(&row.table,&row.key,column)?;
     let owner=records.iter().rev().find(|r|r.key==key).and_then(|r|r.value.as_ref()).map(|b|decode::<Owner>(b)).transpose()?.or(current_owner(o,&row.table,&row.key,column)?);
     if let Some(owner)=owner.as_ref().filter(|o|o.owned){return Ok((o.identity.database,owner.release_epoch,row.generation,owner.epoch));}
     let mut latest:Option<(Version,[u8;16],Version)>=None;
-    let prefix=b"09/bridge/shadow/";let mut shadows=BTreeMap::new();for key in o.store.keys_with_prefix(prefix){if let Some(bytes)=o.store.get(&key)?{shadows.insert(key,bytes);}}for r in records.iter().filter(|r|r.key.starts_with(prefix)){if let Some(bytes)=&r.value{shadows.insert(r.key.clone(),bytes.clone());}}
+    let prefix=shadow_prefix(&row.table,&encode(&row.key)?);let mut shadows=BTreeMap::new();for key in o.store.keys_with_prefix(prefix.as_bytes()){if let Some(bytes)=o.store.get(&key)?{shadows.insert(key,bytes);}}for r in records.iter().filter(|r|r.key.starts_with(prefix.as_bytes())){if let Some(bytes)=&r.value{shadows.insert(r.key.clone(),bytes.clone());}}
     for bytes in shadows.values(){let shadow:Shadow=decode(bytes)?;if shadow.table!=row.table || shadow.key!=row.key {continue;}if let Some(source)=shadow.row {if let Some(cell)=source.cells.iter().find(|c|c.column==column){let candidate=(cell.version,shadow.database,source.generation);if latest.is_none_or(|old|candidate>old){latest=Some(candidate);}}}}
     if let Some((version,database,generation))=latest {return Ok((database,Version::default(),generation,version));}
     Ok((o.identity.database,owner.map(|o|o.release_epoch).unwrap_or_default(),row.generation,row.generation))
+}
+
+fn shadow_prefix(table:&str,key:&[u8])->String {format!("09/bridge/shadow/{}/{}/",table,id(key))}
+fn records_from_changes(changes:&BTreeMap<Vec<u8>,Vec<u8>>)->Vec<Record> {
+    changes.iter().map(|(key,value)|Record::put(key.clone(),value.clone())).collect()
+}
+pub(crate) fn affected_records(records:&[Record])->Result<std::collections::BTreeSet<(String,Vec<u8>)>> {
+    let mut keys=std::collections::BTreeSet::new();
+    for record in records {if let Some(value)=&record.value {
+        if record.key.starts_with(b"09/bridge/owner/") {let owner:Owner=decode(value)?;keys.insert((owner.table,encode(&owner.key)?));}
+        else if record.key.starts_with(b"09/bridge/shadow/") {let shadow:Shadow=decode(value)?;keys.insert((shadow.table,encode(&shadow.key)?));}
+        else if record.key.starts_with(b"10/policy/state/") {let policy:crate::policy::State=decode(value)?;keys.insert((policy.table,encode(&policy.key)?));}
+    }}
+    Ok(keys)
 }

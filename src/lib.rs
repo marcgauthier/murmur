@@ -1,4 +1,7 @@
 //! In-memory SQLite with encrypted background persistence and LWW metadata.
+#[cfg(feature="replication")]
+mod snapshot_stream;
+mod logical_store;
 mod backup;
 #[cfg(feature = "replication")]
 mod files;

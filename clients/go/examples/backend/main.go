@@ -21,6 +21,19 @@ func run(ctx context.Context, e *demo.Env) error {
 		return err
 	}
 	e.Defer(b.Handle.Close)
+	if err = a.Commit([]murmur.Record{murmur.PutRecord([]byte("demo/empty"), []byte{})}); err != nil {
+		return err
+	}
+	values, err := a.Handle.GetMany([][]byte{[]byte("demo/empty"), []byte("demo/missing")})
+	if err != nil {
+		return err
+	}
+	if err = demo.Require(len(values) == 2 && values[0] != nil && len(*values[0]) == 0 && values[1] == nil, "batch missing/empty distinction"); err != nil {
+		return err
+	}
+	if err = murmur.RunBlocking(func() error { return nil }); err != nil {
+		return err
+	}
 	ar, err := murmur.StartReplication(c.Configs[0], a.Handle)
 	if err != nil {
 		return err
@@ -51,6 +64,13 @@ func run(ctx context.Context, e *demo.Env) error {
 		return err
 	}
 	if err = demo.Wait(ctx, "record deletion", func() (bool, error) { _, ok, err := b.Get([]byte("demo/message")); return !ok, err }); err != nil {
+		return err
+	}
+	progress, err := a.Handle.Progress()
+	if err != nil {
+		return err
+	}
+	if err = demo.Require(len(progress) > 0, "backend progress missing"); err != nil {
 		return err
 	}
 	e.Print("Custom callback backend replicated signed records and deletion; ephemeral demo has no durable checkpoints")

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use murmur_replication::Config as ReplConfig;
-use sqlite_session::{Database, OpenMode, Options};
+use sqlite_session::{Database, Migration, OpenMode, Options};
 
 use crate::{Error, Result};
 
@@ -499,6 +499,31 @@ impl Cluster {
             .unwrap_or_else(|| panic!("node{} is stopped", idx + 1))
     }
 
+    /// Run fixture SQL on one node during setup (Go: per-node fixture
+    /// loop). Fast meshes converge the schema from an earlier node before
+    /// a later node's identical migrate runs; that "already exists" is
+    /// the converged fixture, not a failure. Node 0 stays strict (nothing
+    /// has replicated yet, so pre-existing tables there mean a dirty
+    /// runtime dir); later nodes skip on with a log line.
+    pub fn ensure_migrated(&self, idx: usize, sql: &str) -> Result<()> {
+        match self.node(idx).migrate(Migration::new(sql)) {
+            Ok(()) => self.node(idx).flush()?,
+            Err(e) if idx > 0 && e.to_string().contains("already exists") => {
+                eprintln!(
+                    "node{}: fixture schema already converged, skipping identical migrate",
+                    idx + 1
+                );
+            }
+            Err(e) => {
+                return Err(Error::Setup(format!(
+                    "node{} fixture migrate failed: {e}",
+                    idx + 1
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Dial `target` from `from` (both must be running; target addr is its
     /// current ephemeral bind).
     pub fn add_peer(&self, from: usize, target: usize) -> Result<()> {
@@ -571,6 +596,68 @@ impl Cluster {
     /// afterwards, since peers still dial the old address.
     pub fn start_node(&mut self, idx: usize) -> Result<()> {
         self.start_node_inner(idx, None)
+    }
+
+    /// Reopen every listed node concurrently, joining all opens (the
+    /// barrier) before rebinding addresses (Go: `restartBehindBarrier`).
+    /// Sequential reopens skew a storm by minutes when opens take seconds
+    /// each; concurrent opens share the wall clock so every node rejoins
+    /// from the same backlog. Opens touch disjoint dirs and only reinsert
+    /// handles afterwards, so no node observes a half-restarted peer.
+    pub fn start_nodes_parallel(&mut self, idxs: &[usize]) -> Result<()> {
+        struct Params {
+            idx: usize,
+            data_dir: PathBuf,
+            key: [u8; 32],
+            opts: Options,
+        }
+        let mut params = Vec::with_capacity(idxs.len());
+        for &idx in idxs {
+            let st = self.states.get(idx).ok_or(Error::UnknownNode(idx))?;
+            if st.node.db.is_some() {
+                return Err(Error::Setup(format!("node{} is already running", idx + 1)));
+            }
+            let mut db_opts = Options {
+                mode: OpenMode::Existing,
+                database_id: Some(st.database_id),
+                node_id: Some(st.node.node_id),
+                replication: Some(st.config.clone()),
+                ..Options::default()
+            };
+            apply_sqlite(&mut db_opts, &st.sqlite);
+            apply_spool(&mut db_opts, &st.spool);
+            params.push(Params {
+                idx,
+                data_dir: st.node.data_dir.clone(),
+                key: st.key,
+                opts: db_opts,
+            });
+        }
+        let mut opened: Vec<(usize, Database)> = Vec::with_capacity(params.len());
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(params.len());
+            for p in params {
+                handles.push(s.spawn(move || {
+                    (
+                        p.idx,
+                        crate::unlock::open_with_watchdog(&p.data_dir, p.key, p.opts),
+                    )
+                }));
+            }
+            for h in handles {
+                let (idx, result) = h.join().map_err(|_| {
+                    Error::Setup("parallel open thread panicked".into())
+                })?;
+                opened.push((idx, result?));
+            }
+            Ok::<_, Error>(())
+        })?;
+        for (idx, db) in opened {
+            let st = self.states.get_mut(idx).ok_or(Error::UnknownNode(idx))?;
+            st.node.repl_addr = replication_addr(&db)?;
+            st.node.db = Some(db);
+        }
+        Ok(())
     }
 
     /// Replace node `idx`'s stored bridge config (signer-rotation legs, Go

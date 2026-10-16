@@ -56,3 +56,25 @@ Names refer to Rust wire types, so Go `OriginTransaction` uses `Transaction`,
 `SnapshotManifest` uses `Manifest`, `SnapshotIncoming` uses `Incoming`, and bridge
 DTOs use `Origin`/`Header`/`Bundle`. Optional values use pointers. Control JSON limits
 these codecs to JSON-representable values; raw SQL has its own binary boundary.
+
+Scalability configuration adds JSON fields `batch_transactions`, `batch_bytes`, and
+`adaptive_sync`; defaults are 64, 4194304, and false. Capture defaults to 1000000000 ns.
+Replication metrics include `apply_batches`, `apply_bytes`, and `apply_nanos`.
+The `helper_snapshot` operation accepts `method: "build_stream"` with encoded `pages`
+and a backend handle. Custom backend callbacks may receive `keys_page` with `prefix`,
+nullable exclusive `after`, and `limit`. These additions retain the JSON cgo boundary.
+Wire protocol 10 and database format 5 reject older versions.
+
+Custom backends may implement optional `CancellableBackend.CancelPending` to interrupt
+pending owner/admission waits during `Replication.Close`; active durable commits must
+finish. Backends that leave synchronous calls blocked cannot guarantee bounded shutdown.
+
+`backend_progress` accepts a `backend` handle and returns durable origin progress
+through Rust, including the default implementation for custom Go backends.
+
+`backend_get_many` accepts `backend`, ordered `keys`, and nullable `max_bytes`,
+returning an ordered array of nullable byte arrays. Backend callbacks receive
+`get_many` with the same keys/budget; a bounded call may return a shorter prefix,
+with one oversized first value allowed. Unbounded calls require one result per key.
+`helper_run_blocking` invokes callback operation 11 through Rust's blocking utility.
+No Go pointers or long-lived buffers cross the ABI boundary.

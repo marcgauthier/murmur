@@ -25,8 +25,9 @@ sources concurrently over a 6,000-row snapshot.
   and no longer pins node3 (proves the rejoin must use the snapshot path,
   since only the newest 10 per origin survive).
 - Node3 restarts with the same durable directory; all converge on 65 rows
-  with equal digests (90 s) while node3's log-path counters stay flat
-  (proves the rows arrived via snapshot, which bypasses those counters);
+  with equal digests (90 s) while node3's log-path growth stays within
+  the retained tail and far below the gap (proves the bulk arrived via
+  snapshot, which bypasses those counters);
   the 5 pre-stop `stale-*` rows survive the merge.
 - Dual leg: same shape with two stale nodes and one survivor; both rejoin
   via snapshots (120 s), both keep their 5 pre-stop rows, and each
@@ -60,12 +61,17 @@ sources concurrently over a 6,000-row snapshot.
   unchanged, so without this overlay no leg could request a snapshot.
 - No snapshot metrics exist (`ReplicationMetrics` carries no snapshot
   counters), so the Go counter legs map to behavior: `snapshots_received
-  >= 1` becomes "rows converged while the receiver's
-  `received/applied_transactions` stayed flat"; the dual test's
-  progress/deferral-series presence legs become a connected-peer
-  diagnostics assertion; the multi-source suppressed-frames leg becomes
-  behavioral contention coverage (three live sources, one completed
-  transfer, convergence to 6,005 rows).
+  >= 1` becomes "rows converged while the receiver's log growth stayed
+  within the retained tail and far below the gap" (the retained tail
+  legitimately arrives via logs, so a flat pair would be over-strict);
+  the dual test's progress/deferral-series presence legs become a
+  connected-peer diagnostics assertion; the multi-source suppressed-frames
+  leg becomes behavioral contention coverage (three live sources, one
+  completed transfer, convergence to 6,005 rows).
+- Survivor writes flush per write/batch: one replication log entry is
+  minted per flush batch, and retention needs dozens of entries to prune
+  past (a single trailing flush would leave fewer than
+  `minimum_retained`).
 - The collection proof is explicit (`collect_retention` passes plus a
   retention-pin age assertion per survivor/victim pair) rather than a
   fixed 55 s sleep, but the member-deadline wait is kept.

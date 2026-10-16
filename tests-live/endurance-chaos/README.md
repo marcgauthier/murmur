@@ -107,15 +107,19 @@ Transient write errors during chaos are counted, never fatal.
 - Snapshot trust is configured up front (every node trusts every node)
   instead of via the Go fixture policy; without this overlay no leg
   could request a snapshot.
-- No snapshot counters exist (`ReplicationMetrics` carries none), so the
-  Go `snapshots_received >= 1` leg maps to a behavioral proof per
-  offline window: after a 30 s catch-up delay with writers still
-  running, the window counts as proven only when the victim has
-  approximately caught up (row-set drift within `max(200, rows/50)`)
-  while its `applied_transactions` delta stays below the outage's acked
-  write count (a pure log catch-up would have to apply every missed
-  transaction; snapshot application bypasses that counter, as the
-  `snapshot-resync` port relies on).
+- The Go `snapshots_received >= 1` leg maps to an event-driven proof per
+  offline window off the `snapshots_applied` counter in
+  `ReplicationMetrics`: with writers still running, the victim is
+  polled for up to 240 s until a snapshot applies and the post-apply
+  sample shows the bulk arrived via the snapshot path (row-set drift
+  below the outage's acked write count while the log-path
+  `applied_transactions` delta since the apply stays below it too — a
+  pure log catch-up would have to apply every missed transaction, as
+  the `snapshot-resync` port relies on). The victim's own restart plus
+  a donor build plus the chunk transfer can take ~45 s under chaos
+  (spool rescans dominate), and a stale donor winning the race forces
+  a second cycle, so the poll allows two full cycles rather than
+  sampling once at a fixed delay.
 - No GC-failures counter exists, and the engine multiplexes every
   subsystem error (including peer-disconnect noise from
   restarts/flaps) into one `last_error` latch — so unlike the

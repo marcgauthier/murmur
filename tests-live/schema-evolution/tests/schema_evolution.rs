@@ -100,14 +100,32 @@ fn set_note(db: &Database, node: usize, name: &str, note: &str) {
 }
 
 /// Rename a record from an older binding (Go: `Cluster.TypedRename`).
+/// Ordinary transactions cannot update primary keys, so the rename copies
+/// the row's fields under the new name (delete + insert, one transaction).
+/// Callers must barrier on the fields first (Go rename preserves the record
+/// id, so concurrent field writes follow it; the copy only sees local state).
 fn rename_row(db: &Database, node: usize, old: &str, new: &str) {
     let (old, new) = (old.to_owned(), new.to_owned());
+    let old_query = old.clone();
+    let (counter, note): (i64, Option<String>) = db
+        .read(move |sql| {
+            Ok(sql.query_row(
+                "SELECT counter, note FROM live_typed_records WHERE name = ?",
+                [old_query],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
+            )?)
+        })
+        .unwrap_or_else(|e| panic!("node{node} rename read failed: {e}"));
     db.transaction(move |sql| {
-        let changed = sql.execute(
-            "UPDATE live_typed_records SET name = ? WHERE name = ?",
-            (new, old),
+        let deleted = sql.execute(
+            "DELETE FROM live_typed_records WHERE name = ?",
+            [&old],
         )?;
-        assert_eq!(changed, 1, "node{node} rename hit {changed} rows");
+        assert_eq!(deleted, 1, "node{node} rename deleted {deleted} rows");
+        sql.execute(
+            "INSERT INTO live_typed_records(name, counter, note) VALUES(?, ?, ?)",
+            (new, counter, note),
+        )?;
         Ok(())
     })
     .unwrap_or_else(|e| panic!("node{node} rename failed: {e}"));
@@ -294,6 +312,9 @@ fn rolling_typed_schema_migration() {
         // node 2 updates its known Name field after adoption; this must not
         // erase the new Note field. Node 3 inserts a late row.
         set_note(cluster.node(0), 1, "typed-row-0", "added-field-survives");
+        // Barrier: the SQL rename copies local fields, so node 2 must hold
+        // the note before renaming (Go rename keeps the record id).
+        wait_note(&cluster, 1, "typed-row-0", "added-field-survives");
         rename_row(cluster.node(1), 2, "typed-row-0", "typed-row-renamed");
         insert_row(cluster.node(2), 3, "typed-row-late");
         let want_names = [

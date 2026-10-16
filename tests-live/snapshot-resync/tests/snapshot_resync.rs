@@ -179,11 +179,22 @@ fn log_counters(cluster: &Cluster, idx: usize) -> (u64, u64) {
 
 /// Assert the resync used the snapshot path (Go: `spedsql_repl_snapshots_received_total >= 1`,
 /// which has no Rust equivalent).
-fn assert_snapshot_path(cluster: &Cluster, idx: usize, before: (u64, u64)) {
-    assert_eq!(
-        log_counters(cluster, idx),
-        before,
-        "node {} resync arrived over the log path, not a snapshot (log catch-up would hide a snapshot-path regression)",
+/// Snapshot-path proof (Go: receiver snapshot counter): the resync's log
+/// growth must stay within the retained tail and far below the gap. The
+/// retained tail (`minimum_retained` per origin) legitimately arrives via
+/// logs, so a flat counter pair would be over-strict; the bulk can only
+/// have arrived via snapshot, the only other row path.
+fn assert_snapshot_path(cluster: &Cluster, idx: usize, before: (u64, u64), gap: usize) {
+    let (received, _applied) = log_counters(cluster, idx);
+    let growth = received.saturating_sub(before.0);
+    assert!(
+        growth <= 2 * MINIMUM_RETAINED,
+        "node {} resync pulled {growth} log transactions, above the retained tail (2 x {MINIMUM_RETAINED})",
+        idx + 1,
+    );
+    assert!(
+        (growth as usize) < gap,
+        "node {} resync arrived over the log path (log growth {growth}, gap {gap}), not a snapshot (log catch-up would hide a snapshot-path regression)",
         idx + 1,
     );
 }
@@ -326,11 +337,15 @@ fn stale_node_rejoins_via_snapshot() {
         wait_converged(&cluster, 5, BASELINE_TIMEOUT);
 
         // Phase 2: node3 stops; survivors write far past retention.
+        // Flush every write: the product mints one replication log entry
+        // per flush batch, not per SQL transaction, so a single trailing
+        // flush would leave fewer entries than `minimum_retained` and
+        // nothing would ever become eligible for pruning.
         cluster.stop_node(2);
         for i in 0..60 {
             insert(&cluster, 0, 100 + i, &format!("fresh-{i}"));
+            cluster.node(0).flush().expect("flush survivor write");
         }
-        cluster.node(0).flush().expect("flush survivor writes");
         wait_row_count(&cluster, 0, 65, ROW_TIMEOUT);
         wait_row_count(&cluster, 1, 65, ROW_TIMEOUT);
         ensure_snapshot_path(&cluster, &[0, 1], &[2]);
@@ -342,7 +357,7 @@ fn stale_node_rejoins_via_snapshot() {
         wait_converged(&cluster, 65, RESYNC_TIMEOUT);
 
         // The rejoin must have used the snapshot path, not log catch-up.
-        assert_snapshot_path(&cluster, 2, log_before);
+        assert_snapshot_path(&cluster, 2, log_before, 65 - 5);
 
         // Node3's acknowledged pre-stop state survives the snapshot merge.
         assert_eq!(
@@ -377,13 +392,14 @@ fn dual_stale_nodes_rejoin_via_snapshot() {
         cluster.node(2).flush().expect("flush baseline");
         wait_converged(&cluster, 5, BASELINE_TIMEOUT);
 
-        // Two nodes stop; the survivor writes far past retention.
+        // Two nodes stop; the survivor writes far past retention (flushed
+        // per write: one replication log entry is minted per flush batch).
         cluster.stop_node(1);
         cluster.stop_node(2);
         for i in 0..60 {
             insert(&cluster, 0, 100 + i, &format!("fresh-{i}"));
+            cluster.node(0).flush().expect("flush survivor write");
         }
-        cluster.node(0).flush().expect("flush survivor writes");
         wait_row_count(&cluster, 0, 65, ROW_TIMEOUT);
         ensure_snapshot_path(&cluster, &[0], &[1, 2]);
 
@@ -397,7 +413,7 @@ fn dual_stale_nodes_rejoin_via_snapshot() {
         wait_converged(&cluster, 65, RESYNC_TIMEOUT_LONG);
 
         for (k, &idx) in [1, 2].iter().enumerate() {
-            assert_snapshot_path(&cluster, idx, log_before[k]);
+            assert_snapshot_path(&cluster, idx, log_before[k], 65 - 5);
             assert_eq!(
                 stale_rows(&cluster, idx),
                 5,
@@ -452,12 +468,16 @@ fn stale_node_rejoins_via_single_snapshot_source() {
         // interleaves badly enough to expose source contention).
         cluster.stop_node(VICTIM);
         // Batched multi-row transactions: the test needs snapshot volume
-        // (many chunks), not round trips.
+        // (many chunks), not round trips. Flush per batch: one replication
+        // log entry is minted per flush batch, and retention needs dozens
+        // of entries to prune past (a single trailing flush would leave
+        // fewer entries than `minimum_retained`).
         const FRESH_ROWS: i64 = 6000;
         const BATCH: i64 = 100;
         let start = Instant::now();
         for base in (0..FRESH_ROWS).step_by(BATCH as usize) {
             insert_many(&cluster, 0, 100 + base, BATCH, "fresh");
+            cluster.node(0).flush().expect("flush survivor batch");
         }
         eprintln!(
             "wrote {FRESH_ROWS} survivor rows in {:?}",
@@ -478,7 +498,7 @@ fn stale_node_rejoins_via_single_snapshot_source() {
         // multi-source contention: three survivors serve concurrently while
         // the transfer completes to convergence. Rival-source suppression
         // has no Rust counter; contention coverage is behavioral.
-        assert_snapshot_path(&cluster, VICTIM, log_before);
+        assert_snapshot_path(&cluster, VICTIM, log_before, want - 5);
         assert_eq!(
             stale_rows(&cluster, VICTIM),
             5,

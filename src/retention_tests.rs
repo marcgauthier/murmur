@@ -3,7 +3,11 @@ use super::*;
 use net::protocol::{Progress, log_key, progress_key, retained_key};
 
 fn adapter(db: &Database) -> Adapter {
-    let adapter = Adapter {
+    let adapter = Adapter {last_reclaim_ms:std::sync::atomic::AtomicU64::new(0),
+        last_apply_barrier_ms:std::sync::atomic::AtomicU64::new(0),
+        progress_cache:std::sync::Mutex::new(None),
+        merge_deferrals:std::sync::atomic::AtomicUsize::new(0),
+        cancelled:Arc::new(std::sync::atomic::AtomicBool::new(false)),
         inner: Arc::downgrade(&db.inner),
         worker: db.inner.worker.clone(),
         identity: (db.database_id(), db.node_id()),

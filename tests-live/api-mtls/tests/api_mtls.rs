@@ -142,8 +142,16 @@ async fn try_handshake(endpoint: &quinn::Endpoint, addr: SocketAddr) -> bool {
     };
     match tokio::time::timeout(DIAL_TIMEOUT, connecting).await {
         Ok(Ok(conn)) => {
+            // TLS 1.3 completes client-side when the server Finished
+            // arrives, before the server validates our certificate
+            // flight; a rejection therefore always lands as an async
+            // close, never as a synchronous handshake error. Await it:
+            // staying open means the handshake genuinely succeeded.
+            let rejected = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+                .await
+                .is_ok();
             conn.close(0u32.into(), b"probe done");
-            true
+            !rejected
         }
         _ => false,
     }
@@ -205,9 +213,11 @@ fn tls_endpoint_requires_mutual_auth() {
             conn.close(0u32.into(), b"probe done");
             eprintln!("trusted client certificate: handshake + stream ok");
 
-            // No client certificate: the handshake must fail (Go: 401 on
-            // `/v1/status` and `/metrics`). QUIC has no HTTP layer for a
-            // 401, so the same policy enforces one step earlier — and
+            // No client certificate: the server must close the connection
+            // (Go: 401 on `/v1/status` and `/metrics`). QUIC has no HTTP
+            // layer for a 401, and TLS 1.3 finishes client-side before
+            // the server validates the certificate flight, so the
+            // rejection is always observed as an async close — and
             // there is no `/healthz`-style exemption to probe: every
             // connection to this endpoint is authenticated.
             let no_cert = attacker_endpoint(&AttackerCreds {

@@ -29,8 +29,9 @@ Scope (same as Go): version churn only; deletes are out of scope
 - The measurement window produces at least 2000 commits (else stretched
   in 5s steps to a 150s cap); the local writer scheduler serves
   admissions during the window (no starvation).
-- At least one GC run is observed in the window; the replication
-  `last_error` is unchanged across the window (zero GC failures).
+- At least one GC run is observed in the window; no GC-shaped replication
+  error appears across the window (zero GC failures; unrelated transport
+  transients under churn do not fail the check).
 - Balance: `commits - collected <= commits / 10` after the post-stop
   drain (one post-stop run observed, then 2 stable 5s collected polls).
 - A follower observes a churned value for key 1 within 30s
@@ -74,9 +75,11 @@ Scope (same as Go): version churn only; deletes are out of scope
   `status().metrics.retention_runs` replaces `spedsql_gc_runs_total`.
   The test also logs its own successful-update count as a cross-check.
 - No GC-failures counter exists in Rust, so the zero-failures check
-  asserts the replication `last_error` is unchanged across the window
-  (collection errors land there); a repeated identical error string
-  would be missed, unlike Go's counter.
+  fails only when a GC-shaped replication error (retention, collection,
+  pruning, GC, snapshot) appears or differs across the window; asserting
+  the sticky `last_error` is unchanged would trip on unrelated transport
+  transients (dial/handshake/queue pressure) under churn. A repeated
+  identical error string would be missed, unlike Go's counter.
 - No maintenance-class check exists on the Rust collection path
   (retention runs in the replication engine, bypassing the
   `WriterScheduler`; the maintenance class only serves

@@ -1,6 +1,10 @@
 package murmur
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"sort"
+)
 
 type Record struct {
 	Key   Bytes  `json:"key"`
@@ -40,6 +44,22 @@ type Backend interface {
 	Apply([][]byte, []Record) (bool, error)
 	Observe(uint64, uint32) error
 	AcceptSchema([]byte) (bool, error)
+}
+
+// BatchBackend optionally reads an ordered prefix in one storage operation.
+// A nil budget requires one result per key; a non-nil budget permits a shorter
+// prefix and one oversized first value. A nil result entry means missing;
+// a pointer to empty Bytes represents an existing empty value.
+type BatchBackend interface {
+	GetMany(keys [][]byte, maxBytes *uint64) ([]*Bytes, error)
+}
+
+// PagedBackend optionally provides bounded traversal of authoritative keys.
+// CancellableBackend optionally interrupts pending waits during replication close.
+type CancellableBackend interface{ CancelPending() }
+
+type PagedBackend interface {
+	KeysPage(prefix, after []byte, limit uint64) ([][]byte, error)
 }
 type BackendHandle struct{ object }
 
@@ -103,6 +123,11 @@ func backendCall(backend Backend, method string, data []byte) (any, error) {
 		}
 	}
 	switch method {
+	case "cancel_pending":
+		if cancellable, ok := backend.(CancellableBackend); ok {
+			cancellable.CancelPending()
+		}
+		return nil, nil
 	case "identity":
 		db, node := backend.Identity()
 		return [2]NodeID{db, node}, nil
@@ -112,6 +137,104 @@ func backendCall(backend Backend, method string, data []byte) (any, error) {
 			return nil, err
 		}
 		return Bytes(b), err
+	case "get_many":
+		var a struct {
+			Keys     []Bytes `json:"keys"`
+			MaxBytes *uint64 `json:"max_bytes"`
+		}
+		if err := json.Unmarshal(data, &a); err != nil {
+			return nil, err
+		}
+		keys := make([][]byte, len(a.Keys))
+		for i, key := range a.Keys {
+			keys[i] = key
+		}
+		var values []*Bytes
+		if batched, ok := backend.(BatchBackend); ok {
+			var err error
+			values, err = batched.GetMany(keys, a.MaxBytes)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			var total uint64
+			values = make([]*Bytes, 0, len(keys))
+			for _, key := range keys {
+				value, found, err := backend.Get(key)
+				if err != nil {
+					return nil, err
+				}
+				var item *Bytes
+				var size uint64
+				if found {
+					b := Bytes(value)
+					item = &b
+					size = uint64(len(value))
+				}
+				if a.MaxBytes != nil && len(values) > 0 && size > *a.MaxBytes-total {
+					break
+				}
+				total += size
+				values = append(values, item)
+				if a.MaxBytes != nil && total >= *a.MaxBytes {
+					break
+				}
+			}
+		}
+		if len(values) > len(keys) || (a.MaxBytes == nil && len(values) != len(keys)) {
+			return nil, invalidError("GetMany returned wrong number of values")
+		}
+		if len(keys) > 0 && a.MaxBytes != nil && len(values) == 0 {
+			return nil, invalidError("GetMany returned no progress")
+		}
+		if a.MaxBytes != nil && len(values) > 1 {
+			var total uint64
+			for _, value := range values {
+				if value != nil {
+					size := uint64(len(*value))
+					if size > *a.MaxBytes-total {
+						return nil, invalidError("GetMany exceeded byte budget")
+					}
+					total += size
+				}
+			}
+		}
+		if values == nil {
+			values = make([]*Bytes, 0)
+		}
+		return values, nil
+	case "keys_page":
+		var page struct {
+			Prefix Bytes  `json:"prefix"`
+			After  Bytes  `json:"after"`
+			Limit  uint64 `json:"limit"`
+		}
+		if err := json.Unmarshal(data, &page); err != nil {
+			return nil, err
+		}
+		var keys [][]byte
+		var err error
+		if paged, ok := backend.(PagedBackend); ok {
+			keys, err = paged.KeysPage(page.Prefix, page.After, page.Limit)
+		} else {
+			keys, err = backend.Keys(page.Prefix)
+			sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i], keys[j]) < 0 })
+			filtered := make([][]byte, 0)
+			for _, key := range keys {
+				if page.After == nil || bytes.Compare(key, page.After) > 0 {
+					if uint64(len(filtered)) >= page.Limit {
+						break
+					}
+					filtered = append(filtered, key)
+				}
+			}
+			keys = filtered
+		}
+		out := make([]Bytes, len(keys))
+		for i, key := range keys {
+			out[i] = key
+		}
+		return out, err
 	case "keys":
 		keys, err := backend.Keys(a.Prefix)
 		out := make([]Bytes, len(keys))
@@ -169,4 +292,50 @@ func (BackendDefaults) CreateSnapshot(NodeID, ReplicationConfig) (SnapshotManife
 }
 func (BackendDefaults) AcknowledgeSnapshot(NodeID, NodeID, Key) error {
 	return invalidError("durable snapshots unsupported by backend")
+}
+
+// Progress returns durable per-origin watermarks using the Rust backend contract.
+func (h *BackendHandle) Progress() ([]PeerProgress, error) {
+	id, err := h.handle()
+	if err != nil {
+		return nil, err
+	}
+	var progress []PeerProgress
+	err = invoke(0, "backend_progress", map[string]any{"backend": id}, &progress)
+	return progress, err
+}
+
+// GetMany reads keys in input order; nil entries indicate missing records.
+func (h *BackendHandle) GetMany(keys [][]byte) ([]*Bytes, error) { return h.getMany(keys, nil) }
+
+// GetManyBounded reads a prefix, allowing one oversized first value for progress.
+func (h *BackendHandle) GetManyBounded(keys [][]byte, maxBytes uint64) ([]*Bytes, error) {
+	return h.getMany(keys, &maxBytes)
+}
+func (h *BackendHandle) getMany(keys [][]byte, maxBytes *uint64) ([]*Bytes, error) {
+	id, err := h.handle()
+	if err != nil {
+		return nil, err
+	}
+	encoded := make([]Bytes, len(keys))
+	for i, key := range keys {
+		encoded[i] = key
+	}
+	var values []*Bytes
+	err = invoke(0, "backend_get_many", map[string]any{"backend": id, "keys": encoded, "max_bytes": maxBytes}, &values)
+	return values, err
+}
+
+// RunBlocking invokes the Rust scheduler/session utility for a synchronous callback.
+// On ordinary Go calls it executes inline; it does not start a goroutine.
+func RunBlocking(wait func() error) error {
+	if wait == nil {
+		return invalidError("nil blocking callback")
+	}
+	return callbackInvoke(0, "helper_run_blocking", nil, func(op uint32, _ uint64, _ []byte) ([]byte, error) {
+		if op != 11 {
+			return nil, invalidError("blocking callback operation")
+		}
+		return nil, wait()
+	}, nil)
 }

@@ -26,9 +26,11 @@ via the receiver's counters, not merely by convergence.
 - The rejoin transfer is caught in flight (row count strictly between the
   stale count and the target); a completed-before-interrupt transfer fails
   loudly ("widen the payload").
-- Post-interrupt restart under 60 s; convergence within 120 s; the flat
+- Post-interrupt restart under 60 s; convergence within 120 s; the bounded
   post-restart log pair proves the snapshot path (log catch-up would hide
-  a snapshot-path regression); all acked rows present.
+  a snapshot-path regression; the retained tail legitimately arrives via
+  logs, so the proof bounds it instead of requiring zero); all acked rows
+  present.
 - A `post-recovery` write converges within 60 s.
 
 ## Deviations from the Go original
@@ -48,8 +50,13 @@ via the receiver's counters, not merely by convergence.
   pattern); run/collection counters are the same proof.
 - Transfer-in-flight detection uses row counts (strictly between stale
   and target) instead of manifest/chunk counters, which have no Rust
-  equivalent; the snapshot-path proof uses the flat log-counter pair
-  (established `snapshot-resync` port pattern).
+  equivalent; the snapshot-path proof bounds the log-counter pair by the
+  retained tail instead of requiring zero (the retained tail legitimately
+  arrives via logs), unlike the flat-pair `snapshot-resync` pattern.
+- GC passes run on every survivor (one survivor's pass is not enough: the
+  rejoining node would pull the other's intact log). Fixed node ids with
+  the stale node trusting both survivors as snapshot donors (the harness
+  trusts nobody by default; Go fixture policy trusts all nodes).
 - Writers resolve the current-generation handle per write from a shared
   slot refreshed after every restart; a drop guard stops them on panic.
 

@@ -60,7 +60,7 @@ Run each entry with `go run ./examples/NAME` from `clients/go`.
 | [scheduler](scheduler/main.go) | Shares/debt/reserve configuration, writer classes, admission timeout, ticket metadata/release, borrowed scheduler and metrics | All classes acquire tickets; blocked admission times out; database metrics reflect a durable row |
 | [bridge](bridge/main.go) | Real managed Low/High domains, sealed rows/files, snapshot bundles, replay, ownership protection/release | High value protected; release exposes Low shadow; file bytes match across different encryption keys |
 | [bridge-transports](bridge-transports/main.go) | Loopback HTTP PUT, FTP passive upload, private-CA FTPS, HTTPS trust restriction | Uploaded sealed bytes match; private-CA HTTPS is rejected |
-| [backend](backend/main.go) | Complete custom Backend interface, callback ownership, signer binding, standalone replication, signed record journals | Record insertion and deletion reach the other backend |
+| [backend](backend/main.go) | Complete custom Backend interface, callback ownership, signer binding, standalone replication, signed record journals, optional batched reads and blocking utility | Record insertion and deletion reach the other backend; batched reads distinguish missing and empty values |
 | [protocol](protocol/main.go) | Transaction/schema signing, verification, tamper rejection, postcard, constants/keys, certificate identity, authenticated QUIC streams | Ping/Pong returns 42; signatures verify; changed payload and invalid certificate fail |
 | [snapshots](snapshots/main.go) | Signed manifests, donor records, pin boundaries, incomplete/resumed receipt, application, cancellation, expiry | Missing chunks complete the actual payload; cancellation releases outgoing transfer; expired manifest rejected |
 | [sessions](sessions/main.go) | Unmanaged SQLite, session attachment, capture enable/disable, changeset/patchset | Disabled capture stays empty; enabled capture produces both formats |
@@ -125,3 +125,13 @@ client tests. `coverage.json` maps every feature row in the client README to an
 executable example; its test catches missing feature groups, broken paths, and
 examples without smoke tests. The catalog covers capabilities rather than every
 individual configuration field or wire enum variant.
+
+The replication example exercises configurable continuous batches and opt-in adaptive
+capture/application in both dissemination modes. The snapshots example also builds
+an encoded `Content` page stream, verifies partial visibility after its first durable
+installation checkpoint, then resumes to completion. The same scenarios run in their
+smoke tests. Standalone snapshot pages in Go are materialized slices; managed database
+exports stream from Spool. Final snapshot ACK/progress is withheld until all pages install.
+
+The standalone backend example checks `BackendHandle.Progress` after replication.
+Managed backends collect origin heads and watermarks in one serialized Spool read.

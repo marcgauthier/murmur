@@ -6,8 +6,9 @@ use std::{
     path::Path,
     sync::{Arc, Mutex, mpsc},
     thread,
+    time::{Duration, Instant},
 };
-const FORMAT: u32 = 4;
+const FORMAT: u32 = 5;
 const CHUNK: usize = 64 << 10;
 const MAX_PAYLOAD: usize = 512 << 20;
 struct Zstd(i32);
@@ -23,21 +24,11 @@ impl Codec for Zstd {
             .map_err(|e| spool::Error::new(spool::ErrorKind::Io, e.to_string()))
     }
     fn decompress(&self, b: &[u8], max: usize) -> spool::Result<Vec<u8>> {
-        use std::io::Read;
-        let decoder = zstd::stream::read::Decoder::new(b)
-            .map_err(|e| spool::Error::new(spool::ErrorKind::Corrupt, e.to_string()))?;
-        let mut out = Vec::new();
-        decoder
-            .take(max as u64 + 1)
-            .read_to_end(&mut out)
-            .map_err(|e| spool::Error::new(spool::ErrorKind::Corrupt, e.to_string()))?;
-        if out.len() > max {
-            return Err(spool::Error::new(
-                spool::ErrorKind::Corrupt,
-                "zstd size limit",
-            ));
-        }
-        Ok(out)
+        // Spool supplies the authenticated frame's bounded plaintext size.
+        // Decode directly into that capacity instead of repeatedly growing a
+        // streaming output buffer for every 64 KiB point read.
+        zstd::bulk::decompress(b, max)
+            .map_err(|e| spool::Error::new(spool::ErrorKind::Corrupt, e.to_string()))
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +54,11 @@ pub(crate) enum Event {
     ReplicaPatch {rows:Vec<RowState>,deleted:Vec<RowState>,tombstones:Vec<Tombstone>,clock:Version,records:Vec<(Vec<u8>,Option<Vec<u8>>)>,remint:bool},
     ReplicaRecords { state: ReplicaState, records: Vec<(Vec<u8>, Option<Vec<u8>>) > },
     TableReplication { table: String, enabled: bool, schema: Schema },
+    MigrationChunk {
+        before: Vec<RowState>,
+        after: Vec<RowState>,
+        version: Version,
+    },
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct Entry {
@@ -124,7 +120,10 @@ pub(crate) enum Work {
     Stop(mpsc::Sender<Result<()>>),
 }
 pub(crate) struct Opened {
-    pub store: Store,
+    pub schema_version: u64,
+    pub snapshot_history: Option<(u64, Vec<Event>)>,
+    pub last_reclaim: Option<Instant>,
+    pub store: crate::logical_store::LogicalStore,
     #[cfg(feature = "replication")]
     pub replication_config: Option<murmur_replication::Config>,
     pub history: Vec<Event>,
@@ -228,26 +227,34 @@ impl Assembly {
         Ok(self.payload)
     }
 }
-/// Format four recovers winning logical values, rather than applying raw
+/// Format five recovers winning logical values, rather than applying raw
 /// changesets against a baseline that may have changed through replication.
 pub(crate) fn recover_current(opened: &Opened, progress: &crate::progress::OpenProgressReporter) -> Result<Connection> {
     progress.phase(OpenPhase::Rebuilding);
     let c = Connection::open_in_memory()?;
-    let state = metadata::state(&opened.store, opened.schema.clone(), opened.identity.database, opened.clock)?;
     c.execute_batch("BEGIN")?;
-    for table in &state.schema.tables { c.execute_batch(&table.sql)?; }
-    let mut current_table_id = String::new();
-    for row in &state.rows {
-        let table = state.schema.tables.iter().find(|t| t.id == row.table).ok_or(Error::SchemaMismatch)?;
-        if current_table_id != table.id {
-            current_table_id = table.id.clone();
-            progress.set_table(&table.name);
+    for table in &opened.schema.tables { c.execute_batch(&table.sql)?; }
+    for table in &opened.schema.tables {
+        let keys = opened.store.keys_with_prefix(format!("04/meta/row/{}/", table.id).as_bytes());
+        if keys.is_empty() { continue; }
+        progress.set_table(&table.name);
+        let mut statement = c.prepare(&schema::row_insert_sql(table))?;
+        for key in keys {
+            let bytes = opened.store.get(&key)?.ok_or_else(|| Error::Corrupt("missing row record".into()))?;
+            let meta: metadata::RowMeta = decode(&bytes)?;
+            let primary_key: Vec<Value> = decode(&meta.key)?;
+            if metadata::row_key(&table.id, &encode(&primary_key)?) != key {
+                return Err(Error::Corrupt("metadata key collision".into()));
+            }
+            // These are already the authoritative winning rows. Rebuilding SQL
+            // needs neither a second version lookup nor historical tombstones.
+            let values = schema::cell_values(table, &meta.cells)?;
+            statement.execute(rusqlite::params_from_iter(values))?;
+            progress.add_rows(1, 0);
         }
-        schema::put_user_row(&c, table, row)?;
-        progress.add_rows(1, 0);
     }
     progress.phase(OpenPhase::Indexing);
-    for sql in &state.schema.indexes { c.execute_batch(sql)?; }
+    for sql in &opened.schema.indexes { c.execute_batch(sql)?; }
     c.execute_batch("COMMIT")?;
     let check: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
     if check != "ok" { return Err(Error::Corrupt(check)); }
@@ -390,6 +397,8 @@ pub(crate) fn open(path: &Path, key: &[u8], o: &Options, progress: &crate::progr
                     || key.starts_with("08/files/")
                     || key.starts_with("09/bridge/")
                     || key.starts_with("10/policy/")
+                    || key.starts_with("11/blob/")
+                    || key.starts_with("05/meta/deleted/")
                 {
                     // Authoritative metadata stays in Spool; do not load its values into Rust.
                 } else {
@@ -438,7 +447,10 @@ pub(crate) fn open(path: &Path, key: &[u8], o: &Options, progress: &crate::progr
     s.table_replication = store.get(crate::table_replication::SETTINGS_KEY)?
         .map(|bytes| decode(&bytes)).transpose()?.unwrap_or_default();
     Ok(Opened {
-        store,
+        schema_version: 0,
+        snapshot_history: None,
+        last_reclaim: None,
+        store: crate::logical_store::LogicalStore::new(store),
         #[cfg(feature = "replication")]
         replication_config: o.replication.clone(),
         history,
@@ -474,7 +486,7 @@ fn persist_checkpoint(
 ) -> Result<()> {
     #[cfg(feature = "replication")]
     let enabled_table = match &event { Event::TableReplication {table, enabled:true, ..} => Some(table.clone()), _ => None };
-    let local = matches!(&event, Event::Delta { .. } | Event::SchemaCaptured { .. } | Event::ReplicaPatch {remint:true,..} | Event::TableReplication {enabled:true,..});
+    let local = matches!(&event, Event::Delta { .. } | Event::SchemaCaptured { .. } | Event::ReplicaPatch {remint:true,..} | Event::TableReplication {enabled:true,..} | Event::MigrationChunk { .. });
     let (event, mut metadata_changes, clock) = materialize(opened, event)?;
     #[cfg(feature = "replication")]
     if local {
@@ -494,7 +506,7 @@ fn persist_checkpoint(
                     }
                 }
                 for key in opened.store.keys_with_prefix(b"09/bridge/shadow/") {
-                    if std::str::from_utf8(&key).ok().and_then(|key| key.split('/').nth(4)) == Some(table.as_str()) {
+                    if std::str::from_utf8(&key).ok().and_then(|key| key.split('/').nth(3)) == Some(table.as_str()) {
                         if let Some(value) = opened.store.get(&key)? { auxiliary.push(murmur_replication::Record::put(key, value)); }
                     }
                 }
@@ -518,6 +530,7 @@ fn persist_checkpoint(
     if let Event::Schema {schema, ..} = &entry.event {
         metadata_changes.push(Mutation::put(crate::table_replication::SETTINGS_KEY.to_vec(), encode(&schema.table_replication)?));
     }
+    metadata::summarize_tombs(&opened.store, &mut metadata_changes)?;
     let payload = encode(&entry)?;
     let mut records = payload_records(&format!("03/log/{next:020}"), &payload)?;
     let log_keys = records.iter().map(|r| r.key.clone()).collect::<Vec<_>>();
@@ -526,6 +539,7 @@ fn persist_checkpoint(
     opened.store.commit(&records, Durability::Sync)?;
     if let Event::Schema { schema, .. } = &entry.event {
         opened.schema = schema.clone();
+        opened.schema_version = opened.schema_version.wrapping_add(1);
     }
     opened.clock = clock;
     opened.keys.extend(log_keys);
@@ -549,7 +563,7 @@ pub(crate) fn start(
     o: Options,
     status: Arc<Mutex<Status>>,
 ) -> Result<(Store, mpsc::Sender<Work>, thread::JoinHandle<()>)> {
-    let store = opened.store.clone();
+    let store = opened.store.physical();
     let (tx, rx) = mpsc::channel();
     let handle = thread::Builder::new()
         .name("sqlite-checkpoints".into())
@@ -738,8 +752,24 @@ pub(crate) fn start(
     Ok((store, tx, handle))
 }
 
+/// Minimum spacing between the physical reclaims piggybacked on storage
+/// snapshots. Snapshots may run every second under retention pressure,
+/// but segment compaction costs ~1s; obsolete keys are still deleted
+/// every snapshot, only the segment rewrite is deferred.
+const SNAPSHOT_RECLAIM_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
 pub(crate) fn snapshot(o: &mut Opened) -> Result<()> {
-    let history = compact_history(read_history(o)?)?;
+    // The compacted history is just the latest schema event: when no
+    // schema event landed since the last snapshot, reuse it instead of
+    // re-reading thousands of log entries.
+    let history = match &o.snapshot_history {
+        Some((version, history)) if *version == o.schema_version => history.clone(),
+        _ => {
+            let history = compact_history(read_history(o)?)?;
+            o.snapshot_history = Some((o.schema_version, history.clone()));
+            history
+        }
+    };
     let snap = Snapshot {
         format: FORMAT,
         sequence: o.sequence,
@@ -776,7 +806,12 @@ pub(crate) fn snapshot(o: &mut Opened) -> Result<()> {
         o.store.commit(&deletes, Durability::Sync)?;
     }
     o.keys = records.iter().map(|r| r.key.clone()).collect();
-    o.store.reclaim()?;
+    if o.last_reclaim
+        .map_or(true, |t| t.elapsed() >= SNAPSHOT_RECLAIM_MIN_INTERVAL)
+    {
+        o.store.reclaim()?;
+        o.last_reclaim = Some(Instant::now());
+    }
     Ok(())
 }
 
@@ -903,13 +938,29 @@ fn materialize(o: &Opened, event: Event) -> Result<(Event, Vec<Mutation>, Versio
         Event::TableReplication { schema, .. } => {
             (Event::Schema { migration: String::new(), schema, version: o.clock }, Vec::new(), o.clock)
         }
+        Event::MigrationChunk {
+            before,
+            after,
+            version,
+        } => {
+            let changes = metadata::migration(&o.store, &before, &after, version)?;
+            (
+                Event::MigrationChunk {
+                    before: Vec::new(),
+                    after: Vec::new(),
+                    version,
+                },
+                changes,
+                version,
+            )
+        }
         Event::Schema { .. } => {
             return Err(Error::Corrupt("schema input lacks captured rows".into()));
         }
     };
     Ok((event, changes, o.clock.max(version)))
 }
-fn read_payload(store: &Store, prefix: &str) -> Result<Vec<u8>> {
+fn read_payload(store: &crate::logical_store::LogicalStore, prefix: &str) -> Result<Vec<u8>> {
     let h = store
         .get(format!("{prefix}/00000000").as_bytes())?
         .ok_or_else(|| Error::Corrupt("missing record descriptor".into()))?;
@@ -955,9 +1006,32 @@ fn read_history(o: &Opened) -> Result<Vec<Event>> {
     }
     Ok(history)
 }
-// Winning logical values are already durable Spool records. Format four only
+// Winning logical values are already durable Spool records. Format five only
 // needs the latest schema manifest at a compacted recovery boundary; retained
 // signed replication history has its own lifecycle and is not reclaimed here.
 fn compact_history(history: Vec<Event>) -> Result<Vec<Event>> {
     Ok(history.into_iter().filter(|event|matches!(event,Event::Schema{..})).next_back().into_iter().collect())
+}
+
+#[cfg(test)]
+mod recovery_codec_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_zstd_reads_preserve_existing_frames_and_reject_damage() {
+        let codec = Zstd(3);
+        for len in [0, 1, 64 << 10, 2 << 20] {
+            let plain: Vec<u8> = (0..len).map(|n| (n % 251) as u8).collect();
+            let frame = codec.compress(&plain).unwrap();
+            assert_eq!(codec.decompress(&frame, len).unwrap(), plain);
+            if len > 0 { assert!(codec.decompress(&frame, len - 1).is_err()); }
+            assert!(codec.decompress(&frame[..frame.len()-1], len).is_err());
+        }
+        // Streaming encoders may write consecutive frames; old stores remain readable.
+        let mut frames = codec.compress(b"first").unwrap();
+        frames.extend(codec.compress(b"second").unwrap());
+        assert_eq!(codec.decompress(&frames, 11).unwrap(), b"firstsecond");
+        assert!(codec.decompress(&frames, 10).is_err());
+        assert!(codec.decompress(&[0xff;16], 64 << 10).is_err());
+    }
 }

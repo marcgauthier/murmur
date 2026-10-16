@@ -39,7 +39,7 @@ pub(crate) fn filter_records(
         let table = if key.starts_with("10/policy/state/") || key.starts_with("09/bridge/owner/") {
             key.split('/').nth(3)
         } else if key.starts_with("09/bridge/shadow/") {
-            key.split('/').nth(4)
+            key.split('/').nth(3)
         } else {
             None
         };
@@ -130,7 +130,7 @@ mod filter_schema_tests {
     fn filters_policy_and_bridge_records_without_dropping_unrelated_metadata() {
         use murmur_replication::Record;
         let schema=Schema{table_replication:BTreeMap::from([("off".into(),false)]),..Schema::default()};
-        let names=["10/policy/state/off/cell","10/policy/state/on/cell","09/bridge/owner/off/cell","09/bridge/shadow/domain/off/cell","09/bridge/shadow/domain/on/cell","08/files/meta/file"];
+        let names=["10/policy/state/off/cell","10/policy/state/on/cell","09/bridge/owner/off/cell","09/bridge/shadow/off/cell/domain","09/bridge/shadow/on/cell/domain","08/files/meta/file"];
         let records=names.iter().map(|key|Record::put(key.as_bytes().to_vec(),vec![1])).collect();
         let filtered=filter_records(records,&schema).unwrap();let got:Vec<_>=filtered.iter().map(|r|std::str::from_utf8(&r.key).unwrap()).collect();
         assert_eq!(got,[names[1],names[4],names[5]]);

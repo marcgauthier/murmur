@@ -34,6 +34,10 @@ restarts and names plus counters are verified again.
   `UPDATE ... SET counter = counter + ?`.
 - Epoch waits are expressed as `PRAGMA table_info` column-presence waits (the
   established `typed-records` port pattern).
+- Rename is delete + insert copying the row's fields (ordinary transactions
+  cannot update primary keys), barriered on the note first: Go rename
+  preserves the record id, so concurrent field writes follow it, while the
+  SQL copy only sees local state.
 
 ## Compile check (only gate; never run here)
 

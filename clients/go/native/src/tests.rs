@@ -12,7 +12,7 @@ fn abi_and_defaults() {
     let (code, bytes) = request(json!({"op":"defaults"}));
     assert_eq!(code, 0);
     let v: Json = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["capture_interval"], 5_000_000_000_u64);
+    assert_eq!(v["capture_interval"], 1_000_000_000_u64);
     assert_eq!(v["spool_block_bytes"], 65536);
     assert_eq!(v["scheduler"]["local_share"], 90);
 }

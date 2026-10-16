@@ -58,5 +58,17 @@
   ],
   "Unmanaged SQLite sessions": [
     "sessions"
+  ],
+  "Continuous replication and bounded batches": [
+    "replication"
+  ],
+  "Streamed snapshot installation": [
+    "snapshots"
+  ],
+  "Batched backend reads": [
+    "backend"
+  ],
+  "Blocking scheduler utility": [
+    "backend"
   ]
 }

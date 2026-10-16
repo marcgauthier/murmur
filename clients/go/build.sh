@@ -23,7 +23,9 @@ cargo rustc --locked --manifest-path "$client_dir/native/Cargo.toml" \
 cp "$client_dir/native/target/$rust_target/$profile/libmurmur_go.a" "$client_dir/native/lib/$go_os-$go_arch/"
 native_flags="$(sed -n 's/^note: native-static-libs: //p' "$build_log" | tail -1)"
 printf '%s\n' "$native_flags" > "$client_dir/native/lib/$go_os-$go_arch/native-static-libs.txt"
-go run "$client_dir/internal/buildstamp/main.go" "$client_dir/native/lib/$go_os-$go_arch/libmurmur_go.a" "$client_dir/native_build_stamp.go"
+# The fingerprint generator runs on the build host even for a cross build.
+GOOS="$(go env GOHOSTOS)" GOARCH="$(go env GOHOSTARCH)" CGO_ENABLED=0 \
+  go run "$client_dir/internal/buildstamp/main.go" "$client_dir/native/lib/$go_os-$go_arch/libmurmur_go.a" "$client_dir/native_build_stamp.go"
 echo "Native library built for $go_os/$go_arch ($profile)."
 if [[ $# -gt 0 ]]; then
   if [[ "$1" == test ]]; then

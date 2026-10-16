@@ -46,9 +46,16 @@ const VERDICT_POLL: Duration = Duration::from_secs(2);
 /// Full-mesh wait bound (Rust-only settle; Go asserts the mesh instantly
 /// off daemon status endpoints).
 const MESH_TIMEOUT: Duration = Duration::from_secs(60);
-/// Snapshot catch-up observation delay before the proof sample (see
-/// `observe_snapshot_proof`).
-const SNAP_PROOF_DELAY: Duration = Duration::from_secs(30);
+/// Snapshot catch-up observation bound (see `observe_snapshot_proof`):
+/// the victim's own restart plus a donor build plus the chunk transfer can
+/// take ~45 s under chaos (spool rescans dominate), and the victim can
+/// lose the donor race to a stale donor (a concurrently catching-up
+/// node), forcing a second snapshot cycle. The event-driven proof polls
+/// up to 240 s so two full cycles fit instead of sampling once at a
+/// fixed delay.
+const SNAP_PROOF_TIMEOUT: Duration = Duration::from_secs(240);
+/// Snapshot proof poll interval.
+const SNAP_PROOF_POLL: Duration = Duration::from_secs(2);
 /// Distinct error-message sample cap (Go: first 8).
 const ERR_SAMPLE_CAP: usize = 8;
 /// Stored error-message truncation (Go: 200 bytes).
@@ -490,6 +497,13 @@ fn applied_count(db: &Database) -> Option<u64> {
         .map(|h| h.status().metrics.applied_transactions)
 }
 
+/// Durably applied snapshot counter for one node (Go:
+/// `spedsql_repl_snapshots_received_total` equivalent).
+fn snapshots_applied(db: &Database) -> Option<u64> {
+    db.replication()
+        .map(|h| h.status().metrics.snapshots_applied)
+}
+
 /// Row count on one node, or `None` when the read fails.
 fn row_count(db: &Database) -> Option<usize> {
     db.read(|sql| {
@@ -893,17 +907,19 @@ struct SnapObservation {
 }
 
 /// Decide whether a rejoined snapshot victim caught up via the snapshot
-/// path. Go proves this with `spedsql_repl_snapshots_received_total`,
-/// which has no Rust equivalent (`ReplicationMetrics` carries no snapshot
-/// counters), so the proof is behavioral: every writer op is one
-/// transaction, and the victim missed every acked op from its outage, so
-/// a pure log catch-up would advance its `applied_transactions` by at
-/// least the outage's acked count (snapshot application bypasses that
-/// counter, as the `snapshot-resync` port relies on). Writers keep
-/// running throughout (Go parity: no quiesce); the victim is sampled
-/// after a catch-up delay, and the window counts as proven only when the
-/// victim has approximately caught up (bounded row-set drift) while its
-/// applied delta stays below the outage's acked count.
+/// path. Go proves this with `spedsql_repl_snapshots_received_total`; the
+/// Rust proof is event-driven off the equivalent `snapshots_applied`
+/// counter: every writer op is one transaction, and the victim missed
+/// every acked op from its outage, so the window counts as proven when a
+/// snapshot applies and the post-apply sample shows the bulk arrived via
+/// the snapshot path (row drift below the outage's acked count while the
+/// log-path applied delta since the apply stays below it too — a pure
+/// log catch-up would advance `applied_transactions` by at least the
+/// outage's count). Writers keep running throughout (Go parity: no
+/// quiesce); the victim's own restart plus a donor build plus the chunk
+/// transfer can take ~45 s under chaos, and a stale donor winning the
+/// race forces a second cycle, so the proof polls up to
+/// `SNAP_PROOF_TIMEOUT` instead of sampling once at a fixed delay.
 fn observe_snapshot_proof(
     cluster: &Cluster,
     victim: usize,
@@ -911,27 +927,45 @@ fn observe_snapshot_proof(
     acked_at_stop: u64,
 ) -> SnapObservation {
     let acked_at_rejoin = rep.succeeded();
-    let applied_at_rejoin = applied_count(cluster.node(victim)).unwrap_or(0);
-    std::thread::sleep(SNAP_PROOF_DELAY);
     let outage_acked = acked_at_rejoin.saturating_sub(acked_at_stop);
-    let victim_rows = canonical_rows(cluster.node(victim)).unwrap_or_default();
-    let survivor = (victim + 1) % cluster.len();
-    let survivor_rows = canonical_rows(cluster.node(survivor)).unwrap_or_default();
-    let diff_rows = row_diff(&victim_rows, &survivor_rows);
-    let applied_now = applied_count(cluster.node(victim)).unwrap_or(applied_at_rejoin);
-    let applied_delta = applied_now.saturating_sub(applied_at_rejoin);
-    let rows = survivor_rows.len();
-    let tolerance = 200.max(rows / 50);
-    let caught_up = outage_acked > 100 && diff_rows <= tolerance;
-    let proven = caught_up && applied_delta < outage_acked;
-    let obs = SnapObservation {
+    let snaps_at_rejoin = snapshots_applied(cluster.node(victim)).unwrap_or(0);
+    let start = std::time::Instant::now();
+    let mut obs = SnapObservation {
         victim,
         outage_acked,
-        applied_delta,
-        diff_rows,
-        rows,
-        proven,
+        applied_delta: 0,
+        diff_rows: row_diff(
+            &canonical_rows(cluster.node(victim)).unwrap_or_default(),
+            &canonical_rows(cluster.node((victim + 1) % cluster.len())).unwrap_or_default(),
+        ),
+        rows: 0,
+        proven: false,
     };
+    let mut applied_at_apply: Option<u64> = None;
+    while start.elapsed() < SNAP_PROOF_TIMEOUT {
+        std::thread::sleep(SNAP_PROOF_POLL);
+        let snaps = snapshots_applied(cluster.node(victim)).unwrap_or(snaps_at_rejoin);
+        if snaps <= snaps_at_rejoin {
+            continue;
+        }
+        let applied_now = applied_count(cluster.node(victim)).unwrap_or(0);
+        let base = *applied_at_apply.get_or_insert(applied_now);
+        let victim_rows = canonical_rows(cluster.node(victim)).unwrap_or_default();
+        let survivor = (victim + 1) % cluster.len();
+        let survivor_rows = canonical_rows(cluster.node(survivor)).unwrap_or_default();
+        obs.diff_rows = row_diff(&victim_rows, &survivor_rows);
+        obs.rows = survivor_rows.len();
+        obs.applied_delta = applied_now.saturating_sub(base);
+        // The snapshot covered the bulk of the outage when neither the
+        // remaining drift nor the post-apply log tail reaches the
+        // outage's acked count.
+        obs.proven = outage_acked > 100
+            && (obs.diff_rows as u64) < outage_acked
+            && obs.applied_delta < outage_acked;
+        if obs.proven {
+            break;
+        }
+    }
     rep.log(format!(
         "snapshot: node{} proof outageAcked={} appliedDelta={} diffRows={}/{} proven={}",
         obs.victim + 1,
@@ -1281,10 +1315,13 @@ fn wait_converged(
 ) -> (Vec<i64>, Vec<String>, Result<(), String>) {
     let nodes = cluster.len();
     let deadline = Instant::now() + timeout;
+    let start = Instant::now();
+    let mut last_sample = Instant::now() - Duration::from_secs(3600);
     loop {
         let mut counts = vec![0i64; nodes];
         let mut digests = vec![String::new(); nodes];
         let mut first: Option<Vec<String>> = None;
+        let mut agree = 0usize;
         let mut ok = true;
         for i in 0..nodes {
             match canonical_rows(cluster.node(i)) {
@@ -1292,10 +1329,15 @@ fn wait_converged(
                     counts[i] = rows.len() as i64;
                     digests[i] = digest_hex(&rows);
                     match &first {
-                        None => first = Some(rows),
+                        None => {
+                            agree = 1;
+                            first = Some(rows);
+                        }
                         Some(f) => {
                             if *f != rows {
                                 ok = false;
+                            } else {
+                                agree += 1;
                             }
                         }
                     }
@@ -1312,21 +1354,58 @@ fn wait_converged(
         if Instant::now() >= deadline {
             break;
         }
+        if last_sample.elapsed() >= Duration::from_secs(15) {
+            last_sample = Instant::now();
+            let lo = counts.iter().min().copied().unwrap_or(-1);
+            let hi = counts.iter().max().copied().unwrap_or(-1);
+            eprintln!(
+                "[verdict-sample T+{}s] counts={counts:?} spread={} agree={agree}/{nodes}",
+                start.elapsed().as_secs(),
+                hi - lo,
+            );
+        }
         std::thread::sleep(VERDICT_POLL);
     }
     // Final best-effort re-sample for the failure report (Go parity).
     let mut counts = vec![0i64; nodes];
     let mut digests = vec![String::new(); nodes];
+    let mut snapshots: Vec<Vec<String>> = Vec::new();
     for i in 0..nodes {
         match canonical_rows(cluster.node(i)) {
             Some(rows) => {
                 counts[i] = rows.len() as i64;
                 digests[i] = digest_hex(&rows);
+                snapshots.push(rows);
             }
             None => {
                 counts[i] = -1;
                 digests[i] = "unreachable".to_string();
+                snapshots.push(Vec::new());
             }
+        }
+    }
+    // Diagnostic sample: first few rows where node0 and the first
+    // disagreeing node differ (id + full values). Resurrected deletes show
+    // stale values; slow repair shows recently-written values.
+    if snapshots.len() == nodes {
+        for j in 1..nodes {
+            if snapshots[j] == snapshots[0] {
+                continue;
+            }
+            let a: HashSet<&String> = snapshots[0].iter().collect();
+            let b: HashSet<&String> = snapshots[j].iter().collect();
+            let only_a: Vec<&&String> = a.difference(&b).take(5).collect();
+            let only_b: Vec<&&String> = b.difference(&a).take(5).collect();
+            eprintln!(
+                "[verdict-diff] node1-only({}) sample={only_a:?}",
+                a.difference(&b).count(),
+            );
+            eprintln!(
+                "[verdict-diff] node{}-only({}) sample={only_b:?}",
+                j + 1,
+                b.difference(&a).count(),
+            );
+            break;
         }
     }
     (

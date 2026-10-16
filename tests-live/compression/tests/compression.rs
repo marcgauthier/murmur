@@ -340,6 +340,10 @@ fn run_cell(runtime: &Path, mode: &Mode, prof: &Profile, scale: usize) -> CellRe
     }
     let write_dur = start.elapsed();
 
+    // Async commits are admitted without blocking; the location index only
+    // reflects them once the background writer processes the batch, so a
+    // barrier is required before counting (and before measuring sizes).
+    store.flush().expect("flush before count");
     let count = store.keys_with_prefix(b"rec/").len();
     assert_eq!(
         count, rows_total,

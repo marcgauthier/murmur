@@ -93,6 +93,19 @@ impl Store {
     /// the key remains in any surviving authoritative segment.
     fn drop_tombs(&self) -> Result<()> {
         use std::collections::HashMap;
+        // Tombs only drop from drained (zero-live-record) files; when every
+        // file still holds live data the full-spool validation scan below
+        // cannot drop anything, so skip it (it costs seconds on large
+        // stores under load).
+        let any_drained = self.inner.fstats.ids().iter().any(|id| {
+            self.inner
+                .fstats
+                .snapshot(*id)
+                .is_some_and(|s| s.stats.live_records == 0)
+        });
+        if !any_drained {
+            return Ok(());
+        }
         let mut tombs: HashMap<Vec<u8>, crate::index::TombMark> = HashMap::new();
         self.inner.idx.scan_tombs(|key, tm| {
             tombs.insert(key.to_vec(), tm);

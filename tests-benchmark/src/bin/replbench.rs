@@ -9,7 +9,7 @@
 //! Defaults: 20s medium at 100 iters/s, 15s burst, 180s convergence wait.
 //! Each medium iteration is one insert + one update + one point select.
 //! If the replica does not converge in time, partial state and sizes are
-//! still reported with a NOT CONVERGED banner (exit 0).
+//! still reported with a NOT CONVERGED banner and a failing exit status.
 
 use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, SanType};
 use sqlite_session::{
@@ -85,12 +85,7 @@ fn open(root: &Path, config: Config) -> Result<Database, Box<dyn std::error::Err
             mode: OpenMode::CreateNew,
             database_id: Some([7; 16]),
             replication: Some(config),
-            // Burst writes ~55 MiB/s into the session; the 5s default
-            // collection lets it outgrow the queue (writes then wedge on
-            // Busy). Each checkpoint also becomes one replication
-            // transaction, and multi-MB transactions stall replication
-            // (chunked transfer never completes; see report). Collect
-            // every 10ms so transactions stay small single frames.
+            // Keep burst capture bounded and frequent; the general default is 1s.
             capture_interval: Duration::from_millis(10),
             queue_bytes: 128 << 20,
             ..Options::default()
@@ -417,8 +412,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "sqlite malloc (both nodes, process-wide): {:.2} MiB",
         mib(malloc as u64)
     );
-    // NOTE: close() hangs when replication is wedged (shutdown bug), and all
-    // numbers are already collected, so exit without it; the OS reclaims the
-    // tempdir. A clean shutdown path would call a.close()? and b.close()?.
-    std::process::exit(0);
+    let converged=checksum(&b)==want;
+    a.close()?;b.close()?;
+    if !converged {return Err("replica did not converge".into());}
+    Ok(())
 }

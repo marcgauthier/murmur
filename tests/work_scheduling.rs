@@ -145,6 +145,9 @@ fn test_scheduler_maintenance_reserve_under_heavy_load() {
     let sched = Arc::new(sqlite_session::WriterScheduler::new(cfg));
     let stop = Arc::new(AtomicBool::new(false));
 
+    // Hold the first grant until both interactive contenders are queued.
+    // Otherwise a busy host may run all maintenance passes before either starts.
+    let initial = sched.admit(WriterClass::Local).unwrap();
     // Keep interactive classes saturated.
     let mut interactive = Vec::new();
     for _ in 0..2 {
@@ -159,6 +162,20 @@ fn test_scheduler_maintenance_reserve_under_heavy_load() {
             }
         }));
     }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sched.snapshot().local.waiters < 2 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let ready = sched.snapshot().local.waiters >= 2;
+    if !ready {
+        stop.store(true, Ordering::Relaxed);
+        sched.close();
+        drop(initial);
+        for handle in interactive {handle.join().unwrap();}
+        panic!("interactive contenders did not start");
+    }
+    drop(initial);
 
     // Maintenance thread runs passes.
     let mut maint_granted = 0;

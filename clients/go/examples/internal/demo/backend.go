@@ -47,6 +47,30 @@ func (b *RecordBackend) Get(key []byte) ([]byte, bool, error) {
 	v, ok := b.records[string(key)]
 	return append([]byte{}, v...), ok, nil
 }
+func (b *RecordBackend) GetMany(keys [][]byte, maxBytes *uint64) ([]*murmur.Bytes, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]*murmur.Bytes, 0, len(keys))
+	var total uint64
+	for _, key := range keys {
+		v, ok := b.records[string(key)]
+		size := uint64(len(v))
+		if len(out) > 0 && maxBytes != nil && size > *maxBytes-total {
+			break
+		}
+		var item *murmur.Bytes
+		if ok {
+			copy := murmur.Bytes(append([]byte{}, v...))
+			item = &copy
+		}
+		out = append(out, item)
+		total += size
+		if maxBytes != nil && total >= *maxBytes {
+			break
+		}
+	}
+	return out, nil
+}
 func (b *RecordBackend) Keys(prefix []byte) ([][]byte, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

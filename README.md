@@ -58,7 +58,7 @@ when durability is required. The default five-second collection schedule gives a
 | --- | --- |
 | Encryption algorithm | AES-256-GCM (fixed; no algorithm option exposed) |
 | `key` argument to `Database::open(path, key, options)` | Required application-provided 32-byte key; no default |
-| `capture_interval` | 5 seconds |
+| `capture_interval` | 1 second |
 | `capture_bytes` | 8 MiB |
 | `queue_bytes` | 64 MiB |
 | `transaction_bytes` | 64 MiB |
@@ -132,7 +132,7 @@ println!("Committed: {}, Durable: {}, Pending Queue: {} bytes", status.committed
 
 ### Understanding `capture_interval` and write buffer growth
 
-The frequency at which background checkpoints run is governed by `options.capture_interval` (default: **5 seconds**):
+The frequency at which background checkpoints run is governed by `options.capture_interval` (default: **1 second**):
 
 - **Expected buffer accumulation**: When transactions commit, SQLite changesets accumulate in memory during the collection window. If `capture_interval` is set to 5s, the pending session buffer (`status.pending_bytes`) is **expected to continuously grow** across those 5 seconds as writes arrive.
 - **Collection boundary**: Only when the timer elapses (or an explicit `db.flush()` is called) does Murmur capture the accumulated changeset, advance the collection clock, and hand the payload off to the background Spool storage worker to compress, encrypt, and fsync to disk.
@@ -492,12 +492,13 @@ acknowledgements, retired flags, the last collection time and total deleted logs
 
 When a peer cannot recover from retained transaction history, it requests a full
 replicated-state snapshot from an explicitly configured `trusted_snapshot_sources`
-node. Protocol version **9** requires a coordinated upgrade of every peer; version
-8 peers are rejected. Existing databases remain readable. Incomplete version 8
-snapshot staging is discarded because those transfers have no durable donor ID.
+node. Protocol version **10** and database format **5** require upgraded peers
+and newly created databases. Older databases and wire versions are rejected; no
+migration or rolling-version compatibility is provided.
 
-The donor atomically stores an immutable signed manifest, 64 KiB chunks and a
-history-retention pin in encrypted Spool. The manifest binds the database, donor,
+The donor reads an immutable Spool checkpoint and streams 64 KiB chunks into
+encrypted Spool. It publishes the signed manifest and history-retention pin
+atomically after the chunks are durable. The manifest binds the database, donor,
 recipient, schema, payload and chunk hashes, and applied-progress boundary.
 Either peer can reopen and resume the same transfer. Missing chunks are requested
 in pages of at most 128; duplicate chunks are harmless and conflicting data is
@@ -518,9 +519,10 @@ is additional to the payload budget. Peer queues must allow at least 1 MiB so a
 maximum-size manifest fits. Reducing limits can prevent existing transfers from
 resuming; restore compatible limits or allow the transfer to expire.
 
-The receiver merges through existing conflict resolution, preserving local-only
-tables and concurrent local edits. Applied progress and a completion receipt
-commit durably with the merged state before acknowledgement. Receipts survive
+The receiver merges verified record batches through existing conflict resolution,
+preserving local-only tables and concurrent local edits. Each batch becomes visible
+incrementally and commits an installation checkpoint with its durable effects. Final
+applied progress and a completion receipt commit only after all batches install. Receipts survive
 reopening and remain available for one transfer lifetime after completion.
 Snapshots include file metadata; encrypted file contents use normal peer fetching.
 
@@ -536,3 +538,13 @@ reconnecting. No transfer metadata or maintenance SQL is added to SQLite.
 The [embedded Go client](clients/go/README.md) wraps the full public Rust surface
 through cgo, with local builds and Linux/macOS/Windows CI. See its
 [API coverage](clients/go/API-COVERAGE.md) and [runnable example](clients/go/examples/basic/main.go).
+
+Incoming replication now drains continuously in bounded batches (64 transactions,
+4 MiB target by default). A larger transaction runs alone. Ordinary network merges
+read affected primary keys and causal records from Spool rather than whole database
+states. `incoming_interval` only controls a fallback retry, capped at one second.
+`adaptive_sync` is opt-in and defaults to false; it adjusts capture and batch counts
+within configured bounds. Transactions above Spool's 16 MiB physical-value limit use
+64 KiB logical-value pieces without increasing the point-read block default.
+See [scalability configuration and restrictions](USAGE.md#scalability-configuration)
+and the [process benchmark](tests-benchmark/README.md) for validation targets.

@@ -140,10 +140,14 @@ type SchedulerSnapshot struct {
 	Shares      [2]uint32           `json:"shares"`
 }
 type ReplicationMetrics struct {
+	ApplyBatches         uint64 `json:"apply_batches"`
+	ApplyBytes           uint64 `json:"apply_bytes"`
+	ApplyNanos           uint64 `json:"apply_nanos"`
 	PushedTransactions   uint64 `json:"pushed_transactions"`
 	ReceivedTransactions uint64 `json:"received_transactions"`
 	AppliedTransactions  uint64 `json:"applied_transactions"`
 	StagedTransactions   uint64 `json:"staged_transactions"`
+	SnapshotsApplied     uint64 `json:"snapshots_applied"`
 	GossipRounds         uint64 `json:"gossip_rounds"`
 	ProbesSent           uint64 `json:"probes_sent"`
 	ProbesFailed         uint64 `json:"probes_failed"`

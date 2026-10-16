@@ -9,7 +9,7 @@
 //! the Go typed-contention HTTP API, and in-process close/reopen replaces
 //! SIGTERM (see the scenario README.md for deviations).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, Ordering},
     Arc, Mutex,
@@ -28,6 +28,9 @@ const DEADLINE_ENV: &str = "MURMUR_GRACEFUL_MEMBER_DEADLINE_SECONDS";
 const DEFAULT_DEADLINE_SECS: u64 = 25;
 /// Baseline rows (Go: 5).
 const BASELINE_ROWS: usize = 5;
+/// Retained log tail per origin (replication `minimum_retained`); the rejoin
+/// proof allows at most this many log transactions per survivor origin.
+const MINIMUM_RETAINED: u64 = 10;
 /// Phase-A load pre-roll (Go: 4 s).
 const PRE_ROLL: Duration = Duration::from_secs(4);
 /// Load-writer cadence (Go: 25 ms ticker, 1 writer per node).
@@ -242,15 +245,24 @@ fn wait_gc_pass(cluster: &Cluster, idx: usize, baseline: u64, timeout: Duration)
 
 #[test]
 fn graceful_shutdown_mid_write_and_mid_snapshot() {
+    // Fixed node ids so the stale node can name its snapshot donors: the
+    // harness trusts nobody by default, and phase B forces the snapshot
+    // path (Go fixture policy trusts all nodes).
+    let node_ids = [[0x61; 16], [0x62; 16], [0x63; 16]];
     let mut cluster = Cluster::new(ClusterOptions {
         name: "graceful-shutdown".into(),
         num_nodes: 3,
+        node_ids: node_ids.to_vec(),
         replication: Some(ReplicationOptions {
             retention: Some(Duration::from_secs(1)),
-            minimum_retained: Some(10),
+            minimum_retained: Some(MINIMUM_RETAINED),
             maximum_offline: Some(Duration::from_secs(20)),
             ..Default::default()
         }),
+        trusted_snapshot_sources: HashMap::from([(
+            2usize,
+            BTreeSet::from([node_ids[0], node_ids[1]]),
+        )]),
         ..Default::default()
     })
     .expect("cluster setup");
@@ -376,14 +388,16 @@ fn graceful_shutdown_mid_write_and_mid_snapshot() {
         wait_row_count(&cluster, 0, want, COUNT_TIMEOUT);
         wait_row_count(&cluster, 1, want, COUNT_TIMEOUT);
 
-        // Member-deadline expiry plus a GC pass (not a fixed sleep for the
-        // pass: under contention the tick slips, so a fixed wait can elapse
-        // without any pass collecting node 3's ranges, and the rejoin
-        // silently takes the log path). First sleep out node 3's 20 s
-        // member deadline so its ranges stop gating GC, then run passes
-        // until one completes after expiry and collects log batches.
-        let gc_runs_before = gc_runs(&cluster, 0);
-        let collected_before = collected_total(&cluster, 0);
+        // Member-deadline expiry plus a GC pass on EACH survivor (not a fixed
+        // sleep for the pass: under contention the tick slips, so a fixed
+        // wait can elapse without any pass collecting node 3's ranges, and
+        // the rejoin silently takes the log path; and one survivor's pass
+        // is not enough, since node 3 would pull the other's intact log).
+        // First sleep out node 3's 20 s member deadline so its ranges stop
+        // gating GC, then run passes until one completes after expiry and
+        // collects log batches.
+        let gc_runs_before = [gc_runs(&cluster, 0), gc_runs(&cluster, 1)];
+        let collected_before = [collected_total(&cluster, 0), collected_total(&cluster, 1)];
         let deadline_wait = Duration::from_secs(
             std::env::var(DEADLINE_ENV)
                 .ok()
@@ -393,13 +407,22 @@ fn graceful_shutdown_mid_write_and_mid_snapshot() {
         );
         eprintln!("waiting {deadline_wait:?} for member-deadline expiry");
         std::thread::sleep(deadline_wait);
-        wait_gc_pass(&cluster, 0, gc_runs_before, GC_TIMEOUT);
-        let collected_after = collected_total(&cluster, 0);
-        assert!(
-            collected_after > collected_before,
-            "a post-expiry GC pass ran but collected no log batches ({collected_before} -> {collected_after}); node3's ranges are still pinned and the snapshot path is not forced"
-        );
-        eprintln!("GC collected log batches after expiry ({collected_before} -> {collected_after}); snapshot path forced");
+        for survivor in [0, 1] {
+            wait_gc_pass(&cluster, survivor, gc_runs_before[survivor], GC_TIMEOUT);
+            let collected_after = collected_total(&cluster, survivor);
+            assert!(
+                collected_after > collected_before[survivor],
+                "node{} post-expiry GC pass ran but collected no log batches ({} -> {collected_after}); node3's ranges are still pinned and the snapshot path is not forced",
+                survivor + 1,
+                collected_before[survivor],
+            );
+            eprintln!(
+                "node{} GC collected log batches after expiry ({} -> {collected_after})",
+                survivor + 1,
+                collected_before[survivor],
+            );
+        }
+        eprintln!("both survivors collected after expiry; snapshot path forced");
 
         cluster.start_node(2).expect("restart stale node3");
         handles.lock().expect("handles lock")[2] = cluster.node(2).clone();
@@ -437,13 +460,22 @@ fn graceful_shutdown_mid_write_and_mid_snapshot() {
         );
 
         wait_converged(&cluster, want, FINAL_TIMEOUT);
-        // The snapshot path is proven via the receiver's counters (flat
-        // log pair on the fresh post-restart handle), not merely by
-        // convergence: log catch-up would hide a snapshot-path regression.
+        // The snapshot path is proven via the receiver's counters on the
+        // fresh post-restart handle, not merely by convergence: log catch-up
+        // would hide a snapshot-path regression. The retained tail
+        // (minimum_retained per origin) legitimately arrives via logs, so
+        // the proof bounds the log path instead of requiring zero: at most
+        // the retained tail, and far below the gap (the rest can only have
+        // arrived via snapshot, the only other row path).
         let (received, applied) = log_counters(&cluster, 2);
+        let gap = want - stale_count;
         assert!(
-            (received, applied) == (0, 0),
-            "node3 rejoin arrived over the log path (received={received} applied={applied}), want snapshot"
+            received <= 2 * MINIMUM_RETAINED,
+            "node3 rejoin pulled {received} log transactions, above the retained tail (2 x {MINIMUM_RETAINED}); want snapshot for the bulk"
+        );
+        assert!(
+            (received as usize) < gap,
+            "node3 rejoin arrived over the log path (received={received} applied={applied} gap={gap}), want snapshot"
         );
         assert_acknowledged_present(&cluster, &acknowledged.lock().expect("acked lock"));
 

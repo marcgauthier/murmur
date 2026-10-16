@@ -4,8 +4,9 @@
 //! (`views_test.go`). Three nodes each insert one contact; two contacts are
 //! enabled via a counter add and must appear in the managed view on every
 //! node while the third stays out. Node 3 then restarts and its rebuilt view
-//! must contain the same two rows. Plain SQL (table + `VIEW`) replaces the
-//! Go typed-RIME managed query (see the scenario README.md for deviations).
+//! must contain the same two rows. Plain SQL (a `SELECT` over the replicated
+//! table) replaces the Go typed-RIME managed query; application `VIEW`s are
+//! rejected by the product (see the scenario README.md for deviations).
 
 use std::time::Duration;
 
@@ -15,9 +16,10 @@ use murmur_live_harness::{wait_until, Cluster, ClusterOptions};
 /// Base table DDL (Go: typed `contacts` records; `score` plays the role of
 /// the enabling PN counter).
 const TABLE_DDL: &str = "CREATE TABLE contacts(name TEXT NOT NULL PRIMARY KEY, score INTEGER NOT NULL)";
-/// Managed-view DDL (Go: `TypedEnabledNames` over managed typed queries).
-const VIEW_DDL: &str =
-    "CREATE VIEW enabled_names AS SELECT name FROM contacts WHERE score > 0 ORDER BY name";
+/// Managed-view query (Go: `TypedEnabledNames` over managed typed queries).
+/// The product rejects application `VIEW`s, so the same SELECT runs directly
+/// against the replicated base table (identical rows, no DDL object).
+const VIEW_QUERY: &str = "SELECT name FROM contacts WHERE score > 0 ORDER BY name";
 /// View wait deadline (Go: 20 s `waitForViewRows`).
 const VIEW_TIMEOUT: Duration = Duration::from_secs(20);
 /// View poll interval (Go: 25 ms).
@@ -26,7 +28,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Canonical ordered enabled names on one node (Go: `TypedEnabledNames`).
 fn enabled_names(db: &Database) -> Vec<String> {
     db.read(|sql| {
-        let mut stmt = sql.prepare("SELECT name FROM enabled_names")?;
+        let mut stmt = sql.prepare(VIEW_QUERY)?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for name in rows {
@@ -107,10 +109,6 @@ fn typed_view_tracks_replicated_rows_and_rebuilds() {
                 .node(i)
                 .migrate(Migration::new(TABLE_DDL))
                 .expect("migrate contacts table");
-            cluster
-                .node(i)
-                .migrate(Migration::new(VIEW_DDL))
-                .expect("migrate enabled_names view");
             cluster.node(i).flush().expect("flush schema");
         }
 

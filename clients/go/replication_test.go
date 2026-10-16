@@ -410,3 +410,31 @@ func TestSnapshotHelpers(t *testing.T) {
 	_, err = json.Marshal(manifest)
 	must(t, err)
 }
+
+func TestBackendBatchedReadsAndBlockingUtility(t *testing.T) {
+	b, h := backendFor(t, NodeID{1}, NodeID{2})
+	defer h.Close()
+	must(t, b.Commit([]Record{PutRecord([]byte("a"), []byte("one")), PutRecord([]byte("empty"), []byte{})}))
+	values, err := h.GetMany([][]byte{[]byte("a"), []byte("missing"), []byte("empty"), []byte("a")})
+	must(t, err)
+	if len(values) != 4 || values[0] == nil || string(*values[0]) != "one" || values[1] != nil || values[2] == nil || len(*values[2]) != 0 || string(*values[3]) != "one" {
+		t.Fatalf("bad batch: %#v", values)
+	}
+	values, err = h.GetManyBounded([][]byte{[]byte("a"), []byte("empty")}, 1)
+	must(t, err)
+	if len(values) != 1 {
+		t.Fatalf("oversized first value: %d", len(values))
+	}
+	called := false
+	must(t, RunBlocking(func() error { called = true; return nil }))
+	if !called {
+		t.Fatal("callback not called")
+	}
+	want := errors.New("blocking callback failed")
+	if err := RunBlocking(func() error { return want }); !errors.Is(err, want) {
+		t.Fatalf("callback error: %v", err)
+	}
+	if RunBlocking(nil) == nil {
+		t.Fatal("nil callback accepted")
+	}
+}

@@ -13,15 +13,19 @@ impl GoBackend {
     }
 }
 impl net::Backend for GoBackend {
+    fn cancel_pending(&self){let _:net::Result<Json>=self.call("cancel_pending",json!(null));}
     fn identity(&self) -> (net::NodeId, net::NodeId) {
         self.call("identity", Json::Null).unwrap_or_default()
     }
     fn get(&self, key: &[u8]) -> net::Result<Option<Vec<u8>>> {
         self.call("get", json!({"key":key}))
     }
+    fn get_many(&self,keys:&[Vec<u8>])->net::Result<Vec<Option<Vec<u8>>>>{self.call("get_many",json!({"keys":keys,"max_bytes":null}))}
+    fn get_many_bounded(&self,keys:&[Vec<u8>],max_bytes:usize)->net::Result<Vec<Option<Vec<u8>>>>{self.call("get_many",json!({"keys":keys,"max_bytes":max_bytes}))}
     fn keys(&self, prefix: &[u8]) -> net::Result<Vec<Vec<u8>>> {
         self.call("keys", json!({"prefix":prefix}))
     }
+    fn keys_page(&self,prefix:&[u8],after:Option<&[u8]>,limit:usize)->net::Result<Vec<Vec<u8>>> {self.call("keys_page",json!({"prefix":prefix,"after":after,"limit":limit}))}
     fn commit(&self, records: Vec<net::Record>) -> net::Result<()> {
         self.call("commit", json!({"records":records}))
     }
@@ -114,7 +118,10 @@ pub fn replication_json(c: &net::Config) -> Json {
         max_transaction_bytes,
         snapshot_bytes,
         snapshot_staging_bytes,
-        minimum_retained
+        minimum_retained,
+        batch_transactions,
+        batch_bytes,
+        adaptive_sync
     );
     macro_rules! times{($($f:ident),*)=>{$(j[stringify!($f)]=json!(c.$f.as_nanos() as u64);)*}}
     times!(
@@ -141,6 +148,9 @@ pub fn call(id: u64, v: &Json, callback: Option<Callback>) -> db::Result<Json> {
         "backend_new" => Ok(json!(put(Entry::Backend(Arc::new(GoBackend(
             dispatch::foreign(v, callback)?
         )))))),
+        "backend_get_many" => {let b=backend(field(v,"backend")?)?;let keys:Vec<Vec<u8>>=field(v,"keys")?;let values=if v["max_bytes"].is_null(){b.get_many(&keys)}else{b.get_many_bounded(&keys,field(v,"max_bytes")?)};encoded(values.map_err(network)?)},
+        "helper_run_blocking" => {let foreign=dispatch::foreign(v,callback)?;net::run_blocking(||foreign.bytes(11,0,&[]))?;Ok(Json::Null)},
+        "backend_progress" => encoded(backend(field(v,"backend")?)?.progress().map_err(network)?),
         "backend_bind_signer" => {
             net::bind_signer(backend(id)?.as_ref(), &config::replication(&v["config"])?)
                 .map_err(network)?;
@@ -263,7 +273,7 @@ pub fn call(id: u64, v: &Json, callback: Option<Callback>) -> db::Result<Json> {
         "helper_recipient_public" => encoded(net::bridge::recipient_public(field(v, "secret")?)),
         "helper_hex" => encoded(net::hex(&field::<Vec<u8>>(v, "bytes")?)),
         "helper_constants" => Ok(
-            json!({"version":net::protocol::VERSION,"alpn":net::protocol::ALPN,"frame_bytes":net::protocol::FRAME_BYTES,"chunk_bytes":net::protocol::CHUNK_BYTES,"cap_signed_schema":net::protocol::CAP_SIGNED_SCHEMA,"capabilities":net::protocol::CAPABILITIES,"required":net::protocol::REQUIRED,"sign_domain":net::protocol::SIGN_DOMAIN,"schema_sign_domain":net::protocol::SCHEMA_SIGN_DOMAIN,"coverage_key":net::retention::COVERAGE_KEY,"out":net::snapshot::OUT,"in":net::snapshot::IN,"receipts":net::snapshot::RECEIPTS,"pins":net::snapshot::PINS}),
+            json!({"version":net::protocol::VERSION,"alpn":net::protocol::ALPN,"frame_bytes":net::protocol::FRAME_BYTES,"chunk_bytes":net::protocol::CHUNK_BYTES,"cap_signed_schema":net::protocol::CAP_SIGNED_SCHEMA,"capabilities":net::protocol::CAPABILITIES,"required":net::protocol::REQUIRED,"sign_domain":net::protocol::SIGN_DOMAIN,"schema_sign_domain":net::protocol::SCHEMA_SIGN_DOMAIN,"coverage_key":net::retention::COVERAGE_KEY,"out":net::snapshot::OUT,"in":net::snapshot::IN,"receipts":net::snapshot::RECEIPTS,"pins":net::snapshot::PINS,"build_grace_millis":net::snapshot::BUILD_GRACE_MILLIS,"build_stale_millis":net::snapshot::BUILD_STALE_MILLIS,"build_fresh_margin_millis":net::snapshot::BUILD_FRESH_MARGIN_MILLIS}),
         ),
         "helper_validate_options" => {
             let o = config::options(&v["options"], callback)?;
@@ -887,6 +897,11 @@ fn snapshot(v: &Json) -> db::Result<Json> {
             )
             .map_err(network)?,
         );
+    }
+    if method == "build_stream" {
+        let b=backend(field(v,"backend")?)?;
+        let pages:Vec<Vec<u8>>=field(v,"pages")?;
+        return encoded(net::snapshot::build_stream(field(v,"identity")?,field(v,"recipient")?,pages.into_iter().map(Ok),field(v,"progress")?,field(v,"schema")?,&config::replication(&v["config"])?,now,|records|b.commit(records)).map_err(network)?);
     }
     let b = backend(field(v, "backend")?)?;
     match method {

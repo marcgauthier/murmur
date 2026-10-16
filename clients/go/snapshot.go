@@ -84,3 +84,11 @@ func SnapshotPruneLimit(backend *BackendHandle, origin NodeID, now uint64) (uint
 func MaintainSnapshots(backend *BackendHandle, now uint64) error {
 	return snapshotCall(backend, "maintain", map[string]any{"now": now}, nil)
 }
+
+// BuildSnapshotStream persists encoded Content pages in bounded native groups.
+// The supplied Go pages are materialized; database-managed exports stream from Spool.
+func BuildSnapshotStream(backend *BackendHandle, identity [2]NodeID, recipient NodeID, pages []Bytes, progress []PeerProgress, schema Key, config ReplicationConfig, now uint64) (SnapshotManifest, error) {
+	var manifest SnapshotManifest
+	err := snapshotCall(backend, "build_stream", map[string]any{"identity": identity, "recipient": recipient, "pages": nonNil(pages), "progress": nonNil(progress), "schema": schema, "config": config, "now": now}, &manifest)
+	return manifest, err
+}

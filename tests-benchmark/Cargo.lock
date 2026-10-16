@@ -1837,8 +1837,10 @@ dependencies = [
 name = "sqlite-session-benchmark"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "rcgen",
  "rusqlite",
+ "serde_json",
  "sqlite-session",
  "tempfile",
 ]

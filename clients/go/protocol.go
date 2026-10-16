@@ -107,6 +107,9 @@ type ProtocolConstants struct {
 	SnapshotIn       Bytes  `json:"in"`
 	SnapshotReceipts Bytes  `json:"receipts"`
 	SnapshotPins     Bytes  `json:"pins"`
+	BuildGraceMillis       uint64 `json:"build_grace_millis"`
+	BuildStaleMillis       uint64 `json:"build_stale_millis"`
+	BuildFreshMarginMillis uint64 `json:"build_fresh_margin_millis"`
 }
 
 func Constants() (ProtocolConstants, error) {
